@@ -1,0 +1,25 @@
+icloud.8-208-13-52.sslip.io {
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:18765
+}
+
+http://8.208.13.52 {
+	@autoreg_exact path /auto-reg
+	redir @autoreg_exact /auto-reg/ 308
+
+	handle_path /auto-reg/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:18080
+	}
+}
+
+http://grok.sub23ycy.top {
+	reverse_proxy 127.0.0.1:8765
+}
+
+sub23ycy.top, www.sub23ycy.top {
+	reverse_proxy 127.0.0.1:8080
+}

@@ -22,6 +22,15 @@ class VerificationCodeExtractionTests(unittest.TestCase):
             "AB12CD",
         )
 
+    def test_extracts_japanese_verification_code(self):
+        self.assertEqual(
+            extract_verification_code(
+                "ChatGPT 用の一時ログインコード",
+                "この一時検証コードを入力して続行してください: 818214",
+            ),
+            "818214",
+        )
+
     def test_ignores_year_in_security_notification(self):
         self.assertEqual(
             extract_verification_code(

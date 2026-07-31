@@ -49,6 +49,10 @@ COOKIE_CAPTURE_URLS = {
     "global": "https://www.icloud.com/icloudplus/",
     "china": "https://www.icloud.com.cn/icloudplus/",
 }
+HIDEMYEMAIL_CAPTURE_URLS = {
+    "global": "https://www.icloud.com/applications/hidemyemail/current/en-us/index.html?rootDomain=www",
+    "china": "https://www.icloud.com.cn/applications/hidemyemail/current/zh-cn/index.html?rootDomain=www",
+}
 HIDEMYEMAIL_APP_PATH = "/applications/hidemyemail/current/"
 
 
@@ -769,7 +773,7 @@ async def _generate(
     region: str = DEFAULT_REGION,
     db_file: str = DEFAULT_DB_FILE,
     no_db: bool = False,
-) -> None:
+) -> List[str]:
     async with RichHideMyEmail(
         cookie_file=cookie_file,
         output_file=output_file,
@@ -792,6 +796,8 @@ async def _generate(
                 )
         finally:
             conn.close()
+
+    return emails
 
 
 async def _list(
@@ -966,7 +972,17 @@ async def _capture_cookie(cookie_file: str, region: str = DEFAULT_REGION) -> boo
                 return
 
             cookie = request.headers.get("cookie", "")
-            if cookie and not captured.done():
+            request_cookie_values = {
+                part.split("=", 1)[0].strip().upper(): part.split("=", 1)[1].strip()
+                for part in cookie.split(";")
+                if "=" in part
+            }
+            if (
+                cookie
+                and request_cookie_values.get("X-APPLE-WEBAUTH-USER")
+                and request_cookie_values.get("X-APPLE-WEBAUTH-TOKEN")
+                and not captured.done()
+            ):
                 captured.set_result((request.url, cookie))
 
         context.on("request", on_request)
@@ -987,6 +1003,26 @@ async def _capture_cookie(cookie_file: str, region: str = DEFAULT_REGION) -> boo
         ]
 
         while not captured.done() and loop.time() < deadline:
+            # Playwright can read HttpOnly cookies from its own persistent
+            # browser context. This is more reliable than depending on a
+            # particular iCloud+ page layout or application request. Wait
+            # until the signed-in authorization cookie exists, then assemble
+            # the same Cookie header expected by the CLI.
+            browser_cookies = await context.cookies([SETUP_VALIDATE_URLS[region]])
+            cookie_values = {
+                item.get("name", "").upper(): item.get("value", "")
+                for item in browser_cookies
+            }
+            if (
+                cookie_values.get("X-APPLE-WEBAUTH-USER")
+                and cookie_values.get("X-APPLE-WEBAUTH-TOKEN")
+            ):
+                cookie = "; ".join(
+                    f"{item['name']}={item['value']}" for item in browser_cookies
+                )
+                captured.set_result((HIDEMYEMAIL_CAPTURE_URLS[region], cookie))
+                break
+
             if not clicked:
                 for selector in selectors:
                     locator = page.locator(selector).first

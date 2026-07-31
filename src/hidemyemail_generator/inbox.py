@@ -18,10 +18,17 @@ DEFAULT_DB_FILE = "hidemyemail.db"
 DEFAULT_INBOX_CONFIG_FILE = "inbox_config.json"
 DEFAULT_EXPORT_DIR = "exports"
 DEFAULT_FOLDER = "INBOX"
+DEFAULT_IMAP_TIMEOUT = 20
 
 ADDRESS_STATES = ("unused", "used", "trash")
 CODE_KEYWORDS = re.compile(
-    r"验证码|校验码|动态码|安全码|认证码|确认码|临时码|一次性|验证|verification|verify|code|otp|passcode|security code|confirmation",
+    r"验证码|校验码|动态码|安全码|认证码|确认码|临时码|一次性|验证|"
+    r"検証コード|確認コード|認証コード|一時コード|ログインコード|ワンタイム|"
+    r"인증\s*코드|확인\s*코드|로그인\s*코드|일회용|인증번호|"
+    r"verification|verify|code|otp|passcode|security code|confirmation|"
+    r"bestätigungscode|sicherheitscode|anmeldecode|"
+    r"code de vérification|code de confirmation|code temporaire|"
+    r"código de verificación|código de confirmación|código temporal",
     re.IGNORECASE,
 )
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -399,9 +406,9 @@ def sync_inbox(
 ) -> list[dict]:
     conn = connect_db(db_file)
     mailbox = (
-        imaplib.IMAP4_SSL(config.host, config.port)
+        imaplib.IMAP4_SSL(config.host, config.port, timeout=DEFAULT_IMAP_TIMEOUT)
         if config.use_ssl
-        else imaplib.IMAP4(config.host, config.port)
+        else imaplib.IMAP4(config.host, config.port, timeout=DEFAULT_IMAP_TIMEOUT)
     )
     try:
         mailbox.login(config.username, config.password)
@@ -430,7 +437,10 @@ def sync_inbox(
             if exists:
                 continue
 
-            status, msg_data = mailbox.uid("fetch", raw_uid, "(RFC822)")
+            # iCloud's IMAP server may acknowledge RFC822 without returning the
+            # message literal. BODY.PEEK[] is standards-based, works with iCloud,
+            # and does not mark the message as read.
+            status, msg_data = mailbox.uid("fetch", raw_uid, "(BODY.PEEK[])")
             if status != "OK" or not msg_data:
                 continue
 

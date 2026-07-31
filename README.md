@@ -317,12 +317,47 @@ What it does not do:
 For many mail providers, you should use an app password instead of your normal
 mailbox password.
 
+## Camoufox Batch Session Acquisition
+
+The web service can reuse the `openai-register-paylink-ui` project's browser
+worker while replacing its mailbox source with iCloud Hide My Email:
+
+- active iCloud aliases become the browser account pool;
+- valid access tokens are skipped and expired tokens are refreshed;
+- single-account and all-account runs support 1–10 workers and visible/headless mode;
+- only a new OpenAI code matched to the current alias is accepted;
+- the generated password, Session, access token, and storage state are saved in
+  the local `hidemyemail.db`; secrets are omitted from task logs;
+- running batches can be stopped from the web UI.
+
+On Windows, the default source project is the sibling directory
+`../openai-register-paylink-ui-dist-20260706-README-deploy`. Override it with
+`OPENAI_REGISTER_PROJECT_DIR` and `OPENAI_REGISTER_PYTHON` when needed.
+Server builds use `Dockerfile.remote-browser` and an `openai-register-runtime/`
+directory containing only the source project's top-level Python modules. Do not
+copy its state, logs, proxies, or account data. Server browser jobs are forced
+to run headless.
+
+### One-click validation and classification
+
+The **Validate all accounts** action checks every saved access token and
+classifies authenticated accounts as `Plus` or `Free`. Aliases without a token
+remain unverified. An account is treated as invalid only when both independent
+account endpoints explicitly return 401/403. Invalid local GPT credentials
+(password, access token, and Session) are deleted and the alias is removed from
+the GPT list. Network or uncertain failures keep the account. The Apple-side
+iCloud Hide My Email alias is never disabled or deleted by this action.
+
 ## Configuration
 
 | Setting | Values | Notes |
 | --- | --- | --- |
 | `--region` | `china`, `global` | Selects iCloud China or global iCloud endpoints. |
 | `HIDEMYEMAIL_REGION` | `china`, `global` | Optional default region for the CLI and launcher. Defaults to `global`. |
+| `OPENAI_REGISTER_PROJECT_DIR` | path | Source directory for the Camoufox browser worker. |
+| `OPENAI_REGISTER_PYTHON` | path | Python runtime containing the source project's dependencies and Camoufox. |
+| `HIDEMYEMAIL_BROWSER_SERVICE_URL` | URL | Loopback URL used by browser workers to request matched iCloud codes. |
+| `HIDEMYEMAIL_FORCE_BROWSER_HEADLESS` | `0`, `1` | Forces all browser jobs to use headless mode when set to `1`. |
 | `cookies.txt` | local file | Stores the captured cookie in a Git-ignored file. |
 | `emails.txt` | local file | Stores generated addresses unless `--no-output-file` is used. |
 | `inbox_config.json` | local file | Stores IMAP settings for the receiving mailbox. |

@@ -290,12 +290,54 @@ cookies.txt.bak
 
 很多邮箱服务商要求使用“应用专用密码”，不要直接使用网页登录密码。
 
+## Camoufox 浏览器批量获取 Session
+
+网页服务现在可以复用 `openai-register-paylink-ui` 项目的“浏览器取选中 / 浏览器取全部”
+认证工作器，并把邮箱与验证码来源替换为本项目的 iCloud 隐藏邮箱：
+
+- 网页列出当前 iCloud 账号下的全部有效隐藏邮箱；
+- 有效 Access Token 自动跳过，过期 Token 自动重新获取；
+- 支持单个邮箱和全部邮箱、1–10 并发、可见或无头 Camoufox；
+- 只接受本次认证开始后、与目标隐藏邮箱匹配的 OpenAI 验证码；
+- 成功后把 OpenAI 密码、Session、Access Token 和浏览器 storage state 保存在
+  `hidemyemail.db` 的本地设置表中；敏感结果不会写入任务日志；
+- 可以在网页中停止当前任务。真实浏览器任务不会在测试或服务启动时自动执行。
+
+Windows 本地默认查找同级目录：
+
+```text
+../openai-register-paylink-ui-dist-20260706-README-deploy
+```
+
+该目录必须已经安装项目依赖和 Camoufox 运行时。也可以用下面的环境变量指定：
+
+```text
+OPENAI_REGISTER_PROJECT_DIR=D:\path\to\openai-register-project
+OPENAI_REGISTER_PYTHON=D:\path\to\openai-register-project\.venv\Scripts\python.exe
+```
+
+服务器部署使用 `Dockerfile.remote-browser`。构建目录需要包含
+`openai-register-runtime/`（只放目标项目顶层 Python 源文件，不要复制 `state.json`、
+日志、代理或账号数据）。服务器强制使用无头浏览器。
+
+### 一键验证与账号分类
+
+“一键验证账号”会并发查询所有已保存 Access Token 的账号，并把在线有效账号归类为
+`Plus` 或 `Free`。没有 AT 的邮箱保持“等待验证”。只有两个独立账号接口都明确返回
+401/403 时才判定为无效；无效账号会从 GPT 列表移除，并删除本地保存的密码、AT 和
+Session。网络错误、单接口异常或结果不确定时会保留账号。此操作不会停用或删除 Apple
+端的 iCloud 隐藏邮箱。
+
 ## 配置
 
 | 配置 | 值 | 说明 |
 | --- | --- | --- |
 | `--region` | `china`, `global` | 选择 iCloud 中国区或全球区接口。 |
 | `HIDEMYEMAIL_REGION` | `china`, `global` | 命令行和启动器的可选默认区域，默认 `global`。 |
+| `OPENAI_REGISTER_PROJECT_DIR` | 路径 | Camoufox 浏览器工作器源项目目录。 |
+| `OPENAI_REGISTER_PYTHON` | 路径 | 已安装目标项目依赖和 Camoufox 的 Python。 |
+| `HIDEMYEMAIL_BROWSER_SERVICE_URL` | URL | 浏览器工作器回调本服务读取 iCloud 验证码的本机地址。 |
+| `HIDEMYEMAIL_FORCE_BROWSER_HEADLESS` | `0`, `1` | 设为 `1` 时强制所有浏览器任务使用无头模式。 |
 | `cookies.txt` | 本地文件 | 保存捕获到的 Cookie。 |
 | `emails.txt` | 本地文件 | 保存生成的隐藏邮件地址。 |
 | `inbox_config.json` | 本地文件 | 保存接收邮箱 IMAP 配置。 |
@@ -331,6 +373,7 @@ cookies.txt.bak
 
 - Cookie 只保存在本地，并已被 Git 忽略。
 - IMAP 配置和本地收件数据只保存在本地，并已被 Git 忽略。
+- 浏览器任务只把当前认证所需的邮箱和验证码提交给 OpenAI 官方认证页面；Session、AT 和密码只保存在本地数据库。
 - 自动捕获使用独立浏览器配置。
 - 项目不会主动收集、上传或分享你的 Cookie、邮件数据或验证码。
 - 不要提交 `cookies.txt`、`cookies.txt.bak`、`emails.txt`、`inbox_config.json`、`hidemyemail.db`、导出目录或浏览器配置目录。

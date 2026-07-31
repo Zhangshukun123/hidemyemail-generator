@@ -19,6 +19,7 @@ license = { text = "MIT" }
 
 [project.scripts]
 hidemyemail = "hidemyemail_generator.main:cli"
+hidemyemail-web = "hidemyemail_generator.webapp:main"
 
 [project.optional-dependencies]
 capture = [
