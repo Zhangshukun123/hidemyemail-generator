@@ -92,6 +92,54 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 conn.close()
             self.assertEqual(row["state"], "used")
 
+    async def test_partial_two_factor_state_is_saved_before_activation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json, sys\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "result = {'access_token':'at-partial','session_json':'{}'}\n"
+                "print(prefix + json.dumps({'type':'account_registered','result':result,'password':'Strong!Pass123'}), flush=True)\n"
+                "two_factor = {'enabled':False,'status':'enrolled','secret':'JBSWY3DPEHPK3PXP','factor_id':'factor-1','session_id':'session-1'}\n"
+                "print(prefix + json.dumps({'type':'two_factor_enrolled','two_factor':two_factor}), flush=True)\n"
+                "print(prefix + json.dumps({'type':'error','error':'activation failed','password':'Strong!Pass123'}), flush=True)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(
+                [
+                    {
+                        "email": "partial@icloud.com",
+                        "password": "Strong!Pass123",
+                        "enable_2fa": True,
+                    }
+                ],
+                headless=True,
+                concurrency=1,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["failed"], 1)
+            self.assertNotIn("JBSWY3D", json.dumps(snapshot))
+            record = load_account_record(db_file, "partial@icloud.com")
+            self.assertEqual(record["access_token"], "at-partial")
+            self.assertEqual(record["two_factor"]["status"], "enrolled")
+            self.assertEqual(record["two_factor"]["secret"], "JBSWY3DPEHPK3PXP")
+
 
 if __name__ == "__main__":
     unittest.main()

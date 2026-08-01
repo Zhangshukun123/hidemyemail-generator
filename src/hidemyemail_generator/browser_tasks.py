@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import subprocess
-import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -72,6 +71,7 @@ def _save_account_record(
     *,
     result: dict[str, Any] | None = None,
     password: str = "",
+    two_factor: dict[str, Any] | None = None,
 ) -> None:
     target = email.strip().lower()
     current = load_account_record(db_file, target)
@@ -79,6 +79,8 @@ def _save_account_record(
     current["updated_at"] = utc_now()
     if password:
         current["password"] = password
+    if isinstance(two_factor, dict) and two_factor.get("secret"):
+        current["two_factor"] = dict(two_factor)
     if result:
         access_token = str(result.get("access_token") or "").strip()
         session_json = str(result.get("session_json") or "").strip()
@@ -94,6 +96,9 @@ def _save_account_record(
             current["session"] = parsed_session
         if storage_state_json:
             current["storage_state_json"] = storage_state_json
+        result_two_factor = result.get("two_factor")
+        if isinstance(result_two_factor, dict) and result_two_factor.get("secret"):
+            current["two_factor"] = dict(result_two_factor)
 
     conn = connect_db(str(db_file))
     try:
@@ -210,7 +215,7 @@ class BrowserTaskManager:
         if not runtime["available"]:
             raise RuntimeError("；".join(runtime["errors"]))
 
-        deduplicated: list[dict[str, str]] = []
+        deduplicated: list[dict[str, Any]] = []
         seen: set[str] = set()
         for account in accounts:
             email = str(account.get("email") or "").strip().lower()
@@ -221,6 +226,10 @@ class BrowserTaskManager:
                 {
                     "email": email,
                     "password": str(account.get("password") or ""),
+                    "enable_2fa": bool(account.get("enable_2fa", False)),
+                    "two_factor": account.get("two_factor")
+                    if isinstance(account.get("two_factor"), dict)
+                    else {},
                 }
             )
         if not deduplicated:
@@ -246,6 +255,10 @@ class BrowserTaskManager:
                     "message": "等待浏览器任务",
                     "latestLog": "",
                     "_password": item["password"],
+                    "_enable_2fa": item["enable_2fa"],
+                    "_two_factor": item["two_factor"],
+                    "phase": "queued",
+                    "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
                 }
                 for item in deduplicated
             ],
@@ -325,6 +338,7 @@ class BrowserTaskManager:
                 item["message"] = "任务已停止"
                 return
             item["status"] = "running"
+            item["phase"] = "registering_openai"
             item["message"] = "正在启动 Camoufox"
             self._append_log("开始浏览器注册或登录", email=email)
 
@@ -336,6 +350,12 @@ class BrowserTaskManager:
                     "HME_BROWSER_SERVICE_URL": self.service_url,
                     "HME_BROWSER_WORKER_TOKEN": self.worker_token,
                     "HME_OPENAI_PASSWORD": str(item.get("_password") or ""),
+                    "HME_ENABLE_OPENAI_2FA": "1"
+                    if item.get("_enable_2fa")
+                    else "0",
+                    "HME_OPENAI_2FA_STATE": json.dumps(
+                        item.get("_two_factor") or {}, ensure_ascii=False
+                    ),
                 }
             )
             command = [
@@ -392,7 +412,12 @@ class BrowserTaskManager:
                     password=password,
                 )
                 item["status"] = "success"
-                item["message"] = "Session / AT 已保存"
+                item["phase"] = "completed"
+                item["message"] = (
+                    "Session / AT / 2FA 已保存"
+                    if item.get("_enable_2fa")
+                    else "Session / AT 已保存"
+                )
                 self._state["succeeded"] += 1
                 self._append_log("Session / AT 已保存到本地数据库", email=email)
             else:
@@ -402,11 +427,13 @@ class BrowserTaskManager:
                         self.db_file,
                         email,
                         password=password,
+                        two_factor=item.get("_two_factor"),
                     )
                 error = str(item.get("_error") or "")
                 if not error:
                     error = f"浏览器工作器退出，代码 {return_code}"
                 item["status"] = "failed"
+                item["phase"] = "failed"
                 item["message"] = error[:500]
                 self._state["failed"] += 1
                 self._append_log(f"失败：{error[:500]}", email=email)
@@ -440,6 +467,48 @@ class BrowserTaskManager:
                 password = str(event.get("password") or "")
                 if password:
                     item["_password"] = password
+                two_factor = (
+                    result.get("two_factor") if isinstance(result, dict) else None
+                )
+                if isinstance(two_factor, dict):
+                    item["_two_factor"] = two_factor
+                    item["twoFactorEnabled"] = bool(two_factor.get("enabled"))
+            elif kind == "account_registered":
+                result = event.get("result")
+                if isinstance(result, dict):
+                    item["_result"] = result
+                password = str(event.get("password") or "")
+                if password:
+                    item["_password"] = password
+                if isinstance(result, dict):
+                    await asyncio.to_thread(
+                        _save_account_record,
+                        self.db_file,
+                        email,
+                        result=result,
+                        password=password,
+                    )
+                item["message"] = "OpenAI 注册成功，正在开启 2FA"
+            elif kind == "two_factor_start":
+                item["phase"] = "enabling_2fa"
+                item["message"] = "正在创建 TOTP 2FA"
+                self._append_log("OpenAI 注册成功，开始开启 2FA", email=email)
+            elif kind == "two_factor_enrolled":
+                two_factor = event.get("two_factor")
+                if isinstance(two_factor, dict):
+                    item["_two_factor"] = two_factor
+                    await asyncio.to_thread(
+                        _save_account_record,
+                        self.db_file,
+                        email,
+                        password=str(item.get("_password") or ""),
+                        two_factor=two_factor,
+                    )
+                item["message"] = "2FA 密钥已保存，正在激活"
+            elif kind == "two_factor_enabled":
+                item["twoFactorEnabled"] = True
+                item["message"] = "2FA 已开启，正在保存账号"
+                self._append_log("TOTP 2FA 已成功开启", email=email)
             elif kind == "error":
                 item["_error"] = str(event.get("error") or "浏览器任务失败")
                 password = str(event.get("password") or "")
@@ -490,6 +559,12 @@ class BrowserTaskManager:
                 pass
         except asyncio.CancelledError:
             pass
+        return self.snapshot()
+
+    async def wait(self) -> dict[str, Any]:
+        task = self._batch_task
+        if task and not task.done():
+            await asyncio.shield(task)
         return self.snapshot()
 
     async def close(self) -> None:

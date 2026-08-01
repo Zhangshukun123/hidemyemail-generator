@@ -129,3 +129,21 @@ class HideMyEmail:
         return await self._request_json(
             "GET", f"{self.base_url_v2}/list", params=self.params
         )
+
+    async def deactivate_email(self, anonymous_id: str) -> dict:
+        """Deactivate a Hide My Email alias before permanent deletion."""
+        return await self._request_json(
+            "POST",
+            f"{self.base_url_v1}/deactivate",
+            params=self.params,
+            json={"anonymousId": anonymous_id},
+        )
+
+    async def delete_email(self, anonymous_id: str) -> dict:
+        """Permanently delete a Hide My Email alias."""
+        return await self._request_json(
+            "POST",
+            f"{self.base_url_v1}/delete",
+            params=self.params,
+            json={"anonymousId": anonymous_id},
+        )

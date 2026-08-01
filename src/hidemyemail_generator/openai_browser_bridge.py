@@ -10,8 +10,28 @@ import types
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from .openai_mfa import enable_totp_mfa
+except ImportError:
+    from openai_mfa import enable_totp_mfa
+
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
+
+
+class MfaHttpClient:
+    def __init__(self) -> None:
+        import requests
+
+        self.session = requests.Session()
+        self.session.trust_env = False
+
+    def post(self, url: str, **kwargs):
+        kwargs["timeout"] = 60
+        return self.session.post(url, **kwargs)
+
+    def close(self) -> None:
+        self.session.close()
 
 
 def emit(kind: str, **payload) -> None:
@@ -140,6 +160,11 @@ def main() -> int:
     sys.path.insert(0, str(source_dir))
 
     password = os.environ.get("HME_OPENAI_PASSWORD", "")
+    enable_2fa = os.environ.get("HME_ENABLE_OPENAI_2FA", "") == "1"
+    try:
+        pending_2fa = json.loads(os.environ.get("HME_OPENAI_2FA_STATE", "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pending_2fa = {}
     account = None
     try:
         ensure_tkinter_importable()
@@ -171,6 +196,28 @@ def main() -> int:
             browser_engine="camoufox",
         )
         result = worker.run()
+        if enable_2fa:
+            emit(
+                "account_registered",
+                result=result,
+                password=str(account.password or ""),
+            )
+            emit("two_factor_start")
+            mfa_client = MfaHttpClient()
+            try:
+                two_factor = enable_totp_mfa(
+                    mfa_client,
+                    access_token=str(result.get("access_token") or ""),
+                    email=str(account.email or ""),
+                    pending=pending_2fa,
+                    on_enrolled=lambda state: emit(
+                        "two_factor_enrolled", two_factor=state
+                    ),
+                )
+            finally:
+                mfa_client.close()
+            result["two_factor"] = two_factor
+            emit("two_factor_enabled")
         emit(
             "result",
             result=result,

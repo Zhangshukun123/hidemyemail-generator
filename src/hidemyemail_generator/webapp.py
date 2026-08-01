@@ -34,6 +34,8 @@ from .inbox import (
 )
 from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
+from .openai_mfa import generate_totp
+from .registration_tasks import RegistrationTaskManager
 
 
 SESSION_COOKIE_NAME = "hme_session"
@@ -58,59 +60,130 @@ LOGIN_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#07131f">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0f0f10">
   <title>登录 · iCloud 隐藏邮箱</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("hme_theme");
+        const theme = saved === "light" || saved === "dark"
+          ? saved
+          : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.theme = theme;
+        document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#0f0f10" : "#f7f7f5";
+      } catch (_) {}
+    })();
+  </script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css" integrity="sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU" crossorigin="anonymous">
   <style>
-    :root {
+    :root, html[data-theme="dark"] {
       color-scheme: dark;
       font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
       --pico-font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
-      --pico-primary: #6ea8fe;
-      --pico-primary-background: #367bf5;
-      --pico-primary-hover-background: #4a89f7;
+      --pico-primary: #f0f0f0;
+      --pico-primary-background: #ececec;
+      --pico-primary-hover-background: #ffffff;
       --pico-border-radius: 14px;
+      --canvas: #0f0f10;
+      --surface: rgba(25, 25, 26, .96);
+      --surface-border: rgba(255, 255, 255, .1);
+      --text: #f3f3f4;
+      --muted: #9b9b9f;
+      --label: #c4c4c7;
+      --input: #171718;
+      --input-border: #39393b;
+      --input-focus: #77777b;
+      --primary: #ececec;
+      --primary-hover: #ffffff;
+      --primary-text: #151515;
+      --subtle: rgba(255, 255, 255, .035);
+      --grid: rgba(255, 255, 255, .026);
+      --brand: linear-gradient(145deg, #39393c, #19191a);
+      --brand-border: rgba(255, 255, 255, .13);
+      --brand-copy: #a5a5a8;
+      --danger: #e67584;
+      --shadow: 0 32px 90px rgba(0, 0, 0, .44), inset 0 1px 0 rgba(255, 255, 255, .025);
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --pico-primary: #202021;
+      --pico-primary-background: #202021;
+      --pico-primary-hover-background: #0d0d0e;
+      --canvas: #f7f7f5;
+      --surface: rgba(255, 255, 255, .97);
+      --surface-border: rgba(0, 0, 0, .1);
+      --text: #222223;
+      --muted: #6b6b6e;
+      --label: #4d4d50;
+      --input: #ffffff;
+      --input-border: #d4d4d1;
+      --input-focus: #77777a;
+      --primary: #202021;
+      --primary-hover: #0d0d0e;
+      --primary-text: #ffffff;
+      --subtle: rgba(0, 0, 0, .025);
+      --grid: rgba(0, 0, 0, .025);
+      --brand: linear-gradient(145deg, #363638, #171718);
+      --brand-border: rgba(0, 0, 0, .08);
+      --brand-copy: #6d6d70;
+      --danger: #b84354;
+      --shadow: 0 28px 70px rgba(0, 0, 0, .11), inset 0 1px 0 rgba(255, 255, 255, .7);
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0; min-height: 100vh; display: grid; place-items: center; overflow: hidden; color: #edf5ff;
-      background: radial-gradient(circle at 12% 5%, rgba(54,123,245,.24), transparent 32rem),
-                  radial-gradient(circle at 88% 92%, rgba(45,212,191,.12), transparent 30rem), #07131f;
+      margin: 0; min-height: 100vh; display: grid; place-items: center; overflow: hidden; color: var(--text);
+      background: radial-gradient(circle at 12% 0%, var(--subtle), transparent 34rem), var(--canvas);
+      transition: color .2s ease, background-color .2s ease;
     }
     body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .18;
-      background-image: linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
-                        linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+      background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+                        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
       background-size: 32px 32px; mask-image: linear-gradient(to bottom, black, transparent 75%); }
     .login-shell { width: min(440px, calc(100% - 32px)); position: relative; z-index: 1; }
     .login {
-      margin: 0; padding: clamp(26px, 6vw, 38px); border-radius: 26px;
-      background: rgba(10,25,40,.88); border: 1px solid rgba(135,167,207,.2);
-      box-shadow: 0 32px 90px rgba(0,0,0,.42); backdrop-filter: blur(22px);
+      position: relative; margin: 0; padding: clamp(26px, 6vw, 38px); border-radius: 26px;
+      background: var(--surface); border: 1px solid var(--surface-border);
+      box-shadow: var(--shadow); backdrop-filter: blur(22px);
     }
     .brand { display: flex; align-items: center; gap: 13px; margin-bottom: 28px; }
     .icon { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 15px;
-      color: #fff; background: linear-gradient(145deg, #65a4ff, #2768df); box-shadow: 0 12px 28px rgba(54,123,245,.3); }
+      color: #fff; background: var(--brand); border: 1px solid var(--brand-border);
+      box-shadow: 0 10px 24px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.1); }
     .icon svg { width: 23px; height: 23px; }
-    .brand-copy { color: #8da4bf; font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
-    h1 { margin: 3px 0 0; font-size: 28px; letter-spacing: -.035em; color: #f4f8ff; }
-    .intro { margin: 0 0 26px; color: #8fa6c1; line-height: 1.65; font-size: 14px; }
-    label { color: #adbed2; font-size: 13px; font-weight: 650; }
-    input { margin-top: 8px; border-color: #29435e; background: rgba(5,17,29,.76); color: #eef6ff; }
-    input:focus { border-color: #5d99f5; box-shadow: 0 0 0 3px rgba(75,139,244,.15); }
+    .brand-copy { color: var(--brand-copy); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 3px 0 0; font-size: 28px; letter-spacing: -.035em; color: var(--text); }
+    .intro { margin: 0 0 26px; color: var(--muted); line-height: 1.65; font-size: 14px; }
+    label { color: var(--label); font-size: 13px; font-weight: 650; }
+    input { margin-top: 8px; border-color: var(--input-border); background: var(--input); color: var(--text); }
+    input:focus { border-color: var(--input-focus); box-shadow: 0 0 0 3px color-mix(in srgb, var(--input-focus) 18%, transparent); }
     button { width: 100%; margin: 10px 0 0; border: 0; padding: 13px 15px;
-      color: white; background: linear-gradient(135deg, #438bf8, #2869df); font-weight: 750;
-      box-shadow: 0 10px 24px rgba(40,105,223,.22); }
+      color: var(--primary-text); background: var(--primary); font-weight: 750;
+      box-shadow: 0 8px 20px rgba(0,0,0,.14); }
+    #submit { color: var(--primary-text); background: var(--primary); }
+    #submit:hover:not(:disabled) { background: var(--primary-hover); }
+    button:hover:not(:disabled) { background: var(--primary-hover); }
     button:disabled { opacity: .55; cursor: wait; }
-    #notice { min-height: 21px; margin-top: 12px; color: #ff9b9f; font-size: 13px; }
+    #notice { min-height: 21px; margin-top: 12px; color: var(--danger); font-size: 13px; }
     .safe { display: flex; align-items: center; justify-content: center; gap: 7px; margin-top: 19px;
-      color: #6f88a5; font-size: 12px; }
+      color: var(--muted); font-size: 12px; }
     .safe svg { width: 14px; height: 14px; }
+    .theme-toggle { position: absolute; top: 20px; right: 20px; width: 38px; height: 38px; min-height: 38px; margin: 0;
+      display: grid; place-items: center; padding: 0; color: var(--muted); background: transparent; border: 1px solid var(--surface-border); box-shadow: none; }
+    .theme-toggle:hover:not(:disabled) { color: var(--text); background: var(--subtle); }
+    .theme-toggle svg { width: 17px; height: 17px; }
+    .theme-icon-sun, .theme-icon-moon { display: none; }
+    html[data-theme="dark"] .theme-icon-sun { display: block; }
+    html[data-theme="light"] .theme-icon-moon { display: block; }
   </style>
 </head>
 <body>
   <main class="login-shell">
     <form class="login" id="loginForm">
+      <button id="themeToggle" class="theme-toggle" type="button" aria-label="切换主题" title="切换主题">
+        <svg class="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"></path></svg>
+        <svg class="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20.5 15.5A8.5 8.5 0 0 1 8.5 3.5 8.5 8.5 0 1 0 20.5 15.5Z"></path></svg>
+      </button>
       <div class="brand">
         <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m4 7 8 6 8-6"></path></svg></div>
         <div><div class="brand-copy">Private Relay Console</div><h1>隐藏邮箱控制台</h1></div>
@@ -128,6 +201,22 @@ LOGIN_HTML = r"""<!doctype html>
     const form = document.getElementById("loginForm");
     const submit = document.getElementById("submit");
     const notice = document.getElementById("notice");
+    const themeToggle = document.getElementById("themeToggle");
+
+    function applyTheme(theme, persist = false) {
+      document.documentElement.dataset.theme = theme;
+      document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#0f0f10" : "#f7f7f5";
+      themeToggle.setAttribute("aria-label", theme === "dark" ? "切换至白天模式" : "切换至夜间模式");
+      themeToggle.title = themeToggle.getAttribute("aria-label");
+      if (persist) {
+        try { localStorage.setItem("hme_theme", theme); } catch (_) {}
+      }
+    }
+
+    applyTheme(document.documentElement.dataset.theme || "dark");
+    themeToggle.addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
+    });
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       submit.disabled = true;
@@ -564,151 +653,245 @@ GPT_INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#07131f">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0f0f10">
   <title>隐藏邮箱控制台</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("hme_theme");
+        const theme = saved === "light" || saved === "dark"
+          ? saved
+          : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.theme = theme;
+        document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#0f0f10" : "#f7f7f5";
+      } catch (_) {}
+    })();
+  </script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css" integrity="sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU" crossorigin="anonymous">
   <style>
-    :root {
+    :root, html[data-theme="dark"] {
       color-scheme: dark;
       font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
       --pico-font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
       --pico-font-size: 100%;
-      --pico-primary: #75aaff;
-      --pico-primary-background: #367bf5;
-      --pico-primary-hover-background: #4b89f6;
-      --pico-primary-focus: rgba(65, 132, 246, .22);
+      --pico-primary: #f0f0f0;
+      --pico-primary-background: #ececec;
+      --pico-primary-hover-background: #ffffff;
+      --pico-primary-focus: rgba(255, 255, 255, .16);
       --pico-border-radius: 13px;
-      --canvas: #07131f;
-      --surface: rgba(11, 27, 43, .88);
-      --surface-strong: #0d2033;
-      --surface-soft: rgba(17, 38, 59, .62);
-      --border: rgba(124, 157, 195, .2);
-      --text: #edf5ff;
-      --muted: #829ab6;
-      --success: #54d7ad;
-      --warning: #f0b86a;
-      --danger: #ff8f98;
+      --canvas: #0f0f10;
+      --surface: rgba(24, 24, 25, .95);
+      --surface-strong: #1f1f20;
+      --surface-soft: rgba(39, 39, 41, .78);
+      --border: rgba(255, 255, 255, .1);
+      --text: #f3f3f4;
+      --muted: #9b9b9f;
+      --label: #c2c2c5;
+      --success: #55b992;
+      --warning: #d2a14e;
+      --danger: #e67584;
+      --accent: #eeeeef;
+      --accent-contrast: #151515;
+      --page-glow: rgba(255, 255, 255, .04);
+      --grid: rgba(255, 255, 255, .024);
+      --subtle: rgba(255, 255, 255, .045);
+      --subtle-hover: rgba(255, 255, 255, .072);
+      --input: #171718;
+      --input-border: #38383a;
+      --button: #2b2b2d;
+      --button-text: #ececee;
+      --primary: #ececec;
+      --primary-hover: #ffffff;
+      --primary-text: #151515;
+      --stat-bg: rgba(27, 27, 28, .88);
+      --row-bg: rgba(17, 17, 18, .76);
+      --row-hover: rgba(35, 35, 37, .9);
+      --success-soft: rgba(85, 185, 146, .1);
+      --warning-soft: rgba(210, 161, 78, .1);
+      --danger-soft: rgba(230, 117, 132, .1);
+      --accent-soft: rgba(255, 255, 255, .07);
+      --brand: linear-gradient(145deg, #39393c, #19191a);
+      --brand-border: rgba(255, 255, 255, .13);
+      --brand-copy: #a5a5a8;
+      --card-shadow: 0 22px 70px rgba(0, 0, 0, .3), inset 0 1px 0 rgba(255, 255, 255, .018);
+      --toast: rgba(31, 31, 33, .98);
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --pico-primary: #202021;
+      --pico-primary-background: #202021;
+      --pico-primary-hover-background: #0d0d0e;
+      --pico-primary-focus: rgba(32, 32, 33, .16);
+      --canvas: #f7f7f5;
+      --surface: rgba(255, 255, 255, .97);
+      --surface-strong: #ffffff;
+      --surface-soft: rgba(242, 242, 240, .92);
+      --border: rgba(0, 0, 0, .1);
+      --text: #222223;
+      --muted: #6b6b6e;
+      --label: #4e4e51;
+      --success: #147a5b;
+      --warning: #946415;
+      --danger: #b84354;
+      --accent: #202021;
+      --accent-contrast: #ffffff;
+      --page-glow: rgba(0, 0, 0, .025);
+      --grid: rgba(0, 0, 0, .025);
+      --subtle: rgba(0, 0, 0, .035);
+      --subtle-hover: rgba(0, 0, 0, .06);
+      --input: #ffffff;
+      --input-border: #d5d5d2;
+      --button: #e9e9e7;
+      --button-text: #303033;
+      --primary: #202021;
+      --primary-hover: #0d0d0e;
+      --primary-text: #ffffff;
+      --stat-bg: rgba(255, 255, 255, .94);
+      --row-bg: rgba(250, 250, 248, .95);
+      --row-hover: #f1f1ef;
+      --success-soft: rgba(20, 122, 91, .09);
+      --warning-soft: rgba(148, 100, 21, .09);
+      --danger-soft: rgba(184, 67, 84, .09);
+      --accent-soft: rgba(0, 0, 0, .055);
+      --brand: linear-gradient(145deg, #363638, #171718);
+      --brand-border: rgba(0, 0, 0, .08);
+      --brand-copy: #6d6d70;
+      --card-shadow: 0 18px 48px rgba(0, 0, 0, .08), inset 0 1px 0 rgba(255, 255, 255, .7);
+      --toast: rgba(255, 255, 255, .98);
     }
     * { box-sizing: border-box; }
     html { background: var(--canvas); }
     body {
       margin: 0; min-height: 100vh; color: var(--text);
-      background: radial-gradient(circle at 5% -5%, rgba(54,123,245,.22), transparent 32rem),
-                  radial-gradient(circle at 100% 20%, rgba(45,212,191,.09), transparent 29rem), var(--canvas);
+      background: radial-gradient(circle at 8% -5%, var(--page-glow), transparent 34rem), var(--canvas);
+      transition: color .2s ease, background-color .2s ease;
     }
     body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .15;
-      background-image: linear-gradient(rgba(255,255,255,.032) 1px, transparent 1px),
-                        linear-gradient(90deg, rgba(255,255,255,.032) 1px, transparent 1px);
+      background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+                        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
       background-size: 36px 36px; mask-image: linear-gradient(to bottom, black, transparent 72%); }
     main.app-shell { width: min(1240px, calc(100% - 40px)); margin: 0 auto; padding: 34px 0 64px; position: relative; z-index: 1; }
     .app-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
     .brand { display: flex; align-items: center; gap: 15px; }
     .brand-mark { width: 48px; height: 48px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 15px;
-      color: #fff; background: linear-gradient(145deg, #65a4ff, #2768df); box-shadow: 0 12px 30px rgba(54,123,245,.27); }
+      color: #fff; background: var(--brand); border: 1px solid var(--brand-border);
+      box-shadow: 0 10px 24px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.1); }
     .brand-mark svg { width: 23px; height: 23px; }
-    .eyebrow { color: #6e91bd; font-size: 11px; font-weight: 750; letter-spacing: .15em; text-transform: uppercase; }
-    h1 { margin: 3px 0 0; font-size: clamp(25px, 3vw, 34px); letter-spacing: -.04em; color: #f3f8ff; }
+    .eyebrow { color: var(--brand-copy); font-size: 11px; font-weight: 750; letter-spacing: .15em; text-transform: uppercase; }
+    h1 { margin: 3px 0 0; font-size: clamp(25px, 3vw, 34px); letter-spacing: -.04em; color: var(--text); }
     .subtitle { margin-top: 5px; color: var(--muted); font-size: 13px; }
     .header-actions { display: flex; align-items: center; gap: 10px; }
     .runtime-pill { display: flex; align-items: center; gap: 8px; height: 39px; padding: 0 13px; border: 1px solid var(--border);
-      border-radius: 999px; color: #9cb1c9; background: rgba(9,23,37,.68); font-size: 12px; white-space: nowrap; }
-    .runtime-dot { width: 7px; height: 7px; border-radius: 50%; background: #71839a; box-shadow: 0 0 0 4px rgba(113,131,154,.11); }
-    .runtime-dot.ok { background: var(--success); box-shadow: 0 0 0 4px rgba(84,215,173,.11); }
-    .runtime-dot.bad { background: var(--danger); box-shadow: 0 0 0 4px rgba(255,143,152,.11); }
+      border-radius: 999px; color: var(--muted); background: var(--subtle); font-size: 12px; white-space: nowrap; }
+    .runtime-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 4px var(--subtle); }
+    .runtime-dot.ok { background: var(--success); box-shadow: 0 0 0 4px var(--success-soft); }
+    .runtime-dot.bad { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-soft); }
     button {
       width: auto; min-height: 40px; margin: 0; border: 1px solid transparent; padding: 9px 14px; font-size: 13px;
-      font-weight: 720; cursor: pointer; color: #c9d9eb; background: #17314b; box-shadow: none;
+      font-weight: 720; cursor: pointer; color: var(--button-text); background: var(--button); box-shadow: none;
       transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
     }
     button:hover:not(:disabled) { transform: translateY(-1px); }
     button:disabled { opacity: .48; cursor: wait; }
-    .icon-button { width: 40px; padding: 0; display: grid; place-items: center; border-color: var(--border); background: rgba(13,31,49,.74); }
+    .icon-button { width: 40px; padding: 0; display: grid; place-items: center; border-color: var(--border); background: var(--subtle); }
+    .icon-button:hover:not(:disabled) { background: var(--subtle-hover); }
     .icon-button svg { width: 17px; height: 17px; }
+    .theme-icon-sun, .theme-icon-moon { display: none; }
+    html[data-theme="dark"] .theme-icon-sun { display: block; }
+    html[data-theme="light"] .theme-icon-moon { display: block; }
     .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
     .stat-card { margin: 0; padding: 17px 18px; display: flex; align-items: center; gap: 14px; border: 1px solid var(--border);
-      border-radius: 17px; background: rgba(10,25,40,.7); box-shadow: 0 12px 35px rgba(0,0,0,.13); backdrop-filter: blur(14px); }
-    .stat-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: #89b8ff; background: rgba(54,123,245,.12); }
-    .stat-icon.success { color: var(--success); background: rgba(84,215,173,.1); }
-    .stat-icon.warning { color: var(--warning); background: rgba(240,184,106,.1); }
-    .stat-icon.plus { color: #c8a8ff; background: rgba(148,99,235,.12); }
+      border-radius: 17px; background: var(--stat-bg); box-shadow: 0 10px 28px rgba(0,0,0,.08), inset 0 1px 0 var(--subtle); backdrop-filter: blur(14px); }
+    .stat-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: var(--text); background: var(--accent-soft); }
+    .stat-icon.success { color: var(--success); background: var(--success-soft); }
+    .stat-icon.warning { color: var(--warning); background: var(--warning-soft); }
+    .stat-icon.plus { color: var(--warning); background: var(--warning-soft); }
     .stat-icon svg { width: 18px; height: 18px; }
-    .stat-value { font-size: 23px; line-height: 1; font-weight: 780; color: #f0f6ff; font-variant-numeric: tabular-nums; }
+    .stat-value { font-size: 23px; line-height: 1; font-weight: 780; color: var(--text); font-variant-numeric: tabular-nums; }
     .stat-label { margin-top: 5px; color: var(--muted); font-size: 11px; }
     .card {
       margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 20px; box-shadow: 0 22px 65px rgba(0,0,0,.22); overflow: hidden; backdrop-filter: blur(18px);
+      border-radius: 20px; box-shadow: var(--card-shadow); overflow: hidden; backdrop-filter: blur(18px);
     }
     .card + .card { margin-top: 16px; }
     .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 21px 22px; border-bottom: 1px solid var(--border); }
     .section-title { display: flex; gap: 12px; }
     .section-glyph { width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 11px;
-      color: #86b6ff; background: rgba(54,123,245,.11); }
+      color: var(--text); background: var(--accent-soft); }
     .section-glyph svg { width: 18px; height: 18px; }
-    .section-head h2 { margin: 0; font-size: 17px; color: #edf5ff; }
+    .section-head h2 { margin: 0; font-size: 17px; color: var(--text); }
     .section-copy { color: var(--muted); font-size: 12px; line-height: 1.55; margin-top: 5px; max-width: 760px; }
     .automation-body { padding: 18px 22px 21px; }
     .controls { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
-    .control-field { margin: 0; color: #9eb1c7; font-size: 11px; font-weight: 650; }
-    .control-field input[type="number"] { width: 76px; height: 40px; margin: 5px 0 0; border-color: #29435e; background: rgba(5,17,29,.72); color: #eef6ff; padding: 8px 10px; }
-    .switch-field { min-height: 40px; display: flex; align-items: center; gap: 8px; margin: 0 4px 0 0; color: #9eb1c7; font-size: 12px; }
-    input[type="checkbox"] { accent-color: #438bf8; }
-    .primary { border-color: rgba(113,169,255,.22); color: white; background: linear-gradient(135deg, #438bf8, #2869df); box-shadow: 0 9px 22px rgba(40,105,223,.2); }
-    .danger { border-color: rgba(255,143,152,.14); color: #ffb2b8; background: rgba(214,63,75,.12); }
-    .task { margin-top: 16px; padding: 14px 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(6,18,30,.46); }
+    .control-field { margin: 0; color: var(--label); font-size: 11px; font-weight: 650; }
+    .control-field input[type="number"] { width: 76px; height: 40px; margin: 5px 0 0; border-color: var(--input-border); background: var(--input); color: var(--text); padding: 8px 10px; }
+    .switch-field { min-height: 40px; display: flex; align-items: center; gap: 8px; margin: 0 4px 0 0; color: var(--label); font-size: 12px; }
+    input[type="checkbox"] { accent-color: var(--accent); }
+    .primary { border-color: transparent; color: var(--primary-text); background: var(--primary); box-shadow: 0 5px 14px rgba(0,0,0,.12); }
+    .primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .danger { border-color: var(--danger-soft); color: var(--danger); background: var(--danger-soft); }
+    .task { margin-top: 16px; padding: 14px 15px; border: 1px solid var(--border); border-radius: 14px; background: var(--row-bg); }
+    .registration-summary { margin-bottom: 10px; padding: 9px 11px; border-radius: 10px; color: var(--label); background: var(--subtle); font-size: 12px; }
+    .registration-summary.success { color: var(--success); background: var(--success-soft); }
+    .registration-summary.error { color: var(--danger); background: var(--danger-soft); }
     .task-topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .task-summary { color: #b8cbe2; font-size: 12px; }
-    .task progress { width: 150px; height: 5px; margin: 0; accent-color: #438bf8; }
+    .task-summary { color: var(--label); font-size: 12px; }
+    .task progress { width: 150px; height: 5px; margin: 0; accent-color: var(--accent); }
     .task-accounts { display: grid; gap: 6px; margin-top: 11px; max-height: 205px; overflow: auto; }
-    .task-row { display: grid; grid-template-columns: minmax(190px, .8fr) 90px 1.6fr; gap: 10px; padding: 9px 11px; border-radius: 9px; background: rgba(17,38,59,.62); color: #8299b4; font-size: 11px; }
-    .task-row .task-email { color: #d8e8fb; overflow-wrap: anywhere; }
-    .task-log { margin-top: 9px; max-height: 120px; overflow: auto; white-space: pre-wrap; color: #657f9e; font: 11px/1.55 Consolas, monospace; }
+    .task-row { display: grid; grid-template-columns: minmax(190px, .8fr) 90px 1.6fr; gap: 10px; padding: 9px 11px; border-radius: 9px; background: var(--surface-soft); color: var(--muted); font-size: 11px; }
+    .task-row .task-email { color: var(--text); overflow-wrap: anywhere; }
+    .task-log { margin-top: 9px; max-height: 120px; overflow: auto; white-space: pre-wrap; color: var(--muted); font: 11px/1.55 Consolas, monospace; }
     .list-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 22px 14px; }
     .list-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     #verifySummary { max-width: 440px; color: var(--muted); font-size: 11px; text-align: right; }
-    .list-head h2 { margin: 0; font-size: 17px; color: #edf5ff; }
+    .list-head h2 { margin: 0; font-size: 17px; color: var(--text); }
     #summary { color: var(--muted); font-size: 12px; margin-top: 5px; }
     .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 135px 150px auto; gap: 9px; padding: 0 22px 17px; }
     .search-wrap { position: relative; }
-    .search-wrap svg { position: absolute; top: 50%; left: 12px; width: 16px; height: 16px; color: #66809d; transform: translateY(-50%); pointer-events: none; }
-    .toolbar input, .toolbar select { height: 40px; margin: 0; border-color: #29435e; background: rgba(5,17,29,.65); color: #dce9f8; font-size: 12px; }
+    .search-wrap svg { position: absolute; top: 50%; left: 12px; width: 16px; height: 16px; color: var(--muted); transform: translateY(-50%); pointer-events: none; }
+    .toolbar input, .toolbar select { height: 40px; margin: 0; border-color: var(--input-border); background: var(--input); color: var(--text); font-size: 12px; }
     .toolbar input { padding-left: 37px; }
     .list { padding: 0 14px 14px; display: grid; gap: 9px; }
     .email-row {
       display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 16px;
-      padding: 15px 16px; background: rgba(7,19,31,.58); border: 1px solid rgba(117,151,190,.17); border-radius: 14px;
+      padding: 15px 16px; background: var(--row-bg); border: 1px solid var(--border); border-radius: 14px;
       transition: border-color .16s ease, background .16s ease, transform .16s ease;
     }
-    .email-row:hover { border-color: rgba(111,168,255,.34); background: rgba(11,28,45,.78); transform: translateY(-1px); }
+    .email-row:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); background: var(--row-hover); transform: translateY(-1px); }
     .identity { display: flex; align-items: center; gap: 13px; min-width: 0; }
-    .avatar { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; color: #8bb9ff;
-      background: linear-gradient(145deg, rgba(54,123,245,.17), rgba(54,123,245,.07)); font-weight: 780; }
+    .avatar { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; color: var(--text);
+      background: var(--accent-soft); font-weight: 780; }
     .identity-copy { min-width: 0; }
-    .address { font-size: 14px; font-weight: 650; color: #e8f2ff; overflow-wrap: anywhere; }
+    .address { font-size: 14px; font-weight: 650; color: var(--text); overflow-wrap: anywhere; }
     .meta-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
     .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; }
     .status-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
-    .status-badge.ready { color: var(--success); background: rgba(84,215,173,.09); }
-    .status-badge.expired { color: var(--warning); background: rgba(240,184,106,.09); }
-    .status-badge.pending { color: #8fa6c1; background: rgba(143,166,193,.09); }
+    .status-badge.ready { color: var(--success); background: var(--success-soft); }
+    .status-badge.expired { color: var(--warning); background: var(--warning-soft); }
+    .status-badge.pending { color: var(--muted); background: var(--subtle); }
     .plan-badge { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 760; }
-    .plan-badge.plus { color: #d2b7ff; background: rgba(148,99,235,.13); }
-    .plan-badge.free { color: #8ec4ff; background: rgba(54,123,245,.11); }
-    .plan-badge.unverified { color: #8fa6c1; background: rgba(143,166,193,.09); }
-    .meta { color: #6f89a8; font-size: 10px; }
+    .plan-badge.plus { color: var(--warning); background: var(--warning-soft); }
+    .plan-badge.free { color: var(--success); background: var(--success-soft); }
+    .plan-badge.unverified { color: var(--muted); background: var(--subtle); }
+    .meta { color: var(--muted); font-size: 10px; }
     .actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-    .action { min-height: 34px; padding: 7px 10px; border-color: rgba(103,160,235,.12); color: #8ec4ff; background: rgba(25,125,213,.1); white-space: nowrap; font-size: 11px; }
-    .action:first-child { color: #dfefff; background: rgba(54,123,245,.2); }
-    .empty { padding: 66px 20px; text-align: center; color: #728aa8; }
-    .empty-icon { width: 44px; height: 44px; display: grid; place-items: center; margin: 0 auto 12px; border-radius: 14px; color: #718ba9; background: rgba(113,139,169,.08); }
+    .action { min-height: 34px; padding: 7px 10px; border-color: var(--border); color: var(--button-text); background: var(--subtle); white-space: nowrap; font-size: 11px; }
+    .action:hover:not(:disabled) { background: var(--subtle-hover); }
+    .action:first-child { color: var(--primary-text); background: var(--primary); }
+    .action.danger-action { color: var(--danger); border-color: var(--danger-soft); background: var(--danger-soft); }
+    .mfa-badge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; color: var(--success); border: 1px solid var(--success-soft); background: var(--success-soft); }
+    .mfa-badge.pending { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
+    .empty { padding: 66px 20px; text-align: center; color: var(--muted); }
+    .empty-icon { width: 44px; height: 44px; display: grid; place-items: center; margin: 0 auto 12px; border-radius: 14px; color: var(--muted); background: var(--subtle); }
     .empty-icon svg { width: 21px; height: 21px; }
-    .empty strong { display: block; margin-bottom: 4px; color: #9ab0c8; font-size: 13px; }
+    .empty strong { display: block; margin-bottom: 4px; color: var(--label); font-size: 13px; }
     .error { color: var(--danger) !important; }
     .toast { position: fixed; right: 20px; bottom: 20px; z-index: 10; max-width: min(360px, calc(100% - 40px)); padding: 11px 14px;
-      border: 1px solid var(--border); border-radius: 12px; color: #dceafa; background: rgba(13,32,51,.96); box-shadow: 0 18px 45px rgba(0,0,0,.32);
+      border: 1px solid var(--border); border-radius: 12px; color: var(--text); background: var(--toast); box-shadow: 0 18px 48px rgba(0,0,0,.24);
       font-size: 12px; opacity: 0; transform: translateY(10px); pointer-events: none; transition: .2s ease; }
     .toast.show { opacity: 1; transform: translateY(0); }
-    .toast.error { border-color: rgba(255,143,152,.22); }
+    .toast.error { border-color: var(--danger-soft); }
     @media (max-width: 760px) {
       main.app-shell { width: min(100% - 24px, 1240px); padding-top: 22px; }
       .app-header { align-items: flex-start; }
@@ -764,6 +947,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="header-actions">
         <div class="runtime-pill"><span id="runtimeDot" class="runtime-dot"></span><span id="runtimeLabel">正在连接运行环境</span></div>
+        <button id="themeToggle" class="icon-button" type="button" aria-label="切换主题" title="切换主题">
+          <svg class="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"></path></svg>
+          <svg class="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20.5 15.5A8.5 8.5 0 0 1 8.5 3.5 8.5 8.5 0 1 0 20.5 15.5Z"></path></svg>
+        </button>
         <button id="logout" class="icon-button" aria-label="退出登录" title="退出登录"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3"></path><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"></path></svg></button>
       </div>
     </header>
@@ -801,10 +988,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
         <div class="controls">
           <label class="switch-field"><input id="headless" type="checkbox" role="switch"> 无头浏览器</label>
           <label class="control-field">认证并发<input id="concurrency" type="number" min="1" max="10" value="1" aria-label="认证并发数"></label>
+          <button id="registerOne" class="primary">一键注册新账号</button>
           <button id="fetchAll" class="primary">浏览器取全部</button>
           <button id="stopTask" class="danger" disabled>停止当前任务</button>
         </div>
         <div id="task" class="task" aria-live="polite">
+          <div id="registrationSummary" class="registration-summary">一键注册：空闲</div>
           <div class="task-topline">
             <div id="taskSummary" class="task-summary">正在读取浏览器运行环境…</div>
             <progress id="taskProgress" value="0" max="100" hidden></progress>
@@ -854,10 +1043,27 @@ GPT_INDEX_HTML = r"""<!doctype html>
   <script>
     const localToken = __LOCAL_TOKEN__;
     const $ = (id) => document.getElementById(id);
+    const themeToggle = $("themeToggle");
     let currentItems = [];
     let taskPoll = null;
+    let registrationPoll = null;
     let verificationPoll = null;
+    let browserRunning = false;
+    let registrationRunning = false;
+    let browserRuntimeAvailable = false;
     let toastTimer = null;
+
+    function applyTheme(theme, persist = false) {
+      document.documentElement.dataset.theme = theme;
+      document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#0f0f10" : "#f7f7f5";
+      themeToggle.setAttribute("aria-label", theme === "dark" ? "切换至白天模式" : "切换至夜间模式");
+      themeToggle.title = themeToggle.getAttribute("aria-label");
+      if (persist) {
+        try { localStorage.setItem("hme_theme", theme); } catch (_) {}
+      }
+    }
+
+    applyTheme(document.documentElement.dataset.theme || "dark");
 
     async function api(path, options = {}) {
       const headers = { ...(options.headers || {}) };
@@ -897,7 +1103,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
           setTimeout(() => { button.textContent = original; }, 1200);
         } catch (error) {
           button.textContent = original;
-          showToast(error.message, "error");
+          if (error.name !== "AbortError") showToast(error.message, "error");
         } finally {
           button.disabled = false;
         }
@@ -919,6 +1125,21 @@ GPT_INDEX_HTML = r"""<!doctype html>
       await navigator.clipboard.writeText(data.code);
     }
 
+    async function deleteEmail(email) {
+      const warning = `确定永久删除邮箱 ${email} 吗？\n\n该操作会停用并删除 iCloud 隐藏邮箱，同时清除本地保存的 OpenAI 密码、Session、AT 和 2FA，无法撤销。`;
+      if (!confirm(warning)) {
+        const error = new Error("已取消删除");
+        error.name = "AbortError";
+        throw error;
+      }
+      const data = await api("/api/gpt-email/delete", {
+        method: "POST", body: JSON.stringify({ email })
+      });
+      await load();
+      if (!data.deleted) throw new Error(data.message || "邮箱已停用，但永久删除失败");
+      return data;
+    }
+
     function browserOptions() {
       const concurrency = Number($('concurrency').value);
       if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
@@ -927,9 +1148,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return { headless: $('headless').checked, concurrency };
     }
 
-    async function startBrowser(emails = null) {
+    async function startBrowser(emails = null, enableTwoFactor = false) {
       const path = emails ? "/api/browser/fetch-selected" : "/api/browser/fetch-all";
-      const payload = { ...browserOptions() };
+      const payload = { ...browserOptions(), enable_2fa: enableTwoFactor };
       if (emails) payload.emails = emails;
       const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
       if (!data.started) {
@@ -937,6 +1158,22 @@ GPT_INDEX_HTML = r"""<!doctype html>
       }
       await loadTask();
       return data;
+    }
+
+    async function enableTwoFactor(email) {
+      if (!confirm(`将重新登录 ${email} 并开启 TOTP 2FA，是否继续？`)) {
+        const error = new Error("已取消开启 2FA");
+        error.name = "AbortError";
+        throw error;
+      }
+      return startBrowser([email], true);
+    }
+
+    function syncBrowserButtons() {
+      const busy = browserRunning || registrationRunning;
+      $("registerOne").disabled = busy || !browserRuntimeAvailable;
+      $("fetchAll").disabled = busy || !browserRuntimeAvailable;
+      $("stopTask").disabled = !busy;
     }
 
     function renderTask(data) {
@@ -948,6 +1185,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
       };
       $("runtimeDot").className = `runtime-dot ${runtime.available ? "ok" : "bad"}`;
       $("runtimeLabel").textContent = runtime.available ? "运行环境已连接" : "运行环境不可用";
+      browserRuntimeAvailable = Boolean(runtime.available);
+      browserRunning = Boolean(data.running);
       if (!runtime.available) {
         $("taskSummary").className = "task-summary error";
         $("taskSummary").textContent = (runtime.errors || ["Camoufox 运行环境不可用"]).join("；");
@@ -963,8 +1202,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("headless").disabled = true;
         $("headless").title = "服务器环境固定使用无头浏览器";
       }
-      $("fetchAll").disabled = Boolean(data.running) || !runtime.available;
-      $("stopTask").disabled = !data.running;
+      syncBrowserButtons();
       const progress = $("taskProgress");
       progress.hidden = !data.running;
       progress.value = data.total ? Math.round(((data.completed || 0) / data.total) * 100) : 0;
@@ -1003,6 +1241,58 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("runtimeDot").className = "runtime-dot bad";
         $("runtimeLabel").textContent = "连接失败";
       }
+    }
+
+    function renderRegistration(data) {
+      registrationRunning = Boolean(data.running);
+      const phaseNames = {
+        idle: "空闲",
+        generating_email: "正在生成 iCloud 邮箱",
+        confirming_email: "正在同步新邮箱",
+        registering_openai: "正在注册 OpenAI",
+        enabling_2fa: "正在开启 2FA",
+        completed: "注册成功",
+        failed: "注册失败",
+        cancelling: "正在停止",
+        cancelled: "已停止",
+      };
+      const summary = $("registrationSummary");
+      summary.className = `registration-summary ${data.status === "completed" ? "success" : data.status === "failed" ? "error" : ""}`.trim();
+      const phase = phaseNames[data.phase] || data.phase || "空闲";
+      summary.textContent = `一键注册：${phase}${data.email ? ` · ${data.email}` : ""}${data.message && data.phase !== "idle" ? ` · ${data.message}` : ""}`;
+      syncBrowserButtons();
+      if (data.running) {
+        clearTimeout(registrationPoll);
+        registrationPoll = setTimeout(loadRegistration, 1200);
+      }
+    }
+
+    async function loadRegistration() {
+      try {
+        const data = await api("/api/registration/status");
+        const wasRunning = registrationRunning;
+        renderRegistration(data);
+        if (wasRunning && !data.running) {
+          await Promise.all([load(), loadTask()]);
+          showToast(data.status === "completed" ? "新账号已加入邮箱列表" : data.message, data.status === "completed" ? "" : "error");
+        }
+      } catch (error) {
+        $("registrationSummary").className = "registration-summary error";
+        $("registrationSummary").textContent = `一键注册：${error.message}`;
+      }
+    }
+
+    async function startRegistration() {
+      if (!confirm("将创建新的 iCloud 隐藏邮箱，自动生成强密码注册 OpenAI，并在注册成功后开启 TOTP 2FA。是否继续？")) return;
+      const data = await api("/api/registration/start", {
+        method: "POST",
+        body: JSON.stringify({
+          label: "OpenAI 一键注册",
+          headless: $("headless").checked,
+        }),
+      });
+      renderRegistration(data.task);
+      showToast("一键注册已启动");
     }
 
     function renderVerification(data) {
@@ -1103,6 +1393,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
         planBadge.className = `plan-badge ${item.accountType}`;
         planBadge.textContent = planLabel(item.accountType);
         metaLine.append(planBadge, badge);
+        if (item.twoFactorStatus) {
+          const mfaBadge = document.createElement("span");
+          mfaBadge.className = `mfa-badge ${item.hasTwoFactor ? "" : "pending"}`.trim();
+          mfaBadge.textContent = item.hasTwoFactor ? "2FA 已开启" : "2FA 待激活";
+          metaLine.append(mfaBadge);
+        }
         identityCopy.append(address, metaLine);
         identity.append(avatar, identityCopy);
         const actions = document.createElement("div");
@@ -1110,6 +1406,14 @@ GPT_INDEX_HTML = r"""<!doctype html>
         actions.append(actionButton("浏览器获取", () => startBrowser([item.email]), "已启动"));
         actions.append(actionButton("复制邮箱", () => navigator.clipboard.writeText(item.email)));
         if (item.hasPassword) actions.append(actionButton("复制密码", () => copyCredential(item.email, "password")));
+        if (item.hasTwoFactor) {
+          actions.append(
+            actionButton("复制 2FA 密钥", () => copyCredential(item.email, "totp_secret")),
+            actionButton("复制 2FA 码", () => copyCredential(item.email, "totp_code"))
+          );
+        } else if (item.hasPassword) {
+          actions.append(actionButton("开启 2FA", () => enableTwoFactor(item.email), "已启动"));
+        }
         if (item.hasSession) {
           actions.append(
             actionButton("复制 AT", () => copyCredential(item.email, "access_token")),
@@ -1117,6 +1421,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
           );
         }
         actions.append(actionButton("获取 OpenAI 码", () => copyOpenAiCode(item.email)));
+        const deleteButton = actionButton("删除邮箱", () => deleteEmail(item.email), "已删除");
+        deleteButton.classList.add("danger-action");
+        actions.append(deleteButton);
         row.append(identity, actions);
         root.append(row);
       }
@@ -1175,6 +1482,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
     $("search").addEventListener("input", applyFilters);
     $("planFilter").addEventListener("change", applyFilters);
     $("statusFilter").addEventListener("change", applyFilters);
+    $("registerOne").addEventListener("click", async () => {
+      try { await startRegistration(); } catch (error) { showToast(error.message, "error"); }
+    });
     $("verifyAll").addEventListener("click", async () => {
       try { await startVerification(); } catch (error) { showToast(error.message, "error"); }
     });
@@ -1191,14 +1501,22 @@ GPT_INDEX_HTML = r"""<!doctype html>
       try { await startBrowser(); } catch (error) { showToast(error.message, "error"); }
     });
     $("stopTask").addEventListener("click", async () => {
-      if (!confirm("停止当前浏览器获取任务？")) return;
+      if (!confirm("停止当前注册或浏览器任务？")) return;
       try {
-        const data = await api("/api/browser/stop", { method: "POST", body: "{}" });
-        renderTask(data.task);
+        if (registrationRunning) {
+          const data = await api("/api/registration/stop", { method: "POST", body: "{}" });
+          renderRegistration(data.task);
+        } else {
+          const data = await api("/api/browser/stop", { method: "POST", body: "{}" });
+          renderTask(data.task);
+        }
       } catch (error) { showToast(error.message, "error"); }
     });
+    themeToggle.addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
+    });
     $("logout").addEventListener("click", logout);
-    Promise.all([load(), loadTask(), loadVerification()]);
+    Promise.all([load(), loadTask(), loadRegistration(), loadVerification()]);
   </script>
 </body>
 </html>
@@ -1389,6 +1707,19 @@ def _gpt_credential(db_file: Path, email: str, kind: str) -> str:
         return ""
     if kind == "password":
         return str(payload.get("password") or "").strip()
+    two_factor = payload.get("two_factor")
+    if not isinstance(two_factor, dict):
+        two_factor = {}
+    if kind == "totp_secret":
+        return str(two_factor.get("secret") or "").strip()
+    if kind == "totp_code":
+        secret = str(two_factor.get("secret") or "").strip()
+        if not secret or not two_factor.get("enabled"):
+            return ""
+        try:
+            return generate_totp(secret)
+        except RuntimeError:
+            return ""
     if kind == "access_token":
         return str(
             payload.get("access_token") or payload.get("accessToken") or ""
@@ -1402,6 +1733,26 @@ def _gpt_credential(db_file: Path, email: str, kind: str) -> str:
     if isinstance(session, (dict, list)):
         return json.dumps(session, ensure_ascii=False, indent=2)
     return str(session).strip()
+
+
+def _remove_deleted_email_records(db_file: Path, email: str) -> None:
+    target = email.strip().lower()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = connect_db(str(db_file))
+    try:
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_account:{target}",))
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_removed:{target}",))
+        conn.execute(
+            """
+            UPDATE addresses
+            SET state = 'trash', note = 'iCloud alias deleted', updated_at = ?
+            WHERE lower(email) = ?
+            """,
+            (now, target),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -1504,6 +1855,15 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
             {
                 "createdAt": created_at,
                 "hasPassword": bool(str(account.get("password") or "")),
+                "hasTwoFactor": bool(
+                    isinstance(account.get("two_factor"), dict)
+                    and account["two_factor"].get("enabled")
+                ),
+                "twoFactorStatus": str(
+                    account.get("two_factor", {}).get("status") or ""
+                )
+                if isinstance(account.get("two_factor"), dict)
+                else "",
                 "hasSession": bool(access_token),
                 "tokenExpired": token_expired,
                 "sessionStatus": (
@@ -1555,6 +1915,7 @@ def create_app(
     app["inbox_background_last_sync"] = ""
     app["inbox_background_error"] = ""
     app["generate_lock"] = asyncio.Lock()
+    app["delete_lock"] = asyncio.Lock()
     app["inbox_sync_lock"] = asyncio.Lock()
     browser_source = (
         Path(target_project_dir).resolve()
@@ -1593,6 +1954,49 @@ def create_app(
             for row in result.get("result", {}).get("hmeEmails", [])
             if row.get("isActive") and row.get("hme") and row.get("anonymousId")
         ]
+
+    async def generate_registration_email(label: str) -> str:
+        cookie_path: Path = app["cookie_file"]
+        if not cookie_path.exists() or cookie_path.stat().st_size == 0:
+            raise RuntimeError("iCloud Cookie 尚未准备好")
+        async with app["generate_lock"]:
+            account = await fetch_account_info(str(cookie_path), app["region"])
+            if account.get("error"):
+                raise RuntimeError("iCloud Cookie 已失效，请重新获取")
+            generated = await _generate(
+                label=label,
+                count=1,
+                cookie_file=str(cookie_path),
+                output_file=str(app["output_file"]),
+                region=app["region"],
+                db_file=str(app["db_file"]),
+            )
+        if not generated:
+            raise RuntimeError("未能生成地址，可能触发了 Apple 频率限制")
+        return str(generated[0] or "").strip().lower()
+
+    async def confirm_registration_email(email: str) -> None:
+        last_error = ""
+        for _ in range(20):
+            try:
+                identities = await active_icloud_identities()
+                if any(
+                    str(item.get("hme") or "").strip().lower() == email
+                    for item in identities
+                ):
+                    return
+            except RuntimeError as error:
+                last_error = str(error)
+            await asyncio.sleep(1.5)
+        if last_error:
+            raise RuntimeError(f"新邮箱列表同步失败：{last_error}")
+        raise RuntimeError("新邮箱在 30 秒内未出现在 iCloud 列表")
+
+    app["registration_manager"] = RegistrationTaskManager(
+        browser_manager=app["browser_manager"],
+        generate_email=generate_registration_email,
+        confirm_email=confirm_registration_email,
+    )
 
     async def background_inbox_sync() -> None:
         while True:
@@ -1640,6 +2044,14 @@ def create_app(
             await app["verification_manager"].close()
 
     app.cleanup_ctx.append(verification_manager_context)
+
+    async def registration_manager_context(_: web.Application):
+        try:
+            yield
+        finally:
+            await app["registration_manager"].close()
+
+    app.cleanup_ctx.append(registration_manager_context)
 
     async def login_page(request: web.Request) -> web.Response:
         if not app["web_password"] or _session_valid(request):
@@ -1808,7 +2220,13 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
-        if kind not in {"password", "access_token", "session"}:
+        if kind not in {
+            "password",
+            "access_token",
+            "session",
+            "totp_secret",
+            "totp_code",
+        }:
             return web.json_response(
                 {"ok": False, "error": "凭据类型无效"}, status=400
             )
@@ -1820,6 +2238,8 @@ def create_app(
                 "password": "密码",
                 "access_token": "AT",
                 "session": "Session",
+                "totp_secret": "2FA 密钥",
+                "totp_code": "2FA 动态码",
             }[kind]
             return web.json_response(
                 {"ok": False, "error": f"当前邮箱暂无 {name} 数据"}, status=404
@@ -1827,6 +2247,99 @@ def create_app(
         return web.json_response(
             {"ok": True, "value": value}, headers={"Cache-Control": "no-store"}
         )
+
+    async def delete_gpt_email(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(payload.get("email") or "").strip().lower()
+        if not email.endswith("@icloud.com") or len(email) > 320:
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        if any(
+            manager.snapshot().get("running")
+            for manager in (
+                app["registration_manager"],
+                app["browser_manager"],
+                app["verification_manager"],
+            )
+        ):
+            return web.json_response(
+                {"ok": False, "error": "当前有账号任务运行，请停止或等待完成后再删除"},
+                status=409,
+            )
+
+        async with app["delete_lock"]:
+            try:
+                identities = await active_icloud_identities()
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=502
+                )
+            identity = next(
+                (
+                    item
+                    for item in identities
+                    if str(item.get("hme") or "").strip().lower() == email
+                ),
+                None,
+            )
+            if identity is None:
+                return web.json_response(
+                    {"ok": False, "error": "邮箱不存在或已经停用"}, status=404
+                )
+            anonymous_id = str(identity.get("anonymousId") or "").strip()
+            if not anonymous_id:
+                return web.json_response(
+                    {"ok": False, "error": "邮箱缺少 Apple 匿名标识，无法删除"},
+                    status=409,
+                )
+            cookie_path: Path = app["cookie_file"]
+            async with RichHideMyEmail(
+                cookie_file=str(cookie_path), region=app["region"]
+            ) as hme:
+                deactivated = await hme.deactivate_email(anonymous_id)
+                if not deactivated or not deactivated.get("success"):
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": f"停用邮箱失败：{_error_reason(deactivated)}",
+                        },
+                        status=502,
+                    )
+                deleted = await hme.delete_email(anonymous_id)
+
+            await asyncio.to_thread(
+                _remove_deleted_email_records, app["db_file"], email
+            )
+            if not deleted or not deleted.get("success"):
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "deleted": False,
+                        "deactivated": True,
+                        "message": (
+                            "邮箱已停用，但 Apple 未完成永久删除："
+                            f"{_error_reason(deleted)}"
+                        ),
+                    }
+                )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "deleted": True,
+                    "deactivated": True,
+                    "message": "邮箱及本地账号凭据已删除",
+                }
+            )
 
     async def gpt_code(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
@@ -1884,6 +2397,47 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def registration_status(_: web.Request) -> web.Response:
+        return web.json_response(
+            {"ok": True, **app["registration_manager"].snapshot()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def registration_start(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        label = str(payload.get("label") or "OpenAI 一键注册").strip()
+        if not label or len(label) > 100:
+            return web.json_response(
+                {"ok": False, "error": "邮箱标签长度必须是 1–100 个字符"},
+                status=400,
+            )
+        try:
+            task = app["registration_manager"].start(
+                label=label, headless=bool(payload.get("headless", False))
+            )
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=409
+            )
+        return web.json_response({"ok": True, "started": True, "task": task})
+
+    async def registration_stop(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        task = await app["registration_manager"].stop()
+        return web.json_response({"ok": True, "task": task})
+
     async def verification_status(_: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, **app["verification_manager"].snapshot()},
@@ -1939,7 +2493,17 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
+        if app["registration_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "一键注册正在运行，请等待完成"}, status=409
+            )
         headless = bool(payload.get("headless", False))
+        enable_2fa = bool(payload.get("enable_2fa", False))
+        if enable_2fa and not selected_only:
+            return web.json_response(
+                {"ok": False, "error": "批量开启 2FA 仅支持明确选择的邮箱"},
+                status=400,
+            )
         concurrency = payload.get("concurrency", 1)
         if isinstance(concurrency, bool) or not isinstance(concurrency, int):
             return web.json_response(
@@ -1990,11 +2554,22 @@ def create_app(
             access_token = str(
                 record.get("access_token") or record.get("accessToken") or ""
             ).strip()
-            if access_token and not access_token_is_expired(access_token):
+            if (
+                not enable_2fa
+                and access_token
+                and not access_token_is_expired(access_token)
+            ):
                 skipped += 1
                 continue
             accounts.append(
-                {"email": email, "password": str(record.get("password") or "")}
+                {
+                    "email": email,
+                    "password": str(record.get("password") or ""),
+                    "enable_2fa": enable_2fa,
+                    "two_factor": record.get("two_factor")
+                    if isinstance(record.get("two_factor"), dict)
+                    else {},
+                }
             )
         if not accounts:
             message = (
@@ -2214,11 +2789,15 @@ def create_app(
     app.router.add_get("/", index)
     app.router.add_get("/api/gpt-emails", gpt_emails)
     app.router.add_post("/api/gpt-credential", gpt_credential)
+    app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_get("/api/browser/status", browser_status)
     app.router.add_post("/api/browser/fetch-all", browser_fetch_all)
     app.router.add_post("/api/browser/fetch-selected", browser_fetch_selected)
     app.router.add_post("/api/browser/stop", browser_stop)
+    app.router.add_get("/api/registration/status", registration_status)
+    app.router.add_post("/api/registration/start", registration_start)
+    app.router.add_post("/api/registration/stop", registration_stop)
     app.router.add_get("/api/account-verification/status", verification_status)
     app.router.add_post("/api/account-verification/start", verification_start)
     app.router.add_post("/api/account-verification/stop", verification_stop)
