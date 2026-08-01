@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 from hidemyemail_generator.inbox import connect_db, insert_message
 from hidemyemail_generator.webapp import (
     GPT_INDEX_HTML,
+    _gpt_account_export,
     _gpt_email_items,
     _gpt_credential,
     _latest_gpt_code,
@@ -32,6 +34,42 @@ IDENTITIES = [
 
 
 class GptEmailTests(unittest.TestCase):
+    def test_exports_accounts_as_email_password_and_mfa(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            conn = connect_db(str(db_file))
+            try:
+                records = {
+                    "gpt_account:plus@icloud.com": {
+                        "password": "Plus!Password7",
+                        "two_factor": {"secret": "JBSWY3DPEHPK3PXP", "enabled": True},
+                    },
+                    "gpt_account:free@icloud.com": {"password": "Free!Password8"},
+                    "gpt_account:no-password@icloud.com": {"access_token": "at-only"},
+                }
+                conn.executemany(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    [
+                        (key, json.dumps(value, ensure_ascii=False))
+                        for key, value in records.items()
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            self.assertEqual(
+                _gpt_account_export(db_file),
+                [
+                    "free@icloud.com----Free!Password8----",
+                    "plus@icloud.com----Plus!Password7----JBSWY3DPEHPK3PXP",
+                ],
+            )
+            self.assertEqual(
+                _gpt_account_export(db_file, "plus@icloud.com"),
+                ["plus@icloud.com----Plus!Password7----JBSWY3DPEHPK3PXP"],
+            )
+
     def test_matches_exact_and_obfuscated_icloud_relay_ids(self):
         exact = _match_relay_identity(
             "noreply_at_tm_openai_com_8bw8vhsktj5694_3250c0d4@icloud.com",
@@ -193,17 +231,28 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("复制 AT", GPT_INDEX_HTML)
         self.assertIn("复制 Session", GPT_INDEX_HTML)
         self.assertIn("获取 OpenAI 码", GPT_INDEX_HTML)
+        self.assertIn("下载账号", GPT_INDEX_HTML)
+        self.assertIn("/api/gpt-accounts/export", GPT_INDEX_HTML)
+        self.assertIn('downloadAccount(item.email)', GPT_INDEX_HTML)
+        self.assertNotIn('id="downloadAccounts"', GPT_INDEX_HTML)
+        self.assertNotIn("list-footer", GPT_INDEX_HTML)
+        self.assertIn("最新验证码", GPT_INDEX_HTML)
+        self.assertIn("account-code", GPT_INDEX_HTML)
+        self.assertNotIn('id="retrievedCode"', GPT_INDEX_HTML)
         self.assertIn("浏览器取全部", GPT_INDEX_HTML)
         self.assertIn("浏览器获取", GPT_INDEX_HTML)
         self.assertIn("复制密码", GPT_INDEX_HTML)
         self.assertIn("一键验证账号", GPT_INDEX_HTML)
         self.assertIn("一键注册新账号", GPT_INDEX_HTML)
+        self.assertNotIn("将创建新的 iCloud 隐藏邮箱", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 密钥", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 码", GPT_INDEX_HTML)
         self.assertIn("开启 2FA", GPT_INDEX_HTML)
         self.assertIn("删除邮箱", GPT_INDEX_HTML)
         self.assertIn("Plus 账号", GPT_INDEX_HTML)
         self.assertIn("Free 账号", GPT_INDEX_HTML)
+        self.assertNotIn("选择当前结果", GPT_INDEX_HTML)
+        self.assertNotIn("获取选中", GPT_INDEX_HTML)
         self.assertNotIn("封 OpenAI 邮件", GPT_INDEX_HTML)
         self.assertNotIn("自动识别", GPT_INDEX_HTML)
         self.assertNotIn("已识别", GPT_INDEX_HTML)

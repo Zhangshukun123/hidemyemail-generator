@@ -343,10 +343,13 @@ to run headless.
 The **Validate all accounts** action checks every saved access token and
 classifies authenticated accounts as `Plus` or `Free`. Aliases without a token
 remain unverified. An account is treated as invalid only when both independent
-account endpoints explicitly return 401/403. Invalid local GPT credentials
-(password, access token, and Session) are deleted and the alias is removed from
-the GPT list. Network or uncertain failures keep the account. The Apple-side
-iCloud Hide My Email alias is never disabled or deleted by this action.
+account endpoints explicitly return 401. A 403 or an uncertain plan response
+always keeps the account, and a previously classified `Plus` account is never
+removed when its token expires; it is marked for a Session refresh instead.
+When both endpoints return 401, only the invalid access token, Session, and
+browser state are cleared; the email, password, MFA secret, and plan label are
+kept so the account can be authenticated again. The Apple-side iCloud Hide My
+Email alias is never disabled or deleted by this action.
 
 ## Configuration
 

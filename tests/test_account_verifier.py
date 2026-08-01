@@ -7,6 +7,7 @@ from pathlib import Path
 
 from hidemyemail_generator.account_verifier import (
     AccountVerificationManager,
+    remove_invalid_account,
     removed_account_emails,
 )
 from hidemyemail_generator.browser_tasks import load_account_record
@@ -15,7 +16,9 @@ from hidemyemail_generator.openai_account_check_bridge import confirmed_invalid
 from hidemyemail_generator.webapp import _browser_email_items
 
 
-def save_record(db_file: Path, email: str, token: str) -> None:
+def save_record(
+    db_file: Path, email: str, token: str, *, account_type: str = ""
+) -> None:
     conn = connect_db(str(db_file))
     try:
         conn.execute(
@@ -28,6 +31,7 @@ def save_record(db_file: Path, email: str, token: str) -> None:
                         "password": "Secret!A7",
                         "access_token": token,
                         "session": {"accessToken": token},
+                        "account_type": account_type,
                     }
                 ),
             ),
@@ -38,7 +42,26 @@ def save_record(db_file: Path, email: str, token: str) -> None:
 
 
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_classifies_valid_accounts_and_removes_invalid_credentials(self):
+    def test_legacy_removed_marker_does_not_hide_icloud_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            save_record(db_file, "restored@icloud.com", "at-old")
+            remove_invalid_account(db_file, "restored@icloud.com", "legacy removal")
+
+            items = _browser_email_items(
+                db_file,
+                [
+                    {
+                        "hme": "restored@icloud.com",
+                        "anonymousId": "restored",
+                        "isActive": True,
+                    }
+                ],
+            )
+            self.assertEqual([item["email"] for item in items], ["restored@icloud.com"])
+            self.assertFalse(items[0]["hasPassword"])
+
+    async def test_classifies_valid_accounts_and_preserves_invalid_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -71,7 +94,8 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["status"], "completed")
             self.assertEqual(snapshot["plus"], 1)
             self.assertEqual(snapshot["free"], 1)
-            self.assertEqual(snapshot["deleted"], 1)
+            self.assertEqual(snapshot["expired"], 1)
+            self.assertEqual(snapshot["deleted"], 0)
             self.assertNotIn("access_token", json.dumps(snapshot))
             self.assertEqual(
                 load_account_record(db_file, "plus@icloud.com")["account_type"],
@@ -81,8 +105,11 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 load_account_record(db_file, "free@icloud.com")["account_type"],
                 "free",
             )
-            self.assertEqual(load_account_record(db_file, "bad@icloud.com"), {})
-            self.assertIn("bad@icloud.com", removed_account_emails(db_file))
+            preserved = load_account_record(db_file, "bad@icloud.com")
+            self.assertEqual(preserved["password"], "Secret!A7")
+            self.assertNotIn("access_token", preserved)
+            self.assertNotIn("session", preserved)
+            self.assertNotIn("bad@icloud.com", removed_account_emails(db_file))
 
             identities = [
                 {"hme": "plus@icloud.com", "anonymousId": "plus", "isActive": True},
@@ -90,15 +117,70 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 {"hme": "bad@icloud.com", "anonymousId": "bad", "isActive": True},
             ]
             items = _browser_email_items(db_file, identities)
-            self.assertEqual({item["email"] for item in items}, {"plus@icloud.com", "free@icloud.com"})
+            self.assertEqual(
+                {item["email"] for item in items},
+                {"plus@icloud.com", "free@icloud.com", "bad@icloud.com"},
+            )
+
+    async def test_preserves_known_plus_account_when_token_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_check_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'invalid','detail':'both endpoints returned 401'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(
+                db_file,
+                "paid@icloud.com",
+                "at-expired-plus",
+                account_type="plus",
+            )
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["plus"], 1)
+            self.assertEqual(snapshot["deleted"], 0)
+            self.assertEqual(
+                load_account_record(db_file, "paid@icloud.com")["password"],
+                "Secret!A7",
+            )
+            self.assertNotIn(
+                "access_token", load_account_record(db_file, "paid@icloud.com")
+            )
+            self.assertNotIn("paid@icloud.com", removed_account_emails(db_file))
 
 
 class InvalidConfirmationTests(unittest.TestCase):
-    def test_requires_two_independent_authorization_failures(self):
+    def test_requires_two_independent_unauthenticated_responses(self):
         self.assertFalse(confirmed_invalid("/backend-api/me: HTTP 403"))
-        self.assertTrue(
+        self.assertFalse(
             confirmed_invalid(
                 "/backend-api/accounts/check: HTTP 401; /backend-api/me: HTTP 403"
+            )
+        )
+        self.assertFalse(
+            confirmed_invalid(
+                "/backend-api/accounts/check: HTTP 403; /backend-api/me: HTTP 403"
+            )
+        )
+        self.assertTrue(
+            confirmed_invalid(
+                "/backend-api/accounts/check/v4-2023-04-27: HTTP 401; "
+                "/backend-api/me: HTTP 401"
             )
         )
 

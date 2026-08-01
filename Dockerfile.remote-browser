@@ -18,10 +18,14 @@ USER app
 RUN python -m camoufox fetch
 
 USER root
+RUN rm -rf /home/app/.cache/camoufox/fontconfig /home/app/.cache/fontconfig \
+    && ln -s /tmp/camoufox-fontconfig /home/app/.cache/camoufox/fontconfig \
+    && ln -s /tmp/fontconfig-cache /home/app/.cache/fontconfig
+
 COPY pyproject.toml README.md README.zh-CN.md ./
 COPY src ./src
 COPY openai-register-runtime /opt/openai-register-runtime
 RUN pip install --no-cache-dir .
 
 USER app
-ENTRYPOINT ["hidemyemail-web"]
+ENTRYPOINT ["sh", "-c", "mkdir -p /tmp/camoufox-fontconfig /tmp/fontconfig-cache && exec hidemyemail-web \"$@\"", "--"]

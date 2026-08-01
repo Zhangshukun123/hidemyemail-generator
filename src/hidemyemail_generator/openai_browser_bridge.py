@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import types
 from datetime import datetime, timezone
@@ -17,6 +18,61 @@ except ImportError:
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
+
+
+def _fontconfig_generator_with_home(generator, runtime_home: Path):
+    """Run Camoufox's hard-coded fontconfig writer against a writable home."""
+
+    def redirected(fontconfig_path: str) -> str:
+        previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(runtime_home)
+        try:
+            return generator(fontconfig_path)
+        finally:
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
+
+    return redirected
+
+
+def _configure_camoufox_runtime_cache(runtime_home: Path) -> Path:
+    """Point Firefox's XDG font cache at the same writable runtime tree."""
+
+    runtime_cache = runtime_home / ".cache"
+    (runtime_cache / "camoufox" / "fontconfig").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (runtime_cache / "fontconfig").mkdir(parents=True, exist_ok=True)
+    os.environ["XDG_CACHE_HOME"] = str(runtime_cache)
+    return runtime_cache
+
+
+def prepare_writable_camoufox_fontconfig():
+    """Redirect Camoufox and Firefox fontconfig writes to writable /tmp."""
+
+    if os.name != "posix":
+        return None
+
+    from camoufox import utils as camoufox_utils
+
+    generator = getattr(camoufox_utils, "_generate_fontconfig", None)
+    if not callable(generator):
+        return None
+
+    runtime_home = tempfile.TemporaryDirectory(
+        prefix="hidemyemail-camoufox-",
+        dir="/tmp",
+    )
+    runtime_root = Path(runtime_home.name)
+    _configure_camoufox_runtime_cache(runtime_root)
+    camoufox_utils._generate_fontconfig = _fontconfig_generator_with_home(
+        generator,
+        runtime_root,
+    )
+    return runtime_home
 
 
 class MfaHttpClient:
@@ -50,6 +106,98 @@ def safe_log_message(message: str) -> str:
         flags=re.I,
     )
     return text[:1500]
+
+
+def _locator_value_matches(locator, expected: str) -> bool:
+    input_value = getattr(locator, "input_value", None)
+    if not callable(input_value):
+        return False
+    try:
+        actual = input_value(timeout=2000)
+    except TypeError:
+        try:
+            actual = input_value()
+        except Exception:
+            return False
+    except Exception:
+        return False
+    return str(actual or "") == expected
+
+
+def resilient_force_fill_locator(worker, locator, value: str) -> bool:
+    """Fill a React-controlled input and confirm that the value was applied."""
+    expected = str(value)
+
+    try:
+        locator.click(timeout=3000, force=True)
+    except TypeError:
+        try:
+            locator.click(timeout=3000)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        locator.fill(expected, timeout=7000, force=True)
+    except TypeError:
+        try:
+            locator.fill(expected, timeout=7000)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if _locator_value_matches(locator, expected):
+        return True
+
+    try:
+        locator.evaluate(
+            """(el, value) => {
+                el.focus();
+                const proto = el instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+                if (descriptor && descriptor.set) descriptor.set.call(el, value);
+                else el.value = value;
+                const inputEvent = typeof InputEvent === "function"
+                    ? new InputEvent("input", {
+                        bubbles: true,
+                        composed: true,
+                        inputType: "insertText",
+                        data: value,
+                    })
+                    : new Event("input", { bubbles: true, composed: true });
+                el.dispatchEvent(inputEvent);
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            }""",
+            expected,
+        )
+    except Exception:
+        pass
+    if _locator_value_matches(locator, expected):
+        worker.log("[认证] 已使用兼容输入方式填写密码")
+        return True
+
+    try:
+        locator.click(timeout=3000, force=True)
+        locator.press("Control+A", timeout=2000)
+        locator.press("Backspace", timeout=2000)
+        locator.type(expected, delay=25, timeout=10000)
+    except TypeError:
+        try:
+            locator.click(timeout=3000)
+            locator.press("Control+A")
+            locator.press("Backspace")
+            locator.type(expected, delay=25)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    if _locator_value_matches(locator, expected):
+        worker.log("[认证] 已使用键盘输入方式填写密码")
+        return True
+    return False
 
 
 def iso_timestamp(value: float) -> str:
@@ -168,10 +316,17 @@ def main() -> int:
     account = None
     try:
         ensure_tkinter_importable()
+        # Keep the temporary directory alive for the complete browser run.
+        _camoufox_runtime = prepare_writable_camoufox_fontconfig()
+        if _camoufox_runtime is not None:
+            emit("log", message="[运行环境] Camoufox fontconfig 已切换到可写临时目录")
         import app_backend
         from account_models import MailAccount
 
         app_backend.HotmailOtpReader = ICloudOtpReader
+        app_backend.OpenAIRegisterPayLinkWorker._force_fill_locator = (
+            resilient_force_fill_locator
+        )
         account = MailAccount(
             email=args.email.strip().lower(),
             password=password,

@@ -20,11 +20,13 @@ services:
       - /data
     volumes:
       - ./data:/data
+    # Keep the root filesystem read-only, but allow Firefox to initialize its
+    # own process sandbox (Docker's no-new-privileges option prevents startup).
     read_only: true
+    shm_size: 512mb
     tmpfs:
+      # The image redirects Camoufox's runtime-generated fontconfig here too.
       - /tmp:size=512m,mode=1777
-    security_opt:
-      - no-new-privileges:true
     healthcheck:
       test:
         - CMD

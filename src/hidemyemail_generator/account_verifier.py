@@ -42,7 +42,14 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
             record.get("access_token") or record.get("accessToken") or ""
         ).strip()
         if email and token:
-            accounts.append({"email": email, "access_token": token})
+            account_type = str(record.get("account_type") or "").strip().lower()
+            accounts.append(
+                {
+                    "email": email,
+                    "access_token": token,
+                    "account_type": account_type,
+                }
+            )
     return sorted(accounts, key=lambda item: item["email"])
 
 
@@ -89,6 +96,42 @@ def save_account_classification(
         conn.close()
 
 
+def mark_account_session_invalid(db_file: Path, email: str, detail: str) -> None:
+    target = email.strip().lower()
+    record = load_account_record(db_file, target)
+    if not record:
+        return
+    for key in (
+        "access_token",
+        "accessToken",
+        "session",
+        "session_json",
+        "sessionJson",
+        "storage_state_json",
+        "storageStateJson",
+    ):
+        record.pop(key, None)
+    record.update(
+        {
+            "session_invalid_at": utc_now(),
+            "verification_detail": str(detail or "Access Token 已失效")[:1000],
+        }
+    )
+    conn = connect_db(str(db_file))
+    try:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"gpt_account:{target}", json.dumps(record, ensure_ascii=False)),
+        )
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_removed:{target}",))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def remove_invalid_account(db_file: Path, email: str, detail: str) -> None:
     target = email.strip().lower()
     audit = {
@@ -98,6 +141,16 @@ def remove_invalid_account(db_file: Path, email: str, detail: str) -> None:
     }
     conn = connect_db(str(db_file))
     try:
+        existing = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (f"gpt_account:{target}",)
+        ).fetchone()
+        if existing:
+            try:
+                account_record = json.loads(str(existing["value"] or ""))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                account_record = None
+            if isinstance(account_record, dict):
+                audit["account_record"] = account_record
         conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_account:{target}",))
         conn.execute(
             """
@@ -140,6 +193,7 @@ class AccountVerificationManager:
             "completed": 0,
             "plus": 0,
             "free": 0,
+            "expired": 0,
             "deleted": 0,
             "failed": 0,
             "accounts": [],
@@ -189,6 +243,7 @@ class AccountVerificationManager:
             "completed": 0,
             "plus": 0,
             "free": 0,
+            "expired": 0,
             "deleted": 0,
             "failed": 0,
             "accounts": [
@@ -197,6 +252,7 @@ class AccountVerificationManager:
                     "status": "queued",
                     "message": "等待验证",
                     "_access_token": item["access_token"],
+                    "_account_type": item.get("account_type", ""),
                 }
                 for item in accounts
             ],
@@ -228,7 +284,7 @@ class AccountVerificationManager:
                 self._state["status"] = "completed"
                 self._append_log(
                     f"验证完成：Plus {self._state['plus']}，Free {self._state['free']}，"
-                    f"删除 {self._state['deleted']}，失败 {self._state['failed']}"
+                    f"Token 失效 {self._state['expired']}，失败 {self._state['failed']}"
                 )
         except asyncio.CancelledError:
             self._state["status"] = "cancelled"
@@ -310,10 +366,20 @@ class AccountVerificationManager:
                 self._append_log(item["message"], email=email)
             elif return_code == 0 and result == "invalid":
                 await asyncio.to_thread(
-                    remove_invalid_account, self.db_file, email, detail
+                    mark_account_session_invalid, self.db_file, email, detail
                 )
-                item.update(status="deleted", message="账号无效，已删除本地凭据")
-                self._state["deleted"] += 1
+                if item.get("_account_type") == "plus":
+                    item.update(
+                        status="plus",
+                        message="Plus 账号 Token 已失效，账号已保留，请重新获取 Session",
+                    )
+                    self._state["plus"] += 1
+                else:
+                    item.update(
+                        status="expired",
+                        message="Token 已失效，账号凭据已保留，请重新获取 Session",
+                    )
+                    self._state["expired"] += 1
                 self._append_log(item["message"], email=email)
             else:
                 error = detail or stderr.decode("utf-8", errors="replace").strip()
@@ -324,6 +390,7 @@ class AccountVerificationManager:
                 self._append_log(f"验证失败，账号已保留：{item['message']}", email=email)
             self._state["completed"] += 1
             item.pop("_access_token", None)
+            item.pop("_account_type", None)
 
     async def stop(self) -> dict[str, Any]:
         if not self._batch_task or self._batch_task.done():
@@ -357,6 +424,7 @@ class AccountVerificationManager:
 __all__ = [
     "AccountVerificationManager",
     "load_verifiable_accounts",
+    "mark_account_session_invalid",
     "remove_invalid_account",
     "removed_account_emails",
     "save_account_classification",

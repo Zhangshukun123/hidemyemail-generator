@@ -19,7 +19,12 @@ def emit(payload: dict) -> None:
 
 
 def confirmed_invalid(detail: str) -> bool:
-    return len(re.findall(r"HTTP\s+(?:401|403)", str(detail or ""))) >= 2
+    value = str(detail or "")
+    account_check_rejected = re.search(
+        r"/backend-api/accounts/check[^:;]*:\s*HTTP\s+401\b", value
+    )
+    profile_rejected = re.search(r"/backend-api/me:\s*HTTP\s+401\b", value)
+    return bool(account_check_rejected and profile_rejected)
 
 
 def main() -> int:
@@ -47,14 +52,16 @@ def main() -> int:
             token, request_locale=args.locale
         )
     except app_backend.OpllAccountPlanUnknownError as error:
-        # The source detector only raises this after an authenticated endpoint
-        # returned a valid payload. With no paid marker, classify it as Free.
-        emit({"status": "free", "detail": str(error)})
-        return 0
+        # An authenticated response without a reliable plan field is not proof
+        # of a Free account. Keep the existing classification so a Plus account
+        # cannot later be deleted after being incorrectly downgraded to Free.
+        emit({"status": "error", "detail": f"套餐不明确，账号已保留：{error}"})
+        return 1
     except app_backend.OpllAccountInvalidError as error:
         detail = str(error)
-        # Delete only when both independent account endpoints rejected the AT.
-        # A single 403 can also be a transient edge/WAF response.
+        # Delete only when both independent account endpoints explicitly report
+        # an unauthenticated (401) token. A 403 can be returned by account-plan
+        # permissions, edge protection, or regional policy for a valid Plus AT.
         if confirmed_invalid(detail):
             emit({"status": "invalid", "detail": detail})
             return 0

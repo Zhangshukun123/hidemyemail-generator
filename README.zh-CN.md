@@ -324,9 +324,10 @@ OPENAI_REGISTER_PYTHON=D:\path\to\openai-register-project\.venv\Scripts\python.e
 
 “一键验证账号”会并发查询所有已保存 Access Token 的账号，并把在线有效账号归类为
 `Plus` 或 `Free`。没有 AT 的邮箱保持“等待验证”。只有两个独立账号接口都明确返回
-401/403 时才判定为无效；无效账号会从 GPT 列表移除，并删除本地保存的密码、AT 和
-Session。网络错误、单接口异常或结果不确定时会保留账号。此操作不会停用或删除 Apple
-端的 iCloud 隐藏邮箱。
+401 时才判定为无效；403 或套餐不明确时一律保留。已识别为 `Plus` 的账号即使 Token
+过期也不会被移除，只会提示重新获取 Session。两个接口都返回 401 时也只会清除失效
+的 AT、Session 和浏览器状态，邮箱、密码、MFA 密钥及套餐分类都会保留，以便重新认证；
+此操作不会停用或删除 Apple 侧的 iCloud 隐藏邮箱。
 
 ## 配置
 

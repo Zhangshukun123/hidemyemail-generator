@@ -160,6 +160,7 @@ LOGIN_HTML = r"""<!doctype html>
     button { width: 100%; margin: 10px 0 0; border: 0; padding: 13px 15px;
       color: var(--primary-text); background: var(--primary); font-weight: 750;
       box-shadow: 0 8px 20px rgba(0,0,0,.14); }
+    button[type="button"] { margin-block: 0; }
     #submit { color: var(--primary-text); background: var(--primary); }
     #submit:hover:not(:disabled) { background: var(--primary-hover); }
     button:hover:not(:disabled) { background: var(--primary-hover); }
@@ -771,7 +772,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       background-image: linear-gradient(var(--grid) 1px, transparent 1px),
                         linear-gradient(90deg, var(--grid) 1px, transparent 1px);
       background-size: 36px 36px; mask-image: linear-gradient(to bottom, black, transparent 72%); }
-    main.app-shell { width: min(1240px, calc(100% - 40px)); margin: 0 auto; padding: 34px 0 64px; position: relative; z-index: 1; }
+    main.app-shell { width: min(1360px, calc(100% - 40px)); margin: 0 auto; padding: 34px 0 64px; position: relative; z-index: 1; }
     .app-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
     .brand { display: flex; align-items: center; gap: 15px; }
     .brand-mark { width: 48px; height: 48px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 15px;
@@ -782,16 +783,18 @@ GPT_INDEX_HTML = r"""<!doctype html>
     h1 { margin: 3px 0 0; font-size: clamp(25px, 3vw, 34px); letter-spacing: -.04em; color: var(--text); }
     .subtitle { margin-top: 5px; color: var(--muted); font-size: 13px; }
     .header-actions { display: flex; align-items: center; gap: 10px; }
-    .runtime-pill { display: flex; align-items: center; gap: 8px; height: 39px; padding: 0 13px; border: 1px solid var(--border);
+    .runtime-pill { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 13px; border: 1px solid var(--border);
       border-radius: 999px; color: var(--muted); background: var(--subtle); font-size: 12px; white-space: nowrap; }
     .runtime-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 4px var(--subtle); }
     .runtime-dot.ok { background: var(--success); box-shadow: 0 0 0 4px var(--success-soft); }
     .runtime-dot.bad { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-soft); }
     button {
-      width: auto; min-height: 40px; margin: 0; border: 1px solid transparent; padding: 9px 14px; font-size: 13px;
+      width: auto; min-height: 40px; margin: 0; border: 1px solid transparent; padding: 9px 14px; display: inline-flex;
+      align-items: center; justify-content: center; line-height: 1.2; font-size: 13px;
       font-weight: 720; cursor: pointer; color: var(--button-text); background: var(--button); box-shadow: none;
       transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
     }
+    button[type="button"], button[type="submit"], button[type="reset"] { margin-block: 0; }
     button:hover:not(:disabled) { transform: translateY(-1px); }
     button:disabled { opacity: .48; cursor: wait; }
     .icon-button { width: 40px; padding: 0; display: grid; place-items: center; border-color: var(--border); background: var(--subtle); }
@@ -854,12 +857,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .toolbar input { padding-left: 37px; }
     .list { padding: 0 14px 14px; display: grid; gap: 9px; }
     .email-row {
-      display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 16px;
+      display: grid; grid-template-columns: minmax(280px, .9fr) minmax(220px, 1.1fr) auto; align-items: center; gap: 14px;
       padding: 15px 16px; background: var(--row-bg); border: 1px solid var(--border); border-radius: 14px;
-      transition: border-color .16s ease, background .16s ease, transform .16s ease;
+      transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
     }
     .email-row:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); background: var(--row-hover); transform: translateY(-1px); }
-    .identity { display: flex; align-items: center; gap: 13px; min-width: 0; }
+    .identity { grid-column: 1; display: flex; align-items: center; gap: 13px; min-width: 0; }
     .avatar { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; color: var(--text);
       background: var(--accent-soft); font-weight: 780; }
     .identity-copy { min-width: 0; }
@@ -875,13 +878,29 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .plan-badge.free { color: var(--success); background: var(--success-soft); }
     .plan-badge.unverified { color: var(--muted); background: var(--subtle); }
     .meta { color: var(--muted); font-size: 10px; }
-    .actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-    .action { min-height: 34px; padding: 7px 10px; border-color: var(--border); color: var(--button-text); background: var(--subtle); white-space: nowrap; font-size: 11px; }
+    .quick-actions { grid-column: 3; display: flex; align-items: center; gap: 7px; justify-content: flex-end; }
+    .secondary-actions {
+      display: none; grid-column: 1 / -1; gap: 7px; flex-wrap: wrap; padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+    .email-row.expanded .secondary-actions { display: flex; }
+    .action { height: 34px; min-height: 34px; padding: 7px 10px; border-color: var(--border); color: var(--button-text); background: var(--subtle); white-space: nowrap; font-size: 11px; }
     .action:hover:not(:disabled) { background: var(--subtle-hover); }
-    .action:first-child { color: var(--primary-text); background: var(--primary); }
+    .action.quick-copy { color: var(--primary-text); background: var(--primary); border-color: transparent; }
+    .more-action { display: inline-flex; align-items: center; gap: 6px; }
+    .more-action svg { width: 13px; height: 13px; transition: transform .16s ease; }
+    .more-action[aria-expanded="true"] svg { transform: rotate(180deg); }
     .action.danger-action { color: var(--danger); border-color: var(--danger-soft); background: var(--danger-soft); }
     .mfa-badge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; color: var(--success); border: 1px solid var(--success-soft); background: var(--success-soft); }
     .mfa-badge.pending { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
+    .account-state { grid-column: 2; min-width: 0; }
+    .account-code { min-height: 42px; display: flex; align-items: center; gap: 10px; padding: 6px 8px 6px 12px;
+      border: 1px solid var(--success-soft); border-radius: 11px; background: var(--success-soft); }
+    .account-code-label { color: var(--muted); font-size: 10px; white-space: nowrap; }
+    .account-code-value { color: var(--success); font: 750 15px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; user-select: all; }
+    .account-code-status { flex: 1; color: var(--success); font-size: 10px; white-space: nowrap; }
+    .account-code button { width: 30px; height: 30px; min-height: 30px; flex: 0 0 30px; padding: 0; border-color: var(--border); background: var(--subtle); }
+    .account-code button svg { width: 14px; height: 14px; }
     .empty { padding: 66px 20px; text-align: center; color: var(--muted); }
     .empty-icon { width: 44px; height: 44px; display: grid; place-items: center; margin: 0 auto 12px; border-radius: 14px; color: var(--muted); background: var(--subtle); }
     .empty-icon svg { width: 21px; height: 21px; }
@@ -893,7 +912,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .toast.show { opacity: 1; transform: translateY(0); }
     .toast.error { border-color: var(--danger-soft); }
     @media (max-width: 760px) {
-      main.app-shell { width: min(100% - 24px, 1240px); padding-top: 22px; }
+      main.app-shell { width: min(100% - 24px, 1360px); padding-top: 22px; }
       .app-header { align-items: flex-start; }
       .runtime-pill { display: none; }
       .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -904,9 +923,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       .list-actions { max-width: 52%; }
       #verifySummary { text-align: right; }
       .toolbar { grid-template-columns: 1fr 130px 130px auto; padding-inline: 18px; }
-      .email-row { grid-template-columns: 1fr; }
-      .actions { justify-content: stretch; }
-      .action { flex: 1; }
+      .email-row { grid-template-columns: minmax(0, 1fr); }
+      .identity, .account-state, .quick-actions, .secondary-actions { grid-column: 1; }
+      .quick-actions { justify-content: flex-start; }
       .task-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 520px) {
@@ -930,6 +949,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       .toolbar select { grid-row: 2; }
       .toolbar .icon-button { grid-column: 3; grid-row: 1 / span 2; height: 100%; }
       .list-head { padding-inline: 18px; }
+      .quick-actions { width: 100%; }
+      .quick-actions .action { flex: 1; }
+      .secondary-actions .action { flex: 1 1 calc(50% - 7px); }
     }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
   </style>
@@ -1045,6 +1067,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const themeToggle = $("themeToggle");
     let currentItems = [];
+    let visibleItems = [];
+    let retrievedCode = null;
     let taskPoll = null;
     let registrationPoll = null;
     let verificationPoll = null;
@@ -1097,9 +1121,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
         button.disabled = true;
         button.textContent = "处理中…";
         try {
-          await action();
-          button.textContent = successLabel;
-          showToast(successLabel);
+          const result = await action();
+          const resolvedLabel = result && result.successLabel ? result.successLabel : successLabel;
+          button.textContent = resolvedLabel;
+          showToast(resolvedLabel);
           setTimeout(() => { button.textContent = original; }, 1200);
         } catch (error) {
           button.textContent = original;
@@ -1111,18 +1136,72 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return button;
     }
 
+    async function copyText(value) {
+      const text = String(value ?? "");
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (_clipboardError) {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        textarea.style.pointerEvents = "none";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        try { return document.execCommand("copy"); }
+        catch (_fallbackError) { return false; }
+        finally { textarea.remove(); }
+      }
+    }
+
     async function copyCredential(email, kind) {
       const data = await api("/api/gpt-credential", {
         method: "POST", body: JSON.stringify({ email, kind })
       });
-      await navigator.clipboard.writeText(data.value);
+      if (!await copyText(data.value)) throw new Error("浏览器拒绝复制，请检查剪贴板权限");
     }
 
     async function copyOpenAiCode(email) {
       const data = await api("/api/gpt-code", {
         method: "POST", body: JSON.stringify({ email })
       });
-      await navigator.clipboard.writeText(data.code);
+      const copied = await copyText(data.code);
+      retrievedCode = { email, code: data.code, copied };
+      render(visibleItems);
+      return { successLabel: copied ? "验证码已获取并复制" : "验证码已获取，请手动复制" };
+    }
+
+    async function downloadAccount(email) {
+      const response = await fetch("/api/gpt-accounts/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Local-Token": localToken },
+        body: JSON.stringify({ email }),
+        cache: "no-store"
+      });
+      if (response.status === 401) {
+        location.replace("/login");
+        throw new Error("登录已过期");
+      }
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({ error: "下载账号失败" }));
+        throw new Error(data.error || `下载失败 (${response.status})`);
+      }
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const filenameMatch = disposition.match(/filename="([^"]+)"/i);
+      const filename = filenameMatch ? filenameMatch[1] : "openai-account.txt";
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      return { successLabel: "已下载" };
     }
 
     async function deleteEmail(email) {
@@ -1283,7 +1362,6 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     async function startRegistration() {
-      if (!confirm("将创建新的 iCloud 隐藏邮箱，自动生成强密码注册 OpenAI，并在注册成功后开启 TOTP 2FA。是否继续？")) return;
       const data = await api("/api/registration/start", {
         method: "POST",
         body: JSON.stringify({
@@ -1309,7 +1387,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("verifySummary").textContent = "仅验证已保存 AT 的账号";
       } else {
         $("verifySummary").className = data.failed ? "error" : "";
-        $("verifySummary").textContent = `${statusNames[data.status] || data.status} · ${data.completed || 0}/${data.total || 0} · Plus ${data.plus || 0} · Free ${data.free || 0} · 已删除 ${data.deleted || 0} · 失败 ${data.failed || 0}`;
+        $("verifySummary").textContent = `${statusNames[data.status] || data.status} · ${data.completed || 0}/${data.total || 0} · Plus ${data.plus || 0} · Free ${data.free || 0} · Token 失效 ${data.expired || 0} · 失败 ${data.failed || 0}`;
       }
       $("verifyAll").disabled = Boolean(data.running) || !runtime.available;
       $("stopVerify").disabled = !data.running;
@@ -1401,30 +1479,93 @@ GPT_INDEX_HTML = r"""<!doctype html>
         }
         identityCopy.append(address, metaLine);
         identity.append(avatar, identityCopy);
-        const actions = document.createElement("div");
-        actions.className = "actions";
-        actions.append(actionButton("浏览器获取", () => startBrowser([item.email]), "已启动"));
-        actions.append(actionButton("复制邮箱", () => navigator.clipboard.writeText(item.email)));
-        if (item.hasPassword) actions.append(actionButton("复制密码", () => copyCredential(item.email, "password")));
+        const accountState = document.createElement("div");
+        accountState.className = "account-state";
+        if (retrievedCode?.email === item.email) {
+          const codeResult = document.createElement("div");
+          codeResult.className = "account-code";
+          codeResult.setAttribute("role", "status");
+          codeResult.setAttribute("aria-live", "polite");
+          const codeLabel = document.createElement("span");
+          codeLabel.className = "account-code-label";
+          codeLabel.textContent = "最新验证码";
+          const codeValue = document.createElement("strong");
+          codeValue.className = "account-code-value";
+          codeValue.textContent = retrievedCode.code;
+          const codeStatus = document.createElement("span");
+          codeStatus.className = "account-code-status";
+          codeStatus.textContent = retrievedCode.copied ? "已复制" : "可手动复制";
+          const copyCodeButton = document.createElement("button");
+          copyCodeButton.type = "button";
+          copyCodeButton.setAttribute("aria-label", `复制 ${item.email} 的验证码`);
+          copyCodeButton.title = "复制验证码";
+          copyCodeButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>';
+          copyCodeButton.addEventListener("click", async () => {
+            if (await copyText(retrievedCode.code)) {
+              retrievedCode.copied = true;
+              codeStatus.textContent = "已复制";
+              showToast("验证码已复制");
+            } else {
+              showToast("复制失败，请手动选择验证码", "error");
+            }
+          });
+          const dismissCodeButton = document.createElement("button");
+          dismissCodeButton.type = "button";
+          dismissCodeButton.setAttribute("aria-label", `关闭 ${item.email} 的验证码状态`);
+          dismissCodeButton.title = "关闭";
+          dismissCodeButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>';
+          dismissCodeButton.addEventListener("click", () => {
+            retrievedCode = null;
+            accountState.replaceChildren();
+          });
+          codeResult.append(codeLabel, codeValue, codeStatus, copyCodeButton, dismissCodeButton);
+          accountState.append(codeResult);
+        }
+        const quickActions = document.createElement("div");
+        quickActions.className = "quick-actions";
+        const copyEmailButton = actionButton("复制邮箱", async () => {
+          if (!await copyText(item.email)) throw new Error("浏览器拒绝复制，请检查剪贴板权限");
+        });
+        copyEmailButton.classList.add("quick-copy");
+        const moreButton = document.createElement("button");
+        moreButton.type = "button";
+        moreButton.className = "action more-action";
+        moreButton.setAttribute("aria-expanded", "false");
+        moreButton.innerHTML = '更多操作 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>';
+        quickActions.append(copyEmailButton, moreButton);
+        const secondaryActions = document.createElement("div");
+        secondaryActions.className = "secondary-actions";
+        if (item.hasPassword) secondaryActions.append(actionButton("复制密码", () => copyCredential(item.email, "password")));
         if (item.hasTwoFactor) {
-          actions.append(
+          secondaryActions.append(
             actionButton("复制 2FA 密钥", () => copyCredential(item.email, "totp_secret")),
             actionButton("复制 2FA 码", () => copyCredential(item.email, "totp_code"))
           );
         } else if (item.hasPassword) {
-          actions.append(actionButton("开启 2FA", () => enableTwoFactor(item.email), "已启动"));
+          secondaryActions.append(actionButton("开启 2FA", () => enableTwoFactor(item.email), "已启动"));
         }
         if (item.hasSession) {
-          actions.append(
+          secondaryActions.append(
             actionButton("复制 AT", () => copyCredential(item.email, "access_token")),
             actionButton("复制 Session", () => copyCredential(item.email, "session"))
           );
         }
-        actions.append(actionButton("获取 OpenAI 码", () => copyOpenAiCode(item.email)));
+        secondaryActions.append(actionButton("获取 OpenAI 码", () => copyOpenAiCode(item.email)));
         const deleteButton = actionButton("删除邮箱", () => deleteEmail(item.email), "已删除");
         deleteButton.classList.add("danger-action");
-        actions.append(deleteButton);
-        row.append(identity, actions);
+        const downloadButton = actionButton("下载账号", () => downloadAccount(item.email), "已下载");
+        if (!item.hasPassword) {
+          downloadButton.disabled = true;
+          downloadButton.title = "该账号尚未保存密码";
+        }
+        secondaryActions.append(deleteButton, downloadButton);
+        moreButton.addEventListener("click", () => {
+          const expanded = !row.classList.contains("expanded");
+          row.classList.toggle("expanded", expanded);
+          moreButton.setAttribute("aria-expanded", String(expanded));
+          moreButton.firstChild.textContent = expanded ? "收起操作 " : "更多操作 ";
+        });
+        row.append(identity, accountState, quickActions, secondaryActions);
         root.append(row);
       }
     }
@@ -1438,6 +1579,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         (plan === "all" || item.accountType === plan) &&
         (status === "all" || item.sessionStatus === status)
       );
+      visibleItems = items;
       render(items);
       const ready = currentItems.filter((item) => item.sessionStatus === "ready").length;
       $("summary").textContent = items.length === currentItems.length
@@ -1461,6 +1603,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         applyFilters();
       } catch (error) {
         currentItems = [];
+        visibleItems = [];
         $("totalCount").textContent = "—";
         $("plusCount").textContent = "—";
         $("freeCount").textContent = "—";
@@ -1735,6 +1878,59 @@ def _gpt_credential(db_file: Path, email: str, kind: str) -> str:
     return str(session).strip()
 
 
+def _gpt_account_export(db_file: Path, email: str = "") -> list[str]:
+    target = email.strip().lower()
+    if target and (
+        not target.endswith("@icloud.com") or "\n" in target or "\r" in target
+    ):
+        return []
+    conn = connect_db(str(db_file))
+    try:
+        if target:
+            rows = conn.execute(
+                "SELECT key, value FROM settings WHERE key = ?",
+                (f"gpt_account:{target}",),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT key, value
+                FROM settings
+                WHERE key LIKE 'gpt_account:%'
+                ORDER BY key
+                """
+            ).fetchall()
+    finally:
+        conn.close()
+
+    lines: list[str] = []
+    for row in rows:
+        account_email = str(row["key"] or "").split(":", 1)[-1].strip().lower()
+        if (
+            not account_email.endswith("@icloud.com")
+            or "\n" in account_email
+            or "\r" in account_email
+        ):
+            continue
+        try:
+            account = json.loads(str(row["value"] or ""))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(account, dict):
+            continue
+        password = str(account.get("password") or "").strip()
+        if not password:
+            continue
+        two_factor = account.get("two_factor")
+        if not isinstance(two_factor, dict):
+            two_factor = {}
+        mfa_secret = str(two_factor.get("secret") or "").strip()
+        password = password.replace("\r", "").replace("\n", "")
+        mfa_secret = mfa_secret.replace("\r", "").replace("\n", "")
+        lines.append(f"{account_email}----{password}----{mfa_secret}")
+    return lines
+
+
 def _remove_deleted_email_records(db_file: Path, email: str) -> None:
     target = email.strip().lower()
     now = datetime.now(timezone.utc).isoformat()
@@ -1821,11 +2017,10 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
     activity = {
         item["email"]: item for item in _gpt_email_items(db_file, identities)
     }
-    removed = removed_account_emails(db_file)
     items: list[dict] = []
     for identity in identities:
         email = str(identity.get("hme") or "").strip().lower()
-        if not email or email in removed:
+        if not email:
             continue
         current = dict(
             activity.get(email)
@@ -2246,6 +2441,42 @@ def create_app(
             )
         return web.json_response(
             {"ok": True, "value": value}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def export_gpt_accounts(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        email = str(payload.get("email") or "").strip().lower()
+        if not email.endswith("@icloud.com"):
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        lines = await asyncio.to_thread(_gpt_account_export, app["db_file"], email)
+        if not lines:
+            return web.json_response(
+                {"ok": False, "error": "该账号尚未保存密码，无法下载"}, status=404
+            )
+        safe_name = re.sub(r"[^a-z0-9._-]+", "-", email.split("@", 1)[0])
+        filename = (
+            f"openai-account-{safe_name}-"
+            f"{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+        return web.Response(
+            text="\n".join(lines) + "\n",
+            content_type="text/plain",
+            charset="utf-8",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Account-Count": str(len(lines)),
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def delete_gpt_email(request: web.Request) -> web.Response:
@@ -2789,6 +3020,7 @@ def create_app(
     app.router.add_get("/", index)
     app.router.add_get("/api/gpt-emails", gpt_emails)
     app.router.add_post("/api/gpt-credential", gpt_credential)
+    app.router.add_post("/api/gpt-accounts/export", export_gpt_accounts)
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_get("/api/browser/status", browser_status)
