@@ -10,8 +10,10 @@ from pathlib import Path
 
 from hidemyemail_generator.browser_tasks import (
     BrowserTaskManager,
+    _save_account_record,
     access_token_is_expired,
     load_account_record,
+    set_manual_account_type,
 )
 from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.openai_browser_bridge import (
@@ -30,6 +32,74 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_manual_account_type_is_not_overwritten_by_session_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            set_manual_account_type(db_file, "manual@icloud.com", "plus")
+
+            _save_account_record(
+                db_file,
+                "manual@icloud.com",
+                result={
+                    "session_json": json.dumps(
+                        {"account": {"planType": "free"}}
+                    )
+                },
+            )
+
+            record = load_account_record(db_file, "manual@icloud.com")
+            self.assertEqual(record["account_type"], "plus")
+            self.assertEqual(record["account_type_source"], "manual")
+
+            set_manual_account_type(db_file, "manual@icloud.com", "unverified")
+            record = load_account_record(db_file, "manual@icloud.com")
+            self.assertNotIn("account_type", record)
+            self.assertNotIn("account_type_source", record)
+
+    def test_unconfirmed_password_is_not_saved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            _save_account_record(
+                db_file,
+                "passwordless@icloud.com",
+                password="Generated!A7",
+                password_confirmed=False,
+            )
+            self.assertNotIn(
+                "password", load_account_record(db_file, "passwordless@icloud.com")
+            )
+
+            _save_account_record(
+                db_file,
+                "passwordless@icloud.com",
+                password="Generated!A7",
+                password_confirmed=True,
+            )
+            record = load_account_record(db_file, "passwordless@icloud.com")
+            self.assertEqual(record["password"], "Generated!A7")
+            self.assertTrue(record["password_confirmed"])
+
+    def test_fresh_session_plan_updates_saved_account_classification(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+
+            _save_account_record(
+                db_file,
+                "plus@icloud.com",
+                result={
+                    "session_json": json.dumps(
+                        {
+                            "user": {"email": "plus@icloud.com"},
+                            "account": {"planType": "plus"},
+                        }
+                    )
+                },
+            )
+
+            record = load_account_record(db_file, "plus@icloud.com")
+            self.assertEqual(record["account_type"], "plus")
+            self.assertIn("account.planType=plus", record["verification_detail"])
+
     def test_camoufox_runtime_cache_is_writable_and_uses_xdg(self):
         previous_cache = os.environ.get("XDG_CACHE_HOME")
         try:
@@ -159,6 +229,50 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ensure_password_rejects_unconfirmed_worker_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "result = {'access_token':'at-test','session_json':'{}'}\n"
+                "event = {'type':'result','result':result,'password':'LocalOnly!A7','password_confirmed':False}\n"
+                "print(prefix + json.dumps(event), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(
+                [
+                    {
+                        "email": "passwordless@icloud.com",
+                        "password": "LocalOnly!A7",
+                        "ensure_password": True,
+                    }
+                ],
+                headless=True,
+                concurrency=1,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["failed"], 1)
+            self.assertIn("未确认密码设置", snapshot["accounts"][0]["message"])
+            self.assertNotIn(
+                "password", load_account_record(db_file, "passwordless@icloud.com")
+            )
+
     async def test_worker_result_is_saved_without_exposing_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

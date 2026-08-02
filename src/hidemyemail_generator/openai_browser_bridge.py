@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import time
@@ -12,12 +13,68 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from .openai_mfa import enable_totp_mfa
+    from .openai_mfa import enable_totp_mfa, generate_totp
 except ImportError:
-    from openai_mfa import enable_totp_mfa
+    from openai_mfa import enable_totp_mfa, generate_totp
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
+
+
+def load_saved_storage_state(db_file: str, email: str) -> dict:
+    path_text = str(db_file or "").strip()
+    target_email = str(email or "").strip().lower()
+    if not path_text or not target_email:
+        return {}
+    try:
+        connection = sqlite3.connect(path_text)
+        try:
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (f"gpt_account:{target_email}",),
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row:
+            return {}
+        record = json.loads(str(row[0] or "{}"))
+        if not isinstance(record, dict):
+            return {}
+        raw_state = record.get("storage_state_json")
+        if isinstance(raw_state, dict):
+            return dict(raw_state)
+        if not isinstance(raw_state, str) or not raw_state.strip():
+            return {}
+        state = json.loads(raw_state)
+        return state if isinstance(state, dict) else {}
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ):
+        return {}
+
+
+def configure_worker_login_totp(worker, two_factor: dict | None) -> bool:
+    state = two_factor if isinstance(two_factor, dict) else {}
+    secret = str(state.get("secret") or "").strip()
+    if not secret:
+        return False
+
+    def current_code() -> str:
+        return generate_totp(secret)
+
+    worker.login_totp_provider = current_code
+    return True
+
+
+def reusable_enabled_two_factor(two_factor: dict | None) -> dict:
+    state = dict(two_factor) if isinstance(two_factor, dict) else {}
+    if state.get("enabled") and str(state.get("secret") or "").strip():
+        return state
+    return {}
 
 
 def _fontconfig_generator_with_home(generator, runtime_home: Path):
@@ -308,7 +365,16 @@ def main() -> int:
     sys.path.insert(0, str(source_dir))
 
     password = os.environ.get("HME_OPENAI_PASSWORD", "")
+    ensure_password = os.environ.get("HME_ENSURE_OPENAI_PASSWORD", "") == "1"
     enable_2fa = os.environ.get("HME_ENABLE_OPENAI_2FA", "") == "1"
+    saved_storage_state = (
+        load_saved_storage_state(
+            os.environ.get("HME_BROWSER_DB_FILE", ""),
+            args.email,
+        )
+        if ensure_password
+        else {}
+    )
     try:
         pending_2fa = json.loads(os.environ.get("HME_OPENAI_2FA_STATE", "{}"))
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -350,33 +416,51 @@ def main() -> int:
             log,
             browser_engine="camoufox",
         )
+        configure_worker_login_totp(worker, pending_2fa)
+        worker.require_password_setup = ensure_password
+        worker.initial_storage_state = saved_storage_state or None
+        # Session/AT are sufficient for this service. Camoufox can occasionally
+        # stall indefinitely while exporting a complete browser storage snapshot;
+        # the database merge keeps any previously saved snapshot intact.
+        worker.skip_storage_state_capture = True
         result = worker.run()
+        password_confirmed = bool(
+            getattr(worker, "_password_step_submitted", False)
+        )
+        if ensure_password and not password_confirmed:
+            raise RuntimeError("OpenAI 端未确认密码设置，未保存本地密码")
         if enable_2fa:
             emit(
                 "account_registered",
                 result=result,
                 password=str(account.password or ""),
+                password_confirmed=password_confirmed,
             )
-            emit("two_factor_start")
-            mfa_client = MfaHttpClient()
-            try:
-                two_factor = enable_totp_mfa(
-                    mfa_client,
-                    access_token=str(result.get("access_token") or ""),
-                    email=str(account.email or ""),
-                    pending=pending_2fa,
-                    on_enrolled=lambda state: emit(
-                        "two_factor_enrolled", two_factor=state
-                    ),
-                )
-            finally:
-                mfa_client.close()
+            two_factor = reusable_enabled_two_factor(pending_2fa)
+            if two_factor:
+                emit("log", message="账号已有 TOTP 2FA，已保留现有启用状态")
+            else:
+                emit("two_factor_start")
+                mfa_client = MfaHttpClient()
+                try:
+                    two_factor = enable_totp_mfa(
+                        mfa_client,
+                        access_token=str(result.get("access_token") or ""),
+                        email=str(account.email or ""),
+                        pending=pending_2fa,
+                        on_enrolled=lambda state: emit(
+                            "two_factor_enrolled", two_factor=state
+                        ),
+                    )
+                finally:
+                    mfa_client.close()
             result["two_factor"] = two_factor
             emit("two_factor_enabled")
         emit(
             "result",
             result=result,
             password=str(account.password or ""),
+            password_confirmed=password_confirmed,
         )
         return 0
     except KeyboardInterrupt:
@@ -384,6 +468,7 @@ def main() -> int:
             "error",
             error="浏览器任务已停止",
             password=str(getattr(account, "password", "") or ""),
+            password_confirmed=False,
         )
         return 130
     except Exception as error:
@@ -391,6 +476,9 @@ def main() -> int:
             "error",
             error=safe_log_message(str(error)),
             password=str(getattr(account, "password", "") or ""),
+            password_confirmed=bool(
+                getattr(locals().get("worker"), "_password_step_submitted", False)
+            ),
         )
         return 1
 

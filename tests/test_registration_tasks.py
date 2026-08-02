@@ -78,6 +78,7 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(browser.started_accounts[0]["email"], "new-alias@icloud.com")
         self.assertTrue(browser.started_accounts[0]["enable_2fa"])
+        self.assertTrue(browser.started_accounts[0]["ensure_password"])
         self.assertGreaterEqual(len(browser.started_accounts[0]["password"]), 16)
         self.assertTrue(browser.state["headless"])
 

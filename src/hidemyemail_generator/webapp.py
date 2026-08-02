@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 import webbrowser
 from contextlib import suppress
@@ -18,6 +19,7 @@ from .browser_tasks import (
     BrowserTaskManager,
     access_token_is_expired,
     load_account_record,
+    set_manual_account_type,
 )
 from .inbox import (
     DEFAULT_DB_FILE,
@@ -53,6 +55,20 @@ PAGE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+
+
+def _configure_utf8_stdio() -> None:
+    """Keep Rich and browser-worker logs Unicode-safe on Windows."""
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            pass
 
 
 LOGIN_HTML = r"""<!doctype html>
@@ -399,11 +415,20 @@ INDEX_HTML = r"""<!doctype html>
       const headers = { ...(options.headers || {}) };
       if (options.method && options.method !== "GET") headers["X-Local-Token"] = localToken;
       if (options.body) headers["Content-Type"] = "application/json";
-      const response = await fetch(path, { ...options, headers, cache: "no-store" });
+      let response;
+      try {
+        response = await fetch(path, { ...options, headers, cache: "no-store" });
+      } catch (_) {
+        throw new Error("无法连接本地服务，请刷新页面后重试");
+      }
       const data = await response.json().catch(() => ({ ok: false, error: "服务返回了无效响应" }));
       if (response.status === 401) {
         location.replace("/login");
         throw new Error("登录已过期");
+      }
+      if (response.status === 403 && data.error === "本地请求令牌无效") {
+        setTimeout(() => location.reload(), 100);
+        throw new Error("本地服务已重启，正在刷新页面");
       }
       if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败 (${response.status})`);
       return data;
@@ -877,6 +902,13 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .plan-badge.plus { color: var(--warning); background: var(--warning-soft); }
     .plan-badge.free { color: var(--success); background: var(--success-soft); }
     .plan-badge.unverified { color: var(--muted); background: var(--subtle); }
+    .account-type-select {
+      width: auto; min-height: 22px; height: 22px; margin: 0; padding: 1px 24px 1px 8px;
+      border: 0; border-radius: 999px; font-size: 10px; font-weight: 760; cursor: pointer;
+    }
+    .account-type-select.plus { color: var(--warning); background: var(--warning-soft); }
+    .account-type-select.free { color: var(--success); background: var(--success-soft); }
+    .account-type-select.unverified { color: var(--muted); background: var(--subtle); }
     .meta { color: var(--muted); font-size: 10px; }
     .quick-actions { grid-column: 3; display: flex; align-items: center; gap: 7px; justify-content: flex-end; }
     .secondary-actions {
@@ -1093,11 +1125,20 @@ GPT_INDEX_HTML = r"""<!doctype html>
       const headers = { ...(options.headers || {}) };
       if (options.method && options.method !== "GET") headers["X-Local-Token"] = localToken;
       if (options.body) headers["Content-Type"] = "application/json";
-      const response = await fetch(path, { ...options, headers, cache: "no-store" });
+      let response;
+      try {
+        response = await fetch(path, { ...options, headers, cache: "no-store" });
+      } catch (_) {
+        throw new Error("无法连接本地服务，请刷新页面后重试");
+      }
       const data = await response.json().catch(() => ({ ok: false, error: "服务响应无效" }));
       if (response.status === 401) {
         location.replace("/login");
         throw new Error("登录已过期");
+      }
+      if (response.status === 403 && data.error === "本地请求令牌无效") {
+        setTimeout(() => location.reload(), 100);
+        throw new Error("本地服务已重启，正在刷新页面");
       }
       if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败 (${response.status})`);
       return data;
@@ -1248,6 +1289,44 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return startBrowser([email], true);
     }
 
+    async function verifyOrRegisterAccount(item) {
+      if (!item.hasSession || !item.hasPassword) {
+        const reason = !item.hasSession ? "尚未注册或没有 Session" : "尚未确认设置密码";
+        if (!confirm(`账号 ${item.email} ${reason}，将启动浏览器完成账号和密码设置，是否继续？`)) {
+          const error = new Error("已取消账号注册");
+          error.name = "AbortError";
+          throw error;
+        }
+      }
+      const data = await api("/api/account/verify-or-register", {
+        method: "POST",
+        body: JSON.stringify({
+          email: item.email,
+          headless: $("headless").checked,
+        }),
+      });
+      if (data.mode === "verify") {
+        await loadVerification();
+        return { successLabel: "验证已启动" };
+      }
+      await loadTask();
+      return { successLabel: data.mode === "set_password" ? "密码设置已启动" : "注册已启动" };
+    }
+
+    async function setAccountType(email, accountType) {
+      const data = await api("/api/account/type", {
+        method: "POST",
+        body: JSON.stringify({ email, account_type: accountType }),
+      });
+      showToast(
+        data.accountType === "unverified"
+          ? "已恢复为等待验证"
+          : `已手动设置为 ${planLabel(data.accountType)}`
+      );
+      await load();
+      return data;
+    }
+
     function syncBrowserButtons() {
       const busy = browserRunning || registrationRunning;
       $("registerOne").disabled = busy || !browserRuntimeAvailable;
@@ -1319,6 +1398,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("taskSummary").textContent = error.message;
         $("runtimeDot").className = "runtime-dot bad";
         $("runtimeLabel").textContent = "连接失败";
+        clearTimeout(taskPoll);
+        taskPoll = setTimeout(loadTask, 1500);
       }
     }
 
@@ -1358,6 +1439,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
       } catch (error) {
         $("registrationSummary").className = "registration-summary error";
         $("registrationSummary").textContent = `一键注册：${error.message}`;
+        clearTimeout(registrationPoll);
+        registrationPoll = setTimeout(loadRegistration, 1500);
       }
     }
 
@@ -1406,6 +1489,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
       } catch (error) {
         $("verifySummary").className = "error";
         $("verifySummary").textContent = error.message;
+        clearTimeout(verificationPoll);
+        verificationPoll = setTimeout(loadVerification, 1500);
       }
     }
 
@@ -1467,10 +1552,32 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const badge = document.createElement("span");
         badge.className = `status-badge ${item.sessionStatus}`;
         badge.textContent = sessionLabel(item.sessionStatus);
-        const planBadge = document.createElement("span");
-        planBadge.className = `plan-badge ${item.accountType}`;
-        planBadge.textContent = planLabel(item.accountType);
-        metaLine.append(planBadge, badge);
+        const planSelect = document.createElement("select");
+        planSelect.className = `account-type-select ${item.accountType}`;
+        planSelect.setAttribute("aria-label", `更改 ${item.email} 的账号类型`);
+        planSelect.title = item.accountTypeSource === "manual"
+          ? "当前为手动设置；选择等待验证可恢复在线验证"
+          : "手动更改账号类型";
+        for (const [value, label] of [["unverified", "等待验证"], ["free", "Free"], ["plus", "Plus"]]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          planSelect.append(option);
+        }
+        planSelect.value = item.accountType;
+        planSelect.addEventListener("change", async () => {
+          const previous = item.accountType;
+          planSelect.disabled = true;
+          try {
+            await setAccountType(item.email, planSelect.value);
+          } catch (error) {
+            planSelect.value = previous;
+            showToast(error.message, "error");
+          } finally {
+            planSelect.disabled = false;
+          }
+        });
+        metaLine.append(planSelect, badge);
         if (item.twoFactorStatus) {
           const mfaBadge = document.createElement("span");
           mfaBadge.className = `mfa-badge ${item.hasTwoFactor ? "" : "pending"}`.trim();
@@ -1535,6 +1642,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         quickActions.append(copyEmailButton, moreButton);
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
+        secondaryActions.append(actionButton(item.hasPassword ? "验证账号" : "设置密码", () => verifyOrRegisterAccount(item), "已启动"));
         if (item.hasPassword) secondaryActions.append(actionButton("复制密码", () => copyCredential(item.email, "password")));
         if (item.hasTwoFactor) {
           secondaryActions.append(
@@ -1849,6 +1957,8 @@ def _gpt_credential(db_file: Path, email: str, kind: str) -> str:
     if not isinstance(payload, dict):
         return ""
     if kind == "password":
+        if payload.get("password_confirmed") is False:
+            return ""
         return str(payload.get("password") or "").strip()
     two_factor = payload.get("two_factor")
     if not isinstance(two_factor, dict):
@@ -1917,6 +2027,8 @@ def _gpt_account_export(db_file: Path, email: str = "") -> list[str]:
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if not isinstance(account, dict):
+            continue
+        if account.get("password_confirmed") is False:
             continue
         password = str(account.get("password") or "").strip()
         if not password:
@@ -2049,7 +2161,9 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         current.update(
             {
                 "createdAt": created_at,
-                "hasPassword": bool(str(account.get("password") or "")),
+                "hasPassword": bool(str(account.get("password") or ""))
+                and account.get("password_confirmed") is not False,
+                "passwordConfirmed": account.get("password_confirmed") is not False,
                 "hasTwoFactor": bool(
                     isinstance(account.get("two_factor"), dict)
                     and account["two_factor"].get("enabled")
@@ -2065,6 +2179,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                     "expired" if token_expired else "ready" if access_token else "pending"
                 ),
                 "accountType": account_type,
+                "accountTypeSource": str(account.get("account_type_source") or ""),
                 "verifiedAt": str(account.get("verified_at") or ""),
             }
         )
@@ -2115,10 +2230,7 @@ def create_app(
     browser_source = (
         Path(target_project_dir).resolve()
         if target_project_dir
-        else (
-            base_dir.resolve().parent
-            / "openai-register-paylink-ui-dist-20260706-README-deploy"
-        )
+        else (base_dir.resolve().parent / "openai-register-paylink")
     )
     app["browser_manager"] = BrowserTaskManager(
         target_project_dir=browser_source,
@@ -2395,6 +2507,35 @@ def create_app(
                 "items": items,
                 "updatedAt": datetime.now().astimezone().isoformat(),
             },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def account_type_update(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(payload.get("email") or "").strip().lower()
+        account_type = str(payload.get("account_type") or "").strip().lower()
+        if not email.endswith("@icloud.com") or len(email) > 320:
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        if account_type not in {"plus", "free", "unverified"}:
+            return web.json_response(
+                {"ok": False, "error": "账号类型无效"}, status=400
+            )
+        await asyncio.to_thread(
+            set_manual_account_type, app["db_file"], email, account_type
+        )
+        return web.json_response(
+            {"ok": True, "email": email, "accountType": account_type},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -2711,6 +2852,107 @@ def create_app(
         task = await app["verification_manager"].stop()
         return web.json_response({"ok": True, "task": task})
 
+    async def verify_or_register_account(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(payload.get("email") or "").strip().lower()
+        if not email.endswith("@icloud.com") or len(email) > 320:
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        if app["registration_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "一键注册正在运行，请等待完成"}, status=409
+            )
+        if app["browser_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "浏览器任务正在运行，请等待完成"}, status=409
+            )
+        if app["verification_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "账号验证任务正在运行，请等待完成"}, status=409
+            )
+
+        record = await asyncio.to_thread(
+            load_account_record, app["db_file"], email
+        )
+        access_token = str(
+            record.get("access_token") or record.get("accessToken") or ""
+        ).strip()
+        password_confirmed = bool(str(record.get("password") or "")) and (
+            record.get("password_confirmed") is not False
+        )
+        if access_token and password_confirmed:
+            try:
+                task = app["verification_manager"].start(
+                    concurrency=1, emails=[email]
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            return web.json_response(
+                {"ok": True, "started": True, "mode": "verify", "task": task}
+            )
+
+        config_path: Path = app["inbox_config_file"]
+        if not config_path.exists():
+            return web.json_response(
+                {"ok": False, "error": "请先配置接收邮箱，再注册账号"}, status=409
+            )
+        try:
+            identities = await active_icloud_identities()
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=502
+            )
+        identity_emails = {
+            str(item.get("hme") or "").strip().lower() for item in identities
+        }
+        identity_emails -= await asyncio.to_thread(
+            removed_account_emails, app["db_file"]
+        )
+        if email not in identity_emails:
+            return web.json_response(
+                {"ok": False, "error": "该 iCloud 邮箱无效或已停用"}, status=400
+            )
+        try:
+            task = app["browser_manager"].start(
+                [
+                    {
+                        "email": email,
+                        "password": str(record.get("password") or ""),
+                        "ensure_password": True,
+                        "enable_2fa": True,
+                        "two_factor": record.get("two_factor")
+                        if isinstance(record.get("two_factor"), dict)
+                        else {},
+                    }
+                ],
+                headless=bool(payload.get("headless", False)),
+                concurrency=1,
+            )
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=409
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "started": True,
+                "mode": "set_password" if access_token else "register",
+                "task": task,
+            }
+        )
+
     async def start_browser_task(
         request: web.Request, *, selected_only: bool
     ) -> web.Response:
@@ -3019,6 +3261,7 @@ def create_app(
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/", index)
     app.router.add_get("/api/gpt-emails", gpt_emails)
+    app.router.add_post("/api/account/type", account_type_update)
     app.router.add_post("/api/gpt-credential", gpt_credential)
     app.router.add_post("/api/gpt-accounts/export", export_gpt_accounts)
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
@@ -3033,6 +3276,9 @@ def create_app(
     app.router.add_get("/api/account-verification/status", verification_status)
     app.router.add_post("/api/account-verification/start", verification_start)
     app.router.add_post("/api/account-verification/stop", verification_stop)
+    app.router.add_post(
+        "/api/account/verify-or-register", verify_or_register_account
+    )
     app.router.add_get("/api/inbox/status", inbox_status)
     app.router.add_post("/api/inbox/config", inbox_config)
     app.router.add_get("/api/inbox/codes", inbox_codes)
@@ -3093,6 +3339,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _configure_utf8_stdio()
     args = build_parser().parse_args()
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit("For safety, this service may only listen on the local machine.")

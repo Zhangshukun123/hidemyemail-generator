@@ -65,20 +65,39 @@ def load_account_record(db_file: Path, email: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def session_account_type(session: Any) -> tuple[str, str]:
+    if not isinstance(session, dict):
+        return "", ""
+    account = session.get("account")
+    if not isinstance(account, dict):
+        return "", ""
+    raw_plan = str(account.get("planType") or account.get("plan_type") or "").strip()
+    plan = raw_plan.casefold()
+    if any(marker in plan for marker in ("plus", "pro", "team", "enterprise")):
+        return "plus", raw_plan
+    if plan in {"free", "none", "no_plan"}:
+        return "free", raw_plan
+    return "", raw_plan
+
+
 def _save_account_record(
     db_file: Path,
     email: str,
     *,
     result: dict[str, Any] | None = None,
     password: str = "",
+    password_confirmed: bool | None = None,
     two_factor: dict[str, Any] | None = None,
 ) -> None:
     target = email.strip().lower()
     current = load_account_record(db_file, target)
     current["email"] = target
     current["updated_at"] = utc_now()
-    if password:
+    if password and password_confirmed is not False:
         current["password"] = password
+    if password_confirmed is True:
+        current["password_confirmed"] = True
+        current["password_confirmed_at"] = utc_now()
     if isinstance(two_factor, dict) and two_factor.get("secret"):
         current["two_factor"] = dict(two_factor)
     if result:
@@ -94,6 +113,14 @@ def _save_account_record(
             except (json.JSONDecodeError, TypeError, ValueError):
                 parsed_session = session_json
             current["session"] = parsed_session
+            session_type, raw_plan = session_account_type(parsed_session)
+            if session_type and current.get("account_type_source") != "manual":
+                current["account_type"] = session_type
+                current["account_type_source"] = "session"
+                current["verified_at"] = utc_now()
+                current["verification_detail"] = (
+                    f"最新登录 Session account.planType={raw_plan}"
+                )
         if storage_state_json:
             current["storage_state_json"] = storage_state_json
         result_two_factor = result.get("two_factor")
@@ -118,6 +145,42 @@ def _save_account_record(
             mark_address(conn, target, "used")
     finally:
         conn.close()
+
+
+def set_manual_account_type(
+    db_file: Path, email: str, account_type: str
+) -> dict[str, Any]:
+    target = email.strip().lower()
+    selected = str(account_type or "").strip().lower()
+    if selected not in {"plus", "free", "unverified"}:
+        raise ValueError("账号类型无效")
+    current = load_account_record(db_file, target)
+    current["email"] = target
+    current["updated_at"] = utc_now()
+    if selected == "unverified":
+        current.pop("account_type", None)
+        current.pop("account_type_source", None)
+        current["verification_detail"] = "已手动恢复为等待验证"
+    else:
+        current["account_type"] = selected
+        current["account_type_source"] = "manual"
+        current["verified_at"] = utc_now()
+        current["verification_detail"] = f"手动设置为 {selected.title()}"
+
+    conn = connect_db(str(db_file))
+    try:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"gpt_account:{target}", json.dumps(current, ensure_ascii=False)),
+        )
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_removed:{target}",))
+        conn.commit()
+    finally:
+        conn.close()
+    return current
 
 
 class BrowserTaskManager:
@@ -226,6 +289,7 @@ class BrowserTaskManager:
                 {
                     "email": email,
                     "password": str(account.get("password") or ""),
+                    "ensure_password": bool(account.get("ensure_password", False)),
                     "enable_2fa": bool(account.get("enable_2fa", False)),
                     "two_factor": account.get("two_factor")
                     if isinstance(account.get("two_factor"), dict)
@@ -255,6 +319,8 @@ class BrowserTaskManager:
                     "message": "等待浏览器任务",
                     "latestLog": "",
                     "_password": item["password"],
+                    "_ensure_password": item["ensure_password"],
+                    "_password_confirmed": False,
                     "_enable_2fa": item["enable_2fa"],
                     "_two_factor": item["two_factor"],
                     "phase": "queued",
@@ -349,7 +415,11 @@ class BrowserTaskManager:
                     "PYTHONIOENCODING": "utf-8",
                     "HME_BROWSER_SERVICE_URL": self.service_url,
                     "HME_BROWSER_WORKER_TOKEN": self.worker_token,
+                    "HME_BROWSER_DB_FILE": str(self.db_file),
                     "HME_OPENAI_PASSWORD": str(item.get("_password") or ""),
+                    "HME_ENSURE_OPENAI_PASSWORD": "1"
+                    if item.get("_ensure_password")
+                    else "0",
                     "HME_ENABLE_OPENAI_2FA": "1"
                     if item.get("_enable_2fa")
                     else "0",
@@ -403,13 +473,26 @@ class BrowserTaskManager:
 
             password = str(item.get("_password") or "")
             result = item.get("_result")
-            if return_code == 0 and isinstance(result, dict):
+            password_confirmed = bool(item.get("_password_confirmed"))
+            if (
+                return_code == 0
+                and isinstance(result, dict)
+                and (
+                    not item.get("_ensure_password")
+                    or password_confirmed
+                )
+            ):
                 await asyncio.to_thread(
                     _save_account_record,
                     self.db_file,
                     email,
                     result=result,
                     password=password,
+                    password_confirmed=(
+                        password_confirmed
+                        if item.get("_ensure_password")
+                        else None
+                    ),
                 )
                 item["status"] = "success"
                 item["phase"] = "completed"
@@ -421,7 +504,7 @@ class BrowserTaskManager:
                 self._state["succeeded"] += 1
                 self._append_log("Session / AT 已保存到本地数据库", email=email)
             else:
-                if password:
+                if password and not item.get("_ensure_password"):
                     await asyncio.to_thread(
                         _save_account_record,
                         self.db_file,
@@ -430,6 +513,13 @@ class BrowserTaskManager:
                         two_factor=item.get("_two_factor"),
                     )
                 error = str(item.get("_error") or "")
+                if (
+                    not error
+                    and return_code == 0
+                    and item.get("_ensure_password")
+                    and not password_confirmed
+                ):
+                    error = "OpenAI 端未确认密码设置，未保存本地密码"
                 if not error:
                     error = f"浏览器工作器退出，代码 {return_code}"
                 item["status"] = "failed"
@@ -467,6 +557,9 @@ class BrowserTaskManager:
                 password = str(event.get("password") or "")
                 if password:
                     item["_password"] = password
+                item["_password_confirmed"] = bool(
+                    event.get("password_confirmed")
+                )
                 two_factor = (
                     result.get("two_factor") if isinstance(result, dict) else None
                 )
@@ -480,6 +573,8 @@ class BrowserTaskManager:
                 password = str(event.get("password") or "")
                 if password:
                     item["_password"] = password
+                password_confirmed = bool(event.get("password_confirmed"))
+                item["_password_confirmed"] = password_confirmed
                 if isinstance(result, dict):
                     await asyncio.to_thread(
                         _save_account_record,
@@ -487,6 +582,11 @@ class BrowserTaskManager:
                         email,
                         result=result,
                         password=password,
+                        password_confirmed=(
+                            password_confirmed
+                            if item.get("_ensure_password")
+                            else None
+                        ),
                     )
                 item["message"] = "OpenAI 注册成功，正在开启 2FA"
             elif kind == "two_factor_start":
@@ -514,6 +614,10 @@ class BrowserTaskManager:
                 password = str(event.get("password") or "")
                 if password:
                     item["_password"] = password
+                if event.get("password_confirmed") is not None:
+                    item["_password_confirmed"] = bool(
+                        event.get("password_confirmed")
+                    )
 
     async def _read_stderr(
         self, stream: asyncio.StreamReader | None, item: dict[str, Any]
@@ -576,4 +680,5 @@ __all__ = [
     "access_token_is_expired",
     "decode_jwt_payload",
     "load_account_record",
+    "set_manual_account_type",
 ]

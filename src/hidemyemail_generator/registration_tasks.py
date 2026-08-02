@@ -119,6 +119,7 @@ class RegistrationTaskManager:
                     {
                         "email": email,
                         "password": password,
+                        "ensure_password": True,
                         "enable_2fa": True,
                     }
                 ],

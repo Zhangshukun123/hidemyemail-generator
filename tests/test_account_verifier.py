@@ -9,8 +9,12 @@ from hidemyemail_generator.account_verifier import (
     AccountVerificationManager,
     remove_invalid_account,
     removed_account_emails,
+    save_account_classification,
 )
-from hidemyemail_generator.browser_tasks import load_account_record
+from hidemyemail_generator.browser_tasks import (
+    load_account_record,
+    set_manual_account_type,
+)
 from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.openai_account_check_bridge import confirmed_invalid
 from hidemyemail_generator.webapp import _browser_email_items
@@ -42,6 +46,20 @@ def save_record(
 
 
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
+    def test_automatic_classification_preserves_manual_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            set_manual_account_type(db_file, "manual@icloud.com", "free")
+
+            save_account_classification(
+                db_file, "manual@icloud.com", "plus", "online says plus"
+            )
+
+            record = load_account_record(db_file, "manual@icloud.com")
+            self.assertEqual(record["account_type"], "free")
+            self.assertEqual(record["account_type_source"], "manual")
+            self.assertIn("已保留手动设置", record["verification_detail"])
+
     def test_legacy_removed_marker_does_not_hide_icloud_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
@@ -162,6 +180,104 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 "access_token", load_account_record(db_file, "paid@icloud.com")
             )
             self.assertNotIn("paid@icloud.com", removed_account_emails(db_file))
+
+    async def test_preserves_fresh_session_plus_when_plan_endpoint_reports_free(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_check_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'free','detail':'has_active_subscription=false'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(
+                db_file,
+                "paid@icloud.com",
+                "at-plus",
+                account_type="plus",
+            )
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["plus"], 1)
+            self.assertEqual(snapshot["free"], 0)
+            record = load_account_record(db_file, "paid@icloud.com")
+            self.assertEqual(record["account_type"], "plus")
+            self.assertIn("已保留 Plus", record["verification_detail"])
+
+    async def test_can_verify_one_selected_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_check_bridge.py"
+            bridge.write_text(
+                "import json, os\n"
+                "token = os.environ['HME_OPENAI_ACCESS_TOKEN']\n"
+                "status = {'at-plus':'plus','at-free':'free'}[token]\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':status,'detail':'selected result'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "plus@icloud.com", "at-plus")
+            save_record(db_file, "free@icloud.com", "at-free")
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            state = manager.start(concurrency=1, emails=["FREE@ICLOUD.COM"])
+            self.assertEqual(state["total"], 1)
+            self.assertEqual(state["accounts"][0]["email"], "free@icloud.com")
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["status"], "completed")
+            self.assertEqual(snapshot["plus"], 0)
+            self.assertEqual(snapshot["free"], 1)
+            self.assertEqual(
+                load_account_record(db_file, "plus@icloud.com")["account_type"],
+                "",
+            )
+            self.assertEqual(
+                load_account_record(db_file, "free@icloud.com")["account_type"],
+                "free",
+            )
+
+    async def test_selected_account_requires_saved_access_token(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_check_bridge.py"
+            bridge.write_text("# unused\n", encoding="utf-8")
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "所选账号没有可验证的 Access Token"
+            ):
+                manager.start(concurrency=1, emails=["new@icloud.com"])
 
 
 class InvalidConfirmationTests(unittest.TestCase):

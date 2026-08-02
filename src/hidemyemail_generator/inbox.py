@@ -28,9 +28,24 @@ CODE_KEYWORDS = re.compile(
     r"verification|verify|code|otp|passcode|security code|confirmation|"
     r"bestätigungscode|sicherheitscode|anmeldecode|"
     r"code de vérification|code de confirmation|code temporaire|"
-    r"código de verificación|código de confirmación|código temporal",
+    r"código de verificación|código de confirmación|código temporal|"
+    r"código de verificação|código de confirmação|código temporário|"
+    r"código de entrada|código de acesso|"
+    r"codice di verifica|codice di conferma|codice temporaneo|codice di accesso|"
+    r"verificatiecode|bevestigingscode|tijdelijke code|inlogcode|"
+    r"код подтверждения|проверочный код|временный код|код входа|"
+    r"код підтвердження|код перевірки|тимчасовий код|код входу|"
+    r"kod weryfikacyjny|kod potwierdzający|kod tymczasowy|kod logowania|"
+    r"doğrulama kodu|onay kodu|geçici kod|giriş kodu|"
+    r"kode verifikasi|kode konfirmasi|kode sementara|kode masuk|"
+    r"mã xác minh|mã xác nhận|mã tạm thời|mã đăng nhập|"
+    r"รหัสยืนยัน|รหัสตรวจสอบ|รหัสชั่วคราว|รหัสเข้าสู่ระบบ|"
+    r"رمز التحقق|رمز التأكيد|رمز مؤقت|رمز تسجيل الدخول|"
+    r"קוד אימות|קוד אישור|קוד זמני|קוד כניסה|"
+    r"सत्यापन कोड|पुष्टिकरण कोड|अस्थायी कोड|लॉगिन कोड",
     re.IGNORECASE,
 )
+TRUSTED_CODE_PRODUCT_RE = re.compile(r"\b(?:chatgpt|openai)\b", re.IGNORECASE)
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 DIGIT_CODE_RE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
 ALNUM_CODE_RE = re.compile(
@@ -267,17 +282,26 @@ def extract_verification_code(subject: str, body: str) -> str:
     if not text:
         return ""
 
+    trusted_product_message = bool(TRUSTED_CODE_PRODUCT_RE.search(text))
     candidates: list[tuple[int, str]] = []
     for regex, base_score in ((DIGIT_CODE_RE, 50), (ALNUM_CODE_RE, 20)):
         for match in regex.finditer(text):
             code = match.group(0)
             start, end = match.span()
             window = text[max(0, start - 80) : min(len(text), end + 80)]
-            if not CODE_KEYWORDS.search(window):
+            has_keyword = bool(CODE_KEYWORDS.search(window))
+            language_neutral_fallback = (
+                trusted_product_message
+                and regex is DIGIT_CODE_RE
+                and len(code) == 6
+            )
+            if not has_keyword and not language_neutral_fallback:
                 continue
             if re.fullmatch(r"(?:19|20)\d{2}", code):
                 continue
             score = base_score
+            if has_keyword:
+                score += 30
             if len(code) == 6:
                 score += 20
             if len(code) in (4, 5, 7, 8):

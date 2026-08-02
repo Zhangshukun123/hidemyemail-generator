@@ -43,11 +43,15 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
         ).strip()
         if email and token:
             account_type = str(record.get("account_type") or "").strip().lower()
+            account_type_source = str(
+                record.get("account_type_source") or ""
+            ).strip().lower()
             accounts.append(
                 {
                     "email": email,
                     "access_token": token,
                     "account_type": account_type,
+                    "account_type_source": account_type_source,
                 }
             )
     return sorted(accounts, key=lambda item: item["email"])
@@ -74,13 +78,25 @@ def save_account_classification(
     record = load_account_record(db_file, target)
     if not record:
         return
-    record.update(
-        {
-            "account_type": account_type,
-            "verified_at": utc_now(),
-            "verification_detail": str(detail or "")[:1000],
-        }
-    )
+    if record.get("account_type_source") == "manual":
+        record.update(
+            {
+                "verified_at": utc_now(),
+                "verification_detail": (
+                    f"{str(detail or f'自动验证结果为 {account_type.title()}').strip()}；"
+                    "已保留手动设置的账号类型"
+                )[:1000],
+            }
+        )
+    else:
+        record.update(
+            {
+                "account_type": account_type,
+                "account_type_source": "verification",
+                "verified_at": utc_now(),
+                "verification_detail": str(detail or "")[:1000],
+            }
+        )
     conn = connect_db(str(db_file))
     try:
         conn.execute(
@@ -224,15 +240,35 @@ class AccountVerificationManager:
             "runtime": self.availability(),
         }
 
-    def start(self, *, concurrency: int = 3) -> dict[str, Any]:
+    def start(
+        self,
+        *,
+        concurrency: int = 3,
+        emails: list[str] | set[str] | None = None,
+    ) -> dict[str, Any]:
         if self._batch_task and not self._batch_task.done():
             raise RuntimeError("账号验证任务正在运行")
         runtime = self.availability()
         if not runtime["available"]:
             raise RuntimeError("；".join(runtime["errors"]))
         accounts = load_verifiable_accounts(self.db_file)
+        requested: set[str] | None = None
+        if emails is not None:
+            requested = {
+                str(value or "").strip().lower()
+                for value in emails
+                if str(value or "").strip()
+            }
+            accounts = [
+                account for account in accounts if account["email"] in requested
+            ]
         if not accounts:
-            raise RuntimeError("暂无已保存 Access Token 的账号")
+            message = (
+                "所选账号没有可验证的 Access Token"
+                if requested is not None
+                else "暂无已保存 Access Token 的账号"
+            )
+            raise RuntimeError(message)
         concurrency = max(1, min(5, int(concurrency)))
         self._state = {
             "id": uuid.uuid4().hex,
@@ -253,6 +289,7 @@ class AccountVerificationManager:
                     "message": "等待验证",
                     "_access_token": item["access_token"],
                     "_account_type": item.get("account_type", ""),
+                    "_account_type_source": item.get("account_type_source", ""),
                 }
                 for item in accounts
             ],
@@ -354,15 +391,39 @@ class AccountVerificationManager:
             result = str(event.get("status") or "error")
             detail = str(event.get("detail") or "").strip()
             if return_code == 0 and result in {"plus", "free"}:
+                effective_result = result
+                if (
+                    item.get("_account_type_source") == "manual"
+                    and item.get("_account_type") in {"plus", "free"}
+                ):
+                    effective_result = str(item["_account_type"])
+                    detail = (
+                        f"自动验证结果为 {result.title()}；"
+                        "已保留手动设置的账号类型"
+                    )
+                elif result == "free" and item.get("_account_type") == "plus":
+                    effective_result = "plus"
+                    detail = (
+                        "套餐接口返回 Free，但已保存的最新登录 Session 明确为 Plus；"
+                        f"已保留 Plus 分类。{detail}"
+                    )
                 await asyncio.to_thread(
                     save_account_classification,
                     self.db_file,
                     email,
-                    result,
+                    effective_result,
                     detail,
                 )
-                item.update(status=result, message=f"已归类为 {result.title()}")
-                self._state[result] += 1
+                if item.get("_account_type_source") == "manual":
+                    item.update(
+                        status=effective_result,
+                        message=f"已保留手动设置的 {effective_result.title()}",
+                    )
+                elif effective_result != result:
+                    item.update(status="plus", message="已保留 Plus（套餐接口返回 Free）")
+                else:
+                    item.update(status=result, message=f"已归类为 {result.title()}")
+                self._state[effective_result] += 1
                 self._append_log(item["message"], email=email)
             elif return_code == 0 and result == "invalid":
                 await asyncio.to_thread(

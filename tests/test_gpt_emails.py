@@ -46,6 +46,10 @@ class GptEmailTests(unittest.TestCase):
                     },
                     "gpt_account:free@icloud.com": {"password": "Free!Password8"},
                     "gpt_account:no-password@icloud.com": {"access_token": "at-only"},
+                    "gpt_account:unconfirmed@icloud.com": {
+                        "password": "LocalOnly!Password9",
+                        "password_confirmed": False,
+                    },
                 }
                 conn.executemany(
                     "INSERT INTO settings(key, value) VALUES (?, ?)",
@@ -68,6 +72,12 @@ class GptEmailTests(unittest.TestCase):
             self.assertEqual(
                 _gpt_account_export(db_file, "plus@icloud.com"),
                 ["plus@icloud.com----Plus!Password7----JBSWY3DPEHPK3PXP"],
+            )
+            self.assertEqual(
+                _gpt_credential(
+                    db_file, "unconfirmed@icloud.com", "password"
+                ),
+                "",
             )
 
     def test_matches_exact_and_obfuscated_icloud_relay_ids(self):
@@ -225,6 +235,50 @@ class GptEmailTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(stored["code"], "818214")
 
+    def test_latest_code_prefers_newer_portuguese_message(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            conn = connect_db(str(db_file))
+            try:
+                base = {
+                    "account_key": "test",
+                    "folder": "INBOX",
+                    "sender": "noreply@openai.com",
+                    "recipients": "wombat-uneasy04@icloud.com",
+                    "hme_address": "wombat-uneasy04@icloud.com",
+                    "created_at": "2026-08-02T04:10:00+00:00",
+                }
+                insert_message(
+                    conn,
+                    {
+                        **base,
+                        "uid": "older",
+                        "subject": "ChatGPT 用の一時ログインコード",
+                        "code": "818214",
+                        "body_preview": "この一時検証コードを入力してください: 818214",
+                        "received_at": "2026-08-02T04:08:00+00:00",
+                    },
+                )
+                insert_message(
+                    conn,
+                    {
+                        **base,
+                        "uid": "newer",
+                        "subject": "Seu código de entrada temporário do ChatGPT",
+                        "code": "",
+                        "body_preview": "Informe este código de verificação temporário para continuar: 624813",
+                        "received_at": "2026-08-02T04:09:00+00:00",
+                    },
+                )
+            finally:
+                conn.close()
+
+            item = _latest_gpt_code(
+                db_file, "wombat-uneasy04@icloud.com", IDENTITIES
+            )
+            self.assertEqual(item["code"], "624813")
+            self.assertEqual(item["receivedAt"], "2026-08-02T04:09:00+00:00")
+
     def test_served_page_contains_only_gpt_list(self):
         self.assertIn("GPT 邮箱列表", GPT_INDEX_HTML)
         self.assertIn("复制邮箱", GPT_INDEX_HTML)
@@ -242,6 +296,14 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("浏览器取全部", GPT_INDEX_HTML)
         self.assertIn("浏览器获取", GPT_INDEX_HTML)
         self.assertIn("复制密码", GPT_INDEX_HTML)
+        self.assertIn("验证账号", GPT_INDEX_HTML)
+        self.assertIn("verifyOrRegisterAccount(item)", GPT_INDEX_HTML)
+        self.assertIn("/api/account/verify-or-register", GPT_INDEX_HTML)
+        self.assertIn("/api/account/type", GPT_INDEX_HTML)
+        self.assertIn("account-type-select", GPT_INDEX_HTML)
+        self.assertIn("手动更改账号类型", GPT_INDEX_HTML)
+        self.assertIn("无法连接本地服务，请刷新页面后重试", GPT_INDEX_HTML)
+        self.assertIn("本地服务已重启，正在刷新页面", GPT_INDEX_HTML)
         self.assertIn("一键验证账号", GPT_INDEX_HTML)
         self.assertIn("一键注册新账号", GPT_INDEX_HTML)
         self.assertNotIn("将创建新的 iCloud 隐藏邮箱", GPT_INDEX_HTML)
