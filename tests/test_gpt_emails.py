@@ -11,6 +11,7 @@ from hidemyemail_generator.webapp import (
     _gpt_credential,
     _latest_gpt_code,
     _match_relay_identity,
+    _workbench_import_payload,
 )
 
 
@@ -78,6 +79,38 @@ class GptEmailTests(unittest.TestCase):
                     db_file, "unconfirmed@icloud.com", "password"
                 ),
                 "",
+            )
+
+    def test_builds_workbench_import_with_confirmed_password_and_2fa(self):
+        payload = _workbench_import_payload(
+            {
+                "password": "Unique!Password123",
+                "password_confirmed": True,
+                "two_factor": {
+                    "secret": "JBSWY3DPEHPK3PXP",
+                    "enabled": True,
+                },
+                "access_token": "at-test",
+                "session": {"user": {"email": "one@icloud.com"}},
+            },
+            "one@icloud.com",
+        )
+        self.assertEqual(payload["email"], "one@icloud.com")
+        self.assertEqual(payload["password"], "Unique!Password123")
+        self.assertEqual(payload["totpSecret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(payload["accessToken"], "at-test")
+
+        with self.assertRaisesRegex(RuntimeError, "密码尚未"):
+            _workbench_import_payload(
+                {
+                    "password": "Pending!Password123",
+                    "password_confirmed": False,
+                    "two_factor": {
+                        "secret": "JBSWY3DPEHPK3PXP",
+                        "enabled": True,
+                    },
+                },
+                "pending@icloud.com",
             )
 
     def test_matches_exact_and_obfuscated_icloud_relay_ids(self):
@@ -296,6 +329,10 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("浏览器取全部", GPT_INDEX_HTML)
         self.assertIn("浏览器获取", GPT_INDEX_HTML)
         self.assertIn("复制密码", GPT_INDEX_HTML)
+        self.assertIn("一键导入工作台", GPT_INDEX_HTML)
+        self.assertIn("/api/account/import-workbench", GPT_INDEX_HTML)
+        self.assertIn("重置密码", GPT_INDEX_HTML)
+        self.assertIn("reset_password", GPT_INDEX_HTML)
         self.assertIn("验证账号", GPT_INDEX_HTML)
         self.assertIn("verifyOrRegisterAccount(item)", GPT_INDEX_HTML)
         self.assertIn("/api/account/verify-or-register", GPT_INDEX_HTML)

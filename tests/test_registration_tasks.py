@@ -67,10 +67,14 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         async def confirm(email):
             events.append(("confirm", email))
 
+        async def save_password(email, password):
+            events.append(("save_password", email, password))
+
         manager = RegistrationTaskManager(
             browser_manager=browser,
             generate_email=generate,
             confirm_email=confirm,
+            save_pending_password=save_password,
         )
         state = manager.start(label="OpenAI 一键注册", headless=True)
         self.assertTrue(state["running"])
@@ -80,13 +84,10 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["phase"], "completed")
         self.assertEqual(snapshot["email"], "new-alias@icloud.com")
-        self.assertEqual(
-            events,
-            [
-                ("generate", "OpenAI 一键注册"),
-                ("confirm", "new-alias@icloud.com"),
-            ],
-        )
+        self.assertEqual(events[0], ("generate", "OpenAI 一键注册"))
+        self.assertEqual(events[1][0:2], ("save_password", "new-alias@icloud.com"))
+        self.assertEqual(events[2], ("confirm", "new-alias@icloud.com"))
+        self.assertEqual(events[1][2], browser.started_accounts[0]["password"])
         self.assertEqual(browser.started_accounts[0]["email"], "new-alias@icloud.com")
         self.assertTrue(browser.started_accounts[0]["enable_2fa"])
         self.assertTrue(browser.started_accounts[0]["ensure_password"])

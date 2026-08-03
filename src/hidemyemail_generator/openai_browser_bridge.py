@@ -95,6 +95,24 @@ SETTINGS_MENU_SELECTORS = (
     '[role="menuitem"]:has-text("設定")',
     'button:has-text("設定")',
 )
+COMPLETED_ONBOARDING_MARKERS = (
+    'text="You’re all set"',
+    'text="You\'re all set"',
+    'text="You are all set"',
+    'text="準備が完了しました"',
+    'text="准备就绪"',
+    'text="準備就緒"',
+)
+COMPLETED_ONBOARDING_CONTINUE_SELECTORS = (
+    'button:has-text("Continue")',
+    '[role="button"]:has-text("Continue")',
+    'button:has-text("続行")',
+    '[role="button"]:has-text("続行")',
+    'button:has-text("继续")',
+    '[role="button"]:has-text("继续")',
+    'button:has-text("繼續")',
+    '[role="button"]:has-text("繼續")',
+)
 ONE_TIME_CODE_LOGIN_SELECTORS = (
     'button:has-text("Log in with a one-time code")',
     '[role="button"]:has-text("Log in with a one-time code")',
@@ -107,6 +125,23 @@ ONE_TIME_CODE_LOGIN_SELECTORS = (
     'button:has-text("ワンタイムコードでログインする")',
     '[role="button"]:has-text("ワンタイムコードでログインする")',
     'text="ワンタイムコードでログインする"',
+)
+FORGOT_PASSWORD_SELECTORS = (
+    'a:has-text("Forgot password")',
+    'button:has-text("Forgot password")',
+    '[role="button"]:has-text("Forgot password")',
+    'text="Forgot password?"',
+    'a:has-text("忘记密码")',
+    'button:has-text("忘记密码")',
+    'a:has-text("忘記密碼")',
+    'button:has-text("忘記密碼")',
+    'text="忘记了密码?"',
+    'text="忘记了密码？"',
+    'text="忘記密碼?"',
+    'text="忘記密碼？"',
+    'a:has-text("パスワードをお忘れ")',
+    'button:has-text("パスワードをお忘れ")',
+    'text="パスワードをお忘れですか？"',
 )
 SECURITY_TAB_SELECTORS = (
     '[data-testid="security-tab"]',
@@ -166,6 +201,13 @@ PASSWORD_SUCCESS_SELECTORS = (
     'text="パスワードが追加されました"',
     'text="パスワードが設定されました"',
     'text="パスワードが更新されました"',
+    'text="Password reset successfully"',
+    'text="Your password has been reset"',
+    'text="密码重置成功"',
+    'text="密码已重置"',
+    'text="密碼重設成功"',
+    'text="密碼已重設"',
+    'text="パスワードがリセットされました"',
 )
 PROFILE_NAME_CLICK_SCRIPT = r"""
 name => {
@@ -442,10 +484,57 @@ def configure_passwordless_email_code_login(worker, *, enabled: bool) -> bool:
     if getattr(worker, "_hme_email_code_login_configured", False):
         return True
 
+    def password_reset_form_ready(page) -> bool:
+        if _first_visible(page, FORGOT_PASSWORD_SELECTORS, timeout=250) is not None:
+            return False
+        url = str(getattr(page, "url", "") or "").casefold()
+        if any(marker in url for marker in ("password-reset", "reset-password", "new-password")):
+            return True
+        if _first_visible(
+            page,
+            (
+                'input[autocomplete="new-password"]',
+                'input[name*="new-password" i]',
+                'input[name*="new_password" i]',
+            ),
+            timeout=300,
+        ) is not None:
+            return True
+        try:
+            body = str(page.locator("body").inner_text(timeout=500) or "").casefold()
+        except Exception:
+            body = ""
+        return any(
+            marker in body
+            for marker in (
+                "reset your password",
+                "create a new password",
+                "set a new password",
+                "重置密码",
+                "设置新密码",
+                "重設密碼",
+                "設定新密碼",
+                "パスワードをリセット",
+                "新しいパスワード",
+            )
+        )
+
     def fill_password_or_choose_code(self, page):
+        if getattr(self, "_hme_password_reset_requested", False):
+            if password_reset_form_ready(page):
+                original(page)
+                self._hme_password_reset_submitted = True
+                self.log("[认证] 已在邮箱重置流程提交保存的唯一密码")
+            else:
+                self.log("[认证] 已请求重置密码，等待验证码或新密码页面")
+            return None
         if _click_first_visible(page, ONE_TIME_CODE_LOGIN_SELECTORS, timeout=900):
             self._hme_email_code_login_selected = True
             self.log("[认证] 当前账号进入密码页，已改用一次性邮箱验证码登录")
+            return None
+        if _click_first_visible(page, FORGOT_PASSWORD_SELECTORS, timeout=700):
+            self._hme_password_reset_requested = True
+            self.log("[认证] 当前账号只有密码登录入口，已点击忘记密码")
             return None
         if getattr(self, "_hme_email_code_login_selected", False):
             self.log("[认证] 已选择邮箱验证码登录，等待验证码页面加载")
@@ -943,8 +1032,38 @@ def _open_settings_from_profile(page, worker) -> bool:
     return False
 
 
+def _completed_onboarding_visible(page, *, timeout: int = 500) -> bool:
+    return (
+        _first_visible(page, COMPLETED_ONBOARDING_MARKERS, timeout=timeout)
+        is not None
+    )
+
+
+def _dismiss_completed_onboarding(page, worker, *, attempts: int = 3) -> bool:
+    """Dismiss ChatGPT's localized post-registration welcome overlay."""
+
+    for _ in range(max(1, attempts)):
+        if not _completed_onboarding_visible(page, timeout=700):
+            return False
+        if _click_first_visible(
+            page,
+            COMPLETED_ONBOARDING_CONTINUE_SELECTORS,
+            timeout=900,
+        ):
+            worker.log("[密码] 已关闭 ChatGPT 首次使用欢迎页")
+            for _ in range(10):
+                _page_wait(page, 250)
+                if not _completed_onboarding_visible(page, timeout=250):
+                    return True
+            return True
+        _page_wait(page, 300)
+    return False
+
+
 def _security_settings_ready(page, *, attempts: int = 6) -> bool:
     for _ in range(max(1, attempts)):
+        if _completed_onboarding_visible(page, timeout=300):
+            return False
         if (
             _first_visible(page, ADD_PASSWORD_SELECTORS, timeout=700) is not None
             or _password_is_present(page, timeout=700)
@@ -1028,6 +1147,7 @@ def _reuse_single_registration_page(context, worker):
 def _open_security_settings(page, worker) -> bool:
     page.goto(CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=60000)
     _page_wait(page, 1200)
+    _dismiss_completed_onboarding(page, worker)
 
     settings_clicked = _open_settings_from_profile(page, worker)
     if settings_clicked:
@@ -1050,6 +1170,9 @@ def _open_security_settings(page, worker) -> bool:
     ):
         page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
         _page_wait(page, 1000)
+        if _dismiss_completed_onboarding(page, worker):
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            _page_wait(page, 800)
         _click_first_visible(page, SECURITY_TAB_SELECTORS)
         _page_wait(page, 500)
         if _security_settings_ready(page, attempts=3):
@@ -1075,6 +1198,12 @@ def _hold_visible_browser_after_password_failure(page, worker) -> None:
 
 
 def _fill_password_form(page, worker, password: str) -> bool:
+    # The security action can send a passwordless account to OpenAI's ordinary
+    # password-login page.  Filling our newly generated password there does not
+    # set it; it merely produces "Incorrect email address or password".  That
+    # page must enter the reset flow first.
+    if _first_visible(page, FORGOT_PASSWORD_SELECTORS, timeout=350) is not None:
+        return False
     inputs = []
     for selector in PASSWORD_INPUT_SELECTORS:
         inputs = _visible_locators(page, selector, timeout=500)
@@ -1145,9 +1274,14 @@ def ensure_password_in_security_settings(
         worker._password_step_submitted = True
         worker.log("[密码] 安全设置已显示密码管理入口，确认账号已有密码")
         return True
-    if not _click_add_password(page, timeout=1200):
+    password_action_clicked = (
+        _click_first_visible(page, PASSWORD_PRESENT_SELECTORS, timeout=1200)
+        if force_reset_password and _password_is_present(page, timeout=500)
+        else _click_add_password(page, timeout=1200)
+    )
+    if not password_action_clicked:
         _hold_visible_browser_after_password_failure(page, worker)
-        raise RuntimeError("安全设置中未找到“添加密码”按钮")
+        raise RuntimeError("安全设置中未找到添加或重置密码按钮")
 
     worker.log(
         "[密码] 已点击密码行并准备重新设置密码"
@@ -1156,6 +1290,7 @@ def ensure_password_in_security_settings(
     )
     verification_started_at = time.time() - 2
     otp_submitted = False
+    reset_requested = False
     deadline = time.time() + max(15, int(timeout_seconds))
     while time.time() < deadline:
         if not force_reset_password and _password_is_present(page, timeout=300):
@@ -1164,19 +1299,27 @@ def ensure_password_in_security_settings(
             return True
         if _first_visible(page, PASSWORD_SUCCESS_SELECTORS, timeout=300) is not None:
             worker._password_step_submitted = True
-            worker.log("[密码] 页面已确认密码添加成功")
+            worker.log("[密码] 页面已明确确认密码设置成功")
             return True
-        if _fill_password_form(page, worker, target_password):
-            _page_wait(page, 800)
-            worker._password_step_submitted = True
-            worker.log("[密码] 密码已提交，按流程直接读取 Session，不再二次验证")
-            return True
+
+        if not reset_requested and _click_first_visible(
+            page, FORGOT_PASSWORD_SELECTORS, timeout=450
+        ):
+            reset_requested = True
+            verification_started_at = time.time() - 2
+            worker.log("[密码] 当前是密码登录页，已点击忘记密码并进入邮箱重置流程")
+            _page_wait(page, 700)
+            continue
         if not otp_submitted and _fill_settings_otp(
             page, worker, verification_started_at
         ):
             otp_submitted = True
             _page_wait(page, 800)
             continue
+        if _fill_password_form(page, worker, target_password):
+            worker._password_step_submitted = True
+            worker.log("[密码] 新密码已提交，立即获取 Session")
+            return True
         _page_wait(page, 500)
 
     raise TimeoutError("安全设置未在规定时间内确认密码添加成功")
@@ -1253,6 +1396,91 @@ def extract_session_without_navigation(worker, context) -> dict:
     raise RuntimeError(f"无法在当前浏览器后台获取 Session：{last_error}")
 
 
+def _enable_two_factor_before_browser_closes(
+    worker,
+    context,
+    result: dict,
+    pending_two_factor: dict | None,
+) -> dict:
+    """Finish 2FA while the worker's sync_playwright scope is still alive."""
+
+    password = str(getattr(worker.account, "password", "") or "")
+    password_confirmed = bool(
+        getattr(worker, "_password_step_submitted", False)
+    )
+    emit(
+        "account_registered",
+        result=result,
+        password=password,
+        password_confirmed=password_confirmed,
+    )
+    worker._hme_account_registered_emitted = True
+
+    two_factor = reusable_enabled_two_factor(pending_two_factor)
+    if two_factor:
+        worker.log("账号已有 TOTP 2FA，已保留现有启用状态")
+    else:
+        emit("two_factor_start")
+        mfa_client = MfaHttpClient()
+        try:
+            mfa_pending = (
+                dict(pending_two_factor)
+                if isinstance(pending_two_factor, dict)
+                else {}
+            )
+
+            def remember_enrolled(state):
+                nonlocal mfa_pending
+                mfa_pending = dict(state)
+                emit("two_factor_enrolled", two_factor=state)
+
+            for mfa_attempt in range(3):
+                try:
+                    two_factor = enable_totp_mfa(
+                        mfa_client,
+                        access_token=str(result.get("access_token") or ""),
+                        email=str(worker.account.email or ""),
+                        pending=mfa_pending,
+                        on_enrolled=remember_enrolled,
+                    )
+                    break
+                except MfaSetupError as error:
+                    if (
+                        not _mfa_token_was_invalidated(error)
+                        or mfa_attempt >= 2
+                    ):
+                        raise
+                    worker.log(
+                        "[2FA] 密码变更使当前 Token 失效，"
+                        f"正在浏览器关闭前刷新 Session（{mfa_attempt + 1}/2）"
+                    )
+                    page = _reuse_single_registration_page(context, worker)
+                    try:
+                        page.goto(
+                            CHATGPT_HOME_URL,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                        _page_wait(page, 1500 + mfa_attempt * 1000)
+                    except Exception:
+                        _page_wait(page, 2000 + mfa_attempt * 1000)
+                    refreshed = extract_session_without_navigation(worker, context)
+                    result.update(refreshed)
+                    emit(
+                        "account_registered",
+                        result=result,
+                        password=password,
+                        password_confirmed=password_confirmed,
+                    )
+        finally:
+            mfa_client.close()
+
+    result["two_factor"] = two_factor
+    emit("two_factor_enabled")
+    worker._hme_two_factor_completed = True
+    return result
+
+
 def configure_post_registration_password_setup(
     app_backend,
     worker,
@@ -1260,6 +1488,8 @@ def configure_post_registration_password_setup(
     *,
     enabled: bool,
     force_reset_password: bool = False,
+    enable_2fa: bool = False,
+    pending_two_factor: dict | None = None,
 ) -> bool:
     """Run the settings password flow before the worker opens the Session page."""
 
@@ -1270,6 +1500,9 @@ def configure_post_registration_password_setup(
         raise RuntimeError("目标注册工作器缺少 Session 提取方法")
 
     def extract_after_password_setup(context):
+        if getattr(worker, "_hme_password_reset_submitted", False):
+            worker._password_step_submitted = True
+            worker.log("[密码] 邮箱重置后已成功建立会话，确认唯一密码生效")
         if not getattr(worker, "_password_step_submitted", False):
             ensure_password_in_security_settings(
                 app_backend,
@@ -1278,7 +1511,15 @@ def configure_post_registration_password_setup(
                 context=context,
                 force_reset_password=force_reset_password,
             )
-        return extract_session_without_navigation(worker, context)
+        result = extract_session_without_navigation(worker, context)
+        if enable_2fa:
+            result = _enable_two_factor_before_browser_closes(
+                worker,
+                context,
+                result,
+                pending_two_factor,
+            )
+        return result
 
     worker._extract_session_info = extract_after_password_setup
     return True
@@ -1463,6 +1704,8 @@ def main() -> int:
             str(account.password or ""),
             enabled=ensure_password,
             force_reset_password=force_reset_password,
+            enable_2fa=bool(enable_2fa and ensure_password),
+            pending_two_factor=pending_2fa,
         )
         result = worker.run()
         password_confirmed = bool(
@@ -1471,16 +1714,20 @@ def main() -> int:
         if ensure_password and not password_confirmed:
             raise RuntimeError("OpenAI 端未确认密码设置，未保存本地密码")
         if enable_2fa:
-            emit(
-                "account_registered",
-                result=result,
-                password=str(account.password or ""),
-                password_confirmed=password_confirmed,
-            )
-            two_factor = reusable_enabled_two_factor(pending_2fa)
-            if two_factor:
-                emit("log", message="账号已有 TOTP 2FA，已保留现有启用状态")
+            if not getattr(worker, "_hme_account_registered_emitted", False):
+                emit(
+                    "account_registered",
+                    result=result,
+                    password=str(account.password or ""),
+                    password_confirmed=password_confirmed,
+                )
+            if getattr(worker, "_hme_two_factor_completed", False):
+                two_factor = result.get("two_factor")
             else:
+                two_factor = reusable_enabled_two_factor(pending_2fa)
+            if not getattr(worker, "_hme_two_factor_completed", False) and two_factor:
+                emit("log", message="账号已有 TOTP 2FA，已保留现有启用状态")
+            elif not getattr(worker, "_hme_two_factor_completed", False):
                 emit("two_factor_start")
                 mfa_client = MfaHttpClient()
                 try:
@@ -1545,8 +1792,9 @@ def main() -> int:
                             )
                 finally:
                     mfa_client.close()
-            result["two_factor"] = two_factor
-            emit("two_factor_enabled")
+            if not getattr(worker, "_hme_two_factor_completed", False):
+                result["two_factor"] = two_factor
+                emit("two_factor_enabled")
         emit(
             "result",
             result=result,

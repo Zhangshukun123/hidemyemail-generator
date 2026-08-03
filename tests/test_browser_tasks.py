@@ -24,6 +24,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _click_password_add_by_geometry,
     _click_profile_name_by_dom,
     _configure_camoufox_runtime_cache,
+    _dismiss_completed_onboarding,
     _click_first_visible,
     _fontconfig_generator_with_home,
     _mfa_token_was_invalidated,
@@ -37,6 +38,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     resilient_force_fill_locator,
     safe_log_message,
 )
+from hidemyemail_generator.openai_mfa import MfaSetupError
 
 
 def token_with_exp(expires_at: int) -> str:
@@ -47,6 +49,65 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_japanese_completed_onboarding_is_dismissed_before_settings(self):
+        actions = []
+        logs = []
+
+        class Candidate:
+            def __init__(self, page, kind):
+                self.page = page
+                self.kind = kind
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                actions.append(self.kind)
+                if self.kind == "continue":
+                    self.page.state = "home"
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def __init__(self):
+                self.state = "onboarding"
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, selector):
+                candidates = []
+                if (
+                    self.state == "onboarding"
+                    and selector == 'text="準備が完了しました"'
+                ):
+                    candidates = [Candidate(self, "marker")]
+                elif (
+                    self.state == "onboarding"
+                    and selector == 'button:has-text("続行")'
+                ):
+                    candidates = [Candidate(self, "continue")]
+                return Collection(candidates)
+
+        page = Page()
+        worker = SimpleNamespace(log=logs.append)
+
+        self.assertTrue(_dismiss_completed_onboarding(page, worker))
+        self.assertEqual(page.state, "home")
+        self.assertEqual(actions, ["continue"])
+        self.assertIn("首次使用欢迎页", logs[-1])
+
     def test_mfa_invalidated_token_error_is_retryable(self):
         self.assertTrue(
             _mfa_token_was_invalidated(
@@ -109,6 +170,76 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertEqual(actions, ["email_code"])
         self.assertEqual(worker.original_calls, 0)
         self.assertIn("一次性邮箱验证码登录", worker.logs[-1])
+
+    def test_password_only_login_uses_forgot_password_then_saved_password(self):
+        actions = []
+
+        class Candidate:
+            def __init__(self, page, kind):
+                self.page = page
+                self.kind = kind
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                actions.append(self.kind)
+                if self.kind == "forgot_password":
+                    self.page.state = "reset_password"
+                    self.page.url = "https://auth.openai.com/password-reset"
+
+        class Collection:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class Page:
+            def __init__(self):
+                self.state = "login_password"
+                self.url = "https://auth.openai.com/log-in/password"
+
+            def locator(self, selector):
+                if (
+                    self.state == "login_password"
+                    and selector == 'a:has-text("Forgot password")'
+                ):
+                    return Collection([Candidate(self, "forgot_password")])
+                if (
+                    self.state == "reset_password"
+                    and selector == 'input[autocomplete="new-password"]'
+                ):
+                    return Collection([Candidate(self, "new_password")])
+                return Collection([])
+
+        class Worker:
+            def __init__(self):
+                self.original_calls = []
+                self.logs = []
+
+            def _fill_password_step(self, page):
+                self.original_calls.append(page.state)
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        page = Page()
+        self.assertTrue(configure_passwordless_email_code_login(worker, enabled=True))
+
+        worker._fill_password_step(page)
+        worker._fill_password_step(page)
+
+        self.assertEqual(actions, ["forgot_password"])
+        self.assertEqual(worker.original_calls, ["reset_password"])
+        self.assertTrue(worker._hme_password_reset_submitted)
 
     def test_registration_profile_name_is_captured_for_account_menu(self):
         backend = SimpleNamespace(
@@ -329,6 +460,129 @@ class BrowserTaskHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_two_factor_refreshes_invalidated_token_before_browser_closes(self):
+        class Page:
+            url = "https://chatgpt.com/"
+
+            def __init__(self):
+                self.goto_calls = []
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                self.goto_calls.append(url)
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def bring_to_front(self):
+                return None
+
+            def is_closed(self):
+                return False
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(
+                    email="new@icloud.com",
+                    password="Strong!Password123",
+                )
+                self._password_step_submitted = False
+                self.logs = []
+
+            def _extract_session_info(self, _context):
+                self.fail("the original extractor must stay wrapped")
+
+            def log(self, message):
+                self.logs.append(message)
+
+        page = Page()
+        context = SimpleNamespace(pages=[page])
+        worker = Worker()
+        emitted = []
+        session_results = [
+            {"access_token": "at-before-password"},
+            {"access_token": "at-after-password"},
+        ]
+        mfa_tokens = []
+        mfa_client = SimpleNamespace(close=lambda: None)
+
+        def ensure_password(
+            _backend,
+            target_worker,
+            _password,
+            *,
+            context,
+            force_reset_password=False,
+        ):
+            self.assertIsNotNone(context)
+            self.assertFalse(force_reset_password)
+            target_worker._password_step_submitted = True
+            return True
+
+        def enable_mfa(
+            _client,
+            *,
+            access_token,
+            email,
+            pending,
+            on_enrolled,
+        ):
+            self.assertEqual(email, "new@icloud.com")
+            self.assertEqual(pending, {})
+            mfa_tokens.append(access_token)
+            if len(mfa_tokens) == 1:
+                raise MfaSetupError(
+                    "HTTP 401: Your authentication token has been invalidated"
+                )
+            state = {"secret": "ABCDEFGHIJKLMNOP", "enabled": True}
+            on_enrolled(state)
+            return state
+
+        with (
+            patch(
+                "hidemyemail_generator.openai_browser_bridge."
+                "ensure_password_in_security_settings",
+                side_effect=ensure_password,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge."
+                "extract_session_without_navigation",
+                side_effect=session_results,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge.enable_totp_mfa",
+                side_effect=enable_mfa,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge.MfaHttpClient",
+                return_value=mfa_client,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge.emit",
+                side_effect=lambda kind, **payload: emitted.append((kind, payload)),
+            ),
+        ):
+            configure_post_registration_password_setup(
+                SimpleNamespace(),
+                worker,
+                "Strong!Password123",
+                enabled=True,
+                enable_2fa=True,
+                pending_two_factor={},
+            )
+            result = worker._extract_session_info(context)
+
+        self.assertEqual(
+            mfa_tokens,
+            ["at-before-password", "at-after-password"],
+        )
+        self.assertEqual(result["access_token"], "at-after-password")
+        self.assertTrue(result["two_factor"]["enabled"])
+        self.assertEqual(page.goto_calls, ["https://chatgpt.com/"])
+        self.assertTrue(worker._hme_two_factor_completed)
+        self.assertIn("two_factor_start", [kind for kind, _payload in emitted])
+        self.assertIn("two_factor_enabled", [kind for kind, _payload in emitted])
+
     def test_session_is_read_without_opening_a_new_page(self):
         class Response:
             ok = True
@@ -513,6 +767,229 @@ class BrowserTaskHelperTests(unittest.TestCase):
             ["Strong!Password123", "Strong!Password123"],
         )
 
+    def test_password_login_page_uses_forgot_password_before_setting_password(self):
+        class Candidate:
+            def __init__(self, page, kind, index=0):
+                self.page = page
+                self.kind = kind
+                self.index = index
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                self.page.actions.append(self.kind)
+                transitions = {
+                    "profile": "menu",
+                    "settings": "settings",
+                    "security": "security",
+                    "add_password": "auth_password",
+                    "forgot_password": "otp",
+                    "submit_otp": "reset_form",
+                    "submit_password": "password_success",
+                }
+                self.page.state = transitions.get(self.kind, self.page.state)
+
+            def fill(self, value, **_kwargs):
+                if self.kind == "otp_input":
+                    self.page.otp_value = value
+                else:
+                    self.page.filled_password_kinds.append(self.kind)
+                    self.page.password_values[self.index] = value
+
+            def input_value(self, **_kwargs):
+                return self.page.password_values[self.index]
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def __init__(self):
+                self.state = "new"
+                self.url = ""
+                self.actions = []
+                self.password_values = ["", ""]
+                self.filled_password_kinds = []
+                self.otp_value = ""
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                self.state = "home" if url == "https://chatgpt.com/" else "security"
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, selector):
+                candidates = []
+                if self.state == "home" and selector == '[data-testid="profile-button"]':
+                    candidates = [Candidate(self, "profile")]
+                elif self.state == "menu" and selector == '[data-testid="settings-menu-item"]':
+                    candidates = [Candidate(self, "settings")]
+                elif self.state == "settings" and selector == '[data-testid="security-tab"]':
+                    candidates = [Candidate(self, "security")]
+                elif self.state == "security" and selector == '[data-testid="add-password-button"]':
+                    candidates = [Candidate(self, "add_password")]
+                elif self.state == "auth_password" and selector == 'input[type="password"]':
+                    candidates = [Candidate(self, "login_password")]
+                elif self.state == "auth_password" and selector == 'a:has-text("Forgot password")':
+                    candidates = [Candidate(self, "forgot_password")]
+                elif self.state == "otp" and selector == 'input[autocomplete="one-time-code"]':
+                    candidates = [Candidate(self, "otp_input")]
+                elif self.state == "otp" and selector == 'button[type="submit"]:has-text("Continue")':
+                    candidates = [Candidate(self, "submit_otp")]
+                elif self.state == "reset_form" and selector == 'input[type="password"]':
+                    candidates = [
+                        Candidate(self, "new_password", 0),
+                        Candidate(self, "confirm_password", 1),
+                    ]
+                elif self.state == "reset_form" and selector.startswith('button[type="submit"]'):
+                    candidates = [Candidate(self, "submit_password")]
+                elif self.state == "password_success" and selector == 'text="Password added"':
+                    candidates = [Candidate(self, "password_success")]
+                return Collection(candidates)
+
+        class OtpReader:
+            def __init__(self, *_args):
+                pass
+
+            def connect(self):
+                return None
+
+            def wait_for_code(self, _min_timestamp):
+                return "123456"
+
+            def close(self):
+                return None
+
+        page = Page()
+        context = SimpleNamespace(pages=[page])
+        worker = SimpleNamespace(
+            account=SimpleNamespace(email="new@icloud.com"),
+            log=lambda _message: None,
+        )
+
+        with patch(
+            "hidemyemail_generator.openai_browser_bridge.ICloudOtpReader",
+            OtpReader,
+        ):
+            confirmed = ensure_password_in_security_settings(
+                SimpleNamespace(),
+                worker,
+                "Strong!Password123",
+                context=context,
+            )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(page.otp_value, "123456")
+        self.assertNotIn("login_password", page.filled_password_kinds)
+        self.assertEqual(
+            page.filled_password_kinds,
+            ["new_password", "confirm_password"],
+        )
+        self.assertLess(
+            page.actions.index("forgot_password"),
+            page.actions.index("submit_password"),
+        )
+
+    def test_password_submission_returns_without_polling_confirmation(self):
+        class Candidate:
+            def __init__(self, page, kind, index=0):
+                self.page = page
+                self.kind = kind
+                self.index = index
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                transitions = {
+                    "profile": "menu",
+                    "settings": "settings",
+                    "security": "security",
+                    "add_password": "password_form",
+                    "submit_password": "password_failure",
+                }
+                self.page.state = transitions.get(self.kind, self.page.state)
+
+            def fill(self, value, **_kwargs):
+                self.page.password_values[self.index] = value
+
+            def input_value(self, **_kwargs):
+                return self.page.password_values[self.index]
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def __init__(self):
+                self.state = "new"
+                self.url = ""
+                self.password_values = ["", ""]
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                self.state = "home" if url == "https://chatgpt.com/" else "security"
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, selector):
+                candidates = []
+                if self.state == "home" and selector == '[data-testid="profile-button"]':
+                    candidates = [Candidate(self, "profile")]
+                elif self.state == "menu" and selector == '[data-testid="settings-menu-item"]':
+                    candidates = [Candidate(self, "settings")]
+                elif self.state == "settings" and selector == '[data-testid="security-tab"]':
+                    candidates = [Candidate(self, "security")]
+                elif self.state == "security" and selector == '[data-testid="add-password-button"]':
+                    candidates = [Candidate(self, "add_password")]
+                elif self.state == "password_form" and selector == 'input[type="password"]':
+                    candidates = [
+                        Candidate(self, "password_input", 0),
+                        Candidate(self, "password_input", 1),
+                    ]
+                elif self.state == "password_form" and selector.startswith('button[type="submit"]'):
+                    candidates = [Candidate(self, "submit_password")]
+                elif self.state == "password_failure":
+                    raise AssertionError("password submission must not poll the page")
+                return Collection(candidates)
+
+        page = Page()
+        worker = SimpleNamespace(
+            account=SimpleNamespace(email="new@icloud.com"),
+            log=lambda _message: None,
+        )
+
+        submitted = ensure_password_in_security_settings(
+            SimpleNamespace(),
+            worker,
+            "Strong!Password123",
+            context=SimpleNamespace(pages=[page]),
+        )
+
+        self.assertTrue(submitted)
+        self.assertTrue(worker._password_step_submitted)
+
     def test_password_setup_rejects_account_upgrade_offer(self):
         class Candidate:
             def __init__(self, page, kind, aria_label):
@@ -668,7 +1145,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
             self.assertNotIn("account_type", record)
             self.assertNotIn("account_type_source", record)
 
-    def test_unconfirmed_password_is_not_saved(self):
+    def test_unconfirmed_password_is_saved_as_pending(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
             _save_account_record(
@@ -677,9 +1154,9 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 password="Generated!A7",
                 password_confirmed=False,
             )
-            self.assertNotIn(
-                "password", load_account_record(db_file, "passwordless@icloud.com")
-            )
+            pending = load_account_record(db_file, "passwordless@icloud.com")
+            self.assertEqual(pending["password"], "Generated!A7")
+            self.assertFalse(pending["password_confirmed"])
 
             _save_account_record(
                 db_file,

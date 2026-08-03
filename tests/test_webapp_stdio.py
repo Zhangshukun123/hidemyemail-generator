@@ -1,19 +1,48 @@
 import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from rich.console import Console
 
 from hidemyemail_generator.webapp import (
     _configure_utf8_stdio,
     _generation_failure_message,
+    _load_local_env_file,
     create_app,
 )
 
 
 class WebAppStdioTests(unittest.TestCase):
+    def test_loads_local_workbench_settings_without_overriding_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text(
+                "ACCOUNT_WORKBENCH_URL=http://127.0.0.1:3000\n"
+                "ACCOUNT_WORKBENCH_IMPORT_TOKEN=local-token\n"
+                "UNRELATED=value\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"ACCOUNT_WORKBENCH_URL": "http://existing:3000"},
+                clear=False,
+            ):
+                os.environ.pop("ACCOUNT_WORKBENCH_IMPORT_TOKEN", None)
+                os.environ.pop("UNRELATED", None)
+                _load_local_env_file(env_file)
+
+                self.assertEqual(
+                    os.environ["ACCOUNT_WORKBENCH_URL"], "http://existing:3000"
+                )
+                self.assertEqual(
+                    os.environ["ACCOUNT_WORKBENCH_IMPORT_TOKEN"], "local-token"
+                )
+                self.assertNotIn("UNRELATED", os.environ)
+
     def test_generation_error_preserves_icloud_detail(self):
         message = _generation_failure_message(
             {

@@ -93,11 +93,14 @@ def _save_account_record(
     current = load_account_record(db_file, target)
     current["email"] = target
     current["updated_at"] = utc_now()
-    if password and password_confirmed is not False:
+    if password:
         current["password"] = password
     if password_confirmed is True:
         current["password_confirmed"] = True
         current["password_confirmed_at"] = utc_now()
+    elif password_confirmed is False:
+        current["password_confirmed"] = False
+        current.pop("password_confirmed_at", None)
     if isinstance(two_factor, dict) and two_factor.get("secret"):
         current["two_factor"] = dict(two_factor)
     if result:

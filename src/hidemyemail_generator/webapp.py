@@ -12,11 +12,13 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
 from .account_verifier import AccountVerificationManager, removed_account_emails
 from .browser_tasks import (
     BrowserTaskManager,
+    _save_account_record,
     access_token_is_expired,
     load_account_record,
     set_manual_account_type,
@@ -1261,6 +1263,16 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return { successLabel: "已下载" };
     }
 
+    async function importAccountToWorkbench(email) {
+      const data = await api("/api/account/import-workbench", {
+        method: "POST",
+        body: JSON.stringify({ email }),
+      });
+      return {
+        successLabel: data.updated ? "工作台账号已更新" : "已导入工作台",
+      };
+    }
+
     async function deleteEmail(email) {
       const warning = `确定永久删除邮箱 ${email} 吗？\n\n该操作会停用并删除 iCloud 隐藏邮箱，同时清除本地保存的 OpenAI 密码、Session、AT 和 2FA，无法撤销。`;
       if (!confirm(warning)) {
@@ -1305,7 +1317,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return startBrowser([email], true);
     }
 
-    async function verifyOrRegisterAccount(item) {
+    async function verifyOrRegisterAccount(item, resetPassword = false) {
+      if (resetPassword && !confirm(`将通过邮箱验证码为 ${item.email} 重置密码，是否继续？`)) {
+        const error = new Error("已取消重置密码");
+        error.name = "AbortError";
+        throw error;
+      }
       if (!item.hasSession || !item.hasPassword) {
         const reason = !item.hasSession ? "尚未注册或没有 Session" : "尚未确认设置密码";
         if (!confirm(`账号 ${item.email} ${reason}，将启动浏览器完成账号和密码设置，是否继续？`)) {
@@ -1319,6 +1336,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         body: JSON.stringify({
           email: item.email,
           headless: $("headless").checked,
+          reset_password: resetPassword,
         }),
       });
       if (data.mode === "verify") {
@@ -1650,6 +1668,16 @@ GPT_INDEX_HTML = r"""<!doctype html>
           if (!await copyText(item.email)) throw new Error("浏览器拒绝复制，请检查剪贴板权限");
         });
         copyEmailButton.classList.add("quick-copy");
+        const importWorkbenchButton = actionButton(
+          "一键导入工作台",
+          () => importAccountToWorkbench(item.email),
+          "已导入工作台"
+        );
+        importWorkbenchButton.classList.add("quick-import");
+        if (!item.hasPassword || !item.hasTwoFactor) {
+          importWorkbenchButton.disabled = true;
+          importWorkbenchButton.title = "请先完成密码设置并开启 2FA";
+        }
         const moreButton = document.createElement("button");
         moreButton.type = "button";
         moreButton.className = "action more-action";
@@ -1658,8 +1686,14 @@ GPT_INDEX_HTML = r"""<!doctype html>
         quickActions.append(copyEmailButton, moreButton);
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
+        secondaryActions.append(importWorkbenchButton);
         secondaryActions.append(actionButton(item.hasPassword ? "验证账号" : "设置密码", () => verifyOrRegisterAccount(item), "已启动"));
-        if (item.hasPassword) secondaryActions.append(actionButton("复制密码", () => copyCredential(item.email, "password")));
+        if (item.hasPassword) {
+          secondaryActions.append(
+            actionButton("复制密码", () => copyCredential(item.email, "password")),
+            actionButton("重置密码", () => verifyOrRegisterAccount(item, true), "密码重置已启动")
+          );
+        }
         if (item.hasTwoFactor) {
           secondaryActions.append(
             actionButton("复制 2FA 密钥", () => copyCredential(item.email, "totp_secret")),
@@ -2085,6 +2119,40 @@ def _gpt_account_export(db_file: Path, email: str = "") -> list[str]:
     return lines
 
 
+def _workbench_import_payload(record: dict, email: str) -> dict:
+    target = str(email or "").strip().lower()
+    if not target or "@" not in target:
+        raise RuntimeError("邮箱地址无效")
+    password = str(record.get("password") or "")
+    if not password or record.get("password_confirmed") is False:
+        raise RuntimeError("该账号密码尚未在 OpenAI 确认，不能导入工作台")
+    two_factor = (
+        record.get("two_factor")
+        if isinstance(record.get("two_factor"), dict)
+        else {}
+    )
+    totp_secret = str(two_factor.get("secret") or "").strip()
+    if not totp_secret or not two_factor.get("enabled"):
+        raise RuntimeError("该账号 2FA 尚未启用，不能导入工作台")
+    session = record.get("session")
+    if session is None:
+        session = record.get("session_json") or ""
+        if isinstance(session, str) and session.strip():
+            try:
+                session = json.loads(session)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+    return {
+        "email": target,
+        "password": password,
+        "totpSecret": totp_secret,
+        "accessToken": str(
+            record.get("access_token") or record.get("accessToken") or ""
+        ).strip(),
+        "session": session,
+    }
+
+
 def _remove_deleted_email_records(db_file: Path, email: str) -> None:
     target = email.strip().lower()
     now = datetime.now(timezone.utc).isoformat()
@@ -2250,6 +2318,8 @@ def create_app(
     target_python: str = "",
     browser_service_url: str = "http://127.0.0.1:8765",
     force_browser_headless: bool = False,
+    workbench_url: str = "",
+    workbench_import_token: str = "",
 ) -> web.Application:
     app = web.Application(
         client_max_size=16 * 1024, middlewares=[auth_middleware]
@@ -2269,6 +2339,8 @@ def create_app(
     app["generate_lock"] = asyncio.Lock()
     app["delete_lock"] = asyncio.Lock()
     app["inbox_sync_lock"] = asyncio.Lock()
+    app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
+    app["workbench_import_token"] = str(workbench_import_token or "").strip()
     browser_source = (
         Path(target_project_dir).resolve()
         if target_project_dir
@@ -2344,10 +2416,20 @@ def create_app(
             raise RuntimeError(f"新邮箱列表同步失败：{last_error}")
         raise RuntimeError("新邮箱在 30 秒内未出现在 iCloud 列表")
 
+    async def save_registration_password(email: str, password: str) -> None:
+        await asyncio.to_thread(
+            _save_account_record,
+            app["db_file"],
+            email,
+            password=password,
+            password_confirmed=False,
+        )
+
     app["registration_manager"] = RegistrationTaskManager(
         browser_manager=app["browser_manager"],
         generate_email=generate_registration_email,
         confirm_email=confirm_registration_email,
+        save_pending_password=save_registration_password,
     )
 
     async def background_inbox_sync() -> None:
@@ -2818,6 +2900,66 @@ def create_app(
             {"ok": True, **item}, headers={"Cache-Control": "no-store"}
         )
 
+    async def import_workbench_account(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(body.get("email") or "").strip().lower()
+        if not email.endswith("@icloud.com") or len(email) > 320:
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        if not app["workbench_url"] or not app["workbench_import_token"]:
+            return web.json_response(
+                {"ok": False, "error": "OpenAI 账户工作台导入尚未配置"},
+                status=503,
+            )
+        record = await asyncio.to_thread(
+            load_account_record, app["db_file"], email
+        )
+        try:
+            payload = _workbench_import_payload(record, email)
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=409
+            )
+
+        target = f'{app["workbench_url"]}/api/integrations/hidemyemail/import'
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as client:
+                async with client.post(
+                    target,
+                    json=payload,
+                    headers={
+                        "X-HME-Import-Token": app["workbench_import_token"],
+                    },
+                ) as response:
+                    result = await response.json(content_type=None)
+                    if response.status >= 400 or not result.get("success"):
+                        message = str(result.get("error") or "工作台拒绝导入")
+                        raise RuntimeError(message)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as error:
+            return web.json_response(
+                {"ok": False, "error": f"导入工作台失败：{error}"}, status=502
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "imported": int(result.get("imported") or 0),
+                "updated": int(result.get("updated") or 0),
+                "message": "账号凭据已安全导入 OpenAI 账户工作台",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def browser_status(_: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, **app["browser_manager"].snapshot()},
@@ -2939,6 +3081,7 @@ def create_app(
         record = await asyncio.to_thread(
             load_account_record, app["db_file"], email
         )
+        reset_password = bool(payload.get("reset_password", False))
         access_token = str(
             record.get("access_token") or record.get("accessToken") or ""
         ).strip()
@@ -2951,7 +3094,12 @@ def create_app(
             else {}
         )
         two_factor_enabled = bool(saved_two_factor.get("enabled"))
-        if access_token and password_confirmed and two_factor_enabled:
+        if (
+            access_token
+            and password_confirmed
+            and two_factor_enabled
+            and not reset_password
+        ):
             try:
                 task = app["verification_manager"].start(
                     concurrency=1, emails=[email]
@@ -2988,6 +3136,13 @@ def create_app(
         account_password = str(record.get("password") or "")
         if not account_password:
             account_password = generate_openai_password()
+            await asyncio.to_thread(
+                _save_account_record,
+                app["db_file"],
+                email,
+                password=account_password,
+                password_confirmed=False,
+            )
         try:
             task = app["browser_manager"].start(
                 [
@@ -2995,8 +3150,10 @@ def create_app(
                         "email": email,
                         "password": account_password,
                         "ensure_password": True,
-                        "force_reset_password": not bool(
-                            str(record.get("password") or "")
+                        "force_reset_password": bool(
+                            reset_password
+                            or not str(record.get("password") or "")
+                            or record.get("password_confirmed") is False
                         ),
                         "enable_2fa": True,
                         "two_factor": saved_two_factor,
@@ -3014,7 +3171,9 @@ def create_app(
                 "ok": True,
                 "started": True,
                 "mode": (
-                    "enable_2fa"
+                    "set_password"
+                    if reset_password
+                    else "enable_2fa"
                     if access_token and password_confirmed
                     else "set_password"
                     if access_token
@@ -3336,6 +3495,9 @@ def create_app(
     app.router.add_post("/api/account/type", account_type_update)
     app.router.add_post("/api/gpt-credential", gpt_credential)
     app.router.add_post("/api/gpt-accounts/export", export_gpt_accounts)
+    app.router.add_post(
+        "/api/account/import-workbench", import_workbench_account
+    )
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_get("/api/browser/status", browser_status)
@@ -3380,6 +3542,10 @@ async def run_server(args: argparse.Namespace) -> None:
             "HIDEMYEMAIL_FORCE_BROWSER_HEADLESS", ""
         ).strip().lower()
         in {"1", "true", "yes", "on"},
+        workbench_url=os.environ.get("ACCOUNT_WORKBENCH_URL", ""),
+        workbench_import_token=os.environ.get(
+            "ACCOUNT_WORKBENCH_IMPORT_TOKEN", ""
+        ),
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -3410,8 +3576,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_local_env_file(path: Path) -> None:
+    """Load local integration settings without overriding the process environment."""
+    if not path.is_file():
+        return
+    allowed = {
+        "ACCOUNT_WORKBENCH_URL",
+        "ACCOUNT_WORKBENCH_IMPORT_TOKEN",
+        "HIDEMYEMAIL_WEB_PASSWORD",
+    }
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in allowed or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
 def main() -> None:
     _configure_utf8_stdio()
+    _load_local_env_file(Path.cwd() / ".env")
     args = build_parser().parse_args()
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit("For safety, this service may only listen on the local machine.")

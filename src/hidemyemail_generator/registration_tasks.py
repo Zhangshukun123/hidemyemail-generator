@@ -12,6 +12,7 @@ from .browser_tasks import BrowserTaskManager
 
 GenerateEmail = Callable[[str], Awaitable[str]]
 ConfirmEmail = Callable[[str], Awaitable[None]]
+SavePendingPassword = Callable[[str, str], Awaitable[None]]
 
 
 def utc_now() -> str:
@@ -41,10 +42,12 @@ class RegistrationTaskManager:
         browser_manager: BrowserTaskManager,
         generate_email: GenerateEmail,
         confirm_email: ConfirmEmail,
+        save_pending_password: SavePendingPassword | None = None,
     ) -> None:
         self.browser_manager = browser_manager
         self.generate_email = generate_email
         self.confirm_email = confirm_email
+        self.save_pending_password = save_pending_password
         self._task: asyncio.Task | None = None
         self._state: dict[str, Any] = self._idle_state()
 
@@ -105,12 +108,14 @@ class RegistrationTaskManager:
             email = (await self.generate_email(label)).strip().lower()
             if not email:
                 raise RuntimeError("iCloud 未返回新邮箱地址")
+            if self.save_pending_password is not None:
+                await self.save_pending_password(email, password)
             self._state.update(
                 email=email,
                 phase="confirming_email",
-                message="邮箱已生成，正在等待 iCloud 列表同步",
+                message="邮箱和唯一密码已保存，正在等待 iCloud 列表同步",
             )
-            self._append_log(f"已生成邮箱：{email}")
+            self._append_log(f"已生成邮箱并保存唯一密码：{email}")
             await self.confirm_email(email)
             self._state.update(
                 phase="registering_openai",
