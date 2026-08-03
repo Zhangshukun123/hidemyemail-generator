@@ -1234,7 +1234,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return { successLabel: copied ? "验证码已获取并复制" : "验证码已获取，请手动复制" };
     }
 
-    async function downloadAccount(email) {
+    async function copyAccount(email) {
       const response = await fetch("/api/gpt-accounts/export", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Local-Token": localToken },
@@ -1246,22 +1246,14 @@ GPT_INDEX_HTML = r"""<!doctype html>
         throw new Error("登录已过期");
       }
       if (!response.ok) {
-        const data = await response.json().catch(() => ({ error: "下载账号失败" }));
-        throw new Error(data.error || `下载失败 (${response.status})`);
+        const data = await response.json().catch(() => ({ error: "复制账号失败" }));
+        throw new Error(data.error || `复制失败 (${response.status})`);
       }
-      const disposition = response.headers.get("Content-Disposition") || "";
-      const filenameMatch = disposition.match(/filename="([^"]+)"/i);
-      const filename = filenameMatch ? filenameMatch[1] : "openai-account.txt";
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-      return { successLabel: "已下载" };
+      const content = await response.text();
+      if (!await copyText(content)) {
+        throw new Error("浏览器拒绝复制，请检查剪贴板权限");
+      }
+      return { successLabel: "已复制账号" };
     }
 
     async function importAccountToWorkbench(email) {
@@ -1712,12 +1704,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
         secondaryActions.append(actionButton("获取 OpenAI 码", () => copyOpenAiCode(item.email)));
         const deleteButton = actionButton("删除邮箱", () => deleteEmail(item.email), "已删除");
         deleteButton.classList.add("danger-action");
-        const downloadButton = actionButton("下载账号", () => downloadAccount(item.email), "已下载");
+        const copyAccountButton = actionButton("复制账号", () => copyAccount(item.email), "已复制账号");
         if (!item.hasPassword) {
-          downloadButton.disabled = true;
-          downloadButton.title = "该账号尚未保存密码";
+          copyAccountButton.disabled = true;
+          copyAccountButton.title = "该账号尚未保存密码";
         }
-        secondaryActions.append(deleteButton, downloadButton);
+        secondaryActions.append(deleteButton, copyAccountButton);
         moreButton.addEventListener("click", () => {
           const expanded = !row.classList.contains("expanded");
           row.classList.toggle("expanded", expanded);

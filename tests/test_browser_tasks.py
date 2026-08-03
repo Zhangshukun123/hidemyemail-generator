@@ -20,6 +20,7 @@ from hidemyemail_generator.browser_tasks import (
 from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.openai_browser_bridge import (
     ADD_PASSWORD_SELECTORS,
+    PROFILE_MENU_STRICT_SELECTORS,
     _click_add_password,
     _click_password_add_by_geometry,
     _click_profile_name_by_dom,
@@ -28,6 +29,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _click_first_visible,
     _fontconfig_generator_with_home,
     _mfa_token_was_invalidated,
+    _open_settings_from_profile,
     configure_passwordless_email_code_login,
     configure_post_registration_password_setup,
     configure_registration_profile_capture,
@@ -331,6 +333,47 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(_click_profile_name_by_dom(Page(), "Noah Allen"))
         self.assertEqual(calls[0][1], "Noah Allen")
         self.assertIn("aria-haspopup", calls[0][0])
+
+    def test_japanese_profile_menu_matches_current_accessible_label(self):
+        self.assertIn(
+            'button[aria-label*="プロファイルメニューを開く" i]',
+            PROFILE_MENU_STRICT_SELECTORS,
+        )
+
+    def test_current_profile_selector_runs_before_dom_fallback(self):
+        profile_candidate = object()
+        settings_candidate = object()
+        target_selector = (
+            'button[aria-label*="プロファイルメニューを開く" i]'
+        )
+        worker = SimpleNamespace(
+            registration_profile_name="Ava Brown",
+            log=lambda _message: None,
+        )
+
+        def visible_candidates(_page, selector, **_kwargs):
+            return [profile_candidate] if selector == target_selector else []
+
+        with (
+            patch(
+                "hidemyemail_generator.openai_browser_bridge._visible_locators",
+                side_effect=visible_candidates,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge._first_visible",
+                return_value=settings_candidate,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge._click_locator",
+                return_value=True,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge._click_profile_name_by_dom"
+            ) as dom_fallback,
+        ):
+            self.assertTrue(_open_settings_from_profile(object(), worker))
+
+        dom_fallback.assert_not_called()
 
     def test_password_add_geometry_chooses_topmost_add_action(self):
         clicked = []

@@ -42,6 +42,8 @@ PROFILE_MENU_STRICT_SELECTORS = (
     'button[aria-label="プロフィールメニューを開く" i]',
     'button[aria-label="プロフィールメニュー" i]',
     'button[aria-label="アカウントメニュー" i]',
+    'button[aria-label*="プロフィールメニューを開く" i]',
+    'button[aria-label*="プロファイルメニューを開く" i]',
     'button[aria-haspopup="menu"]:has([data-testid*="avatar" i])',
     'button:has([data-testid="user-avatar"])',
 )
@@ -221,31 +223,22 @@ name => {
   };
   const expected = normalize(name);
   if (!expected) return false;
-  const candidates = Array.from(document.querySelectorAll("body *"))
-    .filter(element => visible(element) && normalize(element.textContent) === expected)
-    .filter(element => !Array.from(element.children).some(
-      child => normalize(child.textContent) === expected
-    ))
+  const candidates = Array.from(document.querySelectorAll(
+    'button, [role="button"], a, [aria-haspopup="menu"], [data-testid*="profile" i]'
+  ))
+    .filter(element => visible(element))
+    .filter(element => {
+      const text = normalize(element.textContent);
+      const label = normalize(element.getAttribute("aria-label"));
+      return text.includes(expected) || label.includes(expected);
+    })
     .sort((left, right) => {
       const a = left.getBoundingClientRect();
       const b = right.getBoundingClientRect();
       return (a.width * a.height) - (b.width * b.height);
     });
-  for (const leaf of candidates) {
-    let target = leaf.closest(
-      'button, [role="button"], a, [aria-haspopup="menu"], [data-testid*="profile" i]'
-    );
-    let ancestor = leaf.parentElement;
-    for (let depth = 0; !target && ancestor && depth < 5; depth += 1) {
-      const style = window.getComputedStyle(ancestor);
-      if (style.cursor === "pointer" || ancestor.tabIndex >= 0 ||
-          ancestor.hasAttribute("aria-expanded")) {
-        target = ancestor;
-        break;
-      }
-      ancestor = ancestor.parentElement;
-    }
-    (target || leaf).click();
+  for (const target of candidates) {
+    target.click();
     return true;
   }
   return false;
@@ -993,15 +986,6 @@ def _open_settings_from_profile(page, worker) -> bool:
     profile_name = str(
         getattr(worker, "registration_profile_name", "") or ""
     ).strip()
-    if profile_name and _click_profile_name_by_dom(page, profile_name):
-        _page_wait(page, 600)
-        settings = _first_visible(page, SETTINGS_MENU_SELECTORS, timeout=900)
-        if settings is not None and _click_locator(settings):
-            worker.log(f"[密码] 已点击账号姓名 {profile_name} 并打开设置")
-            return True
-        worker.log("[密码] 姓名入口未打开设置菜单，继续查找账号入口")
-        _dismiss_menu(page)
-        _page_wait(page, 250)
     name_selectors = ()
     if profile_name:
         quoted_name = json.dumps(profile_name, ensure_ascii=False)
@@ -1012,7 +996,6 @@ def _open_settings_from_profile(page, worker) -> bool:
     groups = (
         (name_selectors, True),
         (PROFILE_MENU_STRICT_SELECTORS, True),
-        (PROFILE_MENU_FALLBACK_SELECTORS, False),
     )
     for selectors, strict in groups:
         for selector in selectors:
@@ -1029,6 +1012,31 @@ def _open_settings_from_profile(page, worker) -> bool:
                 worker.log("[密码] 当前按钮未打开设置菜单，已忽略并继续查找账号入口")
                 _dismiss_menu(page)
                 _page_wait(page, 250)
+    # Keep the DOM fallback bounded to interactive elements.  Scanning every
+    # node in ChatGPT's large app DOM can leave Playwright waiting forever.
+    if profile_name and _click_profile_name_by_dom(page, profile_name):
+        _page_wait(page, 600)
+        settings = _first_visible(page, SETTINGS_MENU_SELECTORS, timeout=900)
+        if settings is not None and _click_locator(settings):
+            worker.log(f"[密码] 已点击账号姓名 {profile_name} 并打开设置")
+            return True
+        worker.log("[密码] 姓名入口未打开设置菜单，继续查找账号入口")
+        _dismiss_menu(page)
+        _page_wait(page, 250)
+    for selector in PROFILE_MENU_FALLBACK_SELECTORS:
+        for candidate in _visible_locators(page, selector, timeout=700):
+            if not _profile_candidate_allowed(candidate, strict=False):
+                continue
+            if not _click_locator(candidate):
+                continue
+            _page_wait(page, 600)
+            settings = _first_visible(page, SETTINGS_MENU_SELECTORS, timeout=900)
+            if settings is not None and _click_locator(settings):
+                worker.log("[密码] 已确认账号菜单并打开设置")
+                return True
+            worker.log("[密码] 当前按钮未打开设置菜单，已忽略并继续查找账号入口")
+            _dismiss_menu(page)
+            _page_wait(page, 250)
     return False
 
 
