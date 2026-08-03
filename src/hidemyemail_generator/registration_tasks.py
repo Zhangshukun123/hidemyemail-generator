@@ -73,6 +73,9 @@ class RegistrationTaskManager:
         runtime = self.browser_manager.availability()
         if not runtime.get("available"):
             raise RuntimeError("；".join(runtime.get("errors") or ["浏览器环境不可用"]))
+        reset_browser_state = getattr(self.browser_manager, "reset", None)
+        if callable(reset_browser_state):
+            reset_browser_state()
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",

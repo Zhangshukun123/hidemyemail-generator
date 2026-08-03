@@ -313,10 +313,42 @@ class RichHideMyEmail(HideMyEmail):
         self.console.log(f'[50%] "{email}" - Successfully generated / 生成成功')
 
         # Then, reserve it
-        reserve_res = await self.reserve_email(email, label, DEFAULT_HME_NOTE)
+        reserve_res = None
+        for attempt in range(1, 4):
+            reserve_res = await self.reserve_email(email, label, DEFAULT_HME_NOTE)
+            if reserve_res and reserve_res.get("success"):
+                break
+            if attempt < 3:
+                failure = bridge_error(reserve_res)
+                delay = failure.get("retry_after") or attempt
+                delay = min(5.0, max(0.5, float(delay)))
+                self.console.log(
+                    f'[yellow]"{email}" - Reserve was not confirmed; '
+                    f"retrying ({attempt + 1}/3) / 保留未确认，正在重试[/]"
+                )
+                await asyncio.sleep(delay)
 
-        if not self._check_response(reserve_res, "reserve email", email):
-            return
+        if not reserve_res or not reserve_res.get("success"):
+            # A timed-out reserve request may still have committed on Apple's
+            # side. Confirm through the list endpoint before reporting failure.
+            listed = await self.list_email()
+            rows = (
+                (listed.get("result") or {}).get("hmeEmails") or []
+                if isinstance(listed, dict) and listed.get("success")
+                else []
+            )
+            reserved = any(
+                str(row.get("hme") or "").casefold() == email.casefold()
+                and row.get("isActive")
+                for row in rows
+            )
+            if not reserved:
+                self._check_response(reserve_res, "reserve email", email)
+                return
+            self.console.log(
+                f'[green]"{email}" - Reserve confirmed from iCloud list / '
+                "已从 iCloud 列表确认保留成功[/]"
+            )
 
         self.console.log(f'[100%] "{email}" - Successfully reserved / 保留成功')
         return email

@@ -380,9 +380,10 @@ cookies.txt.bak
   `hidemyemail.db` 的本地设置表中；敏感结果不会写入任务日志；
 - 可以在网页中停止当前任务。真实浏览器任务不会在测试或服务启动时自动执行。
 
-Windows 本地默认查找同级目录：
+Windows 本地会依次查找以下同级目录：
 
 ```text
+../openai-register-paylink
 ../openai-register-paylink-ui-dist-20260706-README-deploy
 ```
 

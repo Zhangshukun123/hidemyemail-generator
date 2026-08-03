@@ -3,8 +3,24 @@ $ErrorActionPreference = "Stop"
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonPath = Join-Path $projectDir ".venv\Scripts\python.exe"
 $pythonWindowPath = Join-Path $projectDir ".venv\Scripts\pythonw.exe"
-$registerProjectDir = Join-Path (Split-Path -Parent $projectDir) "openai-register-paylink"
-$registerPythonPath = Join-Path $registerProjectDir ".venv\Scripts\python.exe"
+$projectParent = Split-Path -Parent $projectDir
+$registerProjectDir = $env:OPENAI_REGISTER_PROJECT_DIR
+if (-not $registerProjectDir) {
+    $registerCandidates = @(
+        (Join-Path $projectParent "openai-register-paylink"),
+        (Join-Path $projectParent "openai-register-paylink-ui-dist-20260706-README-deploy")
+    )
+    $registerProjectDir = $registerCandidates |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_ "app_backend.py") -PathType Leaf } |
+        Select-Object -First 1
+    if (-not $registerProjectDir) {
+        $registerProjectDir = $registerCandidates[0]
+    }
+}
+$registerPythonPath = $env:OPENAI_REGISTER_PYTHON
+if (-not $registerPythonPath) {
+    $registerPythonPath = Join-Path $registerProjectDir ".venv\Scripts\python.exe"
+}
 $logDir = Join-Path $env:LOCALAPPDATA "HideMyEmailGenerator"
 $logFile = Join-Path $logDir "web-ui.log"
 $errorLogFile = Join-Path $logDir "web-ui-error.log"

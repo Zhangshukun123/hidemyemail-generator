@@ -37,7 +37,7 @@ from .inbox import (
 from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
-from .registration_tasks import RegistrationTaskManager
+from .registration_tasks import RegistrationTaskManager, generate_openai_password
 
 
 SESSION_COOKIE_NAME = "hme_session"
@@ -55,6 +55,22 @@ PAGE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+
+OPENAI_RUNTIME_SIBLING_NAMES = (
+    "openai-register-paylink",
+    "openai-register-paylink-ui-dist-20260706-README-deploy",
+)
+
+
+def _default_openai_runtime_dir(base_dir: Path) -> Path:
+    """Find a usable sibling checkout while keeping the new name canonical."""
+
+    parent = base_dir.resolve().parent
+    candidates = [parent / name for name in OPENAI_RUNTIME_SIBLING_NAMES]
+    for candidate in candidates:
+        if (candidate / "app_backend.py").is_file():
+            return candidate
+    return candidates[0]
 
 
 def _configure_utf8_stdio() -> None:
@@ -1781,6 +1797,32 @@ def _error_reason(result: dict) -> str:
     return str(result.get("reason") or error or "iCloud 请求失败")
 
 
+def _generation_failure_message(result: dict) -> str:
+    error = result.get("error") if isinstance(result, dict) else None
+    if isinstance(error, dict):
+        message = str(
+            error.get("message")
+            or error.get("errorMessage")
+            or error.get("reason")
+            or "iCloud 未确认地址创建"
+        ).strip()
+        code = error.get("code") or error.get("errorCode")
+        retry_after = error.get("retry_after") or error.get("retryAfter")
+    else:
+        message = str(error or "iCloud 未确认地址创建").strip()
+        code = None
+        retry_after = None
+    if message.casefold() == "generation failed":
+        message = "iCloud 未确认地址创建"
+    details = []
+    if code is not None:
+        details.append(f"错误码 {code}")
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        details.append(f"建议 {retry_after:g} 秒后重试")
+    suffix = f"（{'；'.join(details)}）" if details else ""
+    return f"iCloud 创建地址失败：{message[:300]}{suffix}"
+
+
 def _resolve_data_path(base_dir: Path, value: str) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (base_dir / path).resolve()
@@ -2230,7 +2272,7 @@ def create_app(
     browser_source = (
         Path(target_project_dir).resolve()
         if target_project_dir
-        else (base_dir.resolve().parent / "openai-register-paylink")
+        else _default_openai_runtime_dir(base_dir)
     )
     app["browser_manager"] = BrowserTaskManager(
         target_project_dir=browser_source,
@@ -2245,6 +2287,8 @@ def create_app(
         db_file=app["db_file"],
         python_executable=app["browser_manager"].python_executable,
     )
+    gpt_code_identity_cache: list[dict] = []
+    gpt_code_identity_cache_at = 0.0
 
     async def active_icloud_identities() -> list[dict]:
         cookie_path: Path = app["cookie_file"]
@@ -2280,7 +2324,7 @@ def create_app(
             )
         emails = generated.get("emails", [])
         if not generated.get("ok") or not emails:
-            raise RuntimeError("未能生成地址，可能触发了 Apple 频率限制")
+            raise RuntimeError(_generation_failure_message(generated))
         return str(emails[0] or "").strip().lower()
 
     async def confirm_registration_email(email: str) -> None:
@@ -2309,6 +2353,9 @@ def create_app(
     async def background_inbox_sync() -> None:
         while True:
             try:
+                if app["browser_manager"].snapshot().get("running"):
+                    await asyncio.sleep(1)
+                    continue
                 config_path: Path = app["inbox_config_file"]
                 if config_path.exists():
                     config = load_config(str(config_path))
@@ -2715,6 +2762,7 @@ def create_app(
             )
 
     async def gpt_code(request: web.Request) -> web.Response:
+        nonlocal gpt_code_identity_cache, gpt_code_identity_cache_at
         if not _local_token_valid(request, app):
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
@@ -2740,20 +2788,26 @@ def create_app(
             config = load_config(str(config_path))
             async with app["inbox_sync_lock"]:
                 await asyncio.to_thread(
-                    sync_inbox, config, str(app["db_file"]), 100
+                    sync_inbox, config, str(app["db_file"]), 30
                 )
         except Exception as error:
             return web.json_response(
                 {"ok": False, "error": _inbox_error_message(error)}, status=502
             )
-        try:
-            identities = await active_icloud_identities()
-        except RuntimeError as error:
-            return web.json_response(
-                {"ok": False, "error": str(error)}, status=502
-            )
+        if not gpt_code_identity_cache or time.monotonic() - gpt_code_identity_cache_at > 120:
+            try:
+                gpt_code_identity_cache = await active_icloud_identities()
+                gpt_code_identity_cache_at = time.monotonic()
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=502
+                )
         item = await asyncio.to_thread(
-            _latest_gpt_code, app["db_file"], email, identities, since
+            _latest_gpt_code,
+            app["db_file"],
+            email,
+            gpt_code_identity_cache,
+            since,
         )
         if not item:
             return web.json_response(
@@ -2891,7 +2945,13 @@ def create_app(
         password_confirmed = bool(str(record.get("password") or "")) and (
             record.get("password_confirmed") is not False
         )
-        if access_token and password_confirmed:
+        saved_two_factor = (
+            record.get("two_factor")
+            if isinstance(record.get("two_factor"), dict)
+            else {}
+        )
+        two_factor_enabled = bool(saved_two_factor.get("enabled"))
+        if access_token and password_confirmed and two_factor_enabled:
             try:
                 task = app["verification_manager"].start(
                     concurrency=1, emails=[email]
@@ -2925,17 +2985,21 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "该 iCloud 邮箱无效或已停用"}, status=400
             )
+        account_password = str(record.get("password") or "")
+        if not account_password:
+            account_password = generate_openai_password()
         try:
             task = app["browser_manager"].start(
                 [
                     {
                         "email": email,
-                        "password": str(record.get("password") or ""),
+                        "password": account_password,
                         "ensure_password": True,
+                        "force_reset_password": not bool(
+                            str(record.get("password") or "")
+                        ),
                         "enable_2fa": True,
-                        "two_factor": record.get("two_factor")
-                        if isinstance(record.get("two_factor"), dict)
-                        else {},
+                        "two_factor": saved_two_factor,
                     }
                 ],
                 headless=bool(payload.get("headless", False)),
@@ -2949,7 +3013,13 @@ def create_app(
             {
                 "ok": True,
                 "started": True,
-                "mode": "set_password" if access_token else "register",
+                "mode": (
+                    "enable_2fa"
+                    if access_token and password_confirmed
+                    else "set_password"
+                    if access_token
+                    else "register"
+                ),
                 "task": task,
             }
         )
@@ -3123,7 +3193,7 @@ def create_app(
         emails = generated.get("emails", [])
         if not generated.get("ok") or not emails:
             return web.json_response(
-                {"ok": False, "error": "未能生成地址，可能触发了 Apple 频率限制"}, status=502
+                {"ok": False, "error": _generation_failure_message(generated)}, status=502
             )
         return web.json_response({"ok": True, "emails": list(emails)})
 

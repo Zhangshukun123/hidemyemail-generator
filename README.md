@@ -471,9 +471,11 @@ worker while replacing its mailbox source with iCloud Hide My Email:
   the local `hidemyemail.db`; secrets are omitted from task logs;
 - running batches can be stopped from the web UI.
 
-On Windows, the default source project is the sibling directory
-`../openai-register-paylink-ui-dist-20260706-README-deploy`. Override it with
-`OPENAI_REGISTER_PROJECT_DIR` and `OPENAI_REGISTER_PYTHON` when needed.
+On Windows, the service first looks for the sibling directory
+`../openai-register-paylink`, then falls back to
+`../openai-register-paylink-ui-dist-20260706-README-deploy`. Override this
+automatic selection with `OPENAI_REGISTER_PROJECT_DIR` and
+`OPENAI_REGISTER_PYTHON` when needed.
 Server builds use `Dockerfile.remote-browser` and an `openai-register-runtime/`
 directory containing only the source project's top-level Python modules. Do not
 copy its state, logs, proxies, or account data. Server browser jobs are forced

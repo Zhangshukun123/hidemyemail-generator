@@ -7,6 +7,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from hidemyemail_generator.browser_tasks import (
     BrowserTaskManager,
@@ -17,8 +19,21 @@ from hidemyemail_generator.browser_tasks import (
 )
 from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.openai_browser_bridge import (
+    ADD_PASSWORD_SELECTORS,
+    _click_add_password,
+    _click_password_add_by_geometry,
+    _click_profile_name_by_dom,
     _configure_camoufox_runtime_cache,
+    _click_first_visible,
     _fontconfig_generator_with_home,
+    _mfa_token_was_invalidated,
+    configure_passwordless_email_code_login,
+    configure_post_registration_password_setup,
+    configure_registration_profile_capture,
+    configure_resilient_registration_navigation,
+    configure_windowed_camoufox,
+    ensure_password_in_security_settings,
+    extract_session_without_navigation,
     resilient_force_fill_locator,
     safe_log_message,
 )
@@ -32,6 +47,603 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_mfa_invalidated_token_error_is_retryable(self):
+        self.assertTrue(
+            _mfa_token_was_invalidated(
+                RuntimeError(
+                    "创建 2FA 验证器失败：HTTP 401 · "
+                    "Your authentication token has been invalidated."
+                )
+            )
+        )
+        self.assertFalse(
+            _mfa_token_was_invalidated(RuntimeError("创建 2FA 验证器失败：HTTP 500"))
+        )
+
+    def test_existing_password_page_switches_to_email_code_login(self):
+        actions = []
+
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                actions.append("email_code")
+
+        class Collection:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class Page:
+            def locator(self, selector):
+                if "ワンタイムコードでログインする" in selector:
+                    return Collection([Candidate()])
+                return Collection([])
+
+        class Worker:
+            def __init__(self):
+                self.original_calls = 0
+                self.logs = []
+
+            def _fill_password_step(self, _page):
+                self.original_calls += 1
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        self.assertTrue(
+            configure_passwordless_email_code_login(worker, enabled=True)
+        )
+        worker._fill_password_step(Page())
+
+        self.assertEqual(actions, ["email_code"])
+        self.assertEqual(worker.original_calls, 0)
+        self.assertIn("一次性邮箱验证码登录", worker.logs[-1])
+
+    def test_registration_profile_name_is_captured_for_account_menu(self):
+        backend = SimpleNamespace(
+            random_profile=lambda: ("Mia Brown", "1997-09-18")
+        )
+        worker = SimpleNamespace()
+
+        self.assertTrue(configure_registration_profile_capture(backend, worker))
+        self.assertEqual(
+            backend.random_profile(), ("Mia Brown", "1997-09-18")
+        )
+        self.assertEqual(worker.registration_profile_name, "Mia Brown")
+
+    def test_japanese_password_row_add_action_is_selected(self):
+        actions = []
+
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                actions.append("password_add")
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def locator(self, selector):
+                if (
+                    selector.startswith("xpath=")
+                    and "normalize-space(.)='パスワード'" in selector
+                ):
+                    return Collection([Candidate()])
+                return Collection([])
+
+        self.assertTrue(_click_first_visible(Page(), ADD_PASSWORD_SELECTORS))
+        self.assertEqual(actions, ["password_add"])
+
+    def test_custom_japanese_password_row_is_clicked_through_dom(self):
+        calls = []
+
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                calls.append("trusted_click")
+
+        class Page:
+            def locator(self, selector):
+                if selector == '[data-hme-password-action="add"]':
+                    return SimpleNamespace(
+                        count=lambda: 1,
+                        nth=lambda _index: Candidate(),
+                    )
+                return SimpleNamespace(count=lambda: 0)
+
+            def evaluate(self, script, options):
+                self.assert_script = script
+                calls.append(options)
+                return {"state": "add", "marked": options["markAdd"]}
+
+        page = Page()
+        self.assertTrue(_click_add_password(page))
+        self.assertIn("パスワード", page.assert_script)
+        self.assertEqual(calls, [{"markAdd": True}, "trusted_click"])
+
+    def test_recorded_profile_name_is_clicked_through_dom(self):
+        calls = []
+
+        class Page:
+            def evaluate(self, script, name):
+                calls.append((script, name))
+                return True
+
+        self.assertTrue(_click_profile_name_by_dom(Page(), "Noah Allen"))
+        self.assertEqual(calls[0][1], "Noah Allen")
+        self.assertIn("aria-haspopup", calls[0][0])
+
+    def test_password_add_geometry_chooses_topmost_add_action(self):
+        clicked = []
+
+        class Page:
+            mouse = SimpleNamespace(
+                click=lambda x, y: clicked.append((x, y))
+            )
+
+            def evaluate(self, script):
+                self.script = script
+                return {"x": 1145.0, "y": 183.0, "top": 170.0, "right": 1190.0}
+
+        page = Page()
+        self.assertTrue(_click_password_add_by_geometry(page))
+        self.assertIn("passwordLabel", page.script)
+        self.assertEqual(clicked, [(1145.0, 183.0)])
+
+    def test_registration_retries_firefox_aborted_navigation(self):
+        calls = []
+        logs = []
+
+        class Page:
+            def goto(self, url, **_kwargs):
+                calls.append(url)
+                if len(calls) == 1:
+                    raise RuntimeError("Page.goto: NS_BINDING_ABORTED")
+                return "response"
+
+        class Worker:
+            def __init__(self):
+                self.log = logs.append
+
+            def _register(self, page, _context):
+                return page.goto(
+                    "https://auth.openai.com/api/accounts/authorize?secret=value"
+                )
+
+        worker = Worker()
+        page = Page()
+
+        self.assertTrue(configure_resilient_registration_navigation(worker))
+        self.assertEqual(worker._register(page, object()), "response")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("自动重定向打断", logs[0])
+        self.assertNotIn("secret=value", logs[0])
+
+    def test_registration_does_not_retry_real_navigation_error(self):
+        calls = []
+
+        class Page:
+            def goto(self, url, **_kwargs):
+                calls.append(url)
+                raise RuntimeError("Page.goto: net::ERR_PROXY_CONNECTION_FAILED")
+
+        class Worker:
+            log = staticmethod(lambda _message: None)
+
+            def _register(self, page, _context):
+                return page.goto("https://auth.openai.com/")
+
+        worker = Worker()
+        configure_resilient_registration_navigation(worker)
+
+        with self.assertRaisesRegex(RuntimeError, "ERR_PROXY_CONNECTION_FAILED"):
+            worker._register(Page(), object())
+        self.assertEqual(len(calls), 1)
+
+    def test_password_setup_runs_before_session_extraction(self):
+        events = []
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="new@icloud.com")
+                self._password_step_submitted = False
+
+            def _extract_session_info(self, context):
+                events.append(("session", context))
+                return {"access_token": "at-test"}
+
+        worker = Worker()
+
+        def ensure_password(
+            _backend,
+            target_worker,
+            _password,
+            *,
+            context,
+            force_reset_password=False,
+        ):
+            self.assertFalse(force_reset_password)
+            events.append(("password", context))
+            target_worker._password_step_submitted = True
+            return True
+
+        def extract_session(_worker, context):
+            events.append(("session_api", context))
+            return {"access_token": "at-test"}
+
+        with (
+            patch(
+                "hidemyemail_generator.openai_browser_bridge."
+                "ensure_password_in_security_settings",
+                side_effect=ensure_password,
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge."
+                "extract_session_without_navigation",
+                side_effect=extract_session,
+            ),
+        ):
+            configured = configure_post_registration_password_setup(
+                SimpleNamespace(),
+                worker,
+                "Strong!Password123",
+                enabled=True,
+            )
+            result = worker._extract_session_info("browser-context")
+
+        self.assertTrue(configured)
+        self.assertEqual(result, {"access_token": "at-test"})
+        self.assertEqual(
+            events,
+            [
+                ("password", "browser-context"),
+                ("session_api", "browser-context"),
+            ],
+        )
+
+    def test_session_is_read_without_opening_a_new_page(self):
+        class Response:
+            ok = True
+            status = 200
+
+            def json(self):
+                return {
+                    "accessToken": "at-test",
+                    "user": {"email": "new@icloud.com"},
+                }
+
+        class Request:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return Response()
+
+        request = Request()
+        context = SimpleNamespace(request=request)
+        logs = []
+        worker = SimpleNamespace(
+            account=SimpleNamespace(email="new@icloud.com"),
+            skip_storage_state_capture=True,
+            _chatgpt_session_email=lambda session: session["user"]["email"],
+            log=logs.append,
+        )
+
+        result = extract_session_without_navigation(worker, context)
+
+        self.assertEqual(result["access_token"], "at-test")
+        self.assertNotIn("storage_state_json", result)
+        self.assertEqual(len(request.calls), 1)
+        self.assertIn("/api/auth/session", request.calls[0][0])
+        self.assertIn("后台获取 Session", logs[-1])
+
+    def test_camoufox_bridge_forces_non_fullscreen_window(self):
+        calls = []
+
+        def original(playwright, *args, **kwargs):
+            calls.append((playwright, args, kwargs))
+            return "browser"
+
+        backend = SimpleNamespace(CamoufoxNewBrowser=original)
+
+        self.assertTrue(configure_windowed_camoufox(backend))
+        self.assertTrue(configure_windowed_camoufox(backend))
+        self.assertEqual(backend.CamoufoxNewBrowser("playwright"), "browser")
+        self.assertEqual(calls[0][2]["window"], (1280, 800))
+        self.assertTrue(
+            calls[0][2]["firefox_user_prefs"][
+                "dom.storageManager.prompt.testing"
+            ]
+        )
+        self.assertTrue(
+            calls[0][2]["firefox_user_prefs"][
+                "dom.storageManager.prompt.testing.allow"
+            ]
+        )
+
+        backend.CamoufoxNewBrowser(
+            "playwright",
+            window=(1024, 700),
+            firefox_user_prefs={"browser.cache.disk.enable": False},
+        )
+        self.assertEqual(calls[1][2]["window"], (1024, 700))
+        self.assertFalse(
+            calls[1][2]["firefox_user_prefs"]["browser.cache.disk.enable"]
+        )
+
+    def test_password_is_added_from_main_settings_security_flow(self):
+        class Candidate:
+            def __init__(self, page, kind, index=0):
+                self.page = page
+                self.kind = kind
+                self.index = index
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                self.page.actions.append(self.kind)
+                transitions = {
+                    "profile": "menu",
+                    "settings": "settings",
+                    "security": "security",
+                    "add_password": "password_form",
+                    "submit_password": "password_set",
+                }
+                self.page.state = transitions.get(self.kind, self.page.state)
+
+            def fill(self, value, **_kwargs):
+                self.page.password_values[self.index] = value
+
+            def input_value(self, **_kwargs):
+                return self.page.password_values[self.index]
+
+        class LocatorCollection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def __init__(self):
+                self.state = "new"
+                self.url = ""
+                self.actions = []
+                self.password_values = ["", ""]
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                self.state = "home" if url == "https://chatgpt.com/" else "security"
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, selector):
+                candidates = []
+                if self.state == "home" and selector == '[data-testid="profile-button"]':
+                    candidates = [Candidate(self, "profile")]
+                elif self.state == "menu" and selector == '[data-testid="settings-menu-item"]':
+                    candidates = [Candidate(self, "settings")]
+                elif self.state == "settings" and selector == '[data-testid="security-tab"]':
+                    candidates = [Candidate(self, "security")]
+                elif self.state == "security" and selector == '[data-testid="add-password-button"]':
+                    candidates = [Candidate(self, "add_password")]
+                elif self.state == "password_form" and selector == 'input[type="password"]':
+                    candidates = [
+                        Candidate(self, "password_input", 0),
+                        Candidate(self, "password_input", 1),
+                    ]
+                elif self.state == "password_form" and selector.startswith(
+                    'button[type="submit"]'
+                ):
+                    candidates = [Candidate(self, "submit_password")]
+                elif self.state == "password_set" and selector == (
+                    'button:has-text("Change password")'
+                ):
+                    candidates = [Candidate(self, "password_present")]
+                return LocatorCollection(candidates)
+
+        page = Page()
+        context = SimpleNamespace(
+            pages=[page],
+            new_page=lambda: self.fail("password setup must reuse the registration page"),
+        )
+        backend = SimpleNamespace(
+            KEPT_REGISTER_BROWSER_SESSIONS={
+                "new@icloud.com": (context, object(), "")
+            }
+        )
+        worker = SimpleNamespace(
+            account=SimpleNamespace(email="new@icloud.com"),
+            log=lambda message: None,
+        )
+
+        confirmed = ensure_password_in_security_settings(
+            backend,
+            worker,
+            "Strong!Password123",
+        )
+
+        self.assertTrue(confirmed)
+        self.assertTrue(worker._password_step_submitted)
+        self.assertEqual(
+            page.actions[:4],
+            ["profile", "settings", "security", "add_password"],
+        )
+        self.assertIn("submit_password", page.actions)
+        self.assertEqual(page.actions.count("profile"), 1)
+        self.assertEqual(
+            page.password_values,
+            ["Strong!Password123", "Strong!Password123"],
+        )
+
+    def test_password_setup_rejects_account_upgrade_offer(self):
+        class Candidate:
+            def __init__(self, page, kind, aria_label):
+                self.page = page
+                self.kind = kind
+                self.aria_label = aria_label
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def get_attribute(self, name, **_kwargs):
+                return self.aria_label if name == "aria-label" else ""
+
+            def inner_text(self, **_kwargs):
+                return self.aria_label
+
+            def text_content(self, **_kwargs):
+                return self.aria_label
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                self.page.actions.append(self.kind)
+                if self.kind == "profile":
+                    self.page.state = "menu"
+                elif self.kind == "settings":
+                    self.page.state = "settings"
+                elif self.kind == "security":
+                    self.page.state = "security"
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def __init__(self):
+                self.url = "https://chatgpt.com/"
+                self.state = "home"
+                self.actions = []
+                self.keyboard = SimpleNamespace(press=lambda _key: None)
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                self.state = "home"
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, selector):
+                candidates = []
+                if self.state == "home" and selector == 'button[aria-haspopup="menu"]':
+                    candidates = [
+                        Candidate(self, "offer", "Upgrade account special offer"),
+                        Candidate(self, "profile", "Account menu"),
+                    ]
+                elif self.state == "menu" and selector == '[data-testid="settings-menu-item"]':
+                    candidates = [Candidate(self, "settings", "Settings")]
+                elif self.state == "settings" and selector == '[data-testid="security-tab"]':
+                    candidates = [Candidate(self, "security", "Security")]
+                elif self.state == "security" and selector == '[data-testid="add-password-button"]':
+                    candidates = [Candidate(self, "add_password", "Add password")]
+                return Collection(candidates)
+
+        page = Page()
+        worker = SimpleNamespace(log=lambda _message: None)
+
+        from hidemyemail_generator.openai_browser_bridge import (
+            _open_security_settings,
+        )
+
+        self.assertTrue(_open_security_settings(page, worker))
+        self.assertNotIn("offer", page.actions)
+        self.assertEqual(page.actions[:3], ["profile", "settings", "security"])
+
+    def test_password_setup_closes_extra_tabs_and_keeps_one_chatgpt_page(self):
+        class Page:
+            def __init__(self, url):
+                self.url = url
+                self.closed = False
+                self.front = False
+
+            def is_closed(self):
+                return self.closed
+
+            def close(self):
+                self.closed = True
+
+            def bring_to_front(self):
+                self.front = True
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, _selector):
+                return SimpleNamespace(count=lambda: 0)
+
+        auth_page = Page("https://auth.openai.com/email-verification")
+        old_chatgpt_page = Page("https://chatgpt.com/")
+        active_chatgpt_page = Page("https://chatgpt.com/?model=auto")
+        context = SimpleNamespace(
+            pages=[auth_page, old_chatgpt_page, active_chatgpt_page],
+            new_page=lambda: self.fail("an existing ChatGPT page must be reused"),
+        )
+        worker = SimpleNamespace(
+            account=SimpleNamespace(email="new@icloud.com"),
+            log=lambda _message: None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "安全设置"):
+            ensure_password_in_security_settings(
+                SimpleNamespace(),
+                worker,
+                "Strong!Password123",
+                context=context,
+            )
+
+        self.assertTrue(auth_page.closed)
+        self.assertTrue(old_chatgpt_page.closed)
+        self.assertFalse(active_chatgpt_page.closed)
+        self.assertTrue(active_chatgpt_page.front)
+
     def test_manual_account_type_is_not_overwritten_by_session_plan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"

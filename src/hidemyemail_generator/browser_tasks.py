@@ -264,6 +264,12 @@ class BrowserTaskManager:
         state["runtime"] = self.availability()
         return state
 
+    def reset(self) -> dict[str, Any]:
+        if self._batch_task and not self._batch_task.done():
+            raise RuntimeError("浏览器获取任务正在运行")
+        self._state = self._idle_state()
+        return self.snapshot()
+
     def start(
         self,
         accounts: list[dict[str, Any]],
@@ -290,6 +296,9 @@ class BrowserTaskManager:
                     "email": email,
                     "password": str(account.get("password") or ""),
                     "ensure_password": bool(account.get("ensure_password", False)),
+                    "force_reset_password": bool(
+                        account.get("force_reset_password", False)
+                    ),
                     "enable_2fa": bool(account.get("enable_2fa", False)),
                     "two_factor": account.get("two_factor")
                     if isinstance(account.get("two_factor"), dict)
@@ -320,6 +329,7 @@ class BrowserTaskManager:
                     "latestLog": "",
                     "_password": item["password"],
                     "_ensure_password": item["ensure_password"],
+                    "_force_reset_password": item["force_reset_password"],
                     "_password_confirmed": False,
                     "_enable_2fa": item["enable_2fa"],
                     "_two_factor": item["two_factor"],
@@ -419,6 +429,9 @@ class BrowserTaskManager:
                     "HME_OPENAI_PASSWORD": str(item.get("_password") or ""),
                     "HME_ENSURE_OPENAI_PASSWORD": "1"
                     if item.get("_ensure_password")
+                    else "0",
+                    "HME_FORCE_RESET_OPENAI_PASSWORD": "1"
+                    if item.get("_force_reset_password")
                     else "0",
                     "HME_ENABLE_OPENAI_2FA": "1"
                     if item.get("_enable_2fa")

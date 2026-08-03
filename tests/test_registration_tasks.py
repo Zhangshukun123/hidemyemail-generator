@@ -8,6 +8,7 @@ from hidemyemail_generator.registration_tasks import generate_openai_password
 class FakeBrowserManager:
     def __init__(self):
         self.started_accounts = []
+        self.reset_count = 0
         self.state = {
             "status": "idle",
             "running": False,
@@ -20,6 +21,16 @@ class FakeBrowserManager:
 
     def snapshot(self):
         return dict(self.state)
+
+    def reset(self):
+        self.reset_count += 1
+        self.state.update(
+            status="idle",
+            running=False,
+            succeeded=0,
+            accounts=[],
+        )
+        return self.snapshot()
 
     def start(self, accounts, *, headless, concurrency):
         self.started_accounts = accounts
@@ -81,6 +92,7 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(browser.started_accounts[0]["ensure_password"])
         self.assertGreaterEqual(len(browser.started_accounts[0]["password"]), 16)
         self.assertTrue(browser.state["headless"])
+        self.assertEqual(browser.reset_count, 1)
 
 
 if __name__ == "__main__":
