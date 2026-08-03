@@ -45,6 +45,7 @@ from .registration_tasks import RegistrationTaskManager, generate_openai_passwor
 SESSION_COOKIE_NAME = "hme_session"
 SESSION_MAX_AGE = 12 * 60 * 60
 PUBLIC_PATHS = {"/login", "/api/login", "/healthz"}
+WORKBENCH_OPENAI_CODE_PATH = "/api/integrations/workbench/openai-code"
 
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -1868,6 +1869,14 @@ def _local_token_valid(request: web.Request, app: web.Application) -> bool:
     )
 
 
+def _workbench_import_token_valid(
+    request: web.Request, app: web.Application
+) -> bool:
+    configured = str(app.get("workbench_import_token") or "")
+    supplied = str(request.headers.get("X-HME-Import-Token") or "")
+    return bool(configured) and hmac.compare_digest(supplied, configured)
+
+
 def _session_valid(request: web.Request) -> bool:
     if not request.app["web_password"]:
         return True
@@ -1881,7 +1890,14 @@ def _session_valid(request: web.Request) -> bool:
 async def auth_middleware(
     request: web.Request, handler
 ) -> web.StreamResponse:
-    if request.path in PUBLIC_PATHS or _session_valid(request):
+    if (
+        request.path in PUBLIC_PATHS
+        or (
+            request.path == WORKBENCH_OPENAI_CODE_PATH
+            and _workbench_import_token_valid(request, request.app)
+        )
+        or _session_valid(request)
+    ):
         return await handler(request)
     if request.path.startswith("/api/"):
         return web.json_response(
@@ -2843,29 +2859,29 @@ def create_app(
                 }
             )
 
-    async def gpt_code(request: web.Request) -> web.Response:
+    async def resolve_gpt_code(
+        email: str, since: str
+    ) -> tuple[dict | None, str, int]:
         nonlocal gpt_code_identity_cache, gpt_code_identity_cache_at
-        if not _local_token_valid(request, app):
-            return web.json_response(
-                {"ok": False, "error": "本地请求令牌无效"}, status=403
-            )
-        try:
-            payload = await request.json()
-        except (json.JSONDecodeError, web.HTTPBadRequest):
-            return web.json_response(
-                {"ok": False, "error": "请求格式无效"}, status=400
-            )
-        email = str(payload.get("email") or "").strip().lower()
-        since = str(payload.get("since") or "").strip()
         if not email.endswith("@icloud.com") or len(email) > 320:
-            return web.json_response(
-                {"ok": False, "error": "邮箱地址无效"}, status=400
-            )
+            return None, "邮箱地址无效", 400
         config_path: Path = app["inbox_config_file"]
         if not config_path.exists():
-            return web.json_response(
-                {"ok": False, "error": "iCloud 收件箱尚未配置"}, status=503
-            )
+            return None, "iCloud 收件箱尚未配置", 503
+
+        # The background inbox task normally has the newest message already.
+        # Check the local database first so the workbench button responds without
+        # waiting for another IMAP round trip when possible.
+        item = await asyncio.to_thread(
+            _latest_gpt_code,
+            app["db_file"],
+            email,
+            gpt_code_identity_cache,
+            since,
+        )
+        if item:
+            return item, "", 200
+
         try:
             config = load_config(str(config_path))
             async with app["inbox_sync_lock"]:
@@ -2873,17 +2889,16 @@ def create_app(
                     sync_inbox, config, str(app["db_file"]), 30
                 )
         except Exception as error:
-            return web.json_response(
-                {"ok": False, "error": _inbox_error_message(error)}, status=502
-            )
-        if not gpt_code_identity_cache or time.monotonic() - gpt_code_identity_cache_at > 120:
+            return None, _inbox_error_message(error), 502
+        if (
+            not gpt_code_identity_cache
+            or time.monotonic() - gpt_code_identity_cache_at > 120
+        ):
             try:
                 gpt_code_identity_cache = await active_icloud_identities()
                 gpt_code_identity_cache_at = time.monotonic()
             except RuntimeError as error:
-                return web.json_response(
-                    {"ok": False, "error": str(error)}, status=502
-                )
+                return None, str(error), 502
         item = await asyncio.to_thread(
             _latest_gpt_code,
             app["db_file"],
@@ -2892,9 +2907,57 @@ def create_app(
             since,
         )
         if not item:
+            return None, "暂未获取到该邮箱的 OpenAI 验证码", 404
+        return item, "", 200
+
+    async def openai_code_payload(
+        request: web.Request,
+    ) -> tuple[dict | None, web.Response | None]:
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return None, web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        if not isinstance(payload, dict):
+            return None, web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        return payload, None
+
+    async def gpt_code(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
             return web.json_response(
-                {"ok": False, "error": "暂未获取到该邮箱的 OpenAI 验证码"},
-                status=404,
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        payload, error_response = await openai_code_payload(request)
+        if error_response is not None:
+            return error_response
+        email = str(payload.get("email") or "").strip().lower()
+        since = str(payload.get("since") or "").strip()
+        item, error, status = await resolve_gpt_code(email, since)
+        if not item:
+            return web.json_response(
+                {"ok": False, "error": error}, status=status
+            )
+        return web.json_response(
+            {"ok": True, **item}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def workbench_openai_code(request: web.Request) -> web.Response:
+        if not _workbench_import_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "工作台认证失败"}, status=401
+            )
+        payload, error_response = await openai_code_payload(request)
+        if error_response is not None:
+            return error_response
+        email = str(payload.get("email") or "").strip().lower()
+        since = str(payload.get("since") or "").strip()
+        item, error, status = await resolve_gpt_code(email, since)
+        if not item:
+            return web.json_response(
+                {"ok": False, "error": error}, status=status
             )
         return web.json_response(
             {"ok": True, **item}, headers={"Cache-Control": "no-store"}
@@ -3500,6 +3563,7 @@ def create_app(
     )
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
+    app.router.add_post(WORKBENCH_OPENAI_CODE_PATH, workbench_openai_code)
     app.router.add_get("/api/browser/status", browser_status)
     app.router.add_post("/api/browser/fetch-all", browser_fetch_all)
     app.router.add_post("/api/browser/fetch-selected", browser_fetch_selected)

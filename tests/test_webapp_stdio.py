@@ -6,9 +6,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from aiohttp.test_utils import TestClient, TestServer
 from rich.console import Console
 
 from hidemyemail_generator.webapp import (
+    WORKBENCH_OPENAI_CODE_PATH,
     _configure_utf8_stdio,
     _generation_failure_message,
     _load_local_env_file,
@@ -104,6 +106,41 @@ class WebAppStdioTests(unittest.TestCase):
                 app["browser_manager"].target_project_dir,
                 packaged.resolve(),
             )
+
+
+class WorkbenchOpenAICodeEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        app = create_app(
+            base_dir=Path(self.temp_dir.name),
+            web_password="web-password",
+            workbench_import_token="shared-workbench-token",
+        )
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp_dir.cleanup()
+
+    async def test_shared_token_bypasses_web_login_but_still_validates_email(self):
+        response = await self.client.post(
+            WORKBENCH_OPENAI_CODE_PATH,
+            json={"email": "not-an-icloud-address"},
+            headers={"X-HME-Import-Token": "shared-workbench-token"},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"], "邮箱地址无效")
+
+    async def test_missing_shared_token_cannot_use_workbench_endpoint(self):
+        response = await self.client.post(
+            WORKBENCH_OPENAI_CODE_PATH,
+            json={"email": "one@icloud.com"},
+        )
+
+        self.assertEqual(response.status, 401)
+        self.assertEqual((await response.json())["error"], "请先登录")
 
 
 if __name__ == "__main__":
