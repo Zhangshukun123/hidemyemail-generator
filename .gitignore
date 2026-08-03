@@ -2,6 +2,8 @@
 .env
 venv/
 .venv/
+.build/
+.swiftpm/
 .cookie-browser-profile/
 build/
 dist/
@@ -16,3 +18,12 @@ cookies.txt.bak
 icloud_cookies.txt
 **/.DS_Store
 *.spec
+# Android local and build files
+android/.gradle/
+android/.idea/
+android/local.properties
+android/app/build/
+android/build/
+android/*.apk
+android/*.aab
+android/*.png

@@ -2278,9 +2278,10 @@ def create_app(
                 region=app["region"],
                 db_file=str(app["db_file"]),
             )
-        if not generated:
+        emails = generated.get("emails", [])
+        if not generated.get("ok") or not emails:
             raise RuntimeError("未能生成地址，可能触发了 Apple 频率限制")
-        return str(generated[0] or "").strip().lower()
+        return str(emails[0] or "").strip().lower()
 
     async def confirm_registration_email(email: str) -> None:
         last_error = ""
@@ -3119,11 +3120,12 @@ def create_app(
                 region=app["region"],
                 db_file=str(app["db_file"]),
             )
-        if not generated:
+        emails = generated.get("emails", [])
+        if not generated.get("ok") or not emails:
             return web.json_response(
                 {"ok": False, "error": "未能生成地址，可能触发了 Apple 频率限制"}, status=502
             )
-        return web.json_response({"ok": True, "emails": list(generated)})
+        return web.json_response({"ok": True, "emails": list(emails)})
 
     async def inbox_status(_: web.Request) -> web.Response:
         config_path: Path = app["inbox_config_file"]

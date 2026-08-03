@@ -1,40 +1,72 @@
 <p align="center">
-  <img width="64%" src="docs/header.png" alt="HideMyEmail Generator">
+  <img width="180" src="docs/app-icon.png" alt="HideMyEmail Generator app icon">
 </p>
 
 <h1 align="center">HideMyEmail Generator</h1>
 
 <p align="center">
-  Generate, reserve, and manage iCloud Hide My Email addresses from a local CLI.
+  Generate, reserve, and manage iCloud Hide My Email addresses from a native macOS app, optional Android companion, or local CLI.
   <br>
-  Includes a Windows launcher, iCloud China support, local inbox, and automated cookie capture.
+  Includes native macOS sign-in, an Android client, a Windows launcher, iCloud China support, and a local inbox.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776ab?logo=python&logoColor=white">
-  <a href="https://github.com/rtunazzz/hidemyemail-generator/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/rtunazzz/hidemyemail-generator?logo=github"></a>
-  <a href="https://github.com/rtunazzz/hidemyemail-generator/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/rtunazzz/hidemyemail-generator/total?logo=github"></a>
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/rtunazzz/hidemyemail-generator?logo=github"></a>
+  <a href="../../releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/rtunazzz/hidemyemail-generator/total?logo=github"></a>
 </p>
 
 <p align="center">
   <strong>English</strong>
   ·
   <a href="./README.zh-CN.md">简体中文</a>
+  ·
+  <a href="./README.ru.md">Русский</a>
 </p>
 
 > You need an active iCloud+ subscription to generate Hide My Email addresses.
 
+## App Preview
+
+<p align="center">
+  <a href="../../releases/latest/download/HideMyEmail-Generator-macOS-Apple-Silicon.dmg"><strong>Download for Apple Silicon (.dmg)</strong></a>
+  ·
+  <a href="../../releases/latest/download/HideMyEmail-Generator-macOS-Intel.dmg"><strong>Download for Intel (.dmg)</strong></a>
+</p>
+
+<p align="center">
+  <img width="100%" src="docs/screenshots/generate.png" alt="Generate Hide My Email addresses from the native macOS app">
+</p>
+
+- Generate one address or a batch with a custom label.
+- Manage local `unused`, `used`, and `trash` addresses alongside the live active
+  or inactive iCloud inventory.
+- Connect a receiving mailbox, sync forwarded messages, and copy extracted
+  verification codes without leaving the app.
+- Copy individual addresses, copy everything, or export local history and CSV data.
+- Schedule larger batches; the app pauses and resumes when Apple rate-limits creation.
+- Sign in natively, keep the session in Keychain, and see connection status at a glance.
+- Keep everything private: address history stays local and the app collects no telemetry.
+
+<p align="center">
+  <img width="49%" src="docs/screenshots/addresses.png" alt="Local address manager with state, source, copy, sync, and export controls">
+  <img width="49%" src="docs/screenshots/inbox.png" alt="Local inbox with message context and extracted verification codes">
+</p>
+
 ## Overview
 
-HideMyEmail Generator is a local command-line utility for Apple's iCloud Hide My
-Email service. It generates and reserves new addresses, lists active or inactive
-ones, and inspects the account behind the currently saved iCloud cookie.
+HideMyEmail Generator is a local macOS app, optional Android companion, and command-line utility for Apple's
+iCloud Hide My Email service. It generates and reserves new addresses, lists
+active or inactive ones, and inspects the account behind the current iCloud
+session.
 
 Alongside the basics it provides:
 
 - region-aware iCloud API targeting for `global` and `china`;
 - automatic iCloud partition detection;
+- a native SwiftUI macOS app with in-app iCloud sign-in;
+- an optional Android client for phone-first alias management;
 - a one-click Windows launcher;
 - bilingual English / Simplified Chinese launcher and CLI output;
 - account-aware cookie management with browser-assisted capture;
@@ -45,8 +77,11 @@ Alongside the basics it provides:
 
 ## Contents
 
+- [App Preview](#app-preview)
 - [Highlights](#highlights)
 - [Quick Start](#quick-start)
+- [macOS App](#macos-app)
+- [Android App](#android-app)
 - [Windows Launcher](#windows-launcher)
 - [CLI Reference](#cli-reference)
 - [Cookie Management](#cookie-management)
@@ -69,6 +104,8 @@ Alongside the basics it provides:
 | Account check | Show the Apple ID, DSID, user partition, and Hide My Email availability for the saved cookie. |
 | iCloud China support | Use `icloud.com.cn` origins, setup validation, and maildomain hosts. |
 | Partition detection | Derive the correct `pNNN-maildomainws` host from captured requests or account validation. |
+| Native macOS app | Generate batches, browse and export local history, and automatically wait through rate limits. |
+| Android app | Phone-first companion for global and China iCloud, alias generation, and local address-state tracking. |
 | Windows launcher | Double-click menu for generation, listing, and cookie management. |
 | Bilingual UI | Launcher and CLI help include English and Simplified Chinese text. |
 | Cookie capture | Open iCloud Plus, click Hide My Email, capture the app request, and save the cookie locally. |
@@ -80,12 +117,20 @@ Alongside the basics it provides:
 
 ### Download a prebuilt binary
 
-Grab a standalone binary from the [latest release](https://github.com/rtunazzz/hidemyemail-generator/releases/latest) — no Python or `uv` required.
+Grab a standalone binary from the [latest release](../../releases/latest) — no Python or `uv` required.
 
 - **Windows:** download `hidemyemail-windows.exe`. Double-click it to open the interactive menu, or run it from a terminal with arguments for CLI usage (`hidemyemail-windows.exe --help`).
-- **macOS:** download `hidemyemail-macos`, then `chmod +x hidemyemail-macos`. Run with no arguments to open the menu, or pass arguments for the CLI. The binary is unsigned, so the first launch is blocked by Gatekeeper — right-click it in Finder and choose **Open** to allow it.
+- **macOS app:** download the
+  [Apple Silicon DMG](../../releases/latest/download/HideMyEmail-Generator-macOS-Apple-Silicon.dmg)
+  for M-series Macs or the
+  [Intel DMG](../../releases/latest/download/HideMyEmail-Generator-macOS-Intel.dmg)
+  for Intel Macs, then right-click the app and choose **Open** the first time.
+- **macOS CLI:** download `hidemyemail-macos` for Apple Silicon or `hidemyemail-macos-x86_64` for Intel. Make it executable with `chmod +x`, then run it from Terminal.
+- **Android app:** build the source under [`android/`](android/).
 
-The prebuilt binaries use manual cookie capture; automatic capture (Playwright) is only available when running from source.
+The native app captures its own iCloud session after you sign in. Prebuilt CLI
+binaries still use manual cookie capture; Playwright capture is available only
+when running the CLI from source.
 
 ### Run from source
 
@@ -100,6 +145,86 @@ On Windows, double-click `start-hidemyemail.bat`. For direct CLI usage:
 ```bash
 uv run hidemyemail --help
 ```
+
+## macOS App
+
+The app requires macOS 13 or newer. It bundles the CLI helper, so Python and
+`uv` are not required.
+
+1. Open the app and choose **Connect iCloud**.
+2. Complete Apple's system account prompt or fallback sign-in form. The iCloud
+   session is captured from the authenticated Hide My Email request before its
+   page loads. The window closes automatically when the session validates.
+3. Use **Generate** for one address or a batch, manage local and live iCloud
+   inventory from **Addresses**, connect a receiving mailbox under **Inbox**,
+   or use **Scheduler** to create addresses at a configurable interval until a
+   target is reached.
+
+The session cookie is validated locally and stored in macOS Keychain. Every
+helper invocation receives it through an owner-only temporary file that is
+deleted immediately afterward. Generated addresses are also appended to
+`~/Library/Application Support/HideMyEmail Generator/emails.txt`. The
+**History** scope stores each address, label, and generation time in a local
+owner-only history file. Address workflow state, inbox metadata, and extracted
+codes stay in `hidemyemail.db` in the same Application Support directory.
+
+The app stores an optional IMAP password or app password in macOS Keychain and
+keeps only non-secret inbox settings in app preferences. It creates an
+owner-only temporary CLI config for each inbox sync and deletes it immediately.
+This is intentionally separate from the CLI's `inbox_config.json` workflow.
+
+If Apple rate-limits creation, the app preserves completed addresses, shows a
+countdown, and retries after at least 30 minutes while the app remains open.
+Use **Import Cookie File…** only if embedded sign-in does not provide the
+required cookie.
+
+To build the unsigned app from source:
+
+```bash
+scripts/build-macos-app.sh "$(uname -m)"
+```
+
+Run this after every change to the Swift app. It removes and regenerates the
+matching app under `build/` and its ZIP and DMG under `dist/`, so those folders
+never continue to serve an older UI.
+
+The script builds one exact architecture and refuses cross-architecture
+packaging. Run it on Apple Silicon for the Apple Silicon app and on an Intel
+Mac (or the matching GitHub runner) for the Intel app.
+
+### Releasing
+
+macOS updates use Sparkle and are published only from version tags. The
+verification public key is embedded in `macos/Info.plist`.
+
+1. Bump the version in `pyproject.toml`, `uv.lock`, and `macos/Info.plist`.
+2. Merge the tested change to `main`.
+3. Tag that commit with the matching `v`-prefixed version, such as `v2.1.1`.
+
+The release workflow rejects mismatched tags or a missing signing key, builds
+both Mac architectures, signs their appcasts, and publishes only after every
+artifact passes.
+
+## Android App
+
+The optional Android client targets Android 6.0 (API 23) or newer and gives
+Android users a phone-first interface for their own iCloud+ Hide My Email
+aliases. It supports global and China iCloud endpoints, raw `Cookie` header or
+browser **Copy as cURL** import, account validation, alias generation,
+active/inactive address lists, editable labels and notes, deactivate/reactivate
+controls, and local `unused` / `used` / `trash` tracking. The UI follows the
+device language with English and Simplified Chinese resources.
+
+Build it from this repository with:
+
+```bash
+cd android
+bash ./gradlew testDebugUnitTest
+bash ./gradlew assembleDebug
+```
+
+On Windows, use `./gradlew.bat` instead. The debug APK is written to
+`android/app/build/outputs/apk/debug/app-debug.apk`.
 
 ## Windows Launcher
 
@@ -166,6 +291,7 @@ Options:
 | `--output` | File used to append generated addresses. Defaults to `emails.txt`. |
 | `--no-output-file` | Print results without writing to an output file. |
 | `--region` | `global` (default) or `china`. |
+| `--result-json` | Write a machine-readable result for integrations such as the macOS app. |
 
 ### List
 
@@ -173,6 +299,21 @@ Options:
 uv run hidemyemail list --active --cookie-file cookies.txt
 uv run hidemyemail list --inactive --cookie-file cookies.txt
 ```
+
+### Manage an Address
+
+```bash
+uv run hidemyemail deactivate abc123@icloud.com
+uv run hidemyemail reactivate abc123@icloud.com
+uv run hidemyemail update-metadata abc123@icloud.com --label "Newsletter" --note "Signed up 2026-07"
+```
+
+Deactivating stops an address from forwarding mail without giving up the address;
+it stays on your account and can be reactivated later. `update-metadata` keeps
+whichever of `--label` / `--note` you leave out.
+
+Each command looks the address up by its email, so no identifier is needed. That
+costs one extra `list` call per invocation.
 
 ### Account Check
 
@@ -395,6 +536,10 @@ These files are local-only and ignored by Git:
 ## Security and Privacy
 
 - Cookies are stored locally and ignored by Git.
+- The macOS app stores its validated session in Keychain and never stores or logs the Apple Account password.
+- IMAP secrets entered in the macOS app are stored in Keychain, never in app preferences or process arguments.
+- The macOS app uses owner-only temporary cookie files and deletes them after each helper invocation.
+- The macOS app contains no analytics, telemetry, advertising, or crash-reporting SDK. It connects only to Apple's iCloud endpoints and, when Inbox is configured, the user's chosen IMAP server.
 - IMAP configuration and local mailbox data are stored locally and ignored by Git.
 - Automatic capture uses a separate browser profile.
 - The project does not intentionally collect, upload, or share your cookies, email data, or verification codes.
@@ -407,6 +552,9 @@ Apple may rate-limit Hide My Email creation. Observed limits are roughly
 `5 * number of people in your iCloud family` new addresses every 30 minutes,
 with a total cap around 700 addresses.
 
+The macOS app does not bypass this limit. It generates sequentially and resumes
+after a cooldown when Apple returns error `-41015`.
+
 ## Disclaimer
 
 This project is an independent community tool and is not affiliated with,
@@ -415,7 +563,7 @@ trademarks of Apple Inc.
 
 ## Acknowledgements
 
-- iCloud China support, the Windows launcher, and the local inbox were
+- iCloud China support, the Windows launcher, local inbox, and Android companion were
   contributed by [@never-seek](https://github.com/never-seek).
 - Thanks to all other [community contributors](https://github.com/rtunazzz/hidemyemail-generator/graphs/contributors).
 

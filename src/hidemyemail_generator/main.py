@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -58,6 +59,69 @@ HIDEMYEMAIL_APP_PATH = "/applications/hidemyemail/current/"
 
 def maildomain_suffix(region: str) -> str:
     return "com.cn" if region == "china" else "com"
+
+
+def bridge_error(response: dict | None) -> dict:
+    if not response:
+        return {"code": None, "message": "Empty response from iCloud", "retry_after": None}
+
+    error = response.get("error")
+    if isinstance(error, dict):
+        code = error.get("errorCode")
+        if code is None:
+            code = error.get("code")
+        message = (
+            error.get("errorMessage")
+            or error.get("message")
+            or response.get("reason")
+            or "Unknown error"
+        )
+        retry_after = error.get("retryAfter")
+    else:
+        code = error if isinstance(error, int) else None
+        message = response.get("reason") or str(error or "Unknown error")
+        retry_after = response.get("retryAfter")
+
+    return {
+        "code": str(code) if code is not None else None,
+        "message": str(message),
+        "retry_after": retry_after if isinstance(retry_after, (int, float)) else None,
+    }
+
+
+def write_result_json(result_file: str | None, payload: dict) -> None:
+    if result_file:
+        path = Path(result_file)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        path.chmod(0o600)
+
+
+def account_summary(account: dict) -> dict:
+    ds_info = account.get("dsInfo", {})
+    full_name = ds_info.get("fullName") or " ".join(
+        part for part in [ds_info.get("firstName"), ds_info.get("lastName")] if part
+    )
+    maildomain = account.get("webservices", {}).get("maildomainws", {})
+    maildomain_host = (
+        account.get("detectedMaildomainHost") or maildomain.get("url") or ""
+    )
+    maildomain_host = re.sub(r"^https?://", "", maildomain_host).split("/", 1)[0]
+    user_partition = account.get("userPartition")
+    try:
+        user_partition = int(user_partition) if user_partition is not None else None
+    except (TypeError, ValueError):
+        user_partition = None
+
+    return {
+        "apple_id": ds_info.get("appleId") or "Unknown",
+        "name": full_name or "Unknown",
+        "dsid": str(ds_info.get("dsid")) if ds_info.get("dsid") is not None else None,
+        "user_partition": user_partition,
+        "maildomain_host": maildomain_host,
+        "hide_my_email_available": bool(
+            ds_info.get("isHideMyEmailFeatureAvailable")
+        ),
+    }
 
 
 def load_cookie_context(cookie_file: str, region: str) -> tuple[str, str]:
@@ -141,13 +205,7 @@ async def fetch_account_info(cookie_file: str, region: str) -> dict:
 async def fetch_account_info_from_cookie(
     cookie: str, region: str, maildomain_host: str = ""
 ) -> dict:
-    headers = {
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-        "Origin": HideMyEmail.REGION_CONFIG[region]["web_origin"],
-        "Referer": f"{HideMyEmail.REGION_CONFIG[region]['web_origin']}/",
-        "Accept": "*/*",
-    }
+    headers = HideMyEmail.browser_headers(region, cookie)
     connector = aiohttp.TCPConnector(
         ssl_context=ssl.create_default_context(cafile=certifi.where())
     )
@@ -218,6 +276,7 @@ class RichHideMyEmail(HideMyEmail):
         self.table = Table()
         self._output_file = output_file
         self._no_output_file = no_output_file
+        self.last_error = None
 
         if not os.path.exists(cookie_file):
             self.console.log(
@@ -232,17 +291,13 @@ class RichHideMyEmail(HideMyEmail):
         self, response: dict, action: str, email: Optional[str] = None
     ) -> bool:
         if not response:
+            self.last_error = bridge_error(response)
             return False
         if "success" not in response or not response["success"]:
-            error = response.get("error", {})
-            err_msg = "Unknown"
-            if isinstance(error, int) and "reason" in response:
-                err_msg = response["reason"]
-            elif isinstance(error, dict) and "errorMessage" in error:
-                err_msg = error["errorMessage"]
+            self.last_error = bridge_error(response)
             email_prefix = f' "{email}"' if email else ""
             self.console.log(
-                f"[bold red][ERR][/]{email_prefix} - Failed to {action}. 失败原因: {err_msg}"
+                f"[bold red][ERR][/]{email_prefix} - Failed to {action}. 失败原因: {self.last_error['message']}"
             )
             return False
         return True
@@ -276,9 +331,15 @@ class RichHideMyEmail(HideMyEmail):
 
     async def generate(self, label: str, count: int) -> List[str]:
         try:
+            self.last_error = None
             emails = []
             self.console.rule()
             if count < 1:
+                self.last_error = {
+                    "code": None,
+                    "message": "Count should be >= 1",
+                    "retry_after": None,
+                }
                 self.console.log("Count should be >= 1 / 数量必须大于等于 1")
                 return emails
             self.console.log(f"Generating {count} email(s)... / 正在生成 {count} 个邮箱...")
@@ -313,20 +374,33 @@ class RichHideMyEmail(HideMyEmail):
         except KeyboardInterrupt:
             return []
 
-    async def list(self, label_query: Optional[str], active: bool) -> None:
+    async def list(self, label_query: Optional[str], active: bool) -> dict:
         gen_res = await self.list_email()
         if not self._check_response(gen_res, "list emails"):
-            return
+            return {"ok": False, "addresses": [], "error": self.last_error}
 
         self.table.add_column("Label / 标签")
         self.table.add_column("Hide My Email / 隐藏邮箱")
         self.table.add_column("Created At / 创建时间")
         self.table.add_column("Is Active / 使用中")
 
+        addresses = []
         for row in gen_res["result"]["hmeEmails"]:
             if row["isActive"] == active and (
                 label_query is None or re.search(label_query, row["label"])
             ):
+                created_at = datetime.datetime.fromtimestamp(
+                    row["createTimestamp"] / 1000, tz=datetime.timezone.utc
+                ).isoformat()
+                addresses.append(
+                    {
+                        "email": row["hme"],
+                        "label": row["label"],
+                        "created_at": created_at,
+                        "is_active": bool(row["isActive"]),
+                        "anonymous_id": row.get("anonymousId") or "",
+                    }
+                )
                 self.table.add_row(
                     row["label"],
                     row["hme"],
@@ -335,6 +409,88 @@ class RichHideMyEmail(HideMyEmail):
                 )
 
         self.console.print(self.table)
+        return {"ok": True, "addresses": addresses, "error": None}
+
+    async def _resolve(self, email: str) -> Optional[dict]:
+        """Looks up the iCloud record for an address, needed for its anonymousId."""
+        gen_res = await self.list_email()
+        if not self._check_response(gen_res, "list emails"):
+            return None
+
+        for row in gen_res["result"]["hmeEmails"]:
+            if row.get("hme") != email:
+                continue
+            if not row.get("anonymousId"):
+                self.last_error = {
+                    "code": None,
+                    "message": f'iCloud returned no identifier for "{email}"',
+                    "retry_after": None,
+                }
+                self.console.log(f"[bold red][ERR][/] {self.last_error['message']}")
+                return None
+            return row
+
+        self.last_error = {
+            "code": None,
+            "message": f'No Hide My Email address matching "{email}"',
+            "retry_after": None,
+        }
+        self.console.log(
+            f'[bold red][ERR][/] {self.last_error["message"]} / 未找到匹配的隐藏邮箱'
+        )
+        return None
+
+    async def set_active(self, email: str, active: bool) -> dict:
+        self.last_error = None
+        row = await self._resolve(email)
+        if row is None:
+            return {"ok": False, "email": email, "is_active": None, "error": self.last_error}
+
+        action = "reactivate" if active else "deactivate"
+        call = self.reactivate_email if active else self.deactivate_email
+        res = await call(row["anonymousId"])
+        if not self._check_response(res, f"{action} email", email):
+            return {"ok": False, "email": email, "is_active": None, "error": self.last_error}
+
+        self.console.log(
+            f'[bold green][OK][/] "{email}" - Successfully {action}d / 操作成功'
+        )
+        return {"ok": True, "email": email, "is_active": active, "error": None}
+
+    async def update_metadata(
+        self, email: str, label: Optional[str], note: Optional[str]
+    ) -> dict:
+        self.last_error = None
+        row = await self._resolve(email)
+        if row is None:
+            return {
+                "ok": False,
+                "email": email,
+                "label": None,
+                "note": None,
+                "error": self.last_error,
+            }
+
+        new_label = label if label is not None else row.get("label") or ""
+        new_note = note if note is not None else row.get("note") or ""
+        res = await self.update_email_metadata(row["anonymousId"], new_label, new_note)
+        if not self._check_response(res, "update email metadata", email):
+            return {
+                "ok": False,
+                "email": email,
+                "label": None,
+                "note": None,
+                "error": self.last_error,
+            }
+
+        self.console.log(f'[bold green][OK][/] "{email}" - Metadata updated / 已更新')
+        return {
+            "ok": True,
+            "email": email,
+            "label": new_label,
+            "note": new_note,
+            "error": None,
+        }
 
 
 @click.group()
@@ -387,6 +543,11 @@ def cli():
     default=False,
     help="Do not save generated addresses to the local inbox database / 不写入本地数据库",
 )
+@click.option(
+    "--result-json",
+    type=click.Path(dir_okay=False),
+    help="Write a machine-readable result to this file",
+)
 def generatecommand(
     count: int,
     label: str,
@@ -396,16 +557,21 @@ def generatecommand(
     region: str,
     db_file: str,
     no_db: bool,
+    result_json: Optional[str],
 ):
     "Generate emails / 生成隐藏邮箱"
     try:
-        asyncio.run(
+        result = asyncio.run(
             _generate(
                 label, count, cookie_file, output, no_output_file, region, db_file, no_db
             )
         )
     except KeyboardInterrupt:
-        pass
+        return
+
+    write_result_json(result_json, result)
+    if result_json and not result["ok"]:
+        raise click.ClickException(result["error"]["message"])
 
 
 @click.command()
@@ -429,12 +595,22 @@ def generatecommand(
     type=REGION_CHOICE,
     help="iCloud region to use / iCloud 区域",
 )
-def listcommand(label_query: Optional[str], active: bool, cookie_file: str, region: str):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def listcommand(
+    label_query: Optional[str],
+    active: bool,
+    cookie_file: str,
+    region: str,
+    result_json: Optional[str],
+):
     "List emails / 查看隐藏邮箱"
     try:
-        asyncio.run(_list(label_query, active, cookie_file, region))
+        result = asyncio.run(_list(label_query, active, cookie_file, region))
     except KeyboardInterrupt:
-        pass
+        return
+    write_result_json(result_json, result)
+    if result_json and not result["ok"]:
+        raise click.ClickException(result["error"]["message"])
 
 
 @click.command()
@@ -451,14 +627,20 @@ def listcommand(label_query: Optional[str], active: bool, cookie_file: str, regi
     type=REGION_CHOICE,
     help="iCloud region to use / iCloud 区域",
 )
-def whoamicommand(cookie_file: str, region: str):
+@click.option(
+    "--result-json",
+    type=click.Path(dir_okay=False),
+    help="Write a machine-readable result to this file",
+)
+def whoamicommand(cookie_file: str, region: str, result_json: Optional[str]):
     "Show the account represented by the saved cookie / 查看当前 Cookie 对应账号"
     try:
-        ok = asyncio.run(_whoami(cookie_file, region))
+        result = asyncio.run(_whoami(cookie_file, region))
     except KeyboardInterrupt:
         return
 
-    if not ok:
+    write_result_json(result_json, result)
+    if not result["ok"]:
         raise click.ClickException("Could not identify the saved iCloud cookie")
 
 
@@ -485,6 +667,96 @@ def capturecookiecommand(cookie_file: str, region: str):
 
     if not ok:
         raise click.ClickException("Could not capture the iCloud cookie")
+
+
+@click.command()
+@click.argument("email")
+@click.option(
+    "--cookie-file",
+    default=DEFAULT_COOKIE_FILENAME,
+    help="Path to cookie file / Cookie 文件路径",
+    type=click.Path(),
+)
+@click.option(
+    "--region",
+    default=DEFAULT_REGION,
+    show_default=True,
+    type=REGION_CHOICE,
+    help="iCloud region to use / iCloud 区域",
+)
+@click.option(
+    "--result-json",
+    type=click.Path(dir_okay=False),
+    help="Write a machine-readable result to this file",
+)
+def deactivatecommand(email: str, cookie_file: str, region: str, result_json: Optional[str]):
+    "Stop an address from forwarding mail / 停用隐藏邮箱转发"
+    _run_address_command(
+        _set_active(email, False, cookie_file, region), result_json
+    )
+
+
+@click.command()
+@click.argument("email")
+@click.option(
+    "--cookie-file",
+    default=DEFAULT_COOKIE_FILENAME,
+    help="Path to cookie file / Cookie 文件路径",
+    type=click.Path(),
+)
+@click.option(
+    "--region",
+    default=DEFAULT_REGION,
+    show_default=True,
+    type=REGION_CHOICE,
+    help="iCloud region to use / iCloud 区域",
+)
+@click.option(
+    "--result-json",
+    type=click.Path(dir_okay=False),
+    help="Write a machine-readable result to this file",
+)
+def reactivatecommand(email: str, cookie_file: str, region: str, result_json: Optional[str]):
+    "Resume forwarding for a deactivated address / 恢复已停用的隐藏邮箱"
+    _run_address_command(_set_active(email, True, cookie_file, region), result_json)
+
+
+@click.command()
+@click.argument("email")
+@click.option("--label", help="New label / 新标签")
+@click.option("--note", help="New note / 新备注")
+@click.option(
+    "--cookie-file",
+    default=DEFAULT_COOKIE_FILENAME,
+    help="Path to cookie file / Cookie 文件路径",
+    type=click.Path(),
+)
+@click.option(
+    "--region",
+    default=DEFAULT_REGION,
+    show_default=True,
+    type=REGION_CHOICE,
+    help="iCloud region to use / iCloud 区域",
+)
+@click.option(
+    "--result-json",
+    type=click.Path(dir_okay=False),
+    help="Write a machine-readable result to this file",
+)
+def updatemetadatacommand(
+    email: str,
+    label: Optional[str],
+    note: Optional[str],
+    cookie_file: str,
+    region: str,
+    result_json: Optional[str],
+):
+    "Change the label or note of an address / 修改隐藏邮箱的标签或备注"
+    if label is None and note is None:
+        raise click.UsageError("Provide --label and/or --note / 请提供 --label 或 --note")
+    _run_address_command(
+        _update_metadata(email, label, note, cookie_file, region), result_json
+    )
 
 
 @click.group(name="inbox")
@@ -554,22 +826,42 @@ def inbox_setup(
     show_default=True,
     type=click.Path(),
 )
-def inbox_status(config_file: str, db_file: str):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_status(config_file: str, db_file: str, result_json: Optional[str]):
     "Show local inbox configuration and database counts / 查看本地收件台状态"
     console = Console()
     try:
         config = load_config(config_file)
-    except FileNotFoundError as e:
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {
+                "ok": False,
+                "config": None,
+                "counts": None,
+                "error": bridge_error({"reason": str(e)}),
+            },
+        )
         raise click.ClickException(str(e)) from e
 
     conn = connect_db(db_file)
     try:
+        state_counts = {state: 0 for state in ADDRESS_STATES}
+        state_counts.update(
+            {
+                row["state"]: row["count"]
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) AS count FROM addresses GROUP BY state"
+                ).fetchall()
+            }
+        )
         counts = {
             "addresses": conn.execute("SELECT COUNT(*) FROM addresses").fetchone()[0],
             "messages": conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
             "codes": conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE code IS NOT NULL AND code != ''"
             ).fetchone()[0],
+            "states": state_counts,
         }
     finally:
         conn.close()
@@ -585,6 +877,21 @@ def inbox_status(config_file: str, db_file: str):
     table.add_row("Messages / 邮件", str(counts["messages"]))
     table.add_row("Codes / 验证码", str(counts["codes"]))
     console.print(table)
+    write_result_json(
+        result_json,
+        {
+            "ok": True,
+            "config": {
+                "host": config.host,
+                "port": config.port,
+                "username": mask_account(config.username),
+                "folder": config.folder,
+                "use_ssl": config.use_ssl,
+            },
+            "counts": counts,
+            "error": None,
+        },
+    )
 
 
 @inboxgroup.command(name="sync")
@@ -602,13 +909,29 @@ def inbox_status(config_file: str, db_file: str):
 )
 @click.option("--limit", default=50, show_default=True, type=int)
 @click.option("--show-codes", is_flag=True, default=False)
-def inbox_sync(config_file: str, db_file: str, limit: int, show_codes: bool):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_sync(
+    config_file: str,
+    db_file: str,
+    limit: int,
+    show_codes: bool,
+    result_json: Optional[str],
+):
     "Fetch new inbox messages through IMAP / 通过 IMAP 同步新邮件"
     console = Console()
     try:
         config = load_config(config_file)
         inserted = sync_inbox(config, db_file=db_file, limit=limit)
     except Exception as e:
+        write_result_json(
+            result_json,
+            {
+                "ok": False,
+                "count": 0,
+                "messages": [],
+                "error": bridge_error({"reason": str(e)}),
+            },
+        )
         raise click.ClickException(str(e)) from e
 
     console.log(f"[bold green][OK][/] Synced {len(inserted)} new message(s) / 已同步 {len(inserted)} 封新邮件")
@@ -629,6 +952,15 @@ def inbox_sync(config_file: str, db_file: str, limit: int, show_codes: bool):
 
     if show_codes:
         _print_messages(db_file, only_codes=True, limit=20)
+    write_result_json(
+        result_json,
+        {
+            "ok": True,
+            "count": len(inserted),
+            "messages": [_message_payload(row) for row in inserted],
+            "error": None,
+        },
+    )
 
 
 @inboxgroup.command(name="codes")
@@ -639,9 +971,21 @@ def inbox_sync(config_file: str, db_file: str, limit: int, show_codes: bool):
     type=click.Path(),
 )
 @click.option("--limit", default=20, show_default=True, type=int)
-def inbox_codes(db_file: str, limit: int):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_codes(db_file: str, limit: int, result_json: Optional[str]):
     "Show recent messages with verification codes / 查看最近验证码邮件"
-    _print_messages(db_file, only_codes=True, limit=limit)
+    try:
+        rows = _print_messages(db_file, only_codes=True, limit=limit)
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {"ok": False, "messages": [], "error": bridge_error({"reason": str(e)})},
+        )
+        raise click.ClickException(str(e)) from e
+    write_result_json(
+        result_json,
+        {"ok": True, "messages": rows, "error": None},
+    )
 
 
 @inboxgroup.command(name="messages")
@@ -652,9 +996,21 @@ def inbox_codes(db_file: str, limit: int):
     type=click.Path(),
 )
 @click.option("--limit", default=20, show_default=True, type=int)
-def inbox_messages(db_file: str, limit: int):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_messages(db_file: str, limit: int, result_json: Optional[str]):
     "Show recent inbox messages / 查看最近收件"
-    _print_messages(db_file, only_codes=False, limit=limit)
+    try:
+        rows = _print_messages(db_file, only_codes=False, limit=limit)
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {"ok": False, "messages": [], "error": bridge_error({"reason": str(e)})},
+        )
+        raise click.ClickException(str(e)) from e
+    write_result_json(
+        result_json,
+        {"ok": True, "messages": rows, "error": None},
+    )
 
 
 @inboxgroup.command(name="addresses")
@@ -670,13 +1026,23 @@ def inbox_messages(db_file: str, limit: int):
     type=click.Path(),
 )
 @click.option("--limit", default=50, show_default=True, type=int)
-def inbox_addresses(state: Optional[str], db_file: str, limit: int):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_addresses(
+    state: Optional[str], db_file: str, limit: int, result_json: Optional[str]
+):
     "List local Hide My Email addresses / 查看本地隐藏邮箱地址"
-    conn = connect_db(db_file)
     try:
-        rows = list_addresses(conn, state=state, limit=limit)
-    finally:
-        conn.close()
+        conn = connect_db(db_file)
+        try:
+            rows = list_addresses(conn, state=state, limit=limit)
+        finally:
+            conn.close()
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {"ok": False, "addresses": [], "error": bridge_error({"reason": str(e)})},
+        )
+        raise click.ClickException(str(e)) from e
 
     table = Table(title="Local Addresses / 本地地址")
     table.add_column("Email / 邮箱")
@@ -693,6 +1059,23 @@ def inbox_addresses(state: Optional[str], db_file: str, limit: int):
             row["updated_at"],
         )
     Console().print(table)
+    write_result_json(
+        result_json,
+        {
+            "ok": True,
+            "addresses": [
+                {
+                    "email": row["email"],
+                    "label": row["label"] or "",
+                    "state": row["state"],
+                    "source": row["source"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ],
+            "error": None,
+        },
+    )
 
 
 @inboxgroup.command(name="mark")
@@ -704,14 +1087,31 @@ def inbox_addresses(state: Optional[str], db_file: str, limit: int):
     show_default=True,
     type=click.Path(),
 )
-def inbox_mark(email: str, state: str, db_file: str):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_mark(email: str, state: str, db_file: str, result_json: Optional[str]):
     "Mark an address as unused, used, or trash / 标记地址状态"
-    conn = connect_db(db_file)
     try:
-        mark_address(conn, email, state)
-    finally:
-        conn.close()
+        conn = connect_db(db_file)
+        try:
+            mark_address(conn, email, state)
+        finally:
+            conn.close()
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {
+                "ok": False,
+                "email": email,
+                "state": state,
+                "error": bridge_error({"reason": str(e)}),
+            },
+        )
+        raise click.ClickException(str(e)) from e
     Console().log(f'[bold green][OK][/] Marked "{email}" as {state} / 已标记地址状态')
+    write_result_json(
+        result_json,
+        {"ok": True, "email": email, "state": state, "error": None},
+    )
 
 
 @inboxgroup.command(name="export")
@@ -727,12 +1127,28 @@ def inbox_mark(email: str, state: str, db_file: str):
     show_default=True,
     type=click.Path(),
 )
-def inbox_export(db_file: str, export_dir: str):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_export(db_file: str, export_dir: str, result_json: Optional[str]):
     "Export local addresses and messages to CSV / 导出本地地址和邮件 CSV"
-    outputs = export_csv_files(db_file=db_file, export_dir=export_dir)
+    try:
+        outputs = export_csv_files(db_file=db_file, export_dir=export_dir)
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {"ok": False, "outputs": {}, "error": bridge_error({"reason": str(e)})},
+        )
+        raise click.ClickException(str(e)) from e
     console = Console()
     for name, path in outputs.items():
         console.log(f"[bold green][OK][/] Exported {name}: {path} / 已导出")
+    write_result_json(
+        result_json,
+        {
+            "ok": True,
+            "outputs": {name: str(path) for name, path in outputs.items()},
+            "error": None,
+        },
+    )
 
 
 @inboxgroup.command(name="sync-hme")
@@ -755,13 +1171,26 @@ def inbox_export(db_file: str, export_dir: str):
     show_default=True,
     type=click.Path(),
 )
-def inbox_sync_hme(cookie_file: str, region: str, db_file: str):
+@click.option("--result-json", type=click.Path(dir_okay=False), hidden=True)
+def inbox_sync_hme(
+    cookie_file: str, region: str, db_file: str, result_json: Optional[str]
+):
     "Sync existing iCloud Hide My Email addresses into the local database / 同步已有 iCloud 隐藏邮箱到本地库"
     try:
         count = asyncio.run(_sync_hme_to_db(cookie_file, region, db_file))
     except KeyboardInterrupt:
         return
+    except Exception as e:
+        write_result_json(
+            result_json,
+            {"ok": False, "count": 0, "error": bridge_error({"reason": str(e)})},
+        )
+        raise
     Console().log(f"[bold green][OK][/] Synced {count} Hide My Email address(es) / 已同步 {count} 个隐藏邮箱")
+    write_result_json(
+        result_json,
+        {"ok": True, "count": count, "error": None},
+    )
 
 
 async def _generate(
@@ -773,7 +1202,7 @@ async def _generate(
     region: str = DEFAULT_REGION,
     db_file: str = DEFAULT_DB_FILE,
     no_db: bool = False,
-) -> List[str]:
+) -> dict:
     async with RichHideMyEmail(
         cookie_file=cookie_file,
         output_file=output_file,
@@ -797,7 +1226,14 @@ async def _generate(
         finally:
             conn.close()
 
-    return emails
+    return {
+        "ok": len(emails) == count,
+        "emails": emails,
+        "error": None
+        if len(emails) == count
+        else hme.last_error
+        or {"code": None, "message": "Generation failed", "retry_after": None},
+    }
 
 
 async def _list(
@@ -805,53 +1241,99 @@ async def _list(
     active: bool,
     cookie_file: str,
     region: str = DEFAULT_REGION,
-) -> None:
+) -> dict:
     async with RichHideMyEmail(cookie_file=cookie_file, region=region) as hme:
-        await hme.list(label_query, active)
+        return await hme.list(label_query, active)
 
 
-async def _whoami(cookie_file: str, region: str = DEFAULT_REGION) -> bool:
+def _run_address_command(coro, result_json: Optional[str]) -> None:
+    try:
+        result = asyncio.run(coro)
+    except KeyboardInterrupt:
+        coro.close()
+        return
+
+    write_result_json(result_json, result)
+    if not result["ok"]:
+        raise click.ClickException(result["error"]["message"])
+
+
+async def _set_active(
+    email: str, active: bool, cookie_file: str, region: str = DEFAULT_REGION
+) -> dict:
+    async with RichHideMyEmail(cookie_file=cookie_file, region=region) as hme:
+        return await hme.set_active(email, active)
+
+
+async def _update_metadata(
+    email: str,
+    label: Optional[str],
+    note: Optional[str],
+    cookie_file: str,
+    region: str = DEFAULT_REGION,
+) -> dict:
+    async with RichHideMyEmail(cookie_file=cookie_file, region=region) as hme:
+        return await hme.update_metadata(email, label, note)
+
+
+async def _whoami(cookie_file: str, region: str = DEFAULT_REGION) -> dict:
     console = Console()
     if not os.path.exists(cookie_file):
-        console.log(f'[bold red][ERR][/] No "{cookie_file}" file found')
-        return False
+        message = f'No "{cookie_file}" file found'
+        console.log(f"[bold red][ERR][/] {message}")
+        return {
+            "ok": False,
+            "account": None,
+            "error": {"code": None, "message": message, "retry_after": None},
+        }
 
     account = await fetch_account_info(cookie_file, region)
     if "error" in account:
         console.log(f"[bold red][ERR][/] {account['error']}")
-        return False
+        return {
+            "ok": False,
+            "account": None,
+            "error": {
+                "code": None,
+                "message": account["error"],
+                "retry_after": None,
+            },
+        }
 
-    ds_info = account.get("dsInfo", {})
-    full_name = ds_info.get("fullName") or " ".join(
-        part for part in [ds_info.get("firstName"), ds_info.get("lastName")] if part
-    )
-    webservices = account.get("webservices", {})
-    maildomain = webservices.get("maildomainws", {})
-
+    summary = account_summary(account)
     table = Table(title="Current iCloud Cookie / 当前 iCloud Cookie", show_header=False)
     table.add_column("Field / 字段")
     table.add_column("Value / 值")
-    table.add_row("Apple ID", ds_info.get("appleId") or "Unknown")
-    table.add_row("Name / 名称", full_name or "Unknown")
-    table.add_row("DSID", str(ds_info.get("dsid") or "Unknown"))
+    table.add_row("Apple ID", summary["apple_id"])
+    table.add_row("Name / 名称", summary["name"])
+    table.add_row("DSID", str(account.get("dsInfo", {}).get("dsid") or "Unknown"))
     table.add_row(
         "Hide My Email / 隐藏邮箱",
-        "Available"
-        if ds_info.get("isHideMyEmailFeatureAvailable")
-        else "Unavailable or unknown",
+        "Available" if summary["hide_my_email_available"] else "Unavailable or unknown",
     )
-    table.add_row("User Partition / 用户分区", str(account.get("userPartition") or "Unknown"))
+    table.add_row(
+        "User Partition / 用户分区", str(summary["user_partition"] or "Unknown")
+    )
     table.add_row(
         "Maildomain",
-        account.get("detectedMaildomainHost")
-        or maildomain.get("url")
-        or "Default",
+        summary["maildomain_host"] or "Default",
     )
     console.print(table)
-    return True
+    return {"ok": True, "account": summary, "error": None}
 
 
-def _print_messages(db_file: str, only_codes: bool, limit: int) -> None:
+def _message_payload(row) -> dict:
+    return {
+        "received_at": row.get("received_at") if isinstance(row, dict) else row["received_at"],
+        "hme_address": row.get("hme_address") if isinstance(row, dict) else row["hme_address"],
+        "sender": row.get("sender") if isinstance(row, dict) else row["sender"],
+        "subject": row.get("subject") if isinstance(row, dict) else row["subject"],
+        "code": row.get("code") if isinstance(row, dict) else row["code"],
+        "body_preview": row.get("body_preview") if isinstance(row, dict) else row["body_preview"],
+    }
+
+
+def _print_messages(db_file: str, only_codes: bool, limit: int) -> list[dict]:
     conn = connect_db(db_file)
     try:
         rows = list_messages(conn, only_codes=only_codes, limit=limit)
@@ -873,6 +1355,7 @@ def _print_messages(db_file: str, only_codes: bool, limit: int) -> None:
             row["code"] or "",
         )
     Console().print(table)
+    return [_message_payload(row) for row in rows]
 
 
 async def _sync_hme_to_db(
@@ -1062,6 +1545,9 @@ cli.add_command(listcommand, name="list")
 cli.add_command(generatecommand, name="generate")
 cli.add_command(whoamicommand, name="whoami")
 cli.add_command(capturecookiecommand, name="capture-cookie")
+cli.add_command(deactivatecommand, name="deactivate")
+cli.add_command(reactivatecommand, name="reactivate")
+cli.add_command(updatemetadatacommand, name="update-metadata")
 cli.add_command(inboxgroup)
 
 if __name__ == "__main__":
