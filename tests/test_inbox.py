@@ -1,6 +1,66 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from hidemyemail_generator.inbox import extract_verification_code
+from hidemyemail_generator.inbox import (
+    InboxConfig,
+    extract_verification_code,
+    sync_inbox,
+)
+
+
+class FakeMailbox:
+    def __init__(self):
+        self.fetched_uids = []
+
+    def login(self, _username, _password):
+        return "OK", []
+
+    def select(self, _folder):
+        return "OK", []
+
+    def uid(self, command, *args):
+        if command == "search":
+            return "OK", [b"1 2 3 4"]
+        if command == "fetch":
+            self.fetched_uids.append(args[0])
+            return "OK", [(b"metadata", b"raw message")]
+        raise AssertionError(f"Unexpected IMAP command: {command}")
+
+    def logout(self):
+        return "BYE", []
+
+
+class InboxSyncTests(unittest.TestCase):
+    def test_sync_fetches_newest_unseen_messages_first(self):
+        mailbox = FakeMailbox()
+        config = InboxConfig(
+            host="imap.example.com",
+            port=993,
+            username="user@example.com",
+            password="password",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "inbox.db"
+            with (
+                patch(
+                    "hidemyemail_generator.inbox.imaplib.IMAP4_SSL",
+                    return_value=mailbox,
+                ),
+                patch(
+                    "hidemyemail_generator.inbox.message_to_record",
+                    return_value={},
+                ),
+                patch(
+                    "hidemyemail_generator.inbox.insert_message",
+                    return_value=True,
+                ),
+            ):
+                sync_inbox(config, str(db_file), limit=3)
+
+        self.assertEqual(mailbox.fetched_uids, [b"4", b"3", b"2"])
 
 
 class VerificationCodeExtractionTests(unittest.TestCase):

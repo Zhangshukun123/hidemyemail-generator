@@ -65,6 +65,48 @@ def load_account_record(db_file: Path, email: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def account_session(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the saved ChatGPT Session object, including legacy JSON fields."""
+
+    for key in ("session", "session_json", "sessionJson"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def account_session_access_token(record: dict[str, Any]) -> str:
+    """Read the current token from Session first, then legacy top-level fields."""
+
+    session = account_session(record)
+    token = str(
+        session.get("accessToken")
+        or session.get("access_token")
+        or record.get("access_token")
+        or record.get("accessToken")
+        or ""
+    ).strip()
+    return token
+
+
+def session_email(session: Any) -> str:
+    if not isinstance(session, dict):
+        return ""
+    user = session.get("user")
+    if isinstance(user, dict):
+        email = str(user.get("email") or "").strip().lower()
+        if email:
+            return email
+    return str(session.get("email") or "").strip().lower()
+
+
 def session_account_type(session: Any) -> tuple[str, str]:
     if not isinstance(session, dict):
         return "", ""
@@ -334,6 +376,7 @@ class BrowserTaskManager:
                     "_ensure_password": item["ensure_password"],
                     "_force_reset_password": item["force_reset_password"],
                     "_password_confirmed": False,
+                    "passwordConfirmed": False,
                     "_enable_2fa": item["enable_2fa"],
                     "_two_factor": item["two_factor"],
                     "phase": "queued",
@@ -490,14 +533,11 @@ class BrowserTaskManager:
             password = str(item.get("_password") or "")
             result = item.get("_result")
             password_confirmed = bool(item.get("_password_confirmed"))
-            if (
-                return_code == 0
-                and isinstance(result, dict)
-                and (
-                    not item.get("_ensure_password")
-                    or password_confirmed
-                )
-            ):
+            session_saved = bool(
+                isinstance(result, dict)
+                and str(result.get("access_token") or "").strip()
+            )
+            if session_saved:
                 await asyncio.to_thread(
                     _save_account_record,
                     self.db_file,
@@ -512,13 +552,23 @@ class BrowserTaskManager:
                 )
                 item["status"] = "success"
                 item["phase"] = "completed"
-                item["message"] = (
-                    "Session / AT / 2FA 已保存"
-                    if item.get("_enable_2fa")
-                    else "Session / AT 已保存"
-                )
+                saved_parts = ["Session / AT 已保存"]
+                if item.get("_ensure_password") and not password_confirmed:
+                    saved_parts.append("密码待设置")
+                if item.get("twoFactorEnabled"):
+                    saved_parts.append("2FA 已开启")
+                elif item.get("_enable_2fa") and not password_confirmed:
+                    saved_parts.append("2FA 已跳过（需先设置密码）")
+                elif item.get("_enable_2fa"):
+                    saved_parts.append("2FA 待开启")
+                item["message"] = "；".join(saved_parts)
                 self._state["succeeded"] += 1
-                self._append_log("Session / AT 已保存到本地数据库", email=email)
+                self._append_log(item["message"], email=email)
+                error = str(item.get("_error") or "")
+                if return_code != 0 and error:
+                    self._append_log(
+                        f"后续账号设置未完成：{error[:500]}", email=email
+                    )
             else:
                 if password and not item.get("_ensure_password"):
                     await asyncio.to_thread(
@@ -576,6 +626,7 @@ class BrowserTaskManager:
                 item["_password_confirmed"] = bool(
                     event.get("password_confirmed")
                 )
+                item["passwordConfirmed"] = item["_password_confirmed"]
                 two_factor = (
                     result.get("two_factor") if isinstance(result, dict) else None
                 )
@@ -591,6 +642,7 @@ class BrowserTaskManager:
                     item["_password"] = password
                 password_confirmed = bool(event.get("password_confirmed"))
                 item["_password_confirmed"] = password_confirmed
+                item["passwordConfirmed"] = password_confirmed
                 if isinstance(result, dict):
                     await asyncio.to_thread(
                         _save_account_record,
@@ -604,7 +656,13 @@ class BrowserTaskManager:
                             else None
                         ),
                     )
-                item["message"] = "OpenAI 注册成功，正在开启 2FA"
+                item["message"] = (
+                    "OpenAI 注册成功，正在开启 2FA"
+                    if item.get("_enable_2fa") and password_confirmed
+                    else "OpenAI 注册成功，密码待设置，已跳过 2FA"
+                    if item.get("_enable_2fa")
+                    else "OpenAI 注册成功，Session 已保存"
+                )
             elif kind == "two_factor_start":
                 item["phase"] = "enabling_2fa"
                 item["message"] = "正在创建 TOTP 2FA"
@@ -634,6 +692,7 @@ class BrowserTaskManager:
                     item["_password_confirmed"] = bool(
                         event.get("password_confirmed")
                     )
+                    item["passwordConfirmed"] = item["_password_confirmed"]
 
     async def _read_stderr(
         self, stream: asyncio.StreamReader | None, item: dict[str, Any]

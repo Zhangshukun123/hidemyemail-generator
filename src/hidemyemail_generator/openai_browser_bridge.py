@@ -25,6 +25,7 @@ CAMOUFOX_PERSISTENT_STORAGE_PREFS = {
     "dom.storageManager.prompt.testing.allow": True,
 }
 CHATGPT_HOME_URL = "https://chatgpt.com/"
+CHATGPT_ACCOUNT_SETTINGS_URL = "https://chatgpt.com/#settings/Account"
 CHATGPT_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
 OTP_POLL_INTERVAL_SECONDS = 1.5
 
@@ -144,6 +145,24 @@ FORGOT_PASSWORD_SELECTORS = (
     'a:has-text("パスワードをお忘れ")',
     'button:has-text("パスワードをお忘れ")',
     'text="パスワードをお忘れですか？"',
+)
+ACCOUNT_TAB_SELECTORS = (
+    '[data-testid="account-tab"]',
+    '[role="tab"]:has-text("Account")',
+    'button:has-text("Account")',
+    'a:has-text("Account")',
+    '[role="tab"]:has-text("账户")',
+    '[role="tab"]:has-text("帐户")',
+    '[role="tab"]:has-text("帳戶")',
+    'button:has-text("账户")',
+    'button:has-text("帐户")',
+    'button:has-text("帳戶")',
+    'a:has-text("账户")',
+    'a:has-text("帐户")',
+    'a:has-text("帳戶")',
+    '[role="tab"]:has-text("アカウント")',
+    'button:has-text("アカウント")',
+    'a:has-text("アカウント")',
 )
 SECURITY_TAB_SELECTORS = (
     '[data-testid="security-tab"]',
@@ -1153,6 +1172,8 @@ def _reuse_single_registration_page(context, worker):
 
 
 def _open_security_settings(page, worker) -> bool:
+    """Open the current Account password page, with legacy Security fallback."""
+
     page.goto(CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=60000)
     _page_wait(page, 1200)
     _dismiss_completed_onboarding(page, worker)
@@ -1160,18 +1181,22 @@ def _open_security_settings(page, worker) -> bool:
     settings_clicked = _open_settings_from_profile(page, worker)
     if settings_clicked:
         _page_wait(page, 700)
-    security_clicked = settings_clicked and _click_first_visible(
-        page, SECURITY_TAB_SELECTORS
-    )
-    if security_clicked:
-        _page_wait(page, 700)
-        if _security_settings_ready(page):
-            worker.log("[密码] 已确认进入安全设置")
-            return True
-        worker.log("[密码] 安全设置点击后未出现密码入口，继续尝试直达地址")
+        for tab_name, selectors in (
+            ("账户设置", ACCOUNT_TAB_SELECTORS),
+            ("旧版安全设置", SECURITY_TAB_SELECTORS),
+        ):
+            if not _click_first_visible(page, selectors):
+                continue
+            _page_wait(page, 700)
+            if _security_settings_ready(page):
+                worker.log(f"[密码] 已确认进入{tab_name}")
+                return True
+            worker.log(f"[密码] {tab_name}未出现密码入口，继续尝试其他入口")
 
-    worker.log("[密码] 设置菜单定位失败，改用安全设置直达地址")
+    worker.log("[密码] 菜单中未找到密码入口，改用账户设置直达地址")
     for target_url in (
+        CHATGPT_ACCOUNT_SETTINGS_URL,
+        "https://chatgpt.com/#settings/account",
         CHATGPT_SECURITY_SETTINGS_URL,
         "https://chatgpt.com/#settings/security",
         "https://chatgpt.com/#settings",
@@ -1181,10 +1206,15 @@ def _open_security_settings(page, worker) -> bool:
         if _dismiss_completed_onboarding(page, worker):
             page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             _page_wait(page, 800)
-        _click_first_visible(page, SECURITY_TAB_SELECTORS)
+        _click_first_visible(page, ACCOUNT_TAB_SELECTORS)
         _page_wait(page, 500)
         if _security_settings_ready(page, attempts=3):
-            worker.log("[密码] 已通过直达地址确认安全设置页面")
+            worker.log("[密码] 已通过直达地址确认账户密码页面")
+            return True
+        _click_first_visible(page, SECURITY_TAB_SELECTORS)
+        _page_wait(page, 400)
+        if _security_settings_ready(page, attempts=2):
+            worker.log("[密码] 已通过旧版安全设置找到密码入口")
             return True
     return False
 
@@ -1277,7 +1307,7 @@ def ensure_password_in_security_settings(
     page = _reuse_single_registration_page(context, worker)
     if not _open_security_settings(page, worker):
         _hold_visible_browser_after_password_failure(page, worker)
-        raise RuntimeError("未能打开 ChatGPT 安全设置，请检查账号菜单结构")
+        raise RuntimeError("未能打开 ChatGPT 账户密码设置，请检查账号菜单结构")
     if not force_reset_password and _password_is_present(page, timeout=900):
         worker._password_step_submitted = True
         worker.log("[密码] 安全设置已显示密码管理入口，确认账号已有密码")
@@ -1289,7 +1319,7 @@ def ensure_password_in_security_settings(
     )
     if not password_action_clicked:
         _hold_visible_browser_after_password_failure(page, worker)
-        raise RuntimeError("安全设置中未找到添加或重置密码按钮")
+        raise RuntimeError("账户设置中未找到添加或重置密码按钮")
 
     worker.log(
         "[密码] 已点击密码行并准备重新设置密码"
@@ -1423,6 +1453,9 @@ def _enable_two_factor_before_browser_closes(
         password_confirmed=password_confirmed,
     )
     worker._hme_account_registered_emitted = True
+    if not password_confirmed:
+        worker.log("[2FA] 密码尚未设置成功，已跳过开启 2FA")
+        return result
 
     two_factor = reusable_enabled_two_factor(pending_two_factor)
     if two_factor:
@@ -1499,7 +1532,7 @@ def configure_post_registration_password_setup(
     enable_2fa: bool = False,
     pending_two_factor: dict | None = None,
 ) -> bool:
-    """Run the settings password flow before the worker opens the Session page."""
+    """Save the authenticated Session before attempting optional account setup."""
 
     if not enabled:
         return False
@@ -1507,26 +1540,60 @@ def configure_post_registration_password_setup(
     if not callable(original_extract):
         raise RuntimeError("目标注册工作器缺少 Session 提取方法")
 
+    # Registration success is sufficient to retain the account.  Password
+    # setup is a follow-up operation and must not block Session extraction in
+    # the target worker's registration loop.
+    worker.require_password_setup = False
+
     def extract_after_password_setup(context):
+        result = extract_session_without_navigation(worker, context)
+        password_confirmed = bool(
+            getattr(worker, "_password_step_submitted", False)
+        )
+        emit(
+            "account_registered",
+            result=result,
+            password=str(getattr(worker.account, "password", "") or ""),
+            password_confirmed=password_confirmed,
+        )
+        worker._hme_account_registered_emitted = True
+
         if getattr(worker, "_hme_password_reset_submitted", False):
             worker._password_step_submitted = True
             worker.log("[密码] 邮箱重置后已成功建立会话，确认唯一密码生效")
         if not getattr(worker, "_password_step_submitted", False):
-            ensure_password_in_security_settings(
-                app_backend,
-                worker,
-                password,
-                context=context,
-                force_reset_password=force_reset_password,
+            try:
+                ensure_password_in_security_settings(
+                    app_backend,
+                    worker,
+                    password,
+                    context=context,
+                    force_reset_password=force_reset_password,
+                )
+            except Exception as error:
+                worker._hme_password_setup_error = safe_log_message(str(error))
+                worker.log(
+                    "[密码] 自动设置未成功；注册 Session 已保存，可稍后单独设置密码"
+                )
+        if getattr(worker, "_password_step_submitted", False):
+            # Password changes may rotate the authenticated token.  Refresh the
+            # saved Session only after OpenAI confirms the password operation.
+            result = extract_session_without_navigation(worker, context)
+            emit(
+                "account_registered",
+                result=result,
+                password=str(getattr(worker.account, "password", "") or ""),
+                password_confirmed=True,
             )
-        result = extract_session_without_navigation(worker, context)
-        if enable_2fa:
+        if enable_2fa and getattr(worker, "_password_step_submitted", False):
             result = _enable_two_factor_before_browser_closes(
                 worker,
                 context,
                 result,
                 pending_two_factor,
             )
+        elif enable_2fa:
+            worker.log("[2FA] 密码尚未设置成功，已跳过开启 2FA")
         return result
 
     worker._extract_session_info = extract_after_password_setup
@@ -1700,7 +1767,6 @@ def main() -> int:
         configure_worker_login_totp(worker, pending_2fa)
         configure_registration_profile_capture(app_backend, worker)
         configure_resilient_registration_navigation(worker)
-        worker.require_password_setup = ensure_password
         worker.initial_storage_state = saved_storage_state or None
         # Session/AT are sufficient for this service. Camoufox can occasionally
         # stall indefinitely while exporting a complete browser storage snapshot;
@@ -1720,8 +1786,11 @@ def main() -> int:
             getattr(worker, "_password_step_submitted", False)
         )
         if ensure_password and not password_confirmed:
-            raise RuntimeError("OpenAI 端未确认密码设置，未保存本地密码")
-        if enable_2fa:
+            emit(
+                "log",
+                message="OpenAI 注册成功且 Session 已保存；密码尚待单独设置",
+            )
+        if enable_2fa and password_confirmed:
             if not getattr(worker, "_hme_account_registered_emitted", False):
                 emit(
                     "account_registered",
@@ -1803,6 +1872,8 @@ def main() -> int:
             if not getattr(worker, "_hme_two_factor_completed", False):
                 result["two_factor"] = two_factor
                 emit("two_factor_enabled")
+        elif enable_2fa:
+            emit("log", message="[2FA] 密码尚未设置成功，已跳过开启 2FA")
         emit(
             "result",
             result=result,

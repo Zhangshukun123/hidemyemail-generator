@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hidemyemail_generator.inbox import connect_db, insert_message
 from hidemyemail_generator.webapp import (
+    _account_has_confirmed_password,
     GPT_INDEX_HTML,
     _gpt_account_export,
     _gpt_email_items,
@@ -35,6 +36,19 @@ IDENTITIES = [
 
 
 class GptEmailTests(unittest.TestCase):
+    def test_two_factor_password_gate_requires_confirmed_password(self):
+        self.assertFalse(_account_has_confirmed_password({}))
+        self.assertFalse(
+            _account_has_confirmed_password(
+                {"password": "Generated!Password123", "password_confirmed": False}
+            )
+        )
+        self.assertTrue(
+            _account_has_confirmed_password(
+                {"password": "Confirmed!Password123", "password_confirmed": True}
+            )
+        )
+
     def test_exports_accounts_as_email_password_and_mfa(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "messages.db"
@@ -339,6 +353,10 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("重置密码", GPT_INDEX_HTML)
         self.assertIn("reset_password", GPT_INDEX_HTML)
         self.assertIn("验证账号", GPT_INDEX_HTML)
+        self.assertIn("item.hasSession || item.hasPassword", GPT_INDEX_HTML)
+        self.assertIn("item.hasSession && !item.hasPassword", GPT_INDEX_HTML)
+        self.assertIn('actionButton("设置密码"', GPT_INDEX_HTML)
+        self.assertIn("根据已保存 Session 验证账号", GPT_INDEX_HTML)
         self.assertIn("verifyOrRegisterAccount(item)", GPT_INDEX_HTML)
         self.assertIn("/api/account/verify-or-register", GPT_INDEX_HTML)
         self.assertIn("/api/account/type", GPT_INDEX_HTML)
@@ -355,6 +373,11 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("删除邮箱", GPT_INDEX_HTML)
         self.assertIn("Plus 账号", GPT_INDEX_HTML)
         self.assertIn("Free 账号", GPT_INDEX_HTML)
+        self.assertIn('id="dateFilter"', GPT_INDEX_HTML)
+        self.assertIn("按添加日期筛选", GPT_INDEX_HTML)
+        self.assertIn("今天添加", GPT_INDEX_HTML)
+        self.assertIn("添加于", GPT_INDEX_HTML)
+        self.assertIn("date-group", GPT_INDEX_HTML)
         self.assertNotIn("选择当前结果", GPT_INDEX_HTML)
         self.assertNotIn("获取选中", GPT_INDEX_HTML)
         self.assertNotIn("封 OpenAI 邮件", GPT_INDEX_HTML)

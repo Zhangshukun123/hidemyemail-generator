@@ -9,7 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .browser_tasks import load_account_record
+from .browser_tasks import (
+    account_session,
+    account_session_access_token,
+    load_account_record,
+    session_account_type,
+    session_email,
+)
 from .inbox import connect_db
 
 
@@ -38,20 +44,25 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
             continue
         if not isinstance(record, dict):
             continue
-        token = str(
-            record.get("access_token") or record.get("accessToken") or ""
-        ).strip()
+        session = account_session(record)
+        token = account_session_access_token(record)
         if email and token:
             account_type = str(record.get("account_type") or "").strip().lower()
             account_type_source = str(
                 record.get("account_type_source") or ""
             ).strip().lower()
+            session_type, raw_session_plan = session_account_type(session)
+            if session_type and account_type_source != "manual":
+                account_type = session_type
+                account_type_source = "session"
             accounts.append(
                 {
                     "email": email,
                     "access_token": token,
                     "account_type": account_type,
                     "account_type_source": account_type_source,
+                    "session_email": session_email(session),
+                    "session_plan": raw_session_plan,
                 }
             )
     return sorted(accounts, key=lambda item: item["email"])
@@ -264,9 +275,9 @@ class AccountVerificationManager:
             ]
         if not accounts:
             message = (
-                "所选账号没有可验证的 Access Token"
+                "所选账号没有可验证的 Session"
                 if requested is not None
-                else "暂无已保存 Access Token 的账号"
+                else "暂无已保存 Session 的账号"
             )
             raise RuntimeError(message)
         concurrency = max(1, min(5, int(concurrency)))
@@ -290,6 +301,8 @@ class AccountVerificationManager:
                     "_access_token": item["access_token"],
                     "_account_type": item.get("account_type", ""),
                     "_account_type_source": item.get("account_type_source", ""),
+                    "_session_email": item.get("session_email", ""),
+                    "_session_plan": item.get("session_plan", ""),
                 }
                 for item in accounts
             ],
@@ -340,8 +353,21 @@ class AccountVerificationManager:
             if self._state.get("status") == "cancelling":
                 item.update(status="cancelled", message="任务已停止")
                 return
-            item.update(status="running", message="正在查询在线套餐")
-            self._append_log("正在验证", email=email)
+            session_owner = str(item.get("_session_email") or "").strip().lower()
+            if session_owner and session_owner != email:
+                item.update(
+                    status="failed",
+                    message=f"Session 账号不匹配：{session_owner}",
+                )
+                self._state["failed"] += 1
+                self._state["completed"] += 1
+                self._append_log(item["message"], email=email)
+                for key in tuple(item):
+                    if key.startswith("_"):
+                        item.pop(key, None)
+                return
+            item.update(status="running", message="正在根据 Session 检查账号")
+            self._append_log("正在检查 Session", email=email)
             token = str(item.get("_access_token") or "")
             env = os.environ.copy()
             env.update(
@@ -390,6 +416,16 @@ class AccountVerificationManager:
                         event = candidate
             result = str(event.get("status") or "error")
             detail = str(event.get("detail") or "").strip()
+            session_detail = ""
+            if session_owner:
+                session_detail = f"Session user.email={session_owner}"
+            session_plan = str(item.get("_session_plan") or "").strip()
+            if session_plan:
+                session_detail = (
+                    f"{session_detail}，" if session_detail else ""
+                ) + f"account.planType={session_plan}"
+            if session_detail:
+                detail = f"{session_detail}；{detail}" if detail else session_detail
             if return_code == 0 and result in {"plus", "free"}:
                 effective_result = result
                 if (
@@ -452,6 +488,9 @@ class AccountVerificationManager:
             self._state["completed"] += 1
             item.pop("_access_token", None)
             item.pop("_account_type", None)
+            item.pop("_account_type_source", None)
+            item.pop("_session_email", None)
+            item.pop("_session_plan", None)
 
     async def stop(self) -> dict[str, Any]:
         if not self._batch_task or self._batch_task.done():

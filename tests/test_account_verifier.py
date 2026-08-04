@@ -7,6 +7,7 @@ from pathlib import Path
 
 from hidemyemail_generator.account_verifier import (
     AccountVerificationManager,
+    load_verifiable_accounts,
     remove_invalid_account,
     removed_account_emails,
     save_account_classification,
@@ -46,6 +47,43 @@ def save_record(
 
 
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
+    def test_loads_token_and_classification_from_saved_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:session-only@icloud.com",
+                        json.dumps(
+                            {
+                                "session_json": json.dumps(
+                                    {
+                                        "accessToken": "at-from-session",
+                                        "user": {
+                                            "email": "session-only@icloud.com"
+                                        },
+                                        "account": {"planType": "plus"},
+                                    }
+                                ),
+                                "password_confirmed": False,
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            accounts = load_verifiable_accounts(db_file)
+
+            self.assertEqual(len(accounts), 1)
+            self.assertEqual(accounts[0]["access_token"], "at-from-session")
+            self.assertEqual(accounts[0]["session_email"], "session-only@icloud.com")
+            self.assertEqual(accounts[0]["account_type"], "plus")
+            self.assertEqual(accounts[0]["account_type_source"], "session")
+
     def test_automatic_classification_preserves_manual_type(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
@@ -259,7 +297,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 "free",
             )
 
-    async def test_selected_account_requires_saved_access_token(self):
+    async def test_selected_account_requires_saved_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -275,9 +313,53 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with self.assertRaisesRegex(
-                RuntimeError, "所选账号没有可验证的 Access Token"
+                RuntimeError, "所选账号没有可验证的 Session"
             ):
                 manager.start(concurrency=1, emails=["new@icloud.com"])
+
+    async def test_rejects_session_owned_by_a_different_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "unused_bridge.py"
+            bridge.write_text("raise AssertionError('must not run')\n", encoding="utf-8")
+            db_file = root / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:expected@icloud.com",
+                        json.dumps(
+                            {
+                                "session": {
+                                    "accessToken": "at-wrong-owner",
+                                    "user": {"email": "other@icloud.com"},
+                                }
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["failed"], 1)
+            self.assertEqual(snapshot["accounts"][0]["status"], "failed")
+            self.assertIn("Session 账号不匹配", snapshot["accounts"][0]["message"])
+            self.assertNotIn("at-wrong-owner", json.dumps(snapshot))
 
 
 class InvalidConfirmationTests(unittest.TestCase):

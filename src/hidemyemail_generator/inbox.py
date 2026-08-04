@@ -447,6 +447,10 @@ def sync_inbox(
         uids = data[0].split()
         if limit > 0:
             uids = uids[-limit:]
+        # Process the newest messages first.  On a fresh or delayed sync there
+        # may be many unseen messages, and callers waiting for a newly-arrived
+        # verification code should not be blocked behind the older backlog.
+        uids.reverse()
 
         inserted: list[dict] = []
         for raw_uid in uids:

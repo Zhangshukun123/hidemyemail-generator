@@ -19,6 +19,7 @@ from .account_verifier import AccountVerificationManager, removed_account_emails
 from .browser_tasks import (
     BrowserTaskManager,
     _save_account_record,
+    account_session_access_token,
     access_token_is_expired,
     load_account_record,
     set_manual_account_type,
@@ -894,7 +895,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     #verifySummary { max-width: 440px; color: var(--muted); font-size: 11px; text-align: right; }
     .list-head h2 { margin: 0; font-size: 17px; color: var(--text); }
     #summary { color: var(--muted); font-size: 12px; margin-top: 5px; }
-    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 135px 150px auto; gap: 9px; padding: 0 22px 17px; }
+    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 135px 150px 140px auto; gap: 9px; padding: 0 22px 17px; }
     .search-wrap { position: relative; }
     .search-wrap svg { position: absolute; top: 50%; left: 12px; width: 16px; height: 16px; color: var(--muted); transform: translateY(-50%); pointer-events: none; }
     .toolbar input, .toolbar select { height: 40px; margin: 0; border-color: var(--input-border); background: var(--input); color: var(--text); font-size: 12px; }
@@ -912,6 +913,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .identity-copy { min-width: 0; }
     .address { font-size: 14px; font-weight: 650; color: var(--text); overflow-wrap: anywhere; }
     .meta-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+    .created-date { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border-radius: 999px;
+      color: var(--muted); background: var(--subtle); font-size: 10px; font-weight: 650; white-space: nowrap; }
+    .date-group { display: flex; align-items: center; gap: 9px; padding: 10px 4px 2px; color: var(--label); font-size: 12px; font-weight: 750; }
+    .date-group::after { content: ""; height: 1px; flex: 1; background: var(--border); }
+    .date-group-count { color: var(--muted); font-size: 10px; font-weight: 650; }
     .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; }
     .status-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
     .status-badge.ready { color: var(--success); background: var(--success-soft); }
@@ -973,7 +979,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       .list-head { align-items: flex-start; }
       .list-actions { max-width: 52%; }
       #verifySummary { text-align: right; }
-      .toolbar { grid-template-columns: 1fr 130px 130px auto; padding-inline: 18px; }
+      .toolbar { grid-template-columns: minmax(180px, 1fr) 125px 125px 125px auto; padding-inline: 18px; }
       .email-row { grid-template-columns: minmax(0, 1fr); }
       .identity, .account-state, .quick-actions, .secondary-actions { grid-column: 1; }
       .quick-actions { justify-content: flex-start; }
@@ -996,9 +1002,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
       .list-actions button { flex: 1; }
       #verifySummary { flex: 1 0 100%; text-align: left; }
       .toolbar { grid-template-columns: 1fr 1fr 44px; }
-      .search-wrap { grid-column: 1 / span 2; }
-      .toolbar select { grid-row: 2; }
-      .toolbar .icon-button { grid-column: 3; grid-row: 1 / span 2; height: 100%; }
+      .search-wrap { grid-column: 1 / span 2; grid-row: 1; }
+      #planFilter { grid-column: 1; grid-row: 2; }
+      #statusFilter { grid-column: 2; grid-row: 2; }
+      #dateFilter { grid-column: 1 / span 2; grid-row: 3; }
+      .toolbar .icon-button { grid-column: 3; grid-row: 1 / span 3; height: 100%; }
       .list-head { padding-inline: 18px; }
       .quick-actions { width: 100%; }
       .quick-actions .action { flex: 1; }
@@ -1084,7 +1092,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
           <div id="summary">正在加载…</div>
         </div>
         <div class="list-actions">
-          <div id="verifySummary">仅验证已保存 AT 的账号</div>
+          <div id="verifySummary">根据已保存 Session 验证账号</div>
           <button id="verifyAll" class="primary">一键验证账号</button>
           <button id="stopVerify" class="danger" disabled>停止验证</button>
         </div>
@@ -1105,6 +1113,14 @@ GPT_INDEX_HTML = r"""<!doctype html>
           <option value="ready">Session 有效</option>
           <option value="expired">Token 已过期</option>
           <option value="pending">尚未获取</option>
+        </select>
+        <select id="dateFilter" aria-label="按添加日期筛选">
+          <option value="all">全部日期</option>
+          <option value="today">今天添加</option>
+          <option value="yesterday">昨天添加</option>
+          <option value="recent">近 7 天添加</option>
+          <option value="earlier">更早添加</option>
+          <option value="unknown">日期未知</option>
         </select>
         <button id="refresh" class="icon-button" aria-label="刷新邮箱列表" title="刷新"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66"></path><path d="M20 4v7h-7"></path></svg></button>
       </div>
@@ -1494,7 +1510,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("verifySummary").textContent = (runtime.errors || ["账号验证运行环境不可用"]).join("；");
       } else if (data.status === "idle") {
         $("verifySummary").className = "";
-        $("verifySummary").textContent = "仅验证已保存 AT 的账号";
+        $("verifySummary").textContent = "根据已保存 Session 验证账号";
       } else {
         $("verifySummary").className = data.failed ? "error" : "";
         $("verifySummary").textContent = `${statusNames[data.status] || data.status} · ${data.completed || 0}/${data.total || 0} · Plus ${data.plus || 0} · Free ${data.free || 0} · Token 失效 ${data.expired || 0} · 失败 ${data.failed || 0}`;
@@ -1523,8 +1539,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
 
     async function startVerification() {
       const verifiable = currentItems.filter((item) => item.hasSession).length;
-      if (!verifiable) throw new Error("暂无已保存 Access Token 的账号");
-      if (!confirm(`将在线验证 ${verifiable} 个账号；明确无效的账号会删除本地密码、AT 和 Session。是否继续？`)) return;
+      if (!verifiable) throw new Error("暂无已保存 Session 的账号");
+      if (!confirm(`将根据 Session 在线检查 ${verifiable} 个账号；失效 Session 会被清除，账号和密码记录会保留。是否继续？`)) return;
       const data = await api("/api/account-verification/start", {
         method: "POST", body: JSON.stringify({ concurrency: 3 })
       });
@@ -1538,6 +1554,42 @@ GPT_INDEX_HTML = r"""<!doctype html>
 
     function planLabel(accountType) {
       return accountType === "plus" ? "Plus" : accountType === "free" ? "Free" : "等待验证";
+    }
+
+    const dateCategoryLabels = {
+      today: "今天添加",
+      yesterday: "昨天添加",
+      recent: "近 7 天添加",
+      earlier: "更早添加",
+      unknown: "添加日期未知",
+    };
+
+    function itemCreatedDate(item) {
+      if (!item.createdAt) return null;
+      const value = new Date(item.createdAt);
+      return Number.isNaN(value.getTime()) ? null : value;
+    }
+
+    function dateCategory(item) {
+      const created = itemCreatedDate(item);
+      if (!created) return "unknown";
+      const now = new Date();
+      const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+      const createdDay = Date.UTC(created.getFullYear(), created.getMonth(), created.getDate());
+      const daysAgo = Math.floor((today - createdDay) / 86400000);
+      if (daysAgo <= 0) return "today";
+      if (daysAgo === 1) return "yesterday";
+      if (daysAgo < 7) return "recent";
+      return "earlier";
+    }
+
+    function createdDateLabel(item) {
+      const created = itemCreatedDate(item);
+      if (!created) return "添加日期未知";
+      return `添加于 ${created.toLocaleString("zh-CN", {
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hour12: false,
+      })}`;
     }
 
     function renderEmpty(title, detail) {
@@ -1561,7 +1613,22 @@ GPT_INDEX_HTML = r"""<!doctype html>
         root.append(renderEmpty(filtered ? "没有匹配的邮箱" : "暂无 GPT 邮箱", filtered ? "尝试更换搜索词或筛选条件" : "同步邮箱后会显示在这里"));
         return;
       }
+      let activeDateCategory = "";
       for (const item of items) {
+        const itemDateCategory = dateCategory(item);
+        if (itemDateCategory !== activeDateCategory) {
+          activeDateCategory = itemDateCategory;
+          const count = items.filter((candidate) => dateCategory(candidate) === itemDateCategory).length;
+          const group = document.createElement("div");
+          group.className = "date-group";
+          const label = document.createElement("span");
+          label.textContent = dateCategoryLabels[itemDateCategory];
+          const total = document.createElement("span");
+          total.className = "date-group-count";
+          total.textContent = `${count} 个`;
+          group.append(label, total);
+          root.append(group);
+        }
         const row = document.createElement("div");
         row.className = "email-row";
         const identity = document.createElement("div");
@@ -1604,7 +1671,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
             planSelect.disabled = false;
           }
         });
-        metaLine.append(planSelect, badge);
+        const createdDate = document.createElement("span");
+        createdDate.className = "created-date";
+        createdDate.textContent = createdDateLabel(item);
+        metaLine.append(planSelect, badge, createdDate);
         if (item.twoFactorStatus) {
           const mfaBadge = document.createElement("span");
           mfaBadge.className = `mfa-badge ${item.hasTwoFactor ? "" : "pending"}`.trim();
@@ -1680,7 +1750,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
         secondaryActions.append(importWorkbenchButton);
-        secondaryActions.append(actionButton(item.hasPassword ? "验证账号" : "设置密码", () => verifyOrRegisterAccount(item), "已启动"));
+        secondaryActions.append(actionButton(item.hasSession || item.hasPassword ? "验证账号" : "设置密码", () => verifyOrRegisterAccount(item), "已启动"));
+        if (item.hasSession && !item.hasPassword) {
+          secondaryActions.append(actionButton("设置密码", () => verifyOrRegisterAccount(item, true), "密码设置已启动"));
+        }
         if (item.hasPassword) {
           secondaryActions.append(
             actionButton("复制密码", () => copyCredential(item.email, "password")),
@@ -1725,11 +1798,18 @@ GPT_INDEX_HTML = r"""<!doctype html>
       const query = $("search").value.trim().toLowerCase();
       const plan = $("planFilter").value;
       const status = $("statusFilter").value;
+      const date = $("dateFilter").value;
+      const dateOrder = { today: 0, yesterday: 1, recent: 2, earlier: 3, unknown: 4 };
       const items = currentItems.filter((item) =>
         (!query || item.email.toLowerCase().includes(query)) &&
         (plan === "all" || item.accountType === plan) &&
-        (status === "all" || item.sessionStatus === status)
-      );
+        (status === "all" || item.sessionStatus === status) &&
+        (date === "all" || dateCategory(item) === date)
+      ).sort((left, right) => {
+        const categoryDifference = dateOrder[dateCategory(left)] - dateOrder[dateCategory(right)];
+        if (categoryDifference) return categoryDifference;
+        return (itemCreatedDate(right)?.getTime() || 0) - (itemCreatedDate(left)?.getTime() || 0);
+      });
       visibleItems = items;
       render(items);
       const ready = currentItems.filter((item) => item.sessionStatus === "ready").length;
@@ -1776,6 +1856,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     $("search").addEventListener("input", applyFilters);
     $("planFilter").addEventListener("change", applyFilters);
     $("statusFilter").addEventListener("change", applyFilters);
+    $("dateFilter").addEventListener("change", applyFilters);
     $("registerOne").addEventListener("click", async () => {
       try { await startRegistration(); } catch (error) { showToast(error.message, "error"); }
     });
@@ -2161,6 +2242,12 @@ def _workbench_import_payload(record: dict, email: str) -> dict:
     }
 
 
+def _account_has_confirmed_password(record: dict) -> bool:
+    return bool(str(record.get("password") or "")) and (
+        record.get("password_confirmed") is not False
+    )
+
+
 def _remove_deleted_email_records(db_file: Path, email: str) -> None:
     target = email.strip().lower()
     now = datetime.now(timezone.utc).isoformat()
@@ -2263,9 +2350,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
             }
         )
         account = load_account_record(db_file, email)
-        access_token = str(
-            account.get("access_token") or account.get("accessToken") or ""
-        ).strip()
+        access_token = account_session_access_token(account)
         token_expired = bool(access_token) and access_token_is_expired(access_token)
         account_type = str(account.get("account_type") or "").lower()
         if account_type not in {"plus", "free"}:
@@ -2279,8 +2364,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         current.update(
             {
                 "createdAt": created_at,
-                "hasPassword": bool(str(account.get("password") or ""))
-                and account.get("password_confirmed") is not False,
+                "hasPassword": _account_has_confirmed_password(account),
                 "passwordConfirmed": account.get("password_confirmed") is not False,
                 "hasTwoFactor": bool(
                     isinstance(account.get("two_factor"), dict)
@@ -3137,24 +3221,14 @@ def create_app(
             load_account_record, app["db_file"], email
         )
         reset_password = bool(payload.get("reset_password", False))
-        access_token = str(
-            record.get("access_token") or record.get("accessToken") or ""
-        ).strip()
-        password_confirmed = bool(str(record.get("password") or "")) and (
-            record.get("password_confirmed") is not False
-        )
+        access_token = account_session_access_token(record)
+        password_confirmed = _account_has_confirmed_password(record)
         saved_two_factor = (
             record.get("two_factor")
             if isinstance(record.get("two_factor"), dict)
             else {}
         )
-        two_factor_enabled = bool(saved_two_factor.get("enabled"))
-        if (
-            access_token
-            and password_confirmed
-            and two_factor_enabled
-            and not reset_password
-        ):
+        if access_token and not reset_password:
             try:
                 task = app["verification_manager"].start(
                     concurrency=1, emails=[email]
@@ -3309,6 +3383,9 @@ def create_app(
             record = await asyncio.to_thread(
                 load_account_record, app["db_file"], email
             )
+            if enable_2fa and not _account_has_confirmed_password(record):
+                skipped += 1
+                continue
             access_token = str(
                 record.get("access_token") or record.get("accessToken") or ""
             ).strip()
@@ -3331,7 +3408,9 @@ def create_app(
             )
         if not accounts:
             message = (
-                "所选邮箱的 Token 都仍有效，无需重复打开浏览器"
+                "所选账号尚未确认设置密码，已跳过开启 2FA"
+                if enable_2fa
+                else "所选邮箱的 Token 都仍有效，无需重复打开浏览器"
                 if selected_only
                 else "全部邮箱的 Token 都仍有效，无需重复打开浏览器"
             )

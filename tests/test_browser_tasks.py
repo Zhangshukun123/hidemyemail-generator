@@ -442,7 +442,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
             worker._register(Page(), object())
         self.assertEqual(len(calls), 1)
 
-    def test_password_setup_runs_before_session_extraction(self):
+    def test_session_is_saved_before_password_setup(self):
         events = []
 
         class Worker:
@@ -484,6 +484,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 "extract_session_without_navigation",
                 side_effect=extract_session,
             ),
+            patch("hidemyemail_generator.openai_browser_bridge.emit"),
         ):
             configured = configure_post_registration_password_setup(
                 SimpleNamespace(),
@@ -498,10 +499,67 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                ("session_api", "browser-context"),
                 ("password", "browser-context"),
                 ("session_api", "browser-context"),
             ],
         )
+
+    def test_password_setup_failure_keeps_registered_session(self):
+        logs = []
+        emitted = []
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(
+                    email="new@icloud.com", password="Generated!Password123"
+                )
+                self._password_step_submitted = False
+                self.require_password_setup = True
+
+            def _extract_session_info(self, _context):
+                return {}
+
+            def log(self, message):
+                logs.append(message)
+
+        worker = Worker()
+        with (
+            patch(
+                "hidemyemail_generator.openai_browser_bridge."
+                "ensure_password_in_security_settings",
+                side_effect=RuntimeError("settings unavailable"),
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge."
+                "extract_session_without_navigation",
+                return_value={"access_token": "at-registered", "session_json": "{}"},
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge.emit",
+                side_effect=lambda kind, **payload: emitted.append((kind, payload)),
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge.enable_totp_mfa"
+            ) as enable_mfa,
+        ):
+            configure_post_registration_password_setup(
+                SimpleNamespace(),
+                worker,
+                "Generated!Password123",
+                enabled=True,
+                enable_2fa=True,
+            )
+            result = worker._extract_session_info("browser-context")
+
+        self.assertEqual(result["access_token"], "at-registered")
+        self.assertFalse(worker.require_password_setup)
+        self.assertFalse(worker._password_step_submitted)
+        self.assertTrue(any(kind == "account_registered" for kind, _ in emitted))
+        self.assertTrue(any("Session 已保存" in message for message in logs))
+        self.assertTrue(any("已跳过开启 2FA" in message for message in logs))
+        self.assertNotIn("two_factor_start", [kind for kind, _ in emitted])
+        enable_mfa.assert_not_called()
 
     def test_two_factor_refreshes_invalidated_token_before_browser_closes(self):
         class Page:
@@ -543,6 +601,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
         worker = Worker()
         emitted = []
         session_results = [
+            {"access_token": "at-registered"},
             {"access_token": "at-before-password"},
             {"access_token": "at-after-password"},
         ]
@@ -1114,6 +1173,76 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertNotIn("offer", page.actions)
         self.assertEqual(page.actions[:3], ["profile", "settings", "security"])
 
+    def test_password_settings_prefers_current_account_tab(self):
+        class Candidate:
+            def __init__(self, page, kind):
+                self.page = page
+                self.kind = kind
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def get_attribute(self, name, **_kwargs):
+                return "Account menu" if name == "aria-label" else ""
+
+            def inner_text(self, **_kwargs):
+                return "Account menu"
+
+            def text_content(self, **_kwargs):
+                return "Account menu"
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                self.page.actions.append(self.kind)
+                self.page.state = self.kind
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Page:
+            def __init__(self):
+                self.url = "https://chatgpt.com/"
+                self.state = "home"
+                self.actions = []
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                self.state = "home"
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def locator(self, selector):
+                candidates = []
+                if self.state == "home" and selector == '[data-testid="profile-button"]':
+                    candidates = [Candidate(self, "profile")]
+                elif self.state == "profile" and selector == '[data-testid="settings-menu-item"]':
+                    candidates = [Candidate(self, "settings")]
+                elif self.state == "settings" and selector == '[data-testid="account-tab"]':
+                    candidates = [Candidate(self, "account")]
+                elif self.state == "account" and selector == '[data-testid="add-password-button"]':
+                    candidates = [Candidate(self, "add_password")]
+                return Collection(candidates)
+
+        page = Page()
+        worker = SimpleNamespace(log=lambda _message: None)
+
+        from hidemyemail_generator.openai_browser_bridge import (
+            _open_security_settings,
+        )
+
+        self.assertTrue(_open_security_settings(page, worker))
+        self.assertEqual(page.actions[:3], ["profile", "settings", "account"])
+
     def test_password_setup_closes_extra_tabs_and_keeps_one_chatgpt_page(self):
         class Page:
             def __init__(self, url):
@@ -1151,7 +1280,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
             log=lambda _message: None,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "安全设置"):
+        with self.assertRaisesRegex(RuntimeError, "账户密码设置"):
             ensure_password_in_security_settings(
                 SimpleNamespace(),
                 worker,
@@ -1361,7 +1490,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_ensure_password_rejects_unconfirmed_worker_result(self):
+    async def test_unconfirmed_password_result_still_saves_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -1399,11 +1528,14 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
-            self.assertEqual(snapshot["failed"], 1)
-            self.assertIn("未确认密码设置", snapshot["accounts"][0]["message"])
-            self.assertNotIn(
-                "password", load_account_record(db_file, "passwordless@icloud.com")
-            )
+            self.assertEqual(snapshot["succeeded"], 1)
+            self.assertEqual(snapshot["failed"], 0)
+            self.assertIn("密码待设置", snapshot["accounts"][0]["message"])
+            self.assertFalse(snapshot["accounts"][0]["passwordConfirmed"])
+            record = load_account_record(db_file, "passwordless@icloud.com")
+            self.assertEqual(record["access_token"], "at-test")
+            self.assertEqual(record["password"], "LocalOnly!A7")
+            self.assertFalse(record["password_confirmed"])
 
     async def test_worker_result_is_saved_without_exposing_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1467,7 +1599,7 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 "import json, sys\n"
                 "prefix = 'HME_BROWSER_EVENT:'\n"
                 "result = {'access_token':'at-partial','session_json':'{}'}\n"
-                "print(prefix + json.dumps({'type':'account_registered','result':result,'password':'Strong!Pass123'}), flush=True)\n"
+                "print(prefix + json.dumps({'type':'account_registered','result':result,'password':'Strong!Pass123','password_confirmed':True}), flush=True)\n"
                 "two_factor = {'enabled':False,'status':'enrolled','secret':'JBSWY3DPEHPK3PXP','factor_id':'factor-1','session_id':'session-1'}\n"
                 "print(prefix + json.dumps({'type':'two_factor_enrolled','two_factor':two_factor}), flush=True)\n"
                 "print(prefix + json.dumps({'type':'error','error':'activation failed','password':'Strong!Pass123'}), flush=True)\n"
@@ -1497,7 +1629,9 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
-            self.assertEqual(snapshot["failed"], 1)
+            self.assertEqual(snapshot["succeeded"], 1)
+            self.assertEqual(snapshot["failed"], 0)
+            self.assertIn("2FA 待开启", snapshot["accounts"][0]["message"])
             self.assertNotIn("JBSWY3D", json.dumps(snapshot))
             record = load_account_record(db_file, "partial@icloud.com")
             self.assertEqual(record["access_token"], "at-partial")

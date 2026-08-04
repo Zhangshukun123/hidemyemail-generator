@@ -147,12 +147,27 @@ class RegistrationTaskManager:
                 await asyncio.sleep(0.4)
             browser_result = await browser_wait
             if browser_result.get("succeeded") == 1:
+                accounts = browser_result.get("accounts") or []
+                account = accounts[0] if accounts else {}
+                password_confirmed = bool(account.get("passwordConfirmed"))
+                two_factor_enabled = bool(account.get("twoFactorEnabled"))
+                detail = ["注册成功，Session 已保存"]
+                if password_confirmed:
+                    detail.append("密码已设置")
+                else:
+                    detail.append("密码待设置")
+                if two_factor_enabled:
+                    detail.append("2FA 已开启")
+                elif not password_confirmed:
+                    detail.append("2FA 已跳过（需先设置密码）")
+                else:
+                    detail.append("2FA 待开启")
                 self._state.update(
                     status="completed",
                     phase="completed",
-                    message="注册成功，密码和 2FA 已保存，账号已加入邮箱列表",
+                    message="；".join(detail),
                 )
-                self._append_log("OpenAI 注册和 2FA 开启成功，凭据已保存")
+                self._append_log("；".join(detail))
             elif browser_result.get("status") in {"cancelled", "cancelling"}:
                 self._state.update(
                     status="cancelled",
