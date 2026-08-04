@@ -1246,13 +1246,16 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     async function copyOpenAiCode(email, button) {
-      const since = new Date().toISOString();
+      // OpenAI may send the code just before the user opens this menu. Keep a
+      // short look-back window so that code is still retrievable, while older
+      // registration codes remain excluded.
+      const since = new Date(Date.now() - 5 * 60_000).toISOString();
       const deadline = Date.now() + 60_000;
       if (retrievedCode?.email === email) {
         retrievedCode = null;
         button.closest(".email-row")?.querySelector(".account-state")?.replaceChildren();
       }
-      button.textContent = "等待新验证码…";
+      button.textContent = "查找最近验证码…";
       while (Date.now() < deadline) {
         try {
           const data = await api("/api/gpt-code", {
@@ -1261,13 +1264,13 @@ GPT_INDEX_HTML = r"""<!doctype html>
           const copied = await copyText(data.code);
           retrievedCode = { email, code: data.code, copied };
           render(visibleItems);
-          return { successLabel: copied ? "新验证码已获取并复制" : "新验证码已获取，请手动复制" };
+          return { successLabel: copied ? "验证码已获取并复制" : "验证码已获取，请手动复制" };
         } catch (error) {
           if (error.status !== 404) throw error;
         }
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
-      throw new Error("60 秒内未收到新验证码，请确认 OpenAI 已发送验证码后重试");
+      throw new Error("未找到最近 5 分钟发送的验证码，请让 OpenAI 重新发送后再试");
     }
 
     async function copyAccount(email) {

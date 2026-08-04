@@ -338,10 +338,13 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("复制 AT", GPT_INDEX_HTML)
         self.assertIn("复制 Session", GPT_INDEX_HTML)
         self.assertIn("获取 OpenAI 码", GPT_INDEX_HTML)
-        self.assertIn("const since = new Date().toISOString()", GPT_INDEX_HTML)
+        self.assertIn(
+            "const since = new Date(Date.now() - 5 * 60_000).toISOString()",
+            GPT_INDEX_HTML,
+        )
         self.assertIn("JSON.stringify({ email, since })", GPT_INDEX_HTML)
-        self.assertIn("等待新验证码…", GPT_INDEX_HTML)
-        self.assertIn("60 秒内未收到新验证码", GPT_INDEX_HTML)
+        self.assertIn("查找最近验证码…", GPT_INDEX_HTML)
+        self.assertIn("未找到最近 5 分钟发送的验证码", GPT_INDEX_HTML)
         self.assertIn("error.status = response.status", GPT_INDEX_HTML)
         self.assertIn("复制账号", GPT_INDEX_HTML)
         self.assertIn("/api/gpt-accounts/export", GPT_INDEX_HTML)
