@@ -10,7 +10,9 @@ from hidemyemail_generator.webapp import (
     _gpt_account_export,
     _gpt_email_items,
     _gpt_credential,
+    _effective_gpt_code_since,
     _latest_gpt_code,
+    _inbox_error_message,
     _match_relay_identity,
     _workbench_import_payload,
 )
@@ -36,6 +38,48 @@ IDENTITIES = [
 
 
 class GptEmailTests(unittest.TestCase):
+    def test_imap_connection_error_explains_registration_code_dependency(self):
+        message = _inbox_error_message(TimeoutError())
+
+        self.assertIn("OpenAI 注册验证码无法收取", message)
+        self.assertIn("与 2FA 无关", message)
+
+    def test_active_browser_task_excludes_codes_from_earlier_runs(self):
+        snapshot = {
+            "running": True,
+            "startedAt": "2026-08-04T11:31:10+00:00",
+            "accounts": [{"email": "Wombat-Uneasy04@icloud.com"}],
+        }
+        self.assertEqual(
+            _effective_gpt_code_since(
+                "2026-08-04T11:26:10+00:00",
+                "wombat-uneasy04@icloud.com",
+                snapshot,
+                {
+                    "running": True,
+                    "startedAt": "2026-08-04T11:31:20+00:00",
+                    "accounts": [{"email": "wombat-uneasy04@icloud.com"}],
+                },
+            ),
+            "2026-08-04T11:31:20+00:00",
+        )
+        self.assertEqual(
+            _effective_gpt_code_since(
+                "2026-08-04T11:32:00+00:00",
+                "wombat-uneasy04@icloud.com",
+                snapshot,
+            ),
+            "2026-08-04T11:32:00+00:00",
+        )
+        self.assertEqual(
+            _effective_gpt_code_since(
+                "2026-08-04T11:26:10+00:00",
+                "ally-gospels.7v@icloud.com",
+                snapshot,
+            ),
+            "2026-08-04T11:26:10+00:00",
+        )
+
     def test_two_factor_password_gate_requires_confirmed_password(self):
         self.assertFalse(_account_has_confirmed_password({}))
         self.assertFalse(
@@ -132,6 +176,22 @@ class GptEmailTests(unittest.TestCase):
                 },
                 "pending@icloud.com",
             )
+
+    def test_plus_workbench_import_targets_plus_group(self):
+        payload = _workbench_import_payload(
+            {
+                "account_type": "plus",
+                "session": {
+                    "accessToken": "at-plus",
+                    "user": {"email": "plus@icloud.com"},
+                },
+            },
+            "plus@icloud.com",
+        )
+
+        self.assertEqual(payload["account_type"], "plus")
+        self.assertEqual(payload["group"], "Plus")
+        self.assertEqual(payload["session"]["accessToken"], "at-plus")
 
     def test_matches_exact_and_obfuscated_icloud_relay_ids(self):
         exact = _match_relay_identity(
@@ -332,6 +392,71 @@ class GptEmailTests(unittest.TestCase):
             self.assertEqual(item["code"], "624813")
             self.assertEqual(item["receivedAt"], "2026-08-02T04:09:00+00:00")
 
+    def test_consumed_code_is_not_returned_twice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            conn = connect_db(str(db_file))
+            try:
+                base = {
+                    "account_key": "test",
+                    "folder": "INBOX",
+                    "sender": "noreply@openai.com",
+                    "recipients": "wombat-uneasy04@icloud.com",
+                    "hme_address": "wombat-uneasy04@icloud.com",
+                    "subject": "Your temporary ChatGPT login code",
+                    "body_preview": "Use this verification code to continue",
+                    "created_at": "2026-08-04T12:00:00+00:00",
+                }
+                insert_message(
+                    conn,
+                    {
+                        **base,
+                        "uid": "first",
+                        "code": "123456",
+                        "received_at": "2026-08-04T12:00:00+00:00",
+                    },
+                )
+            finally:
+                conn.close()
+
+            first = _latest_gpt_code(
+                db_file,
+                "wombat-uneasy04@icloud.com",
+                IDENTITIES,
+                consume=True,
+            )
+            self.assertEqual(first["code"], "123456")
+            self.assertIsNone(
+                _latest_gpt_code(
+                    db_file,
+                    "wombat-uneasy04@icloud.com",
+                    IDENTITIES,
+                    consume=True,
+                )
+            )
+
+            conn = connect_db(str(db_file))
+            try:
+                insert_message(
+                    conn,
+                    {
+                        **base,
+                        "uid": "second",
+                        "code": "654321",
+                        "received_at": "2026-08-04T12:01:00+00:00",
+                    },
+                )
+            finally:
+                conn.close()
+
+            second = _latest_gpt_code(
+                db_file,
+                "wombat-uneasy04@icloud.com",
+                IDENTITIES,
+                consume=True,
+            )
+            self.assertEqual(second["code"], "654321")
+
     def test_served_page_contains_only_gpt_list(self):
         self.assertIn("GPT 邮箱列表", GPT_INDEX_HTML)
         self.assertIn("复制邮箱", GPT_INDEX_HTML)
@@ -339,12 +464,20 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("复制 Session", GPT_INDEX_HTML)
         self.assertIn("获取 OpenAI 码", GPT_INDEX_HTML)
         self.assertIn(
-            "const since = new Date(Date.now() - 5 * 60_000).toISOString()",
+            "activeTaskStartedAt",
             GPT_INDEX_HTML,
         )
+        self.assertIn("browserStartedAt", GPT_INDEX_HTML)
+        self.assertIn("activeBrowserEmails.has(targetEmail)", GPT_INDEX_HTML)
+        self.assertIn("verificationStartedAt", GPT_INDEX_HTML)
+        self.assertIn("activeVerificationEmails.has(targetEmail)", GPT_INDEX_HTML)
+        self.assertIn(
+            "new Date(Date.now() - 5 * 60_000).toISOString()", GPT_INDEX_HTML
+        )
         self.assertIn("JSON.stringify({ email, since })", GPT_INDEX_HTML)
-        self.assertIn("查找最近验证码…", GPT_INDEX_HTML)
-        self.assertIn("未找到最近 5 分钟发送的验证码", GPT_INDEX_HTML)
+        self.assertIn("等待本轮验证码…", GPT_INDEX_HTML)
+        self.assertIn("查找未使用验证码…", GPT_INDEX_HTML)
+        self.assertIn("最近 5 分钟内尚未使用的新验证码", GPT_INDEX_HTML)
         self.assertIn("error.status = response.status", GPT_INDEX_HTML)
         self.assertIn("复制账号", GPT_INDEX_HTML)
         self.assertIn("/api/gpt-accounts/export", GPT_INDEX_HTML)
@@ -364,6 +497,8 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("复制密码", GPT_INDEX_HTML)
         self.assertIn("一键导入工作台", GPT_INDEX_HTML)
         self.assertIn("/api/account/import-workbench", GPT_INDEX_HTML)
+        self.assertIn('data.group === "Plus"', GPT_INDEX_HTML)
+        self.assertIn("已导入工作台 Plus 分组", GPT_INDEX_HTML)
         self.assertIn("if (!item.hasImportableSession)", GPT_INDEX_HTML)
         self.assertIn("请先获取 Session 后再导入工作台", GPT_INDEX_HTML)
         self.assertNotIn("请先完成密码设置并开启 2FA", GPT_INDEX_HTML)
@@ -371,15 +506,21 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("reset_password", GPT_INDEX_HTML)
         self.assertIn("验证账号", GPT_INDEX_HTML)
         self.assertIn('actionButton("验证账号"', GPT_INDEX_HTML)
-        self.assertIn("将使用协议登录", GPT_INDEX_HTML)
-        self.assertIn("重新获取 Session 并验证账号；不会启动浏览器", GPT_INDEX_HTML)
-        self.assertIn("使用协议登录重新获取 Session 并验证账号，不会启动浏览器", GPT_INDEX_HTML)
+        self.assertIn('item.sessionStatus !== "ready"', GPT_INDEX_HTML)
+        self.assertIn("启动无头浏览器重新获取 Session", GPT_INDEX_HTML)
+        self.assertIn("已保存的 Session 验证账号", GPT_INDEX_HTML)
+        self.assertIn("使用无头浏览器重新获取 Session 并验证账号", GPT_INDEX_HTML)
+        self.assertIn('data.mode === "refresh_session"', GPT_INDEX_HTML)
         self.assertNotIn("请先获取 Session 后再验证账号", GPT_INDEX_HTML)
         self.assertNotIn("将启动浏览器完成账号和密码设置", GPT_INDEX_HTML)
         self.assertIn("if (!item.hasPassword)", GPT_INDEX_HTML)
         self.assertIn('actionButton("设置密码"', GPT_INDEX_HTML)
-        self.assertIn("根据 Session 验证账号，不设置密码和 2FA", GPT_INDEX_HTML)
-        self.assertIn("将只根据 Session 在线检查", GPT_INDEX_HTML)
+        self.assertIn(
+            "缺失 Session 时使用无头浏览器，支持多进程", GPT_INDEX_HTML
+        )
+        self.assertIn("最多并行 ${concurrency} 个进程", GPT_INDEX_HTML)
+        self.assertIn("JSON.stringify({ concurrency, emails })", GPT_INDEX_HTML)
+        self.assertIn('id="concurrency" type="number" min="1" max="10" value="3"', GPT_INDEX_HTML)
         self.assertIn("verifyOrRegisterAccount(item)", GPT_INDEX_HTML)
         self.assertIn("/api/account/verify-or-register", GPT_INDEX_HTML)
         self.assertIn("/api/account/type", GPT_INDEX_HTML)
@@ -396,7 +537,8 @@ class GptEmailTests(unittest.TestCase):
         self.assertNotIn("将创建新的 iCloud 隐藏邮箱", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 密钥", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 码", GPT_INDEX_HTML)
-        self.assertIn("开启 2FA", GPT_INDEX_HTML)
+        self.assertNotIn("开启 2FA", GPT_INDEX_HTML)
+        self.assertNotIn("enableTwoFactor", GPT_INDEX_HTML)
         self.assertIn("删除邮箱", GPT_INDEX_HTML)
         self.assertIn("Plus 账号", GPT_INDEX_HTML)
         self.assertIn("Free 账号", GPT_INDEX_HTML)
@@ -414,6 +556,24 @@ class GptEmailTests(unittest.TestCase):
         self.assertNotIn("生成新地址", GPT_INDEX_HTML)
         self.assertNotIn("使用中的地址", GPT_INDEX_HTML)
         self.assertNotIn("收件箱与验证码", GPT_INDEX_HTML)
+
+    def test_operation_account_selection_is_highlighted_and_exclusive(self):
+        self.assertIn(".email-row.operation-selected", GPT_INDEX_HTML)
+        self.assertIn("正在操作", GPT_INDEX_HTML)
+        self.assertIn('let selectedOperationEmail = ""', GPT_INDEX_HTML)
+        self.assertIn("function syncOperationSelection()", GPT_INDEX_HTML)
+        self.assertIn(
+            'row.classList.toggle("operation-selected", selected)',
+            GPT_INDEX_HTML,
+        )
+        self.assertIn(
+            'selectedOperationEmail = selectedOperationEmail === item.email ? "" : item.email',
+            GPT_INDEX_HTML,
+        )
+        self.assertIn(
+            'moreButton.querySelector(".more-action-label").textContent = selected ? "收起操作" : "更多操作"',
+            GPT_INDEX_HTML,
+        )
 
 
 if __name__ == "__main__":

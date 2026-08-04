@@ -25,6 +25,7 @@ from .browser_tasks import (
     load_account_record,
     set_manual_account_type,
 )
+from .code_portal import CODE_PORTAL_HTML
 from .inbox import (
     DEFAULT_DB_FILE,
     DEFAULT_FOLDER,
@@ -46,8 +47,9 @@ from .registration_tasks import RegistrationTaskManager, generate_openai_passwor
 
 SESSION_COOKIE_NAME = "hme_session"
 SESSION_MAX_AGE = 12 * 60 * 60
-PUBLIC_PATHS = {"/login", "/api/login", "/healthz"}
+PUBLIC_PATHS = {"/login", "/api/login", "/access", "/healthz"}
 WORKBENCH_OPENAI_CODE_PATH = "/api/integrations/workbench/openai-code"
+GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -903,11 +905,22 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .toolbar input { padding-left: 37px; }
     .list { padding: 0 14px 14px; display: grid; gap: 9px; }
     .email-row {
+      position: relative;
       display: grid; grid-template-columns: minmax(280px, .9fr) minmax(220px, 1.1fr) auto; align-items: center; gap: 14px;
       padding: 15px 16px; background: var(--row-bg); border: 1px solid var(--border); border-radius: 14px;
       transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
     }
     .email-row:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); background: var(--row-hover); transform: translateY(-1px); }
+    .email-row.operation-selected {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 9%, var(--row-bg));
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent), 0 14px 32px rgba(0, 0, 0, .16);
+    }
+    .email-row.operation-selected::before {
+      content: ""; position: absolute; top: 11px; bottom: 11px; left: 5px; width: 4px;
+      border-radius: 999px; background: var(--accent);
+    }
+    .email-row.operation-selected:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--row-bg)); }
     .identity { grid-column: 1; display: flex; align-items: center; gap: 13px; min-width: 0; }
     .avatar { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; color: var(--text);
       background: var(--accent-soft); font-weight: 780; }
@@ -916,6 +929,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .meta-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
     .created-date { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border-radius: 999px;
       color: var(--muted); background: var(--subtle); font-size: 10px; font-weight: 650; white-space: nowrap; }
+    .operation-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 2px 9px; border-radius: 999px;
+      color: var(--accent-contrast); background: var(--accent); font-size: 10px; font-weight: 800; white-space: nowrap; }
+    .operation-badge[hidden] { display: none; }
+    .operation-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 16%, transparent); }
     .date-group { display: flex; align-items: center; gap: 9px; padding: 10px 4px 2px; color: var(--label); font-size: 12px; font-weight: 750; }
     .date-group::after { content: ""; height: 1px; flex: 1; background: var(--border); }
     .date-group-count { color: var(--muted); font-size: 10px; font-weight: 650; }
@@ -1069,7 +1086,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       <div class="automation-body">
         <div class="controls">
           <label class="switch-field"><input id="headless" type="checkbox" role="switch"> 无头浏览器</label>
-          <label class="control-field">认证并发<input id="concurrency" type="number" min="1" max="10" value="1" aria-label="认证并发数"></label>
+          <label class="control-field">认证并发<input id="concurrency" type="number" min="1" max="10" value="3" aria-label="认证并发数"></label>
           <button id="registerOne" class="primary">一键注册新账号</button>
           <button id="fetchAll" class="primary">浏览器取全部</button>
           <button id="stopTask" class="danger" disabled>停止当前任务</button>
@@ -1093,7 +1110,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
           <div id="summary">正在加载…</div>
         </div>
         <div class="list-actions">
-          <div id="verifySummary">根据 Session 验证账号，不设置密码和 2FA</div>
+          <div id="verifySummary">验证账号；缺失 Session 时使用无头浏览器，支持多进程</div>
           <button id="verifyAll" class="primary">一键验证账号</button>
           <button id="stopVerify" class="danger" disabled>停止验证</button>
         </div>
@@ -1141,9 +1158,15 @@ GPT_INDEX_HTML = r"""<!doctype html>
     let registrationPoll = null;
     let verificationPoll = null;
     let browserRunning = false;
+    let browserStartedAt = "";
+    let activeBrowserEmails = new Set();
+    let verificationRunning = false;
+    let verificationStartedAt = "";
+    let activeVerificationEmails = new Set();
     let registrationRunning = false;
     let browserRuntimeAvailable = false;
     let toastTimer = null;
+    let selectedOperationEmail = "";
 
     function applyTheme(theme, persist = false) {
       document.documentElement.dataset.theme = theme;
@@ -1246,16 +1269,24 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     async function copyOpenAiCode(email, button) {
-      // OpenAI may send the code just before the user opens this menu. Keep a
-      // short look-back window so that code is still retrievable, while older
-      // registration codes remain excluded.
-      const since = new Date(Date.now() - 5 * 60_000).toISOString();
+      // An active browser task must only receive a code sent for this run.
+      // Outside a task, allow a recently delivered code. The server records
+      // each served message so the same code cannot be returned twice.
+      const targetEmail = String(email || "").toLowerCase();
+      const activeTaskStartedAt = [
+        browserRunning && activeBrowserEmails.has(targetEmail) ? browserStartedAt : "",
+        verificationRunning && activeVerificationEmails.has(targetEmail)
+          ? verificationStartedAt
+          : "",
+      ].filter(Boolean).sort().pop() || "";
+      const since = activeTaskStartedAt
+        || new Date(Date.now() - 5 * 60_000).toISOString();
       const deadline = Date.now() + 60_000;
       if (retrievedCode?.email === email) {
         retrievedCode = null;
         button.closest(".email-row")?.querySelector(".account-state")?.replaceChildren();
       }
-      button.textContent = "查找最近验证码…";
+      button.textContent = activeTaskStartedAt ? "等待本轮验证码…" : "查找未使用验证码…";
       while (Date.now() < deadline) {
         try {
           const data = await api("/api/gpt-code", {
@@ -1270,7 +1301,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
         }
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
-      throw new Error("未找到最近 5 分钟发送的验证码，请让 OpenAI 重新发送后再试");
+      throw new Error(activeTaskStartedAt
+        ? "未找到本轮任务发送的新验证码，请让 OpenAI 重新发送后再试"
+        : "未找到最近 5 分钟内尚未使用的新验证码，请让 OpenAI 重新发送后再试");
     }
 
     async function copyAccount(email) {
@@ -1300,6 +1333,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
         method: "POST",
         body: JSON.stringify({ email }),
       });
+      if (data.group === "Plus") {
+        return {
+          successLabel: data.updated ? "工作台 Plus 分组已更新" : "已导入工作台 Plus 分组",
+        };
+      }
       return {
         successLabel: data.updated ? "工作台账号已更新" : "已导入工作台",
       };
@@ -1328,9 +1366,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return { headless: $('headless').checked, concurrency };
     }
 
-    async function startBrowser(emails = null, enableTwoFactor = false) {
+    async function startBrowser(emails = null) {
       const path = emails ? "/api/browser/fetch-selected" : "/api/browser/fetch-all";
-      const payload = { ...browserOptions(), enable_2fa: enableTwoFactor };
+      const payload = browserOptions();
       if (emails) payload.emails = emails;
       const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
       if (!data.started) {
@@ -1340,23 +1378,18 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
-    async function enableTwoFactor(email) {
-      if (!confirm(`将重新登录 ${email} 并开启 TOTP 2FA，是否继续？`)) {
-        const error = new Error("已取消开启 2FA");
-        error.name = "AbortError";
-        throw error;
-      }
-      return startBrowser([email], true);
-    }
-
     async function verifyOrRegisterAccount(item, resetPassword = false) {
       if (resetPassword && !confirm(`将通过邮箱验证码为 ${item.email} 重置密码，是否继续？`)) {
         const error = new Error("已取消重置密码");
         error.name = "AbortError";
         throw error;
       }
-      if (!resetPassword && !confirm(`将使用协议登录为 ${item.email} 重新获取 Session 并验证账号；不会启动浏览器。是否继续？`)) {
-        const error = new Error("已取消协议登录");
+      const needsSessionRefresh = item.sessionStatus !== "ready";
+      const verifyPrompt = needsSessionRefresh
+        ? `当前没有可用 Session，将为 ${item.email} 启动无头浏览器重新获取 Session 并验证账号。是否继续？`
+        : `将使用 ${item.email} 已保存的 Session 验证账号；不会设置密码或 2FA。是否继续？`;
+      if (!resetPassword && !confirm(verifyPrompt)) {
+        const error = new Error("已取消验证账号");
         error.name = "AbortError";
         throw error;
       }
@@ -1370,7 +1403,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
       });
       if (data.mode === "verify") {
         await loadVerification();
-        return { successLabel: "协议登录已启动" };
+        return { successLabel: "验证已启动" };
+      }
+      if (data.mode === "refresh_session") {
+        await loadVerification();
+        return { successLabel: "正在重新获取 Session" };
       }
       await loadTask();
       return { successLabel: data.mode === "set_password" ? "密码设置已启动" : "注册已启动" };
@@ -1408,6 +1445,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
       $("runtimeLabel").textContent = runtime.available ? "运行环境已连接" : "运行环境不可用";
       browserRuntimeAvailable = Boolean(runtime.available);
       browserRunning = Boolean(data.running);
+      browserStartedAt = browserRunning ? String(data.startedAt || "") : "";
+      activeBrowserEmails = new Set(
+        browserRunning ? accounts.map((item) => String(item.email || "").toLowerCase()) : []
+      );
       if (!runtime.available) {
         $("taskSummary").className = "task-summary error";
         $("taskSummary").textContent = (runtime.errors || ["Camoufox 运行环境不可用"]).join("；");
@@ -1520,16 +1561,24 @@ GPT_INDEX_HTML = r"""<!doctype html>
 
     function renderVerification(data) {
       const runtime = data.runtime || {};
+      const accounts = data.accounts || [];
       const statusNames = {
         idle: "尚未验证", running: "验证中", cancelling: "正在停止",
         completed: "验证完成", cancelled: "已停止",
       };
+      verificationRunning = Boolean(data.running);
+      verificationStartedAt = verificationRunning ? String(data.startedAt || "") : "";
+      activeVerificationEmails = new Set(
+        verificationRunning
+          ? accounts.map((item) => String(item.email || "").toLowerCase())
+          : []
+      );
       if (!runtime.available) {
         $("verifySummary").className = "error";
         $("verifySummary").textContent = (runtime.errors || ["账号验证运行环境不可用"]).join("；");
       } else if (data.status === "idle") {
         $("verifySummary").className = "";
-        $("verifySummary").textContent = "根据 Session 验证账号，不设置密码和 2FA";
+        $("verifySummary").textContent = "验证账号；缺失 Session 时使用无头浏览器，支持多进程";
       } else {
         $("verifySummary").className = data.failed ? "error" : "";
         $("verifySummary").textContent = `${statusNames[data.status] || data.status} · ${data.completed || 0}/${data.total || 0} · Plus ${data.plus || 0} · Free ${data.free || 0} · Token 失效 ${data.expired || 0} · 失败 ${data.failed || 0}`;
@@ -1557,11 +1606,15 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     async function startVerification() {
-      const verifiable = currentItems.filter((item) => item.hasSession).length;
-      if (!verifiable) throw new Error("暂无已保存 Session 的账号");
-      if (!confirm(`将只根据 Session 在线检查 ${verifiable} 个账号，不设置密码或 2FA；失效 Session 会被清除，账号记录会保留。是否继续？`)) return;
+      const emails = currentItems.map((item) => item.email);
+      if (!emails.length) throw new Error("暂无可验证账号");
+      const concurrency = browserOptions().concurrency;
+      const refreshCount = currentItems.filter((item) => item.sessionStatus !== "ready").length;
+      if (!confirm(
+        `将验证 ${emails.length} 个账号；其中 ${refreshCount} 个账号会通过无头浏览器重新获取 Session，最多并行 ${concurrency} 个进程。不会设置密码或 2FA，是否继续？`
+      )) return;
       const data = await api("/api/account-verification/start", {
-        method: "POST", body: JSON.stringify({ concurrency: 3 })
+        method: "POST", body: JSON.stringify({ concurrency, emails })
       });
       renderVerification(data.task);
       showToast("账号验证已启动");
@@ -1624,6 +1677,20 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return empty;
     }
 
+    function syncOperationSelection() {
+      for (const row of $("list").querySelectorAll(".email-row")) {
+        const selected = row.dataset.accountEmail === selectedOperationEmail;
+        row.classList.toggle("operation-selected", selected);
+        row.classList.toggle("expanded", selected);
+        if (selected) row.setAttribute("aria-current", "true");
+        else row.removeAttribute("aria-current");
+        const moreButton = row.querySelector(".more-action");
+        moreButton.setAttribute("aria-expanded", String(selected));
+        moreButton.querySelector(".more-action-label").textContent = selected ? "收起操作" : "更多操作";
+        row.querySelector(".operation-badge").hidden = !selected;
+      }
+    }
+
     function render(items) {
       const root = $("list");
       root.replaceChildren();
@@ -1650,6 +1717,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         }
         const row = document.createElement("div");
         row.className = "email-row";
+        row.dataset.accountEmail = item.email;
         const identity = document.createElement("div");
         identity.className = "identity";
         const avatar = document.createElement("div");
@@ -1693,11 +1761,15 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const createdDate = document.createElement("span");
         createdDate.className = "created-date";
         createdDate.textContent = createdDateLabel(item);
-        metaLine.append(planSelect, badge, createdDate);
-        if (item.twoFactorStatus) {
+        const operationBadge = document.createElement("span");
+        operationBadge.className = "operation-badge";
+        operationBadge.textContent = "正在操作";
+        operationBadge.hidden = true;
+        metaLine.append(operationBadge, planSelect, badge, createdDate);
+        if (item.hasTwoFactor) {
           const mfaBadge = document.createElement("span");
-          mfaBadge.className = `mfa-badge ${item.hasTwoFactor ? "" : "pending"}`.trim();
-          mfaBadge.textContent = item.hasTwoFactor ? "2FA 已开启" : "2FA 待激活";
+          mfaBadge.className = "mfa-badge";
+          mfaBadge.textContent = "2FA 已开启";
           metaLine.append(mfaBadge);
         }
         identityCopy.append(address, metaLine);
@@ -1764,13 +1836,15 @@ GPT_INDEX_HTML = r"""<!doctype html>
         moreButton.type = "button";
         moreButton.className = "action more-action";
         moreButton.setAttribute("aria-expanded", "false");
-        moreButton.innerHTML = '更多操作 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>';
+        moreButton.innerHTML = '<span class="more-action-label">更多操作</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>';
         quickActions.append(copyEmailButton, moreButton);
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
         secondaryActions.append(importWorkbenchButton);
-        const verifyAccountButton = actionButton("验证账号", () => verifyOrRegisterAccount(item), "协议登录已启动");
-        verifyAccountButton.title = "使用协议登录重新获取 Session 并验证账号，不会启动浏览器";
+        const verifyAccountButton = actionButton("验证账号", () => verifyOrRegisterAccount(item), "验证已启动");
+        verifyAccountButton.title = item.sessionStatus === "ready"
+          ? "使用现有 Session 验证账号"
+          : "使用无头浏览器重新获取 Session 并验证账号";
         secondaryActions.append(verifyAccountButton);
         if (!item.hasPassword) {
           secondaryActions.append(actionButton("设置密码", () => verifyOrRegisterAccount(item, true), "密码设置已启动"));
@@ -1786,8 +1860,6 @@ GPT_INDEX_HTML = r"""<!doctype html>
             actionButton("复制 2FA 密钥", () => copyCredential(item.email, "totp_secret")),
             actionButton("复制 2FA 码", () => copyCredential(item.email, "totp_code"))
           );
-        } else if (item.hasPassword) {
-          secondaryActions.append(actionButton("开启 2FA", () => enableTwoFactor(item.email), "已启动"));
         }
         if (item.hasSession) {
           secondaryActions.append(
@@ -1805,14 +1877,13 @@ GPT_INDEX_HTML = r"""<!doctype html>
         }
         secondaryActions.append(deleteButton, copyAccountButton);
         moreButton.addEventListener("click", () => {
-          const expanded = !row.classList.contains("expanded");
-          row.classList.toggle("expanded", expanded);
-          moreButton.setAttribute("aria-expanded", String(expanded));
-          moreButton.firstChild.textContent = expanded ? "收起操作 " : "更多操作 ";
+          selectedOperationEmail = selectedOperationEmail === item.email ? "" : item.email;
+          syncOperationSelection();
         });
         row.append(identity, accountState, quickActions, secondaryActions);
         root.append(row);
       }
+      syncOperationSelection();
     }
 
     function applyFilters() {
@@ -2007,7 +2078,10 @@ def _inbox_error_message(error: Exception) -> str:
     if "authentication" in message or "login" in message or "auth" in message:
         return "IMAP 登录失败，请确认已开启 IMAP，并使用授权码或应用专用密码"
     if isinstance(error, (TimeoutError, OSError)):
-        return "无法连接 IMAP 服务器，请检查主机、端口和网络"
+        return (
+            "无法连接 IMAP 服务器，OpenAI 注册验证码无法收取（与 2FA 无关）；"
+            "请检查主机、端口和网络"
+        )
     return "同步邮箱失败，请检查 IMAP 设置"
 
 
@@ -2239,10 +2313,13 @@ def _workbench_import_payload(record: dict, email: str) -> dict:
         raise RuntimeError("该账号尚未保存有效 Session，不能导入工作台")
     if not str(session.get("accessToken") or session.get("access_token") or "").strip():
         session = {**session, "accessToken": access_token}
-    return {
+    payload = {
         "email": target,
         "session": session,
     }
+    if str(record.get("account_type") or "").strip().lower() == "plus":
+        payload.update({"account_type": "plus", "group": "Plus"})
+    return payload
 
 
 def _account_has_confirmed_password(record: dict) -> bool:
@@ -2284,13 +2361,57 @@ def _parse_timestamp(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _effective_gpt_code_since(
+    since: str, email: str, *task_snapshots: dict | None
+) -> str:
+    """Do not let an active login or verification reuse an earlier code."""
+    target = email.strip().lower()
+    requested_at = _parse_timestamp(since)
+    effective_since = since
+    for candidate in task_snapshots:
+        snapshot = candidate if isinstance(candidate, dict) else {}
+        if not snapshot.get("running"):
+            continue
+        active_emails = {
+            str(item.get("email") or "").strip().lower()
+            for item in snapshot.get("accounts", [])
+            if isinstance(item, dict)
+        }
+        if target not in active_emails:
+            continue
+        task_started = str(snapshot.get("startedAt") or "").strip()
+        task_started_at = _parse_timestamp(task_started)
+        if task_started_at and (
+            requested_at is None or task_started_at > requested_at
+        ):
+            requested_at = task_started_at
+            effective_since = task_started
+    return effective_since
+
+
 def _latest_gpt_code(
-    db_file: Path, email: str, identities: list[dict], since: str = ""
+    db_file: Path,
+    email: str,
+    identities: list[dict],
+    since: str = "",
+    *,
+    consume: bool = False,
 ) -> dict | None:
     target = email.strip().lower()
     since_at = _parse_timestamp(since)
     conn = connect_db(str(db_file))
     try:
+        consumed_message_id = 0
+        cursor_key = f"{GPT_CODE_CURSOR_PREFIX}{target}"
+        if consume:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor_row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (cursor_key,)
+            ).fetchone()
+            try:
+                consumed_message_id = int(cursor_row["value"] if cursor_row else 0)
+            except (TypeError, ValueError):
+                consumed_message_id = 0
         rows = conn.execute(
             """
             SELECT id, received_at, hme_address, sender, subject, code, body_preview
@@ -2304,6 +2425,9 @@ def _latest_gpt_code(
             """
         ).fetchall()
         for row in rows:
+            message_id = int(row["id"])
+            if consume and message_id <= consumed_message_id:
+                continue
             received_at = str(row["received_at"] or "")
             received = _parse_timestamp(received_at)
             if since_at and (not received or received < since_at):
@@ -2327,7 +2451,63 @@ def _latest_gpt_code(
                 )
                 matched_email = str((identity or {}).get("hme") or "").lower()
             if matched_email == target:
+                if consume:
+                    conn.execute(
+                        """
+                        INSERT INTO settings(key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (cursor_key, str(message_id)),
+                    )
+                    conn.commit()
                 return {"code": code, "receivedAt": received_at}
+        return None
+    finally:
+        conn.close()
+
+
+def _latest_code_for_email(
+    db_file: Path, email: str, identities: list[dict]
+) -> dict | None:
+    """Return only the newest code that can be attributed to one exact alias."""
+
+    target = email.strip().lower()
+    conn = connect_db(str(db_file))
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, received_at, hme_address, sender, subject, code, body_preview
+            FROM messages
+            ORDER BY COALESCE(received_at, created_at) DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        for row in rows:
+            matched_email = str(row["hme_address"] or "").strip().lower()
+            if matched_email != target:
+                identity = _match_relay_identity(
+                    str(row["sender"] or ""), identities
+                )
+                matched_email = str((identity or {}).get("hme") or "").lower()
+            if matched_email != target:
+                continue
+            code = str(row["code"] or "").strip()
+            if not code:
+                code = extract_verification_code(
+                    str(row["subject"] or ""), str(row["body_preview"] or "")
+                )
+                if code:
+                    conn.execute(
+                        "UPDATE messages SET code = ? WHERE id = ?",
+                        (code, row["id"]),
+                    )
+                    conn.commit()
+            if not code:
+                continue
+            return {
+                "code": code,
+                "receivedAt": str(row["received_at"] or ""),
+            }
         return None
     finally:
         conn.close()
@@ -2379,11 +2559,15 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 )
                 if isinstance(account.get("two_factor"), dict)
                 else "",
-                "hasSession": bool(access_token),
+                "hasSession": bool(session and access_token),
                 "hasImportableSession": bool(session and access_token),
                 "tokenExpired": token_expired,
                 "sessionStatus": (
-                    "expired" if token_expired else "ready" if access_token else "pending"
+                    "expired"
+                    if token_expired
+                    else "ready"
+                    if session and access_token
+                    else "pending"
                 ),
                 "accountType": account_type,
                 "accountTypeSource": str(account.get("account_type_source") or ""),
@@ -2436,6 +2620,7 @@ def create_app(
     app["generate_lock"] = asyncio.Lock()
     app["delete_lock"] = asyncio.Lock()
     app["inbox_sync_lock"] = asyncio.Lock()
+    app["identity_lock"] = asyncio.Lock()
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
     browser_source = (
@@ -2457,6 +2642,7 @@ def create_app(
         python_executable=app["browser_manager"].python_executable,
         code_service_url=browser_service_url,
         code_service_token=app["local_token"],
+        browser_manager=app["browser_manager"],
     )
     gpt_code_identity_cache: list[dict] = []
     gpt_code_identity_cache_at = 0.0
@@ -2465,10 +2651,11 @@ def create_app(
         cookie_path: Path = app["cookie_file"]
         if not cookie_path.exists() or cookie_path.stat().st_size == 0:
             raise RuntimeError("iCloud Cookie 尚未准备好")
-        async with RichHideMyEmail(
-            cookie_file=str(cookie_path), region=app["region"]
-        ) as hme:
-            result = await hme.list_email()
+        async with app["identity_lock"]:
+            async with RichHideMyEmail(
+                cookie_file=str(cookie_path), region=app["region"]
+            ) as hme:
+                result = await hme.list_email()
         if not result or not result.get("success"):
             raise RuntimeError(_error_reason(result))
         return [
@@ -2584,6 +2771,31 @@ def create_app(
             raise web.HTTPFound("/")
         return web.Response(
             text=LOGIN_HTML,
+            content_type="text/html",
+            headers=PAGE_HEADERS,
+        )
+
+    async def access_page(request: web.Request) -> web.Response:
+        supplied = str(request.query.get("token") or "")
+        configured = str(app.get("workbench_import_token") or "")
+        if not configured or not hmac.compare_digest(supplied, configured):
+            raise web.HTTPNotFound()
+        response = web.HTTPFound("/code")
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            app["session_token"],
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            secure=request.headers.get("X-Forwarded-Proto") == "https",
+            samesite="Strict",
+            path="/",
+        )
+        response.headers.update(PAGE_HEADERS)
+        return response
+
+    async def code_page(_: web.Request) -> web.Response:
+        return web.Response(
+            text=CODE_PORTAL_HTML,
             content_type="text/html",
             headers=PAGE_HEADERS,
         )
@@ -2942,6 +3154,13 @@ def create_app(
         if not config_path.exists():
             return None, "iCloud 收件箱尚未配置", 503
 
+        since = _effective_gpt_code_since(
+            since,
+            email,
+            app["browser_manager"].snapshot(),
+            app["verification_manager"].snapshot(),
+        )
+
         # The background inbox task normally has the newest message already.
         # Check the local database first so the workbench button responds without
         # waiting for another IMAP round trip when possible.
@@ -2951,6 +3170,7 @@ def create_app(
             email,
             gpt_code_identity_cache,
             since,
+            consume=True,
         )
         if item:
             return item, "", 200
@@ -2978,6 +3198,7 @@ def create_app(
             email,
             gpt_code_identity_cache,
             since,
+            consume=True,
         )
         if not item:
             return None, "暂未获取到该邮箱的 OpenAI 验证码", 404
@@ -3036,6 +3257,55 @@ def create_app(
             {"ok": True, **item}, headers={"Cache-Control": "no-store"}
         )
 
+    async def latest_code(request: web.Request) -> web.Response:
+        payload, error_response = await openai_code_payload(request)
+        if error_response is not None:
+            return error_response
+        email = str(payload.get("email") or "").strip().lower()
+        if not email.endswith("@icloud.com") or len(email) > 320:
+            return web.json_response(
+                {"ok": False, "error": "请输入有效的 iCloud 子邮箱"}, status=400
+            )
+        try:
+            identities = await active_icloud_identities()
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=502
+            )
+        if not any(
+            str(item.get("hme") or "").strip().lower() == email
+            for item in identities
+        ):
+            return web.json_response(
+                {"ok": False, "error": "未找到这个 iCloud 子邮箱"}, status=404
+            )
+        config_path: Path = app["inbox_config_file"]
+        if not config_path.exists():
+            return web.json_response(
+                {"ok": False, "error": "iCloud 收件箱尚未配置"}, status=503
+            )
+        try:
+            config = load_config(str(config_path))
+            async with app["inbox_sync_lock"]:
+                await asyncio.to_thread(
+                    sync_inbox, config, str(app["db_file"]), 100
+                )
+        except Exception as error:
+            return web.json_response(
+                {"ok": False, "error": _inbox_error_message(error)}, status=502
+            )
+        item = await asyncio.to_thread(
+            _latest_code_for_email, app["db_file"], email, identities
+        )
+        if not item:
+            return web.json_response(
+                {"ok": False, "error": "该子邮箱暂未收到验证码"}, status=404
+            )
+        return web.json_response(
+            {"ok": True, "email": email, **item},
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def import_workbench_account(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
@@ -3086,12 +3356,23 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": f"导入工作台失败：{error}"}, status=502
             )
+        imported_account = (
+            result.get("account") if isinstance(result.get("account"), dict) else {}
+        )
+        imported_type = str(imported_account.get("accountType") or "").lower()
+        imported_group = str(imported_account.get("group") or "")
         return web.json_response(
             {
                 "ok": True,
                 "imported": int(result.get("imported") or 0),
                 "updated": int(result.get("updated") or 0),
-                "message": "账号凭据已安全导入 OpenAI 账户工作台",
+                "accountType": imported_type,
+                "group": imported_group,
+                "message": (
+                    "Plus 账号已导入 OpenAI 账户工作台 Plus 分组"
+                    if imported_type == "plus" and imported_group == "Plus"
+                    else "账号凭据已安全导入 OpenAI 账户工作台"
+                ),
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -3164,13 +3445,45 @@ def create_app(
         if (
             isinstance(concurrency, bool)
             or not isinstance(concurrency, int)
-            or not 1 <= concurrency <= 5
+            or not 1 <= concurrency <= 10
         ):
             return web.json_response(
-                {"ok": False, "error": "验证并发必须是 1–5 的整数"}, status=400
+                {"ok": False, "error": "验证并发必须是 1–10 的整数"}, status=400
             )
+        raw_emails = payload.get("emails")
+        emails: list[str] | None = None
+        if raw_emails is not None:
+            if app["registration_manager"].snapshot().get("running"):
+                return web.json_response(
+                    {"ok": False, "error": "一键注册正在运行，请等待完成"},
+                    status=409,
+                )
+            if app["browser_manager"].snapshot().get("running"):
+                return web.json_response(
+                    {"ok": False, "error": "浏览器任务正在运行，请等待完成"},
+                    status=409,
+                )
+            if not isinstance(raw_emails, list) or not 1 <= len(raw_emails) <= 500:
+                return web.json_response(
+                    {"ok": False, "error": "验证账号列表无效"}, status=400
+                )
+            emails = []
+            for value in raw_emails:
+                email = str(value or "").strip().lower()
+                if not email.endswith("@icloud.com") or len(email) > 320:
+                    return web.json_response(
+                        {"ok": False, "error": "验证账号列表包含无效邮箱"},
+                        status=400,
+                    )
+                emails.append(email)
         try:
-            task = app["verification_manager"].start(concurrency=concurrency)
+            task = (
+                app["verification_manager"].start_with_browser(
+                    concurrency=concurrency, emails=emails
+                )
+                if emails is not None
+                else app["verification_manager"].start(concurrency=concurrency)
+            )
         except RuntimeError as error:
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
@@ -3218,13 +3531,30 @@ def create_app(
             load_account_record, app["db_file"], email
         )
         reset_password = bool(payload.get("reset_password", False))
+        session = account_session(record)
         access_token = account_session_access_token(record)
-        password_confirmed = _account_has_confirmed_password(record)
         saved_two_factor = (
             record.get("two_factor")
             if isinstance(record.get("two_factor"), dict)
             else {}
         )
+        if (
+            not reset_password
+            and session
+            and access_token
+            and not access_token_is_expired(access_token)
+        ):
+            try:
+                task = app["verification_manager"].start(
+                    concurrency=1, emails=[email]
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            return web.json_response(
+                {"ok": True, "started": True, "mode": "verify", "task": task}
+            )
         config_path: Path = app["inbox_config_file"]
         if not config_path.exists():
             return web.json_response(
@@ -3248,15 +3578,20 @@ def create_app(
             )
         if not reset_password:
             try:
-                task = app["verification_manager"].start_protocol_relogin(
-                    email=email
+                task = app["verification_manager"].start_with_browser(
+                    emails=[email], concurrency=1
                 )
             except RuntimeError as error:
                 return web.json_response(
                     {"ok": False, "error": str(error)}, status=409
                 )
             return web.json_response(
-                {"ok": True, "started": True, "mode": "verify", "task": task}
+                {
+                    "ok": True,
+                    "started": True,
+                    "mode": "refresh_session",
+                    "task": task,
+                }
             )
         registration_only = not access_token and not reset_password
         account_password = (
@@ -3283,7 +3618,7 @@ def create_app(
                             or not str(record.get("password") or "")
                             or record.get("password_confirmed") is False
                         ),
-                        "enable_2fa": not registration_only,
+                        "enable_2fa": False,
                         "two_factor": saved_two_factor,
                     }
                 ],
@@ -3299,13 +3634,7 @@ def create_app(
                 "ok": True,
                 "started": True,
                 "mode": (
-                    "set_password"
-                    if reset_password
-                    else "enable_2fa"
-                    if access_token and password_confirmed
-                    else "set_password"
-                    if access_token
-                    else "register"
+                    "set_password" if reset_password or access_token else "register"
                 ),
                 "task": task,
             }
@@ -3329,10 +3658,9 @@ def create_app(
                 {"ok": False, "error": "一键注册正在运行，请等待完成"}, status=409
             )
         headless = bool(payload.get("headless", False))
-        enable_2fa = bool(payload.get("enable_2fa", False))
-        if enable_2fa and not selected_only:
+        if bool(payload.get("enable_2fa", False)):
             return web.json_response(
-                {"ok": False, "error": "批量开启 2FA 仅支持明确选择的邮箱"},
+                {"ok": False, "error": "已停用新账号的 2FA 设置"},
                 status=400,
             )
         concurrency = payload.get("concurrency", 1)
@@ -3382,15 +3710,11 @@ def create_app(
             record = await asyncio.to_thread(
                 load_account_record, app["db_file"], email
             )
-            if enable_2fa and not _account_has_confirmed_password(record):
-                skipped += 1
-                continue
             access_token = str(
                 record.get("access_token") or record.get("accessToken") or ""
             ).strip()
             if (
-                not enable_2fa
-                and access_token
+                access_token
                 and not access_token_is_expired(access_token)
             ):
                 skipped += 1
@@ -3399,7 +3723,7 @@ def create_app(
                 {
                     "email": email,
                     "password": str(record.get("password") or ""),
-                    "enable_2fa": enable_2fa,
+                    "enable_2fa": False,
                     "two_factor": record.get("two_factor")
                     if isinstance(record.get("two_factor"), dict)
                     else {},
@@ -3407,9 +3731,7 @@ def create_app(
             )
         if not accounts:
             message = (
-                "所选账号尚未确认设置密码，已跳过开启 2FA"
-                if enable_2fa
-                else "所选邮箱的 Token 都仍有效，无需重复打开浏览器"
+                "所选邮箱的 Token 都仍有效，无需重复打开浏览器"
                 if selected_only
                 else "全部邮箱的 Token 都仍有效，无需重复打开浏览器"
             )
@@ -3621,6 +3943,9 @@ def create_app(
 
     app.router.add_get("/login", login_page)
     app.router.add_post("/api/login", login_api)
+    app.router.add_get("/access", access_page)
+    app.router.add_get("/code", code_page)
+    app.router.add_post("/api/code/latest", latest_code)
     app.router.add_post("/api/logout", logout_api)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/", index)
@@ -3677,9 +4002,7 @@ async def run_server(args: argparse.Namespace) -> None:
         ).strip().lower()
         in {"1", "true", "yes", "on"},
         workbench_url=os.environ.get("ACCOUNT_WORKBENCH_URL", ""),
-        workbench_import_token=os.environ.get(
-            "ACCOUNT_WORKBENCH_IMPORT_TOKEN", ""
-        ),
+        workbench_import_token=_configured_workbench_import_token(),
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -3735,6 +4058,15 @@ def _load_local_env_file(path: Path) -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
         os.environ[key] = value
+
+
+def _configured_workbench_import_token() -> str:
+    """Use the token checked by the workbench when both aliases are present."""
+    return str(
+        os.environ.get("HME_IMPORT_TOKEN")
+        or os.environ.get("ACCOUNT_WORKBENCH_IMPORT_TOKEN")
+        or ""
+    ).strip()
 
 
 def main() -> None:

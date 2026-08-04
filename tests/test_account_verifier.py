@@ -13,6 +13,7 @@ from hidemyemail_generator.account_verifier import (
     save_account_classification,
 )
 from hidemyemail_generator.browser_tasks import (
+    _save_account_record,
     load_account_record,
     set_manual_account_type,
 )
@@ -47,6 +48,140 @@ def save_record(
 
 
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
+    def test_top_level_token_without_session_is_not_verifiable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:legacy@icloud.com",
+                        json.dumps({"access_token": "legacy-token-only"}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            self.assertEqual(load_verifiable_accounts(db_file), [])
+            items = _browser_email_items(
+                db_file,
+                [
+                    {
+                        "hme": "legacy@icloud.com",
+                        "anonymousId": "legacy",
+                        "isActive": True,
+                    }
+                ],
+            )
+            self.assertFalse(items[0]["hasSession"])
+            self.assertFalse(items[0]["hasImportableSession"])
+            self.assertEqual(items[0]["sessionStatus"], "expired")
+
+    async def test_headless_browser_refreshes_multiple_sessions_in_one_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_check_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'free','detail':'verified'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            _save_account_record(
+                db_file,
+                "one@icloud.com",
+                two_factor={
+                    "secret": "JBSWY3DPEHPK3PXP",
+                    "enabled": True,
+                },
+            )
+
+            class BrowserManagerStub:
+                def __init__(self):
+                    self.started = []
+                    self.running = False
+
+                def availability(self):
+                    return {"available": True, "errors": []}
+
+                def snapshot(self):
+                    return {"running": self.running}
+
+                def start(self, accounts, **options):
+                    self.started.append((accounts, options))
+                    self.running = True
+                    for account in accounts:
+                        _save_account_record(
+                            db_file,
+                            account["email"],
+                            result={
+                                "access_token": f"at-{account['email']}",
+                                "session_json": json.dumps(
+                                    {
+                                        "accessToken": f"at-{account['email']}",
+                                        "user": {"email": account["email"]},
+                                    }
+                                ),
+                            },
+                        )
+                    return {"running": True}
+
+                async def wait(self):
+                    self.running = False
+                    accounts = self.started[0][0]
+                    return {
+                        "status": "completed",
+                        "accounts": [
+                            {"email": item["email"], "status": "success"}
+                            for item in accounts
+                        ],
+                    }
+
+                async def stop(self):
+                    self.running = False
+                    return {"status": "cancelled"}
+
+            browser_manager = BrowserManagerStub()
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                browser_manager=browser_manager,
+            )
+
+            state = manager.start_with_browser(
+                emails=["two@icloud.com", "one@icloud.com"], concurrency=2
+            )
+            self.assertTrue(state["headless"])
+            self.assertEqual(state["concurrency"], 2)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["status"], "completed")
+            self.assertEqual(snapshot["free"], 2)
+            self.assertEqual(snapshot["failed"], 0)
+            self.assertEqual(len(browser_manager.started), 1)
+            accounts, options = browser_manager.started[0]
+            self.assertEqual(len(accounts), 2)
+            self.assertTrue(options["headless"])
+            self.assertEqual(options["concurrency"], 2)
+            browser_accounts = {item["email"]: item for item in accounts}
+            self.assertEqual(
+                browser_accounts["one@icloud.com"]["two_factor"]["secret"],
+                "JBSWY3DPEHPK3PXP",
+            )
+            self.assertEqual(
+                browser_accounts["two@icloud.com"]["two_factor"], {}
+            )
+
     def test_loads_token_and_classification_from_saved_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
@@ -319,6 +454,86 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             record = load_account_record(db_file, "keep@icloud.com")
             self.assertEqual(record["access_token"], "at-keep")
             self.assertEqual(record["session"]["accessToken"], "at-keep")
+
+    async def test_protocol_failure_falls_back_to_browser_and_verifies(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            check_bridge = root / "check_browser_session.py"
+            check_bridge.write_text(
+                "import json, os\n"
+                "assert os.environ['HME_OPENAI_ACCESS_TOKEN'] == 'at-browser'\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'free','detail':'browser session verified'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            protocol_project = root / "protocol"
+            (protocol_project / "services").mkdir(parents=True)
+            (protocol_project / "services" / "chatgpt-service.js").write_text(
+                "// availability marker\n", encoding="utf-8"
+            )
+            protocol_bridge = root / "failed_protocol.py"
+            protocol_bridge.write_text(
+                "import json, sys\n"
+                "print('HME_PROTOCOL_EVENT:' + json.dumps({'status':'error','detail':'auth state failed'}), flush=True)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+
+            class BrowserManagerStub:
+                def __init__(self):
+                    self.started = []
+
+                def start(self, accounts, **options):
+                    self.started.append((accounts, options))
+                    save_record(db_file, "fallback@icloud.com", "at-browser")
+                    return {"running": True}
+
+                async def wait(self):
+                    return {
+                        "status": "completed",
+                        "succeeded": 1,
+                        "accounts": [
+                            {
+                                "email": "fallback@icloud.com",
+                                "status": "success",
+                                "message": "Session / AT 已保存",
+                            }
+                        ],
+                    }
+
+                async def stop(self):
+                    return {"status": "cancelled"}
+
+            browser_manager = BrowserManagerStub()
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=check_bridge,
+                protocol_project_dir=protocol_project,
+                node_executable=Path(sys.executable),
+                protocol_bridge_file=protocol_bridge,
+                code_service_url="http://127.0.0.1:8765",
+                code_service_token="local-test-token",
+                browser_manager=browser_manager,
+            )
+            manager.start_protocol_relogin(email="fallback@icloud.com", headless=True)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["status"], "completed")
+            self.assertEqual(snapshot["free"], 1)
+            self.assertEqual(len(browser_manager.started), 1)
+            self.assertTrue(browser_manager.started[0][1]["headless"])
+            self.assertIn(
+                "浏览器已重新获取 Session",
+                "\n".join(item["message"] for item in snapshot["logs"]),
+            )
+            record = load_account_record(db_file, "fallback@icloud.com")
+            self.assertEqual(record["access_token"], "at-browser")
 
     async def test_preserves_fresh_session_plus_when_plan_endpoint_reports_free(self):
         with tempfile.TemporaryDirectory() as temp_dir:

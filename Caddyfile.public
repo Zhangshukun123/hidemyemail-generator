@@ -3,6 +3,66 @@ icloud.8-208-13-52.sslip.io {
 	reverse_proxy 127.0.0.1:18765
 }
 
+icloud-code.8-208-13-52.sslip.io {
+	header Strict-Transport-Security "max-age=31536000"
+
+	@health {
+		method GET
+		path /healthz
+	}
+	handle @health {
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@favicon {
+		method GET
+		path /favicon.ico
+	}
+	handle @favicon {
+		respond 204
+	}
+
+	@openai_code {
+		method POST
+		path /api/integrations/workbench/openai-code
+	}
+	handle @openai_code {
+		request_body {
+			max_size 256KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_access {
+		method GET
+		path /access /code
+	}
+	handle @portal_access {
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_code {
+		method POST
+		path /api/code/latest
+	}
+	handle @portal_code {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@root path /
+	handle @root {
+		rewrite * /code
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	handle {
+		respond 404
+	}
+}
+
 http://8.208.13.52 {
 	@autoreg_exact path /auto-reg
 	redir @autoreg_exact /auto-reg/ 308

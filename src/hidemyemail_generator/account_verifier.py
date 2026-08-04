@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from .browser_tasks import (
+    BrowserTaskManager,
     _save_account_record,
     account_session,
     account_session_access_token,
+    access_token_is_expired,
     load_account_record,
     session_account_type,
     session_email,
@@ -50,7 +52,7 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
             continue
         session = account_session(record)
         token = account_session_access_token(record)
-        if email and token:
+        if email and session and token:
             account_type = str(record.get("account_type") or "").strip().lower()
             account_type_source = str(
                 record.get("account_type_source") or ""
@@ -198,6 +200,7 @@ class AccountVerificationManager:
         protocol_bridge_file: Path | None = None,
         code_service_url: str = "",
         code_service_token: str = "",
+        browser_manager: BrowserTaskManager | None = None,
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.db_file = db_file.resolve()
@@ -217,6 +220,7 @@ class AccountVerificationManager:
         ).resolve()
         self.code_service_url = str(code_service_url or "").strip().rstrip("/")
         self.code_service_token = str(code_service_token or "")
+        self.browser_manager = browser_manager
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._state: dict[str, Any] = self._idle_state()
@@ -341,7 +345,9 @@ class AccountVerificationManager:
         self._batch_task = asyncio.create_task(self._run_batch(concurrency))
         return self.snapshot()
 
-    def start_protocol_relogin(self, *, email: str) -> dict[str, Any]:
+    def start_protocol_relogin(
+        self, *, email: str, headless: bool = False
+    ) -> dict[str, Any]:
         if self._batch_task and not self._batch_task.done():
             raise RuntimeError("账号验证任务正在运行")
         runtime = self.protocol_availability()
@@ -355,6 +361,11 @@ class AccountVerificationManager:
         account_type_source = str(
             record.get("account_type_source") or ""
         ).strip().lower()
+        saved_two_factor = (
+            record.get("two_factor")
+            if isinstance(record.get("two_factor"), dict)
+            else {}
+        )
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -373,7 +384,9 @@ class AccountVerificationManager:
                     "status": "queued",
                     "message": "等待协议登录",
                     "_protocol_relogin": True,
+                    "_headless": bool(headless),
                     "_password": str(record.get("password") or ""),
+                    "_two_factor": saved_two_factor,
                     "_access_token": "",
                     "_account_type": account_type,
                     "_account_type_source": account_type_source,
@@ -388,6 +401,271 @@ class AccountVerificationManager:
         self._append_log(f"协议重新登录已启动：{target}")
         self._batch_task = asyncio.create_task(self._run_batch(1))
         return self.snapshot()
+
+    def start_with_browser(
+        self,
+        *,
+        emails: list[str] | set[str],
+        concurrency: int = 3,
+    ) -> dict[str, Any]:
+        """Refresh missing Sessions in one headless browser batch, then verify."""
+        if self._batch_task and not self._batch_task.done():
+            raise RuntimeError("账号验证任务正在运行")
+        runtime = self.availability()
+        if not runtime["available"]:
+            raise RuntimeError("；".join(runtime["errors"]))
+        if self.browser_manager is None:
+            raise RuntimeError("无头浏览器运行环境不可用")
+
+        targets = sorted(
+            {
+                str(value or "").strip().lower()
+                for value in emails
+                if str(value or "").strip()
+            }
+        )
+        if not targets:
+            raise RuntimeError("没有需要验证的账号")
+        concurrency = max(1, min(10, int(concurrency)))
+        accounts: list[dict[str, Any]] = []
+        refresh_count = 0
+        for email in targets:
+            record = load_account_record(self.db_file, email)
+            session = account_session(record)
+            token = account_session_access_token(record)
+            refresh_session = (
+                not session or not token or access_token_is_expired(token)
+            )
+            refresh_count += int(refresh_session)
+            account_type = str(record.get("account_type") or "").strip().lower()
+            account_type_source = str(
+                record.get("account_type_source") or ""
+            ).strip().lower()
+            session_type, raw_session_plan = session_account_type(session)
+            if session_type and account_type_source != "manual":
+                account_type = session_type
+                account_type_source = "session"
+            saved_two_factor = (
+                record.get("two_factor")
+                if isinstance(record.get("two_factor"), dict)
+                else {}
+            )
+            accounts.append(
+                {
+                    "email": email,
+                    "status": "queued",
+                    "message": (
+                        "等待无头浏览器重新获取 Session"
+                        if refresh_session
+                        else "等待验证"
+                    ),
+                    "_refresh_session": refresh_session,
+                    "_access_token": token,
+                    "_account_type": account_type,
+                    "_account_type_source": account_type_source,
+                    "_session_email": session_email(session),
+                    "_session_plan": raw_session_plan,
+                    "_two_factor": saved_two_factor,
+                }
+            )
+
+        if refresh_count:
+            browser_runtime = self.browser_manager.availability()
+            if not browser_runtime.get("available"):
+                raise RuntimeError("；".join(browser_runtime.get("errors", [])))
+        self._state = {
+            "id": uuid.uuid4().hex,
+            "status": "running",
+            "running": True,
+            "headless": True,
+            "concurrency": concurrency,
+            "total": len(accounts),
+            "completed": 0,
+            "plus": 0,
+            "free": 0,
+            "expired": 0,
+            "deleted": 0,
+            "failed": 0,
+            "accounts": accounts,
+            "logs": [],
+            "startedAt": utc_now(),
+            "finishedAt": "",
+        }
+        self._append_log(
+            f"无头浏览器验证已启动：{len(accounts)} 个账号，"
+            f"刷新 Session {refresh_count} 个，并发 {concurrency}"
+        )
+        self._batch_task = asyncio.create_task(
+            self._refresh_sessions_and_verify(concurrency)
+        )
+        return self.snapshot()
+
+    @staticmethod
+    def _clear_private_item_fields(item: dict[str, Any]) -> None:
+        for key in tuple(item):
+            if key.startswith("_"):
+                item.pop(key, None)
+
+    def _fail_session_refresh(self, item: dict[str, Any], message: str) -> None:
+        item.update(status="failed", message=str(message or "无头浏览器未返回 Session")[:500])
+        self._state["failed"] += 1
+        self._state["completed"] += 1
+        self._append_log(f"Session 获取失败，账号已保留：{item['message']}", email=item["email"])
+        self._clear_private_item_fields(item)
+
+    async def _refresh_sessions_and_verify(self, concurrency: int) -> None:
+        refresh_items = [
+            item for item in self._state["accounts"] if item.get("_refresh_session")
+        ]
+        try:
+            if refresh_items:
+                for item in refresh_items:
+                    item.update(status="running", message="正在启动无头浏览器获取 Session")
+                self._append_log(
+                    f"正在启动 {len(refresh_items)} 个账号的无头浏览器进程，"
+                    f"并发 {concurrency}"
+                )
+                self.browser_manager.start(
+                    [
+                        {
+                            "email": item["email"],
+                            "password": "",
+                            "ensure_password": False,
+                            "force_reset_password": False,
+                            "enable_2fa": False,
+                            "two_factor": item.get("_two_factor") or {},
+                        }
+                        for item in refresh_items
+                    ],
+                    headless=True,
+                    concurrency=concurrency,
+                )
+                browser_task = await self.browser_manager.wait()
+                browser_accounts = {
+                    str(account.get("email") or "").strip().lower(): account
+                    for account in browser_task.get("accounts", [])
+                    if isinstance(account, dict)
+                }
+                for item in refresh_items:
+                    email = str(item["email"])
+                    browser_account = browser_accounts.get(email, {})
+                    if browser_account.get("status") != "success":
+                        self._fail_session_refresh(
+                            item,
+                            str(
+                                browser_account.get("message")
+                                or browser_account.get("latestLog")
+                                or "无头浏览器未返回 Session"
+                            ),
+                        )
+                        continue
+                    record = await asyncio.to_thread(
+                        load_account_record, self.db_file, email
+                    )
+                    session = account_session(record)
+                    token = account_session_access_token(record)
+                    if not session or not token:
+                        self._fail_session_refresh(item, "无头浏览器未保存有效 Session")
+                        continue
+                    owner = session_email(session)
+                    if owner and owner != email:
+                        self._fail_session_refresh(
+                            item, f"浏览器返回的 Session 账号不匹配：{owner}"
+                        )
+                        continue
+                    session_type, session_plan = session_account_type(session)
+                    if item.get("_account_type_source") != "manual" and session_type:
+                        item["_account_type"] = session_type
+                        item["_account_type_source"] = "session"
+                    item.update(
+                        status="queued",
+                        message="Session 已获取，等待验证",
+                        _access_token=token,
+                        _session_email=owner,
+                        _session_plan=session_plan,
+                        _refresh_session=False,
+                    )
+                    self._append_log("无头浏览器已获取 Session", email=email)
+        except asyncio.CancelledError:
+            if self.browser_manager.snapshot().get("running"):
+                await self.browser_manager.stop()
+            self._state["status"] = "cancelled"
+            self._state["running"] = False
+            self._state["finishedAt"] = utc_now()
+            self._append_log("账号验证任务已停止")
+            raise
+        except Exception as error:
+            for item in refresh_items:
+                if item.get("status") != "failed":
+                    self._fail_session_refresh(item, str(error))
+
+        await self._run_batch(concurrency)
+
+    async def _browser_relogin(
+        self, item: dict[str, Any], email: str, protocol_error: str
+    ) -> tuple[bool, str]:
+        if self.browser_manager is None:
+            return False, protocol_error
+        item.update(
+            status="running",
+            message="协议登录不可用，正在改用浏览器重新获取 Session",
+        )
+        self._append_log(item["message"], email=email)
+        try:
+            self.browser_manager.start(
+                [
+                    {
+                        "email": email,
+                        "password": "",
+                        "ensure_password": False,
+                        "force_reset_password": False,
+                        "enable_2fa": False,
+                        "two_factor": item.get("_two_factor") or {},
+                    }
+                ],
+                headless=bool(item.get("_headless", False)),
+                concurrency=1,
+            )
+            browser_task = await self.browser_manager.wait()
+        except asyncio.CancelledError:
+            await self.browser_manager.stop()
+            raise
+        except RuntimeError as error:
+            return False, f"{protocol_error}；浏览器重新获取失败：{error}"
+
+        browser_accounts = browser_task.get("accounts", [])
+        browser_account = next(
+            (
+                account
+                for account in browser_accounts
+                if str(account.get("email") or "").strip().lower() == email
+            ),
+            {},
+        )
+        record = await asyncio.to_thread(load_account_record, self.db_file, email)
+        session = account_session(record)
+        token = account_session_access_token(record)
+        if not session or not token:
+            detail = str(
+                browser_account.get("message")
+                or browser_account.get("latestLog")
+                or "浏览器任务未返回 Session"
+            ).strip()
+            return False, f"{protocol_error}；浏览器重新获取失败：{detail}"
+
+        owner = session_email(session)
+        if owner and owner != email:
+            return False, f"浏览器返回的 Session 账号不匹配：{owner}"
+        session_type, session_plan = session_account_type(session)
+        if item.get("_account_type_source") != "manual" and session_type:
+            item["_account_type"] = session_type
+            item["_account_type_source"] = "session"
+        item["_access_token"] = token
+        item["_session_email"] = owner
+        item["_session_plan"] = session_plan
+        item["message"] = "浏览器已重新获取 Session，正在验证账号"
+        self._append_log(item["message"], email=email)
+        return True, ""
 
     def _append_log(self, message: str, *, email: str = "") -> None:
         entry = {"at": utc_now(), "email": email, "message": str(message)[:1000]}
@@ -553,11 +831,17 @@ class AccountVerificationManager:
     ) -> None:
         email = str(item["email"])
         async with semaphore:
+            if item.get("status") in {"failed", "cancelled"}:
+                return
             if self._state.get("status") == "cancelling":
                 item.update(status="cancelled", message="任务已停止")
                 return
             if item.get("_protocol_relogin"):
                 succeeded, error = await self._protocol_relogin(item, email)
+                if not succeeded:
+                    succeeded, error = await self._browser_relogin(
+                        item, email, error
+                    )
                 if not succeeded:
                     item.update(status="failed", message=error)
                     self._state["failed"] += 1
@@ -714,6 +998,8 @@ class AccountVerificationManager:
         if not self._batch_task or self._batch_task.done():
             return self.snapshot()
         self._state["status"] = "cancelling"
+        if self.browser_manager and self.browser_manager.snapshot().get("running"):
+            await self.browser_manager.stop()
         processes = list(self._processes.values())
         for process in processes:
             if process.returncode is None:
