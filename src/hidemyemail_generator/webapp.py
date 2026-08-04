@@ -1061,7 +1061,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
           <div class="section-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"></rect><path d="M8 21h8M12 18v3M7 9h.01M10 9h7M7 13h.01M10 13h5"></path></svg></div>
           <div>
           <h2>浏览器获取 Session</h2>
-            <div class="section-copy">自动复用注册流程获取凭据；有效 Token 会跳过，验证码仅读取本次请求后的新邮件。</div>
+            <div class="section-copy">注册阶段只保存 Session/AT，不设置密码、2FA，也不执行账号验证。</div>
           </div>
         </div>
       </div>
@@ -1092,7 +1092,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
           <div id="summary">正在加载…</div>
         </div>
         <div class="list-actions">
-          <div id="verifySummary">根据已保存 Session 验证账号</div>
+          <div id="verifySummary">根据 Session 验证账号，不设置密码和 2FA</div>
           <button id="verifyAll" class="primary">一键验证账号</button>
           <button id="stopVerify" class="danger" disabled>停止验证</button>
         </div>
@@ -1453,7 +1453,6 @@ GPT_INDEX_HTML = r"""<!doctype html>
         generating_email: "正在生成 iCloud 邮箱",
         confirming_email: "正在同步新邮箱",
         registering_openai: "正在注册 OpenAI",
-        enabling_2fa: "正在开启 2FA",
         completed: "注册成功",
         failed: "注册失败",
         cancelling: "正在停止",
@@ -1510,7 +1509,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("verifySummary").textContent = (runtime.errors || ["账号验证运行环境不可用"]).join("；");
       } else if (data.status === "idle") {
         $("verifySummary").className = "";
-        $("verifySummary").textContent = "根据已保存 Session 验证账号";
+        $("verifySummary").textContent = "根据 Session 验证账号，不设置密码和 2FA";
       } else {
         $("verifySummary").className = data.failed ? "error" : "";
         $("verifySummary").textContent = `${statusNames[data.status] || data.status} · ${data.completed || 0}/${data.total || 0} · Plus ${data.plus || 0} · Free ${data.free || 0} · Token 失效 ${data.expired || 0} · 失败 ${data.failed || 0}`;
@@ -1540,7 +1539,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     async function startVerification() {
       const verifiable = currentItems.filter((item) => item.hasSession).length;
       if (!verifiable) throw new Error("暂无已保存 Session 的账号");
-      if (!confirm(`将根据 Session 在线检查 ${verifiable} 个账号；失效 Session 会被清除，账号和密码记录会保留。是否继续？`)) return;
+      if (!confirm(`将只根据 Session 在线检查 ${verifiable} 个账号，不设置密码或 2FA；失效 Session 会被清除，账号记录会保留。是否继续？`)) return;
       const data = await api("/api/account-verification/start", {
         method: "POST", body: JSON.stringify({ concurrency: 3 })
       });
@@ -2508,20 +2507,10 @@ def create_app(
             raise RuntimeError(f"新邮箱列表同步失败：{last_error}")
         raise RuntimeError("新邮箱在 30 秒内未出现在 iCloud 列表")
 
-    async def save_registration_password(email: str, password: str) -> None:
-        await asyncio.to_thread(
-            _save_account_record,
-            app["db_file"],
-            email,
-            password=password,
-            password_confirmed=False,
-        )
-
     app["registration_manager"] = RegistrationTaskManager(
         browser_manager=app["browser_manager"],
         generate_email=generate_registration_email,
         confirm_email=confirm_registration_email,
-        save_pending_password=save_registration_password,
     )
 
     async def background_inbox_sync() -> None:
@@ -3262,8 +3251,11 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "该 iCloud 邮箱无效或已停用"}, status=400
             )
-        account_password = str(record.get("password") or "")
-        if not account_password:
+        registration_only = not access_token and not reset_password
+        account_password = (
+            "" if registration_only else str(record.get("password") or "")
+        )
+        if not registration_only and not account_password:
             account_password = generate_openai_password()
             await asyncio.to_thread(
                 _save_account_record,
@@ -3278,13 +3270,13 @@ def create_app(
                     {
                         "email": email,
                         "password": account_password,
-                        "ensure_password": True,
+                        "ensure_password": not registration_only,
                         "force_reset_password": bool(
                             reset_password
                             or not str(record.get("password") or "")
                             or record.get("password_confirmed") is False
                         ),
-                        "enable_2fa": True,
+                        "enable_2fa": not registration_only,
                         "two_factor": saved_two_factor,
                     }
                 ],

@@ -356,7 +356,8 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("item.hasSession || item.hasPassword", GPT_INDEX_HTML)
         self.assertIn("item.hasSession && !item.hasPassword", GPT_INDEX_HTML)
         self.assertIn('actionButton("设置密码"', GPT_INDEX_HTML)
-        self.assertIn("根据已保存 Session 验证账号", GPT_INDEX_HTML)
+        self.assertIn("根据 Session 验证账号，不设置密码和 2FA", GPT_INDEX_HTML)
+        self.assertIn("将只根据 Session 在线检查", GPT_INDEX_HTML)
         self.assertIn("verifyOrRegisterAccount(item)", GPT_INDEX_HTML)
         self.assertIn("/api/account/verify-or-register", GPT_INDEX_HTML)
         self.assertIn("/api/account/type", GPT_INDEX_HTML)
@@ -366,6 +367,10 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("本地服务已重启，正在刷新页面", GPT_INDEX_HTML)
         self.assertIn("一键验证账号", GPT_INDEX_HTML)
         self.assertIn("一键注册新账号", GPT_INDEX_HTML)
+        self.assertIn(
+            "注册阶段只保存 Session/AT，不设置密码、2FA，也不执行账号验证",
+            GPT_INDEX_HTML,
+        )
         self.assertNotIn("将创建新的 iCloud 隐藏邮箱", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 密钥", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 码", GPT_INDEX_HTML)

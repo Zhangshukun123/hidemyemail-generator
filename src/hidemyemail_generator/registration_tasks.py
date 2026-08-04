@@ -12,7 +12,6 @@ from .browser_tasks import BrowserTaskManager
 
 GenerateEmail = Callable[[str], Awaitable[str]]
 ConfirmEmail = Callable[[str], Awaitable[None]]
-SavePendingPassword = Callable[[str, str], Awaitable[None]]
 
 
 def utc_now() -> str:
@@ -42,12 +41,10 @@ class RegistrationTaskManager:
         browser_manager: BrowserTaskManager,
         generate_email: GenerateEmail,
         confirm_email: ConfirmEmail,
-        save_pending_password: SavePendingPassword | None = None,
     ) -> None:
         self.browser_manager = browser_manager
         self.generate_email = generate_email
         self.confirm_email = confirm_email
-        self.save_pending_password = save_pending_password
         self._task: asyncio.Task | None = None
         self._state: dict[str, Any] = self._idle_state()
 
@@ -91,9 +88,8 @@ class RegistrationTaskManager:
             "finishedAt": "",
         }
         self._append_log("开始一键注册")
-        password = generate_openai_password()
         self._task = asyncio.create_task(
-            self._run(label=label, headless=bool(headless), password=password)
+            self._run(label=label, headless=bool(headless))
         )
         return self.snapshot()
 
@@ -103,32 +99,30 @@ class RegistrationTaskManager:
         )
         del self._state["logs"][:-100]
 
-    async def _run(self, *, label: str, headless: bool, password: str) -> None:
+    async def _run(self, *, label: str, headless: bool) -> None:
         try:
             email = (await self.generate_email(label)).strip().lower()
             if not email:
                 raise RuntimeError("iCloud 未返回新邮箱地址")
-            if self.save_pending_password is not None:
-                await self.save_pending_password(email, password)
             self._state.update(
                 email=email,
                 phase="confirming_email",
-                message="邮箱和唯一密码已保存，正在等待 iCloud 列表同步",
+                message="邮箱已生成，正在等待 iCloud 列表同步",
             )
-            self._append_log(f"已生成邮箱并保存唯一密码：{email}")
+            self._append_log(f"已生成邮箱：{email}")
             await self.confirm_email(email)
             self._state.update(
                 phase="registering_openai",
-                message="邮箱已加入列表，正在用自动生成的强密码注册 OpenAI",
+                message="邮箱已加入列表，正在注册 OpenAI 并保存 Session",
             )
             self._append_log("iCloud 邮箱已确认，启动 Camoufox")
             self.browser_manager.start(
                 [
                     {
                         "email": email,
-                        "password": password,
-                        "ensure_password": True,
-                        "enable_2fa": True,
+                        "password": "",
+                        "ensure_password": False,
+                        "enable_2fa": False,
                     }
                 ],
                 headless=headless,
@@ -136,32 +130,14 @@ class RegistrationTaskManager:
             )
             browser_wait = asyncio.create_task(self.browser_manager.wait())
             while not browser_wait.done():
-                browser_state = self.browser_manager.snapshot()
-                accounts = browser_state.get("accounts") or []
-                account = accounts[0] if accounts else {}
-                if account.get("phase") == "enabling_2fa":
-                    self._state.update(
-                        phase="enabling_2fa",
-                        message=str(account.get("message") or "正在开启 TOTP 2FA"),
-                    )
                 await asyncio.sleep(0.4)
             browser_result = await browser_wait
             if browser_result.get("succeeded") == 1:
-                accounts = browser_result.get("accounts") or []
-                account = accounts[0] if accounts else {}
-                password_confirmed = bool(account.get("passwordConfirmed"))
-                two_factor_enabled = bool(account.get("twoFactorEnabled"))
-                detail = ["注册成功，Session 已保存"]
-                if password_confirmed:
-                    detail.append("密码已设置")
-                else:
-                    detail.append("密码待设置")
-                if two_factor_enabled:
-                    detail.append("2FA 已开启")
-                elif not password_confirmed:
-                    detail.append("2FA 已跳过（需先设置密码）")
-                else:
-                    detail.append("2FA 待开启")
+                detail = [
+                    "注册成功，Session 已保存",
+                    "未设置密码和 2FA",
+                    "未执行账号验证",
+                ]
                 self._state.update(
                     status="completed",
                     phase="completed",
