@@ -95,7 +95,7 @@ class GptEmailTests(unittest.TestCase):
                 "",
             )
 
-    def test_builds_workbench_import_with_confirmed_password_and_2fa(self):
+    def test_builds_workbench_import_from_session_only(self):
         payload = _workbench_import_payload(
             {
                 "password": "Unique!Password123",
@@ -109,12 +109,18 @@ class GptEmailTests(unittest.TestCase):
             },
             "one@icloud.com",
         )
-        self.assertEqual(payload["email"], "one@icloud.com")
-        self.assertEqual(payload["password"], "Unique!Password123")
-        self.assertEqual(payload["totpSecret"], "JBSWY3DPEHPK3PXP")
-        self.assertEqual(payload["accessToken"], "at-test")
+        self.assertEqual(
+            payload,
+            {
+                "email": "one@icloud.com",
+                "session": {
+                    "user": {"email": "one@icloud.com"},
+                    "accessToken": "at-test",
+                },
+            },
+        )
 
-        with self.assertRaisesRegex(RuntimeError, "密码尚未"):
+        with self.assertRaisesRegex(RuntimeError, "尚未保存有效 Session"):
             _workbench_import_payload(
                 {
                     "password": "Pending!Password123",
@@ -332,6 +338,11 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("复制 AT", GPT_INDEX_HTML)
         self.assertIn("复制 Session", GPT_INDEX_HTML)
         self.assertIn("获取 OpenAI 码", GPT_INDEX_HTML)
+        self.assertIn("const since = new Date().toISOString()", GPT_INDEX_HTML)
+        self.assertIn("JSON.stringify({ email, since })", GPT_INDEX_HTML)
+        self.assertIn("等待新验证码…", GPT_INDEX_HTML)
+        self.assertIn("60 秒内未收到新验证码", GPT_INDEX_HTML)
+        self.assertIn("error.status = response.status", GPT_INDEX_HTML)
         self.assertIn("复制账号", GPT_INDEX_HTML)
         self.assertIn("/api/gpt-accounts/export", GPT_INDEX_HTML)
         self.assertIn('copyAccount(item.email)', GPT_INDEX_HTML)
@@ -350,11 +361,19 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("复制密码", GPT_INDEX_HTML)
         self.assertIn("一键导入工作台", GPT_INDEX_HTML)
         self.assertIn("/api/account/import-workbench", GPT_INDEX_HTML)
+        self.assertIn("if (!item.hasImportableSession)", GPT_INDEX_HTML)
+        self.assertIn("请先获取 Session 后再导入工作台", GPT_INDEX_HTML)
+        self.assertNotIn("请先完成密码设置并开启 2FA", GPT_INDEX_HTML)
         self.assertIn("重置密码", GPT_INDEX_HTML)
         self.assertIn("reset_password", GPT_INDEX_HTML)
         self.assertIn("验证账号", GPT_INDEX_HTML)
-        self.assertIn("item.hasSession || item.hasPassword", GPT_INDEX_HTML)
-        self.assertIn("item.hasSession && !item.hasPassword", GPT_INDEX_HTML)
+        self.assertIn('actionButton("验证账号"', GPT_INDEX_HTML)
+        self.assertIn("将使用协议登录", GPT_INDEX_HTML)
+        self.assertIn("重新获取 Session 并验证账号；不会启动浏览器", GPT_INDEX_HTML)
+        self.assertIn("使用协议登录重新获取 Session 并验证账号，不会启动浏览器", GPT_INDEX_HTML)
+        self.assertNotIn("请先获取 Session 后再验证账号", GPT_INDEX_HTML)
+        self.assertNotIn("将启动浏览器完成账号和密码设置", GPT_INDEX_HTML)
+        self.assertIn("if (!item.hasPassword)", GPT_INDEX_HTML)
         self.assertIn('actionButton("设置密码"', GPT_INDEX_HTML)
         self.assertIn("根据 Session 验证账号，不设置密码和 2FA", GPT_INDEX_HTML)
         self.assertIn("将只根据 Session 在线检查", GPT_INDEX_HTML)

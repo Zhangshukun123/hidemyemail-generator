@@ -163,8 +163,9 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             preserved = load_account_record(db_file, "bad@icloud.com")
             self.assertEqual(preserved["password"], "Secret!A7")
-            self.assertNotIn("access_token", preserved)
-            self.assertNotIn("session", preserved)
+            self.assertEqual(preserved["access_token"], "at-bad")
+            self.assertEqual(preserved["session"]["accessToken"], "at-bad")
+            self.assertIn("session_invalid_at", preserved)
             self.assertNotIn("bad@icloud.com", removed_account_emails(db_file))
 
             identities = [
@@ -214,10 +215,110 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 load_account_record(db_file, "paid@icloud.com")["password"],
                 "Secret!A7",
             )
-            self.assertNotIn(
-                "access_token", load_account_record(db_file, "paid@icloud.com")
+            self.assertEqual(
+                load_account_record(db_file, "paid@icloud.com")["access_token"],
+                "at-expired-plus",
             )
             self.assertNotIn("paid@icloud.com", removed_account_emails(db_file))
+
+    async def test_protocol_relogin_replaces_session_without_browser(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            check_bridge = root / "fake_check_bridge.py"
+            check_bridge.write_text(
+                "import json, os\n"
+                "assert os.environ['HME_OPENAI_ACCESS_TOKEN'] == 'at-new'\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'free','detail':'new session verified'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            protocol_project = root / "protocol"
+            (protocol_project / "services").mkdir(parents=True)
+            (protocol_project / "services" / "chatgpt-service.js").write_text(
+                "// availability marker\n", encoding="utf-8"
+            )
+            protocol_bridge = root / "fake_protocol_bridge.py"
+            protocol_bridge.write_text(
+                "import json, os\n"
+                "assert os.environ['HME_PROTOCOL_EMAIL'] == 'login@icloud.com'\n"
+                "assert os.environ['HME_PROTOCOL_PASSWORD'] == 'Secret!A7'\n"
+                "session = {'accessToken':'at-new','user':{'email':'login@icloud.com'},'account':{'planType':'free'}}\n"
+                "print('HME_PROTOCOL_EVENT:' + json.dumps({'status':'success','session':session}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "login@icloud.com", "at-old")
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=check_bridge,
+                protocol_project_dir=protocol_project,
+                node_executable=Path(sys.executable),
+                protocol_bridge_file=protocol_bridge,
+                code_service_url="http://127.0.0.1:8765",
+                code_service_token="local-test-token",
+            )
+            state = manager.start_protocol_relogin(email="LOGIN@ICLOUD.COM")
+            self.assertEqual(state["accounts"][0]["message"], "等待协议登录")
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["status"], "completed")
+            self.assertEqual(snapshot["free"], 1)
+            self.assertNotIn("at-new", json.dumps(snapshot))
+            self.assertNotIn("Secret!A7", json.dumps(snapshot))
+            record = load_account_record(db_file, "login@icloud.com")
+            self.assertEqual(record["access_token"], "at-new")
+            self.assertEqual(record["session"]["accessToken"], "at-new")
+            self.assertEqual(record["session_acquisition_method"], "protocol_login")
+
+    async def test_failed_protocol_relogin_preserves_existing_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            check_bridge = root / "unused_check.py"
+            check_bridge.write_text("raise AssertionError('must not run')\n", encoding="utf-8")
+            protocol_project = root / "protocol"
+            (protocol_project / "services").mkdir(parents=True)
+            (protocol_project / "services" / "chatgpt-service.js").write_text(
+                "// availability marker\n", encoding="utf-8"
+            )
+            protocol_bridge = root / "failed_protocol.py"
+            protocol_bridge.write_text(
+                "import json, sys\n"
+                "print('HME_PROTOCOL_EVENT:' + json.dumps({'status':'error','detail':'login rejected'}), flush=True)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "keep@icloud.com", "at-keep")
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=check_bridge,
+                protocol_project_dir=protocol_project,
+                node_executable=Path(sys.executable),
+                protocol_bridge_file=protocol_bridge,
+                code_service_url="http://127.0.0.1:8765",
+                code_service_token="local-test-token",
+            )
+            manager.start_protocol_relogin(email="keep@icloud.com")
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["failed"], 1)
+            self.assertIn("原 Session 已保留", snapshot["logs"][-2]["message"])
+            record = load_account_record(db_file, "keep@icloud.com")
+            self.assertEqual(record["access_token"], "at-keep")
+            self.assertEqual(record["session"]["accessToken"], "at-keep")
 
     async def test_preserves_fresh_session_plus_when_plan_endpoint_reports_free(self):
         with tempfile.TemporaryDirectory() as temp_dir:

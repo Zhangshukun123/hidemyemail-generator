@@ -143,5 +143,87 @@ class WorkbenchOpenAICodeEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())["error"], "请先登录")
 
 
+class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verify_uses_protocol_relogin_and_never_starts_browser(self):
+        class ManagerStub:
+            def __init__(self, *, allow_protocol=False):
+                self.allow_protocol = allow_protocol
+                self.protocol_emails = []
+                self.browser_starts = 0
+
+            def snapshot(self):
+                return {"running": False}
+
+            def start_protocol_relogin(self, *, email):
+                if not self.allow_protocol:
+                    raise AssertionError("protocol relogin called on wrong manager")
+                self.protocol_emails.append(email)
+                return {"running": True, "accounts": [{"email": email}]}
+
+            def start(self, *_args, **_kwargs):
+                self.browser_starts += 1
+                raise AssertionError("browser must not start during account verification")
+
+            async def close(self):
+                return None
+
+        class FakeHideMyEmail:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def list_email(self):
+                return {
+                    "success": True,
+                    "result": {
+                        "hmeEmails": [
+                            {
+                                "hme": "protocol@icloud.com",
+                                "anonymousId": "protocol-id",
+                                "isActive": True,
+                            }
+                        ]
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "cookies.txt").write_text("cookie", encoding="utf-8")
+            (base_dir / "inbox_config.json").write_text("{}\n", encoding="utf-8")
+            app = create_app(base_dir=base_dir)
+            protocol_manager = ManagerStub(allow_protocol=True)
+            browser_manager = ManagerStub()
+            app["verification_manager"] = protocol_manager
+            app["browser_manager"] = browser_manager
+            client = TestClient(TestServer(app))
+            with mock.patch(
+                "hidemyemail_generator.webapp.RichHideMyEmail", FakeHideMyEmail
+            ):
+                await client.start_server()
+                try:
+                    response = await client.post(
+                        "/api/account/verify-or-register",
+                        json={
+                            "email": "protocol@icloud.com",
+                            "headless": False,
+                            "reset_password": False,
+                        },
+                        headers={"X-Local-Token": app["local_token"]},
+                    )
+                    payload = await response.json()
+                finally:
+                    await client.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["mode"], "verify")
+            self.assertEqual(protocol_manager.protocol_emails, ["protocol@icloud.com"])
+            self.assertEqual(browser_manager.browser_starts, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

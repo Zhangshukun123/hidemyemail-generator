@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .browser_tasks import (
+    _save_account_record,
     account_session,
     account_session_access_token,
     load_account_record,
@@ -20,6 +23,7 @@ from .inbox import connect_db
 
 
 EVENT_PREFIX = "HME_VERIFY_EVENT:"
+PROTOCOL_EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
 MAX_LOG_ITEMS = 300
 
 
@@ -128,16 +132,6 @@ def mark_account_session_invalid(db_file: Path, email: str, detail: str) -> None
     record = load_account_record(db_file, target)
     if not record:
         return
-    for key in (
-        "access_token",
-        "accessToken",
-        "session",
-        "session_json",
-        "sessionJson",
-        "storage_state_json",
-        "storageStateJson",
-    ):
-        record.pop(key, None)
     record.update(
         {
             "session_invalid_at": utc_now(),
@@ -199,6 +193,11 @@ class AccountVerificationManager:
         db_file: Path,
         python_executable: Path,
         bridge_file: Path | None = None,
+        protocol_project_dir: Path | None = None,
+        node_executable: Path | None = None,
+        protocol_bridge_file: Path | None = None,
+        code_service_url: str = "",
+        code_service_token: str = "",
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.db_file = db_file.resolve()
@@ -206,6 +205,18 @@ class AccountVerificationManager:
         self.bridge_file = (
             bridge_file or Path(__file__).with_name("openai_account_check_bridge.py")
         ).resolve()
+        self.protocol_project_dir = (
+            protocol_project_dir
+            or self.target_project_dir.parent / "chatgpt-session-forge"
+        ).resolve()
+        detected_node = str(node_executable or shutil.which("node") or "").strip()
+        self.node_executable = Path(detected_node).resolve() if detected_node else None
+        self.protocol_bridge_file = (
+            protocol_bridge_file
+            or Path(__file__).with_name("openai_protocol_login_bridge.js")
+        ).resolve()
+        self.code_service_url = str(code_service_url or "").strip().rstrip("/")
+        self.code_service_token = str(code_service_token or "")
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._state: dict[str, Any] = self._idle_state()
@@ -239,6 +250,22 @@ class AccountVerificationManager:
             missing.append("目标项目缺少 app_backend.py")
         if not self.bridge_file.is_file():
             missing.append("当前项目缺少账号验证桥接脚本")
+        return {"available": not missing, "errors": missing}
+
+    def protocol_availability(self) -> dict[str, Any]:
+        missing = list(self.availability()["errors"])
+        if not self.protocol_project_dir.is_dir():
+            missing.append(f"协议登录项目不存在：{self.protocol_project_dir}")
+        if not (
+            self.protocol_project_dir / "services" / "chatgpt-service.js"
+        ).is_file():
+            missing.append("协议登录项目缺少 services/chatgpt-service.js")
+        if not self.node_executable or not self.node_executable.is_file():
+            missing.append("未找到 Node.js，无法执行协议登录")
+        if not self.protocol_bridge_file.is_file():
+            missing.append("当前项目缺少协议登录桥接脚本")
+        if not self.code_service_url or not self.code_service_token:
+            missing.append("本地验证码服务尚未配置")
         return {"available": not missing, "errors": missing}
 
     def snapshot(self) -> dict[str, Any]:
@@ -314,6 +341,54 @@ class AccountVerificationManager:
         self._batch_task = asyncio.create_task(self._run_batch(concurrency))
         return self.snapshot()
 
+    def start_protocol_relogin(self, *, email: str) -> dict[str, Any]:
+        if self._batch_task and not self._batch_task.done():
+            raise RuntimeError("账号验证任务正在运行")
+        runtime = self.protocol_availability()
+        if not runtime["available"]:
+            raise RuntimeError("；".join(runtime["errors"]))
+        target = str(email or "").strip().lower()
+        if not target or "@" not in target:
+            raise RuntimeError("邮箱地址无效")
+        record = load_account_record(self.db_file, target)
+        account_type = str(record.get("account_type") or "").strip().lower()
+        account_type_source = str(
+            record.get("account_type_source") or ""
+        ).strip().lower()
+        self._state = {
+            "id": uuid.uuid4().hex,
+            "status": "running",
+            "running": True,
+            "concurrency": 1,
+            "total": 1,
+            "completed": 0,
+            "plus": 0,
+            "free": 0,
+            "expired": 0,
+            "deleted": 0,
+            "failed": 0,
+            "accounts": [
+                {
+                    "email": target,
+                    "status": "queued",
+                    "message": "等待协议登录",
+                    "_protocol_relogin": True,
+                    "_password": str(record.get("password") or ""),
+                    "_access_token": "",
+                    "_account_type": account_type,
+                    "_account_type_source": account_type_source,
+                    "_session_email": "",
+                    "_session_plan": "",
+                }
+            ],
+            "logs": [],
+            "startedAt": utc_now(),
+            "finishedAt": "",
+        }
+        self._append_log(f"协议重新登录已启动：{target}")
+        self._batch_task = asyncio.create_task(self._run_batch(1))
+        return self.snapshot()
+
     def _append_log(self, message: str, *, email: str = "") -> None:
         entry = {"at": utc_now(), "email": email, "message": str(message)[:1000]}
         logs = self._state.setdefault("logs", [])
@@ -345,6 +420,134 @@ class AccountVerificationManager:
             self._state["finishedAt"] = utc_now()
             self._processes.clear()
 
+    @staticmethod
+    def _protocol_environment_proxy(env: dict[str, str]) -> None:
+        proxies = urllib.request.getproxies()
+        http_proxy = str(proxies.get("http") or "").strip()
+        https_proxy = str(proxies.get("https") or http_proxy).strip()
+        if http_proxy:
+            env.setdefault("HTTP_PROXY", http_proxy)
+        if https_proxy:
+            env.setdefault("HTTPS_PROXY", https_proxy)
+        current_no_proxy = str(env.get("NO_PROXY") or "").strip()
+        local_hosts = "127.0.0.1,localhost"
+        env["NO_PROXY"] = (
+            f"{current_no_proxy},{local_hosts}" if current_no_proxy else local_hosts
+        )
+
+    @staticmethod
+    def _protocol_event(stdout: bytes) -> dict[str, Any]:
+        event: dict[str, Any] = {}
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            if not line.startswith(PROTOCOL_EVENT_PREFIX):
+                continue
+            try:
+                candidate = json.loads(line[len(PROTOCOL_EVENT_PREFIX) :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                event = candidate
+        return event
+
+    async def _protocol_relogin(
+        self, item: dict[str, Any], email: str
+    ) -> tuple[bool, str]:
+        item.update(
+            status="running",
+            message="正在使用协议重新登录（不会启动浏览器）",
+        )
+        self._append_log(item["message"], email=email)
+        password = str(item.get("_password") or "")
+        env = os.environ.copy()
+        env.update(
+            {
+                "HME_PROTOCOL_EMAIL": email,
+                "HME_PROTOCOL_PASSWORD": password,
+                "HME_PROTOCOL_PROJECT_DIR": str(self.protocol_project_dir),
+                "HME_CODE_SERVICE_URL": self.code_service_url,
+                "HME_CODE_SERVICE_TOKEN": self.code_service_token,
+                "NODE_USE_ENV_PROXY": "1",
+            }
+        )
+        self._protocol_environment_proxy(env)
+        command = [str(self.node_executable)]
+        if self.node_executable and self.node_executable.name.casefold() in {
+            "node",
+            "node.exe",
+        }:
+            command.append("--use-env-proxy")
+        command.append(str(self.protocol_bridge_file))
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self.protocol_project_dir),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+                limit=2 * 1024 * 1024,
+            )
+            self._processes[email] = process
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=240
+                )
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                return False, "协议登录超时，请稍后重试"
+            return_code = process.returncode
+        except asyncio.CancelledError:
+            item.update(status="cancelled", message="任务已停止")
+            raise
+        except Exception as error:
+            stdout, stderr, return_code = b"", str(error).encode(), -1
+        finally:
+            self._processes.pop(email, None)
+
+        event = self._protocol_event(stdout)
+        if return_code != 0 or event.get("status") != "success":
+            error = str(event.get("detail") or "").strip()
+            if not error:
+                error = stderr.decode("utf-8", errors="replace").strip()
+            for secret in (password, self.code_service_token):
+                if secret:
+                    error = error.replace(secret, "[REDACTED]")
+            return False, (error or "协议登录失败")[:500]
+
+        session = event.get("session")
+        if not isinstance(session, dict):
+            return False, "协议登录没有返回有效 Session"
+        token = str(session.get("accessToken") or session.get("access_token") or "").strip()
+        if not token:
+            return False, "协议登录返回的 Session 缺少 Access Token"
+        owner = session_email(session)
+        if owner and owner != email:
+            return False, f"协议登录返回的 Session 账号不匹配：{owner}"
+
+        await asyncio.to_thread(
+            _save_account_record,
+            self.db_file,
+            email,
+            result={
+                "access_token": token,
+                "session_json": json.dumps(session, ensure_ascii=False),
+                "session_acquisition_method": "protocol_login",
+            },
+        )
+        session_type, session_plan = session_account_type(session)
+        if item.get("_account_type_source") != "manual" and session_type:
+            item["_account_type"] = session_type
+            item["_account_type_source"] = "session"
+        item["_access_token"] = token
+        item["_session_email"] = owner
+        item["_session_plan"] = session_plan
+        item["message"] = "协议登录成功，正在验证账号"
+        self._append_log(item["message"], email=email)
+        return True, ""
+
     async def _run_account(
         self, item: dict[str, Any], semaphore: asyncio.Semaphore
     ) -> None:
@@ -353,6 +556,19 @@ class AccountVerificationManager:
             if self._state.get("status") == "cancelling":
                 item.update(status="cancelled", message="任务已停止")
                 return
+            if item.get("_protocol_relogin"):
+                succeeded, error = await self._protocol_relogin(item, email)
+                if not succeeded:
+                    item.update(status="failed", message=error)
+                    self._state["failed"] += 1
+                    self._state["completed"] += 1
+                    self._append_log(
+                        f"协议登录失败，原 Session 已保留：{error}", email=email
+                    )
+                    for key in tuple(item):
+                        if key.startswith("_"):
+                            item.pop(key, None)
+                    return
             session_owner = str(item.get("_session_email") or "").strip().lower()
             if session_owner and session_owner != email:
                 item.update(
@@ -468,13 +684,13 @@ class AccountVerificationManager:
                 if item.get("_account_type") == "plus":
                     item.update(
                         status="plus",
-                        message="Plus 账号 Token 已失效，账号已保留，请重新获取 Session",
+                        message="Plus 账号 Token 已失效，原 Session 已保留",
                     )
                     self._state["plus"] += 1
                 else:
                     item.update(
                         status="expired",
-                        message="Token 已失效，账号凭据已保留，请重新获取 Session",
+                        message="Token 已失效，原 Session 已保留",
                     )
                     self._state["expired"] += 1
                 self._append_log(item["message"], email=email)
@@ -491,6 +707,8 @@ class AccountVerificationManager:
             item.pop("_account_type_source", None)
             item.pop("_session_email", None)
             item.pop("_session_plan", None)
+            item.pop("_password", None)
+            item.pop("_protocol_relogin", None)
 
     async def stop(self) -> dict[str, Any]:
         if not self._batch_task or self._batch_task.done():

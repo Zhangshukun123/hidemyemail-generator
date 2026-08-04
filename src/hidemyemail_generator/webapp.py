@@ -19,6 +19,7 @@ from .account_verifier import AccountVerificationManager, removed_account_emails
 from .browser_tasks import (
     BrowserTaskManager,
     _save_account_record,
+    account_session,
     account_session_access_token,
     access_token_is_expired,
     load_account_record,
@@ -1175,7 +1176,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
         setTimeout(() => location.reload(), 100);
         throw new Error("本地服务已重启，正在刷新页面");
       }
-      if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败 (${response.status})`);
+      if (!response.ok || data.ok === false) {
+        const error = new Error(data.error || `请求失败 (${response.status})`);
+        error.status = response.status;
+        throw error;
+      }
       return data;
     }
 
@@ -1197,7 +1202,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         button.disabled = true;
         button.textContent = "处理中…";
         try {
-          const result = await action();
+          const result = await action(button);
           const resolvedLabel = result && result.successLabel ? result.successLabel : successLabel;
           button.textContent = resolvedLabel;
           showToast(resolvedLabel);
@@ -1240,14 +1245,29 @@ GPT_INDEX_HTML = r"""<!doctype html>
       if (!await copyText(data.value)) throw new Error("浏览器拒绝复制，请检查剪贴板权限");
     }
 
-    async function copyOpenAiCode(email) {
-      const data = await api("/api/gpt-code", {
-        method: "POST", body: JSON.stringify({ email })
-      });
-      const copied = await copyText(data.code);
-      retrievedCode = { email, code: data.code, copied };
-      render(visibleItems);
-      return { successLabel: copied ? "验证码已获取并复制" : "验证码已获取，请手动复制" };
+    async function copyOpenAiCode(email, button) {
+      const since = new Date().toISOString();
+      const deadline = Date.now() + 60_000;
+      if (retrievedCode?.email === email) {
+        retrievedCode = null;
+        button.closest(".email-row")?.querySelector(".account-state")?.replaceChildren();
+      }
+      button.textContent = "等待新验证码…";
+      while (Date.now() < deadline) {
+        try {
+          const data = await api("/api/gpt-code", {
+            method: "POST", body: JSON.stringify({ email, since })
+          });
+          const copied = await copyText(data.code);
+          retrievedCode = { email, code: data.code, copied };
+          render(visibleItems);
+          return { successLabel: copied ? "新验证码已获取并复制" : "新验证码已获取，请手动复制" };
+        } catch (error) {
+          if (error.status !== 404) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      throw new Error("60 秒内未收到新验证码，请确认 OpenAI 已发送验证码后重试");
     }
 
     async function copyAccount(email) {
@@ -1332,13 +1352,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
         error.name = "AbortError";
         throw error;
       }
-      if (!item.hasSession || !item.hasPassword) {
-        const reason = !item.hasSession ? "尚未注册或没有 Session" : "尚未确认设置密码";
-        if (!confirm(`账号 ${item.email} ${reason}，将启动浏览器完成账号和密码设置，是否继续？`)) {
-          const error = new Error("已取消账号注册");
-          error.name = "AbortError";
-          throw error;
-        }
+      if (!resetPassword && !confirm(`将使用协议登录为 ${item.email} 重新获取 Session 并验证账号；不会启动浏览器。是否继续？`)) {
+        const error = new Error("已取消协议登录");
+        error.name = "AbortError";
+        throw error;
       }
       const data = await api("/api/account/verify-or-register", {
         method: "POST",
@@ -1350,7 +1367,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       });
       if (data.mode === "verify") {
         await loadVerification();
-        return { successLabel: "验证已启动" };
+        return { successLabel: "协议登录已启动" };
       }
       await loadTask();
       return { successLabel: data.mode === "set_password" ? "密码设置已启动" : "注册已启动" };
@@ -1736,9 +1753,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
           "已导入工作台"
         );
         importWorkbenchButton.classList.add("quick-import");
-        if (!item.hasPassword || !item.hasTwoFactor) {
+        if (!item.hasImportableSession) {
           importWorkbenchButton.disabled = true;
-          importWorkbenchButton.title = "请先完成密码设置并开启 2FA";
+          importWorkbenchButton.title = "请先获取 Session 后再导入工作台";
         }
         const moreButton = document.createElement("button");
         moreButton.type = "button";
@@ -1749,8 +1766,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
         secondaryActions.append(importWorkbenchButton);
-        secondaryActions.append(actionButton(item.hasSession || item.hasPassword ? "验证账号" : "设置密码", () => verifyOrRegisterAccount(item), "已启动"));
-        if (item.hasSession && !item.hasPassword) {
+        const verifyAccountButton = actionButton("验证账号", () => verifyOrRegisterAccount(item), "协议登录已启动");
+        verifyAccountButton.title = "使用协议登录重新获取 Session 并验证账号，不会启动浏览器";
+        secondaryActions.append(verifyAccountButton);
+        if (!item.hasPassword) {
           secondaryActions.append(actionButton("设置密码", () => verifyOrRegisterAccount(item, true), "密码设置已启动"));
         }
         if (item.hasPassword) {
@@ -1773,7 +1792,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
             actionButton("复制 Session", () => copyCredential(item.email, "session"))
           );
         }
-        secondaryActions.append(actionButton("获取 OpenAI 码", () => copyOpenAiCode(item.email)));
+        secondaryActions.append(actionButton("获取 OpenAI 码", (button) => copyOpenAiCode(item.email, button)));
         const deleteButton = actionButton("删除邮箱", () => deleteEmail(item.email), "已删除");
         deleteButton.classList.add("danger-action");
         const copyAccountButton = actionButton("复制账号", () => copyAccount(item.email), "已复制账号");
@@ -2211,32 +2230,14 @@ def _workbench_import_payload(record: dict, email: str) -> dict:
     target = str(email or "").strip().lower()
     if not target or "@" not in target:
         raise RuntimeError("邮箱地址无效")
-    password = str(record.get("password") or "")
-    if not password or record.get("password_confirmed") is False:
-        raise RuntimeError("该账号密码尚未在 OpenAI 确认，不能导入工作台")
-    two_factor = (
-        record.get("two_factor")
-        if isinstance(record.get("two_factor"), dict)
-        else {}
-    )
-    totp_secret = str(two_factor.get("secret") or "").strip()
-    if not totp_secret or not two_factor.get("enabled"):
-        raise RuntimeError("该账号 2FA 尚未启用，不能导入工作台")
-    session = record.get("session")
-    if session is None:
-        session = record.get("session_json") or ""
-        if isinstance(session, str) and session.strip():
-            try:
-                session = json.loads(session)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+    session = account_session(record)
+    access_token = account_session_access_token(record)
+    if not session or not access_token:
+        raise RuntimeError("该账号尚未保存有效 Session，不能导入工作台")
+    if not str(session.get("accessToken") or session.get("access_token") or "").strip():
+        session = {**session, "accessToken": access_token}
     return {
         "email": target,
-        "password": password,
-        "totpSecret": totp_secret,
-        "accessToken": str(
-            record.get("access_token") or record.get("accessToken") or ""
-        ).strip(),
         "session": session,
     }
 
@@ -2349,6 +2350,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
             }
         )
         account = load_account_record(db_file, email)
+        session = account_session(account)
         access_token = account_session_access_token(account)
         token_expired = bool(access_token) and access_token_is_expired(access_token)
         account_type = str(account.get("account_type") or "").lower()
@@ -2375,6 +2377,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 if isinstance(account.get("two_factor"), dict)
                 else "",
                 "hasSession": bool(access_token),
+                "hasImportableSession": bool(session and access_token),
                 "tokenExpired": token_expired,
                 "sessionStatus": (
                     "expired" if token_expired else "ready" if access_token else "pending"
@@ -2449,6 +2452,8 @@ def create_app(
         target_project_dir=browser_source,
         db_file=app["db_file"],
         python_executable=app["browser_manager"].python_executable,
+        code_service_url=browser_service_url,
+        code_service_token=app["local_token"],
     )
     gpt_code_identity_cache: list[dict] = []
     gpt_code_identity_cache_at = 0.0
@@ -3217,19 +3222,6 @@ def create_app(
             if isinstance(record.get("two_factor"), dict)
             else {}
         )
-        if access_token and not reset_password:
-            try:
-                task = app["verification_manager"].start(
-                    concurrency=1, emails=[email]
-                )
-            except RuntimeError as error:
-                return web.json_response(
-                    {"ok": False, "error": str(error)}, status=409
-                )
-            return web.json_response(
-                {"ok": True, "started": True, "mode": "verify", "task": task}
-            )
-
         config_path: Path = app["inbox_config_file"]
         if not config_path.exists():
             return web.json_response(
@@ -3250,6 +3242,18 @@ def create_app(
         if email not in identity_emails:
             return web.json_response(
                 {"ok": False, "error": "该 iCloud 邮箱无效或已停用"}, status=400
+            )
+        if not reset_password:
+            try:
+                task = app["verification_manager"].start_protocol_relogin(
+                    email=email
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            return web.json_response(
+                {"ok": True, "started": True, "mode": "verify", "task": task}
             )
         registration_only = not access_token and not reset_password
         account_password = (

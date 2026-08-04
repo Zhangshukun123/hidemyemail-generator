@@ -149,6 +149,11 @@ def _save_account_record(
         access_token = str(result.get("access_token") or "").strip()
         session_json = str(result.get("session_json") or "").strip()
         storage_state_json = str(result.get("storage_state_json") or "").strip()
+        acquisition_method = str(
+            result.get("session_acquisition_method") or ""
+        ).strip()
+        if access_token or session_json:
+            current.pop("session_invalid_at", None)
         if access_token:
             current["access_token"] = access_token
         if session_json:
@@ -168,6 +173,8 @@ def _save_account_record(
                 )
         if storage_state_json:
             current["storage_state_json"] = storage_state_json
+        if acquisition_method:
+            current["session_acquisition_method"] = acquisition_method
         result_two_factor = result.get("two_factor")
         if isinstance(result_two_factor, dict) and result_two_factor.get("secret"):
             current["two_factor"] = dict(result_two_factor)
