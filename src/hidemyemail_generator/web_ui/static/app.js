@@ -323,7 +323,7 @@
       networkMode.className = "badge " + (registrationProxy.enabled ? "success" : "blue");
       networkMode.textContent = registrationProxy.enabled
         ? "动态代理 · " + (registrationProxy.countryLabel || registrationProxy.country || "")
-        : "本机 IP 直连";
+        : "本机 IP 直连 · 语言随出口";
       if (registrationProxy.country) {
         $("registrationProxyCountry").value = registrationProxy.country;
       }

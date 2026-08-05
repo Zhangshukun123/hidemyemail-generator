@@ -32,7 +32,6 @@ CAMOUFOX_AUTH_RESOURCE_CACHE_PREFS = {
     "browser.cache.memory.enable": True,
     "network.http.use-cache": True,
 }
-DIRECT_REGISTRATION_LOCALE = "zh-CN"
 AUTH_RESOURCE_RELOAD_ATTEMPTS = 2
 CHATGPT_HOME_URL = "https://chatgpt.com/"
 CHATGPT_ACCOUNT_SETTINGS_URL = "https://chatgpt.com/#settings/Account"
@@ -796,18 +795,204 @@ def configure_windowed_camoufox(app_backend) -> bool:
         return True
 
     def windowed_camoufox(playwright, *args, **kwargs):
-        kwargs.setdefault("window", CAMOUFOX_WINDOW_SIZE)
+        slot_index, slot_count = _browser_window_slot_from_environment()
+        layout = _camoufox_window_layout(slot_index, slot_count)
+        kwargs.setdefault("window", (layout["width"], layout["height"]))
         firefox_user_prefs = dict(kwargs.get("firefox_user_prefs") or {})
         firefox_user_prefs.update(CAMOUFOX_PERSISTENT_STORAGE_PREFS)
         if not str(os.environ.get("HME_REGISTRATION_PROXY_URL") or "").strip():
             kwargs["enable_cache"] = True
             firefox_user_prefs.update(CAMOUFOX_AUTH_RESOURCE_CACHE_PREFS)
         kwargs["firefox_user_prefs"] = firefox_user_prefs
-        return original(playwright, *args, **kwargs)
+        browser = original(playwright, *args, **kwargs)
+        if not kwargs.get("headless") and slot_count > 1:
+            # Camoufox creates its visible top-level window only after the
+            # caller opens a context/page.  Move it in the background so this
+            # wrapper can return and let page creation proceed.
+            import threading
+
+            threading.Thread(
+                target=_move_camoufox_window,
+                args=(browser, layout),
+                name=f"camoufox-window-slot-{slot_index + 1}",
+                daemon=True,
+            ).start()
+        return browser
 
     windowed_camoufox._hme_windowed = True
     app_backend.CamoufoxNewBrowser = windowed_camoufox
     return True
+
+
+def _browser_window_slot_from_environment() -> tuple[int, int]:
+    try:
+        slot_count = max(
+            1,
+            min(10, int(os.environ.get("HME_BROWSER_WINDOW_SLOTS") or "1")),
+        )
+    except (TypeError, ValueError):
+        slot_count = 1
+    try:
+        slot_index = max(
+            0,
+            min(
+                slot_count - 1,
+                int(os.environ.get("HME_BROWSER_WINDOW_SLOT") or "0"),
+            ),
+        )
+    except (TypeError, ValueError):
+        slot_index = 0
+    return slot_index, slot_count
+
+
+def _primary_screen_size() -> tuple[int, int]:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            width = int(ctypes.windll.user32.GetSystemMetrics(0))
+            height = int(ctypes.windll.user32.GetSystemMetrics(1))
+            if width >= 1024 and height >= 720:
+                return width, height
+        except Exception:
+            pass
+    return 1920, 1080
+
+
+def _camoufox_window_layout(
+    slot_index: int,
+    slot_count: int,
+    *,
+    screen_size: tuple[int, int] | None = None,
+) -> dict[str, int]:
+    screen_width, screen_height = screen_size or _primary_screen_size()
+    count = max(1, min(10, int(slot_count)))
+    index = max(0, min(count - 1, int(slot_index)))
+    if count == 1:
+        width, height = CAMOUFOX_WINDOW_SIZE
+        return {
+            "slot": 0,
+            "slots": 1,
+            "x": max(0, (screen_width - width) // 2),
+            "y": max(0, (screen_height - height) // 2),
+            "width": width,
+            "height": height,
+        }
+    columns = min(3, count)
+    rows = (count + columns - 1) // columns
+    tile_width = max(1, screen_width // columns)
+    usable_height = max(720, screen_height - 60)
+    tile_height = max(1, usable_height // rows)
+    margin = 10
+    width = max(560, tile_width - margin * 2)
+    height = max(560, min(900, tile_height - margin * 2))
+    column = index % columns
+    row = index // columns
+    return {
+        "slot": index,
+        "slots": count,
+        "x": column * tile_width + margin,
+        "y": row * tile_height + margin,
+        "width": width,
+        "height": height,
+    }
+
+
+def _windows_descendant_process_ids(root_pid: int) -> set[int]:
+    if os.name != "nt" or root_pid <= 0:
+        return {root_pid} if root_pid > 0 else set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessEntry32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot in {0, -1}:
+            return {root_pid}
+        parents: dict[int, int] = {}
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                parents[int(entry.th32ProcessID)] = int(
+                    entry.th32ParentProcessID
+                )
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        kernel32.CloseHandle(snapshot)
+        descendants = {int(root_pid)}
+        changed = True
+        while changed:
+            changed = False
+            for process_id, parent_id in parents.items():
+                if parent_id in descendants and process_id not in descendants:
+                    descendants.add(process_id)
+                    changed = True
+        return descendants
+    except Exception:
+        return {root_pid}
+
+
+def _move_camoufox_window(browser, layout: dict[str, int]) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        process = browser._impl_obj._connection._transport._proc
+        root_pid = int(process.pid)
+        user32 = ctypes.windll.user32
+        moved = False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            process_ids = _windows_descendant_process_ids(root_pid)
+            handles: list[int] = []
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def collect_window(hwnd, _lparam):
+                process_id = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+                if (
+                    int(process_id.value) in process_ids
+                    and user32.IsWindowVisible(hwnd)
+                ):
+                    handles.append(int(hwnd))
+                return True
+
+            user32.EnumWindows(collect_window, 0)
+            for hwnd in handles:
+                moved = bool(
+                    user32.MoveWindow(
+                        hwnd,
+                        int(layout["x"]),
+                        int(layout["y"]),
+                        int(layout["width"]),
+                        int(layout["height"]),
+                        True,
+                    )
+                ) or moved
+            # Firefox may replace or reposition its initial top-level window
+            # while the first context/page is being created.  Keep applying
+            # the slot briefly so the final browser window stays tiled.
+            time.sleep(0.1)
+        return moved
+    except Exception:
+        return False
 
 
 def _auth_page_resource_state(page) -> dict:
@@ -871,7 +1056,7 @@ def configure_direct_registration_browser(
     worker,
     *,
     enabled: bool,
-    locale: str = DIRECT_REGISTRATION_LOCALE,
+    locale: str = "",
 ) -> bool:
     """Keep proxy-free registration local while stabilizing its auth page."""
 
@@ -899,10 +1084,11 @@ def configure_direct_registration_browser(
             "HTTP 缓存禁用",
             "隔离任务内存缓存启用",
         )
-        text = text.replace(
-            "GeoIP/时区/语言/WebRTC 自动对齐",
-            f"GeoIP/时区/WebRTC 自动对齐 · 语言 {locale}",
-        )
+        if locale:
+            text = text.replace(
+                "GeoIP/时区/语言/WebRTC 自动对齐",
+                f"GeoIP/时区/WebRTC 自动对齐 · 语言 {locale}",
+            )
         return original_log(text)
 
     def new_direct_context(
@@ -913,8 +1099,8 @@ def configure_direct_registration_browser(
         *args,
         **kwargs,
     ):
-        if not str(kwargs.get("locale_override") or "").strip():
-            kwargs["locale_override"] = str(locale or DIRECT_REGISTRATION_LOCALE)
+        if locale and not str(kwargs.get("locale_override") or "").strip():
+            kwargs["locale_override"] = str(locale)
         return original_new_context(
             playwright,
             proxy,
@@ -934,6 +1120,31 @@ def configure_direct_registration_browser(
     worker.log = direct_log
     worker._hme_direct_registration_configured = True
     return True
+
+
+def detect_direct_registration_location(app_backend, log) -> dict[str, str]:
+    """Detect the real local exit without introducing a proxy."""
+
+    detector = getattr(app_backend, "detect_proxy_health", None)
+    locale_for_country = getattr(app_backend, "country_browser_locale", None)
+    if not callable(detector) or not callable(locale_for_country):
+        return {"country": "", "locale": "", "timezone": ""}
+    try:
+        health = detector("", timeout=12, check_stripe=False)
+    except Exception as error:
+        log(
+            "[直连] 本机公网出口地区检测失败，"
+            f"浏览器将继续使用 Camoufox GeoIP 自动语言：{safe_log_message(error)}"
+        )
+        return {"country": "", "locale": "", "timezone": ""}
+    country = str(getattr(health, "country", "") or "").strip().upper()
+    timezone_name = str(getattr(health, "timezone", "") or "").strip()
+    locale = str(locale_for_country(country) or "").strip() if country else ""
+    return {
+        "country": country,
+        "locale": locale,
+        "timezone": timezone_name,
+    }
 
 
 def _navigation_was_aborted(error: Exception) -> bool:
@@ -1941,6 +2152,7 @@ def main() -> int:
             log,
             browser_engine="camoufox",
         )
+        direct_location = {"country": "", "locale": "", "timezone": ""}
         if proxy_url:
             health = worker._prepare_fingerprint_for_proxy(
                 proxy, "注册", check_stripe=False
@@ -1957,13 +2169,32 @@ def main() -> int:
             )
         else:
             emit("log", message="[代理] 注册动态代理未启用，使用本地直连")
+            direct_location = detect_direct_registration_location(
+                app_backend, log
+            )
         configure_password_first_login(worker, enabled=ensure_password)
-        if configure_direct_registration_browser(worker, enabled=not bool(proxy_url)):
+        if configure_direct_registration_browser(
+            worker,
+            enabled=not bool(proxy_url),
+            locale=str(direct_location.get("locale") or ""),
+        ):
+            country = str(direct_location.get("country") or "未知")
+            locale = str(direct_location.get("locale") or "GeoIP 自动")
+            timezone_name = str(direct_location.get("timezone") or "自动")
             emit(
                 "log",
                 message=(
                     "[直连] 未配置本次注册代理；浏览器使用本机公网 IP，"
-                    "认证页面语言固定为中文"
+                    f"出口国家 {country}，语言 {locale}，时区 {timezone_name}"
+                ),
+            )
+        slot_index, slot_count = _browser_window_slot_from_environment()
+        if slot_count > 1 and not args.headless:
+            emit(
+                "log",
+                message=(
+                    f"[并发] 当前浏览器使用独立窗口槽位 "
+                    f"{slot_index + 1}/{slot_count}"
                 ),
             )
         configure_worker_login_totp(worker, pending_2fa)

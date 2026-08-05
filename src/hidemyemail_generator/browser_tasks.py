@@ -434,8 +434,10 @@ class BrowserTaskManager:
                     "_two_factor": item["two_factor"],
                     "phase": "queued",
                     "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
+                    "_window_slot": slot_index % min(concurrency, len(deduplicated)),
+                    "_window_slots": min(concurrency, len(deduplicated)),
                 }
-                for item in deduplicated
+                for slot_index, item in enumerate(deduplicated)
             ],
             "logs": [],
             "startedAt": utc_now(),
@@ -580,6 +582,12 @@ class BrowserTaskManager:
                         proxy_state.get("country") or ""
                     ),
                     "HME_REGISTRATION_PROXY_REQUIRED": "1" if proxy_url else "0",
+                    "HME_BROWSER_WINDOW_SLOT": str(
+                        max(0, int(item.get("_window_slot") or 0))
+                    ),
+                    "HME_BROWSER_WINDOW_SLOTS": str(
+                        max(1, int(item.get("_window_slots") or 1))
+                    ),
                 }
             )
             command = [

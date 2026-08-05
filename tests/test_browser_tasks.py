@@ -25,6 +25,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _click_add_password,
     _click_password_add_by_geometry,
     _click_profile_name_by_dom,
+    _camoufox_window_layout,
     _configure_camoufox_runtime_cache,
     _dismiss_completed_onboarding,
     _click_first_visible,
@@ -38,6 +39,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     configure_resilient_registration_navigation,
     configure_windowed_camoufox,
     ensure_password_in_security_settings,
+    detect_direct_registration_location,
     extract_session_without_navigation,
     require_registration_proxy_country,
     resilient_force_fill_locator,
@@ -811,7 +813,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
             ]
         )
 
-    def test_direct_registration_uses_local_connection_with_chinese_locale(self):
+    def test_direct_registration_uses_detected_exit_locale(self):
         calls = []
 
         class Worker:
@@ -831,11 +833,40 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 self.logs.append(message)
 
         worker = Worker()
-        self.assertTrue(configure_direct_registration_browser(worker, enabled=True))
+        self.assertTrue(
+            configure_direct_registration_browser(
+                worker, enabled=True, locale="ja-JP"
+            )
+        )
         worker._new_browser_context("playwright", SimpleNamespace(), None)
 
-        self.assertEqual(calls[0][3]["locale_override"], "zh-CN")
+        self.assertEqual(calls[0][3]["locale_override"], "ja-JP")
         self.assertNotIn("proxy", calls[0][3])
+
+    def test_direct_registration_location_uses_real_exit_country(self):
+        backend = SimpleNamespace(
+            detect_proxy_health=lambda *_args, **_kwargs: SimpleNamespace(
+                country="JP", timezone="Asia/Tokyo"
+            ),
+            country_browser_locale=lambda country: {"JP": "ja-JP"}[country],
+        )
+
+        location = detect_direct_registration_location(backend, lambda _line: None)
+
+        self.assertEqual(
+            location,
+            {"country": "JP", "locale": "ja-JP", "timezone": "Asia/Tokyo"},
+        )
+
+    def test_three_browser_windows_use_distinct_screen_slots(self):
+        layouts = [
+            _camoufox_window_layout(index, 3, screen_size=(3200, 1800))
+            for index in range(3)
+        ]
+
+        self.assertEqual([item["slot"] for item in layouts], [0, 1, 2])
+        self.assertEqual(len({item["x"] for item in layouts}), 3)
+        self.assertTrue(all(item["width"] >= 1000 for item in layouts))
 
     def test_direct_registration_reloads_unstyled_password_page(self):
         class Page:
@@ -1614,6 +1645,52 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_workers_receive_distinct_window_slots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json, os\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "slot = os.environ.get('HME_BROWSER_WINDOW_SLOT', '')\n"
+                "slots = os.environ.get('HME_BROWSER_WINDOW_SLOTS', '')\n"
+                "print(prefix + json.dumps({'type':'log','message':'window-slot=' + slot + '/' + slots}), flush=True)\n"
+                "print(prefix + json.dumps({'type':'result','result':{'access_token':'at-test'}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(
+                [
+                    {"email": f"slot-{index}@icloud.com", "password": ""}
+                    for index in range(3)
+                ],
+                headless=False,
+                concurrency=3,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            logs = {
+                entry["message"]
+                for entry in manager.snapshot()["logs"]
+                if "window-slot=" in entry["message"]
+            }
+            self.assertEqual(
+                logs,
+                {"window-slot=0/3", "window-slot=1/3", "window-slot=2/3"},
+            )
+
     async def test_registration_uses_unique_country_proxy_without_exposing_secret(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
