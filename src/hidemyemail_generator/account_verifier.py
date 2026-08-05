@@ -34,7 +34,7 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
+def load_verifiable_accounts(db_file: Path) -> list[dict[str, Any]]:
     conn = connect_db(str(db_file))
     try:
         rows = conn.execute(
@@ -42,7 +42,7 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
         ).fetchall()
     finally:
         conn.close()
-    accounts: list[dict[str, str]] = []
+    accounts: list[dict[str, Any]] = []
     for row in rows:
         email = str(row["key"] or "").removeprefix("gpt_account:").strip().lower()
         try:
@@ -70,6 +70,11 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, str]]:
                     "account_type_source": account_type_source,
                     "session_email": session_email(session),
                     "session_plan": raw_session_plan,
+                    "two_factor": (
+                        record.get("two_factor")
+                        if isinstance(record.get("two_factor"), dict)
+                        else {}
+                    ),
                 }
             )
     return sorted(accounts, key=lambda item: item["email"])
@@ -224,6 +229,7 @@ class AccountVerificationManager:
         self.browser_manager = browser_manager
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._browser_refresh_lock = asyncio.Lock()
         self._state: dict[str, Any] = self._idle_state()
 
     @staticmethod
@@ -335,6 +341,7 @@ class AccountVerificationManager:
                     "_account_type_source": item.get("account_type_source", ""),
                     "_session_email": item.get("session_email", ""),
                     "_session_plan": item.get("session_plan", ""),
+                    "_two_factor": item.get("two_factor") or {},
                 }
                 for item in accounts
             ],
@@ -435,7 +442,10 @@ class AccountVerificationManager:
             session = account_session(record)
             token = account_session_access_token(record)
             refresh_session = (
-                not session or not token or access_token_is_expired(token)
+                not session
+                or not token
+                or access_token_is_expired(token)
+                or bool(record.get("session_invalid_at"))
             )
             refresh_count += int(refresh_session)
             account_type = str(record.get("account_type") or "").strip().lower()
@@ -603,13 +613,23 @@ class AccountVerificationManager:
         await self._run_batch(concurrency)
 
     async def _browser_relogin(
-        self, item: dict[str, Any], email: str, protocol_error: str
+        self,
+        item: dict[str, Any],
+        email: str,
+        protocol_error: str,
+        *,
+        force_headless: bool = False,
     ) -> tuple[bool, str]:
         if self.browser_manager is None:
             return False, protocol_error
+        previous_token = str(item.get("_access_token") or "").strip()
         item.update(
             status="running",
-            message="协议登录不可用，正在改用浏览器重新获取 Session",
+            message=(
+                "正在使用无头浏览器自动提取新的 Session"
+                if force_headless
+                else "协议登录不可用，正在改用浏览器重新获取 Session"
+            ),
         )
         self._append_log(item["message"], email=email)
         try:
@@ -624,7 +644,7 @@ class AccountVerificationManager:
                         "two_factor": item.get("_two_factor") or {},
                     }
                 ],
-                headless=bool(item.get("_headless", False)),
+                headless=bool(force_headless or item.get("_headless", False)),
                 concurrency=1,
             )
             browser_task = await self.browser_manager.wait()
@@ -643,6 +663,13 @@ class AccountVerificationManager:
             ),
             {},
         )
+        if browser_account.get("status") != "success":
+            detail = str(
+                browser_account.get("message")
+                or browser_account.get("latestLog")
+                or "浏览器任务未成功提取 Session"
+            ).strip()
+            return False, f"{protocol_error}；浏览器重新获取失败：{detail}"
         record = await asyncio.to_thread(load_account_record, self.db_file, email)
         session = account_session(record)
         token = account_session_access_token(record)
@@ -653,6 +680,8 @@ class AccountVerificationManager:
                 or "浏览器任务未返回 Session"
             ).strip()
             return False, f"{protocol_error}；浏览器重新获取失败：{detail}"
+        if previous_token and token == previous_token:
+            return False, f"{protocol_error}；浏览器重新获取后 Access Token 未更新"
 
         owner = session_email(session)
         if owner and owner != email:
@@ -827,6 +856,68 @@ class AccountVerificationManager:
         self._append_log(item["message"], email=email)
         return True, ""
 
+    async def _check_access_token(
+        self, item: dict[str, Any], email: str, token: str
+    ) -> tuple[int, dict[str, Any], bytes]:
+        event: dict[str, Any] = {}
+        stderr = b""
+        jwt_type, jwt_plan = jwt_account_type(token)
+        if jwt_type == "plus" and not access_token_is_expired(token):
+            event = {
+                "status": "plus",
+                "detail": f"JWT chatgpt_plan_type={jwt_plan}（本地快速验证）",
+            }
+            item["message"] = "JWT 已确认 Plus"
+            self._append_log(item["message"], email=email)
+            return 0, event, stderr
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "HME_OPENAI_ACCESS_TOKEN": token,
+            }
+        )
+        command = [
+            str(self.python_executable),
+            str(self.bridge_file),
+            "--source-dir",
+            str(self.target_project_dir),
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self.target_project_dir),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+                limit=1024 * 1024,
+            )
+            self._processes[email] = process
+            stdout, stderr = await process.communicate()
+            return_code = process.returncode
+        except asyncio.CancelledError:
+            item.update(status="cancelled", message="任务已停止")
+            raise
+        except Exception as error:
+            stdout, stderr, return_code = b"", str(error).encode(), -1
+        finally:
+            self._processes.pop(email, None)
+
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            if not line.startswith(EVENT_PREFIX):
+                continue
+            try:
+                candidate = json.loads(line[len(EVENT_PREFIX) :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                event = candidate
+        return return_code, event, stderr
+
     async def _run_account(
         self, item: dict[str, Any], semaphore: asyncio.Semaphore
     ) -> None:
@@ -867,78 +958,72 @@ class AccountVerificationManager:
                     if key.startswith("_"):
                         item.pop(key, None)
                 return
-            item.update(status="running", message="正在根据 Session 检查账号")
-            self._append_log("正在检查 Session", email=email)
-            token = str(item.get("_access_token") or "")
-            event: dict[str, Any] = {}
-            stdout = b""
+            automatic_refresh_attempted = False
+            automatic_refresh_succeeded = False
+            automatic_refresh_error = ""
+            result = "error"
+            detail = ""
             stderr = b""
             return_code = 0
-            jwt_type, jwt_plan = jwt_account_type(token)
-            if jwt_type == "plus" and not access_token_is_expired(token):
-                event = {
-                    "status": "plus",
-                    "detail": f"JWT chatgpt_plan_type={jwt_plan}（本地快速验证）",
-                }
-                item["message"] = "JWT 已确认 Plus"
-                self._append_log(item["message"], email=email)
-            else:
-                env = os.environ.copy()
-                env.update(
-                    {
-                        "PYTHONUTF8": "1",
-                        "PYTHONIOENCODING": "utf-8",
-                        "HME_OPENAI_ACCESS_TOKEN": token,
-                    }
+            token = ""
+            for verification_attempt in range(2):
+                item.update(
+                    status="running",
+                    message=(
+                        "正在重新校验自动提取的 Session"
+                        if verification_attempt
+                        else "正在根据 Session 检查账号"
+                    ),
                 )
-                command = [
-                    str(self.python_executable),
-                    str(self.bridge_file),
-                    "--source-dir",
-                    str(self.target_project_dir),
-                ]
-                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                try:
-                    process = await asyncio.create_subprocess_exec(
-                        *command,
-                        cwd=str(self.target_project_dir),
-                        env=env,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        creationflags=creationflags,
-                        limit=1024 * 1024,
+                self._append_log(item["message"], email=email)
+                token = str(item.get("_access_token") or "")
+                return_code, event, stderr = await self._check_access_token(
+                    item, email, token
+                )
+                result = str(event.get("status") or "error")
+                detail = str(event.get("detail") or "").strip()
+                session_owner = str(
+                    item.get("_session_email") or ""
+                ).strip().lower()
+                session_detail = ""
+                if session_owner:
+                    session_detail = f"Session user.email={session_owner}"
+                session_plan = str(item.get("_session_plan") or "").strip()
+                if session_plan:
+                    session_detail = (
+                        f"{session_detail}，" if session_detail else ""
+                    ) + f"account.planType={session_plan}"
+                if session_detail:
+                    detail = (
+                        f"{session_detail}；{detail}" if detail else session_detail
                     )
-                    self._processes[email] = process
-                    stdout, stderr = await process.communicate()
-                    return_code = process.returncode
-                except asyncio.CancelledError:
-                    item.update(status="cancelled", message="任务已停止")
-                    raise
-                except Exception as error:
-                    stdout, stderr, return_code = b"", str(error).encode(), -1
-                finally:
-                    self._processes.pop(email, None)
+                if not (
+                    return_code == 0
+                    and result == "invalid"
+                    and not automatic_refresh_attempted
+                ):
+                    break
 
-                for line in stdout.decode("utf-8", errors="replace").splitlines():
-                    if line.startswith(EVENT_PREFIX):
-                        try:
-                            candidate = json.loads(line[len(EVENT_PREFIX) :])
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(candidate, dict):
-                            event = candidate
-            result = str(event.get("status") or "error")
-            detail = str(event.get("detail") or "").strip()
-            session_detail = ""
-            if session_owner:
-                session_detail = f"Session user.email={session_owner}"
-            session_plan = str(item.get("_session_plan") or "").strip()
-            if session_plan:
-                session_detail = (
-                    f"{session_detail}，" if session_detail else ""
-                ) + f"account.planType={session_plan}"
-            if session_detail:
-                detail = f"{session_detail}；{detail}" if detail else session_detail
+                automatic_refresh_attempted = True
+                item.update(
+                    status="running",
+                    message="Token 已失效，正在使用无头浏览器自动提取 Session",
+                )
+                self._append_log(item["message"], email=email)
+                async with self._browser_refresh_lock:
+                    refreshed, automatic_refresh_error = await self._browser_relogin(
+                        item,
+                        email,
+                        "Token 已失效",
+                        force_headless=True,
+                    )
+                if not refreshed:
+                    break
+                automatic_refresh_succeeded = True
+                self._append_log(
+                    "无头浏览器自动提取完成，准备重新校验 Access Token",
+                    email=email,
+                )
             if return_code == 0 and result in {"plus", "free"}:
                 effective_result = result
                 if (
@@ -975,19 +1060,35 @@ class AccountVerificationManager:
                 self._state[effective_result] += 1
                 self._append_log(item["message"], email=email)
             elif return_code == 0 and result == "invalid":
+                if automatic_refresh_succeeded:
+                    invalid_message = (
+                        "无头浏览器已自动提取 Session，但新 Token 仍失效，"
+                        "原 Session 已保留"
+                    )
+                elif automatic_refresh_attempted:
+                    refresh_detail = str(automatic_refresh_error or "").strip()
+                    invalid_message = "Token 已失效，无头浏览器自动提取失败"
+                    if refresh_detail:
+                        invalid_message += f"：{refresh_detail}"
+                    invalid_message += "；原 Session 已保留"
+                else:
+                    invalid_message = "Token 已失效，原 Session 已保留"
                 await asyncio.to_thread(
-                    mark_account_session_invalid, self.db_file, email, detail
+                    mark_account_session_invalid,
+                    self.db_file,
+                    email,
+                    invalid_message,
                 )
                 if item.get("_account_type") == "plus":
                     item.update(
                         status="plus",
-                        message="Plus 账号 Token 已失效，原 Session 已保留",
+                        message=f"Plus 账号 {invalid_message}",
                     )
                     self._state["plus"] += 1
                 else:
                     item.update(
                         status="expired",
-                        message="Token 已失效，原 Session 已保留",
+                        message=invalid_message,
                     )
                     self._state["expired"] += 1
                 self._append_log(item["message"], email=email)
@@ -999,13 +1100,7 @@ class AccountVerificationManager:
                 self._state["failed"] += 1
                 self._append_log(f"验证失败，账号已保留：{item['message']}", email=email)
             self._state["completed"] += 1
-            item.pop("_access_token", None)
-            item.pop("_account_type", None)
-            item.pop("_account_type_source", None)
-            item.pop("_session_email", None)
-            item.pop("_session_plan", None)
-            item.pop("_password", None)
-            item.pop("_protocol_relogin", None)
+            self._clear_private_item_fields(item)
 
     async def stop(self) -> dict[str, Any]:
         if not self._batch_task or self._batch_task.done():

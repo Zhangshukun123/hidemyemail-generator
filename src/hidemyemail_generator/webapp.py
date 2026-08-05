@@ -45,6 +45,7 @@ from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
 from .registration_tasks import RegistrationTaskManager, generate_openai_password
+from .web_ui import build_app_page, build_login_page
 
 
 SESSION_COOKIE_NAME = "hme_session"
@@ -2415,6 +2416,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
 </html>
 """
 
+# The structured frontend is assembled from package resources by a Page Builder.
+# Keep the legacy constants above temporarily for compatibility with older tests
+# and downstream imports while runtime traffic uses the new modular interface.
+DESIGNED_LOGIN_HTML = build_login_page()
+DESIGNED_INDEX_HTML = build_app_page()
+
 
 def _error_reason(result: dict) -> str:
     error = result.get("error", {}) if result else {}
@@ -2743,6 +2750,16 @@ def _workbench_import_payload(record: dict, email: str) -> dict:
         "email": target,
         "session": session,
     }
+    password = str(record.get("password") or "")
+    if password.strip() and record.get("password_confirmed") is not False:
+        payload["password"] = password
+
+    two_factor = record.get("two_factor")
+    if isinstance(two_factor, dict) and two_factor.get("enabled"):
+        totp_secret = str(two_factor.get("secret") or "").strip()
+        if totp_secret:
+            payload["totp_secret"] = totp_secret
+
     if str(record.get("account_type") or "").strip().lower() == "plus":
         payload.update({"account_type": "plus", "group": "Plus"})
     return payload
@@ -3185,7 +3202,10 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         session = account_session(account)
         access_token = account_session_access_token(account)
         card_link = _account_card_link(account)
-        token_expired = bool(access_token) and access_token_is_expired(access_token)
+        token_expired = bool(access_token) and (
+            access_token_is_expired(access_token)
+            or bool(account.get("session_invalid_at"))
+        )
         account_type = str(account.get("account_type") or "").lower()
         if account_type not in {"plus", "free"}:
             account_type = "unverified"
@@ -3210,7 +3230,9 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 if isinstance(account.get("two_factor"), dict)
                 else "",
                 "hasSession": bool(session and access_token),
-                "hasImportableSession": bool(session and access_token),
+                "hasImportableSession": bool(
+                    session and access_token and not token_expired
+                ),
                 "tokenExpired": token_expired,
                 "sessionStatus": (
                     "expired"
@@ -3458,7 +3480,7 @@ def create_app(
         if not app["web_password"] or _session_valid(request):
             raise web.HTTPFound("/")
         return web.Response(
-            text=LOGIN_HTML,
+            text=DESIGNED_LOGIN_HTML,
             content_type="text/html",
             headers=PAGE_HEADERS,
         )
@@ -3550,7 +3572,7 @@ def create_app(
         )
 
     async def index(_: web.Request) -> web.Response:
-        body = GPT_INDEX_HTML.replace(
+        body = DESIGNED_INDEX_HTML.replace(
             "__LOCAL_TOKEN__", json.dumps(app["local_token"])
         )
         return web.Response(
@@ -4056,6 +4078,8 @@ def create_app(
                 "updated": int(result.get("updated") or 0),
                 "accountType": imported_type,
                 "group": imported_group,
+                "hasPassword": "password" in payload,
+                "hasTwoFactor": "totp_secret" in payload,
                 "message": (
                     "Plus 账号已导入 OpenAI 账户工作台 Plus 分组"
                     if imported_type == "plus" and imported_group == "Plus"
@@ -4353,6 +4377,7 @@ def create_app(
             and session
             and access_token
             and not access_token_is_expired(access_token)
+            and not record.get("session_invalid_at")
         ):
             try:
                 task = app["verification_manager"].start(

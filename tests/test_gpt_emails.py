@@ -214,7 +214,7 @@ class GptEmailTests(unittest.TestCase):
                 "",
             )
 
-    def test_builds_workbench_import_from_session_only(self):
+    def test_builds_workbench_import_with_confirmed_credentials(self):
         payload = _workbench_import_payload(
             {
                 "password": "Unique!Password123",
@@ -232,6 +232,8 @@ class GptEmailTests(unittest.TestCase):
             payload,
             {
                 "email": "one@icloud.com",
+                "password": "Unique!Password123",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
                 "session": {
                     "user": {"email": "one@icloud.com"},
                     "accessToken": "at-test",
@@ -239,6 +241,35 @@ class GptEmailTests(unittest.TestCase):
             },
         )
 
+    def test_workbench_import_omits_unconfirmed_credentials(self):
+        payload = _workbench_import_payload(
+            {
+                "password": "Pending!Password123",
+                "password_confirmed": False,
+                "two_factor": {
+                    "secret": "JBSWY3DPEHPK3PXP",
+                    "enabled": False,
+                },
+                "session": {
+                    "accessToken": "at-pending",
+                    "user": {"email": "pending@icloud.com"},
+                },
+            },
+            "pending@icloud.com",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "email": "pending@icloud.com",
+                "session": {
+                    "accessToken": "at-pending",
+                    "user": {"email": "pending@icloud.com"},
+                },
+            },
+        )
+
+    def test_workbench_import_still_requires_session(self):
         with self.assertRaisesRegex(RuntimeError, "尚未保存有效 Session"):
             _workbench_import_payload(
                 {

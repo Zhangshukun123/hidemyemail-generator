@@ -10,6 +10,7 @@ from unittest import mock
 from aiohttp.test_utils import TestClient, TestServer
 from rich.console import Console
 
+from hidemyemail_generator.account_verifier import mark_account_session_invalid
 from hidemyemail_generator.browser_tasks import (
     _save_account_record,
     load_account_record,
@@ -612,7 +613,7 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
 
-        async def run_case(*, has_valid_session):
+        async def run_case(*, has_valid_session, marked_invalid=False):
             with tempfile.TemporaryDirectory() as temp_dir:
                 base_dir = Path(temp_dir)
                 (base_dir / "cookies.txt").write_text("cookie", encoding="utf-8")
@@ -627,6 +628,12 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                             "session_json": '{"accessToken":"valid-session-token"}',
                         },
                     )
+                    if marked_invalid:
+                        mark_account_session_invalid(
+                            app["db_file"],
+                            "protocol@icloud.com",
+                            "online endpoint returned 401",
+                        )
                 verification_manager = ManagerStub(
                     allow_protocol=True,
                     allow_verify=True,
@@ -680,6 +687,19 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["mode"], "refresh_session")
         self.assertEqual(verification_manager.protocol_emails, [])
+        self.assertEqual(
+            verification_manager.browser_refresh_starts,
+            [{"emails": ["protocol@icloud.com"], "concurrency": 1}],
+        )
+        self.assertEqual(verification_manager.verify_starts, [])
+        self.assertEqual(browser_manager.browser_starts, 0)
+
+        response, payload, verification_manager, browser_manager = await run_case(
+            has_valid_session=True,
+            marked_invalid=True,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["mode"], "refresh_session")
         self.assertEqual(
             verification_manager.browser_refresh_starts,
             [{"emails": ["protocol@icloud.com"], "concurrency": 1}],

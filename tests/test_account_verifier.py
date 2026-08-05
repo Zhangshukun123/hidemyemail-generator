@@ -397,6 +397,164 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 {item["email"] for item in items},
                 {"plus@icloud.com", "free@icloud.com", "bad@icloud.com"},
             )
+            invalid_item = next(
+                item for item in items if item["email"] == "bad@icloud.com"
+            )
+            self.assertEqual(invalid_item["sessionStatus"], "expired")
+            self.assertFalse(invalid_item["hasImportableSession"])
+
+    async def test_invalid_token_automatically_refreshes_in_headless_browser(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "refresh_then_verify.py"
+            bridge.write_text(
+                "import json, os\n"
+                "token = os.environ['HME_OPENAI_ACCESS_TOKEN']\n"
+                "status = 'invalid' if token == 'at-expired' else 'free'\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':status,'detail':'online check'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "refresh@icloud.com", "at-expired")
+
+            class BrowserManagerStub:
+                def __init__(self):
+                    self.started = []
+
+                def start(self, accounts, **options):
+                    self.started.append((accounts, options))
+                    _save_account_record(
+                        db_file,
+                        "refresh@icloud.com",
+                        result={
+                            "access_token": "at-fresh",
+                            "session_json": json.dumps(
+                                {
+                                    "accessToken": "at-fresh",
+                                    "user": {"email": "refresh@icloud.com"},
+                                }
+                            ),
+                        },
+                    )
+                    return {"running": True}
+
+                async def wait(self):
+                    return {
+                        "status": "completed",
+                        "accounts": [
+                            {
+                                "email": "refresh@icloud.com",
+                                "status": "success",
+                            }
+                        ],
+                    }
+
+                async def stop(self):
+                    return {"status": "cancelled"}
+
+                def snapshot(self):
+                    return {"running": False}
+
+            browser_manager = BrowserManagerStub()
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                browser_manager=browser_manager,
+            )
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["free"], 1)
+            self.assertEqual(snapshot["expired"], 0)
+            self.assertEqual(snapshot["failed"], 0)
+            self.assertEqual(len(browser_manager.started), 1)
+            self.assertTrue(browser_manager.started[0][1]["headless"])
+            self.assertEqual(
+                load_account_record(db_file, "refresh@icloud.com")["access_token"],
+                "at-fresh",
+            )
+            messages = "\n".join(item["message"] for item in snapshot["logs"])
+            self.assertIn("无头浏览器自动提取完成", messages)
+            self.assertIn("重新校验自动提取的 Session", messages)
+
+    async def test_invalid_token_is_automatically_refreshed_only_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "always_invalid.py"
+            bridge.write_text(
+                "import json\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'invalid','detail':'rejected'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "retry-once@icloud.com", "at-expired")
+
+            class BrowserManagerStub:
+                def __init__(self):
+                    self.started = []
+
+                def start(self, accounts, **options):
+                    self.started.append((accounts, options))
+                    _save_account_record(
+                        db_file,
+                        "retry-once@icloud.com",
+                        result={
+                            "access_token": "at-still-invalid",
+                            "session_json": json.dumps(
+                                {
+                                    "accessToken": "at-still-invalid",
+                                    "user": {"email": "retry-once@icloud.com"},
+                                }
+                            ),
+                        },
+                    )
+                    return {"running": True}
+
+                async def wait(self):
+                    return {
+                        "status": "completed",
+                        "accounts": [
+                            {
+                                "email": "retry-once@icloud.com",
+                                "status": "success",
+                            }
+                        ],
+                    }
+
+                async def stop(self):
+                    return {"status": "cancelled"}
+
+                def snapshot(self):
+                    return {"running": False}
+
+            browser_manager = BrowserManagerStub()
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                browser_manager=browser_manager,
+            )
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["expired"], 1)
+            self.assertEqual(len(browser_manager.started), 1)
+            self.assertIn("新 Token 仍失效", snapshot["accounts"][0]["message"])
 
     async def test_preserves_known_plus_account_when_token_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
