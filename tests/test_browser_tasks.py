@@ -32,6 +32,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _mfa_token_was_invalidated,
     _open_settings_from_profile,
     configure_password_first_login,
+    configure_direct_registration_browser,
     configure_post_registration_password_setup,
     configure_registration_profile_capture,
     configure_resilient_registration_navigation,
@@ -758,6 +759,13 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(configure_windowed_camoufox(backend))
         self.assertEqual(backend.CamoufoxNewBrowser("playwright"), "browser")
         self.assertEqual(calls[0][2]["window"], (1280, 800))
+        self.assertTrue(calls[0][2]["enable_cache"])
+        self.assertTrue(
+            calls[0][2]["firefox_user_prefs"]["browser.cache.memory.enable"]
+        )
+        self.assertTrue(
+            calls[0][2]["firefox_user_prefs"]["network.http.use-cache"]
+        )
         self.assertTrue(
             calls[0][2]["firefox_user_prefs"][
                 "dom.storageManager.prompt.testing"
@@ -778,6 +786,99 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertFalse(
             calls[1][2]["firefox_user_prefs"]["browser.cache.disk.enable"]
         )
+
+        proxy_calls = []
+
+        def proxy_original(playwright, *args, **kwargs):
+            proxy_calls.append((playwright, args, kwargs))
+            return "browser"
+
+        proxy_backend = SimpleNamespace(CamoufoxNewBrowser=proxy_original)
+        with patch.dict(
+            os.environ,
+            {"HME_REGISTRATION_PROXY_URL": "http://proxy.example:8080"},
+        ):
+            self.assertTrue(configure_windowed_camoufox(proxy_backend))
+            proxy_backend.CamoufoxNewBrowser(
+                "playwright",
+                enable_cache=False,
+                firefox_user_prefs={"browser.cache.memory.enable": False},
+            )
+        self.assertFalse(proxy_calls[0][2]["enable_cache"])
+        self.assertFalse(
+            proxy_calls[0][2]["firefox_user_prefs"][
+                "browser.cache.memory.enable"
+            ]
+        )
+
+    def test_direct_registration_uses_local_connection_with_chinese_locale(self):
+        calls = []
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def _new_browser_context(
+                self, playwright, proxy, storage_state=None, **kwargs
+            ):
+                calls.append((playwright, proxy, storage_state, kwargs))
+                return "browser", "context"
+
+            def _fill_password_step(self, _page):
+                calls.append("password")
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        self.assertTrue(configure_direct_registration_browser(worker, enabled=True))
+        worker._new_browser_context("playwright", SimpleNamespace(), None)
+
+        self.assertEqual(calls[0][3]["locale_override"], "zh-CN")
+        self.assertNotIn("proxy", calls[0][3])
+
+    def test_direct_registration_reloads_unstyled_password_page(self):
+        class Page:
+            def __init__(self):
+                self.checks = 0
+                self.reloads = 0
+
+            def evaluate(self, _script):
+                self.checks += 1
+                return {
+                    "isAuthPage": True,
+                    "styleSheetCount": 1 if self.reloads else 0,
+                    "loadedStyleLinkCount": 1 if self.reloads else 0,
+                }
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+            def reload(self, **_kwargs):
+                self.reloads += 1
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+                self.password_fills = 0
+
+            def _new_browser_context(self, *_args, **_kwargs):
+                return "browser", "context"
+
+            def _fill_password_step(self, _page):
+                self.password_fills += 1
+
+            def log(self, message):
+                self.logs.append(message)
+
+        page = Page()
+        worker = Worker()
+        self.assertTrue(configure_direct_registration_browser(worker, enabled=True))
+        worker._fill_password_step(page)
+
+        self.assertEqual(page.reloads, 1)
+        self.assertEqual(worker.password_fills, 1)
+        self.assertTrue(any("本机 IP 直连" in line for line in worker.logs))
 
     def test_password_is_added_from_main_settings_security_flow(self):
         class Candidate:

@@ -317,8 +317,13 @@
       $("registrationProxyEnabled").checked = Boolean(registrationProxy.enabled);
       $("registrationProxyEnabled").disabled = !registrationProxy.configured;
       $("registrationProxyEnabled").title = registrationProxy.configured
-        ? "注册全程使用所选国家的粘性动态代理"
+        ? "开启时使用所选国家的粘性动态代理；关闭时使用本机公网 IP 直连"
         : "请先设置代理连接";
+      const networkMode = $("registrationNetworkMode");
+      networkMode.className = "badge " + (registrationProxy.enabled ? "success" : "blue");
+      networkMode.textContent = registrationProxy.enabled
+        ? "动态代理 · " + (registrationProxy.countryLabel || registrationProxy.country || "")
+        : "本机 IP 直连";
       if (registrationProxy.country) {
         $("registrationProxyCountry").value = registrationProxy.country;
       }
@@ -701,8 +706,8 @@
         (runtime.available ? "✓ Camoufox 运行环境已连接" : "× Camoufox 运行环境不可用") +
         '</strong><span>' + escapeHtml(runtime.targetProject || (runtime.errors || []).join("；") || "未返回运行目录") +
         '</span></div></section><section class="form-section"><h3>注册动态代理</h3><div class="connection-card"><strong>' +
-        (proxy.enabled ? "✓ 已启用 " + escapeHtml(proxy.countryLabel || proxy.country || "") + " 出口" : proxy.configured ? "已配置但暂停" : "尚未配置") +
-        '</strong><span>连接：' + escapeHtml(proxy.endpoint || "未保存") + '</span><span>每个账号自动生成独立 SID；单账号注册、2FA 和 Session 获取全程保持同一出口。</span></div></section><div class="settings-actions"><button class="button" data-action="set-registration-proxy-credential">更新代理连接</button><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
+        (proxy.enabled ? "✓ 已启用 " + escapeHtml(proxy.countryLabel || proxy.country || "") + " 出口" : "本机 IP 直连") +
+        '</strong><span>代理连接：' + escapeHtml(proxy.endpoint || "未保存") + '</span><span>关闭动态代理时不会使用已保存的代理连接，注册全程走本机公网 IP；开启后每个账号自动生成独立 SID。</span></div></section><div class="settings-actions"><button class="button" data-action="set-registration-proxy-credential">更新代理连接</button><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
     }
 
     renderWorkbenchSettings() {
@@ -1140,7 +1145,7 @@
             enabled: event.target.checked,
           });
           this.store.patch({ registrationProxy: data });
-          this.toast(data.enabled ? "注册动态代理已启用" : "注册动态代理已关闭");
+          this.toast(data.enabled ? "注册动态代理已启用" : "动态代理已关闭，注册将使用本机 IP 直连");
         } catch (error) {
           event.target.checked = !event.target.checked;
           this.toast(error.message, "error");

@@ -100,6 +100,9 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("正在领取库存", page)
         self.assertIn("已按并发", page)
         self.assertIn("inventoryAvailable", page)
+        self.assertIn('id="registrationNetworkMode"', page)
+        self.assertIn("本机 IP 直连", page)
+        self.assertIn("关闭时使用本机公网 IP 直连", page)
 
     def test_verification_results_keep_every_account_visible(self):
         page = build_app_page()

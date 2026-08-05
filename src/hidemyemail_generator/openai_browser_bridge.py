@@ -24,6 +24,16 @@ CAMOUFOX_PERSISTENT_STORAGE_PREFS = {
     "dom.storageManager.prompt.testing": True,
     "dom.storageManager.prompt.testing.allow": True,
 }
+CAMOUFOX_AUTH_RESOURCE_CACHE_PREFS = {
+    # Every registration uses a disposable browser/context.  Keeping the
+    # in-memory HTTP cache enabled inside that isolated run lets OpenAI's auth
+    # CSS/JavaScript survive redirects and transient direct-connection errors
+    # without sharing data between accounts.
+    "browser.cache.memory.enable": True,
+    "network.http.use-cache": True,
+}
+DIRECT_REGISTRATION_LOCALE = "zh-CN"
+AUTH_RESOURCE_RELOAD_ATTEMPTS = 2
 CHATGPT_HOME_URL = "https://chatgpt.com/"
 CHATGPT_ACCOUNT_SETTINGS_URL = "https://chatgpt.com/#settings/Account"
 CHATGPT_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
@@ -789,11 +799,140 @@ def configure_windowed_camoufox(app_backend) -> bool:
         kwargs.setdefault("window", CAMOUFOX_WINDOW_SIZE)
         firefox_user_prefs = dict(kwargs.get("firefox_user_prefs") or {})
         firefox_user_prefs.update(CAMOUFOX_PERSISTENT_STORAGE_PREFS)
+        if not str(os.environ.get("HME_REGISTRATION_PROXY_URL") or "").strip():
+            kwargs["enable_cache"] = True
+            firefox_user_prefs.update(CAMOUFOX_AUTH_RESOURCE_CACHE_PREFS)
         kwargs["firefox_user_prefs"] = firefox_user_prefs
         return original(playwright, *args, **kwargs)
 
     windowed_camoufox._hme_windowed = True
     app_backend.CamoufoxNewBrowser = windowed_camoufox
+    return True
+
+
+def _auth_page_resource_state(page) -> dict:
+    try:
+        state = page.evaluate(
+            """() => {
+                const host = String(location.hostname || '').toLowerCase();
+                const isAuthPage = host === 'auth.openai.com'
+                    || host.endsWith('.auth.openai.com');
+                const styleSheets = Array.from(document.styleSheets || []);
+                const loadedLinks = Array.from(
+                    document.querySelectorAll('link[rel~="stylesheet"]')
+                ).filter((link) => Boolean(link.sheet));
+                return {
+                    isAuthPage,
+                    styleSheetCount: styleSheets.length,
+                    loadedStyleLinkCount: loadedLinks.length,
+                };
+            }"""
+        )
+    except Exception:
+        return {"isAuthPage": False, "styleSheetCount": 1, "loadedStyleLinkCount": 0}
+    return state if isinstance(state, dict) else {}
+
+
+def ensure_auth_page_resources(
+    page,
+    log,
+    *,
+    reload_attempts: int = AUTH_RESOURCE_RELOAD_ATTEMPTS,
+) -> bool:
+    """Reload an unstyled OpenAI password page before submitting its form."""
+
+    attempts = max(0, int(reload_attempts))
+    for attempt in range(attempts + 1):
+        for _ in range(8):
+            state = _auth_page_resource_state(page)
+            if not state.get("isAuthPage") or int(state.get("styleSheetCount") or 0) > 0:
+                return True
+            _page_wait(page, 500)
+        if attempt >= attempts:
+            break
+        log(
+            "[认证] OpenAI 密码页样式资源尚未加载，"
+            f"保持本机 IP 直连并重新加载 ({attempt + 1}/{attempts})"
+        )
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+        except TypeError:
+            page.reload()
+        except Exception as error:
+            log(f"[认证] 直连页面重新加载未完成：{safe_log_message(error)}")
+        _page_wait(page, 1500)
+    raise RuntimeError(
+        "OpenAI 认证页 CSS/JavaScript 未完整加载；当前保持本机 IP 直连，"
+        "请检查本机网络或 Cloudflare 验证后重试"
+    )
+
+
+def configure_direct_registration_browser(
+    worker,
+    *,
+    enabled: bool,
+    locale: str = DIRECT_REGISTRATION_LOCALE,
+) -> bool:
+    """Keep proxy-free registration local while stabilizing its auth page."""
+
+    if not enabled:
+        return False
+    if getattr(worker, "_hme_direct_registration_configured", False):
+        return True
+    original_new_context = getattr(worker, "_new_browser_context", None)
+    original_fill_password = getattr(worker, "_fill_password_step", None)
+    original_log = getattr(worker, "log", None)
+    if (
+        not callable(original_new_context)
+        or not callable(original_fill_password)
+        or not callable(original_log)
+    ):
+        return False
+
+    def direct_log(message):
+        text = str(message or "")
+        text = text.replace(
+            "浏览器 HTTP 缓存保持禁用",
+            "当前隔离任务启用内存资源缓存",
+        )
+        text = text.replace(
+            "HTTP 缓存禁用",
+            "隔离任务内存缓存启用",
+        )
+        text = text.replace(
+            "GeoIP/时区/语言/WebRTC 自动对齐",
+            f"GeoIP/时区/WebRTC 自动对齐 · 语言 {locale}",
+        )
+        return original_log(text)
+
+    def new_direct_context(
+        self,
+        playwright,
+        proxy,
+        storage_state=None,
+        *args,
+        **kwargs,
+    ):
+        if not str(kwargs.get("locale_override") or "").strip():
+            kwargs["locale_override"] = str(locale or DIRECT_REGISTRATION_LOCALE)
+        return original_new_context(
+            playwright,
+            proxy,
+            storage_state,
+            *args,
+            **kwargs,
+        )
+
+    def fill_password_after_resource_check(self, page):
+        ensure_auth_page_resources(page, self.log)
+        return original_fill_password(page)
+
+    worker._new_browser_context = types.MethodType(new_direct_context, worker)
+    worker._fill_password_step = types.MethodType(
+        fill_password_after_resource_check, worker
+    )
+    worker.log = direct_log
+    worker._hme_direct_registration_configured = True
     return True
 
 
@@ -1819,6 +1958,14 @@ def main() -> int:
         else:
             emit("log", message="[代理] 注册动态代理未启用，使用本地直连")
         configure_password_first_login(worker, enabled=ensure_password)
+        if configure_direct_registration_browser(worker, enabled=not bool(proxy_url)):
+            emit(
+                "log",
+                message=(
+                    "[直连] 未配置本次注册代理；浏览器使用本机公网 IP，"
+                    "认证页面语言固定为中文"
+                ),
+            )
         configure_worker_login_totp(worker, pending_2fa)
         configure_registration_profile_capture(app_backend, worker)
         configure_resilient_registration_navigation(worker)
