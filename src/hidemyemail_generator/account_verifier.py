@@ -17,6 +17,7 @@ from .browser_tasks import (
     account_session,
     account_session_access_token,
     access_token_is_expired,
+    jwt_account_type,
     load_account_record,
     session_account_type,
     session_email,
@@ -869,51 +870,63 @@ class AccountVerificationManager:
             item.update(status="running", message="正在根据 Session 检查账号")
             self._append_log("正在检查 Session", email=email)
             token = str(item.get("_access_token") or "")
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PYTHONUTF8": "1",
-                    "PYTHONIOENCODING": "utf-8",
-                    "HME_OPENAI_ACCESS_TOKEN": token,
-                }
-            )
-            command = [
-                str(self.python_executable),
-                str(self.bridge_file),
-                "--source-dir",
-                str(self.target_project_dir),
-            ]
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    cwd=str(self.target_project_dir),
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    creationflags=creationflags,
-                    limit=1024 * 1024,
-                )
-                self._processes[email] = process
-                stdout, stderr = await process.communicate()
-                return_code = process.returncode
-            except asyncio.CancelledError:
-                item.update(status="cancelled", message="任务已停止")
-                raise
-            except Exception as error:
-                stdout, stderr, return_code = b"", str(error).encode(), -1
-            finally:
-                self._processes.pop(email, None)
-
             event: dict[str, Any] = {}
-            for line in stdout.decode("utf-8", errors="replace").splitlines():
-                if line.startswith(EVENT_PREFIX):
-                    try:
-                        candidate = json.loads(line[len(EVENT_PREFIX) :])
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(candidate, dict):
-                        event = candidate
+            stdout = b""
+            stderr = b""
+            return_code = 0
+            jwt_type, jwt_plan = jwt_account_type(token)
+            if jwt_type == "plus" and not access_token_is_expired(token):
+                event = {
+                    "status": "plus",
+                    "detail": f"JWT chatgpt_plan_type={jwt_plan}（本地快速验证）",
+                }
+                item["message"] = "JWT 已确认 Plus"
+                self._append_log(item["message"], email=email)
+            else:
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PYTHONUTF8": "1",
+                        "PYTHONIOENCODING": "utf-8",
+                        "HME_OPENAI_ACCESS_TOKEN": token,
+                    }
+                )
+                command = [
+                    str(self.python_executable),
+                    str(self.bridge_file),
+                    "--source-dir",
+                    str(self.target_project_dir),
+                ]
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *command,
+                        cwd=str(self.target_project_dir),
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        creationflags=creationflags,
+                        limit=1024 * 1024,
+                    )
+                    self._processes[email] = process
+                    stdout, stderr = await process.communicate()
+                    return_code = process.returncode
+                except asyncio.CancelledError:
+                    item.update(status="cancelled", message="任务已停止")
+                    raise
+                except Exception as error:
+                    stdout, stderr, return_code = b"", str(error).encode(), -1
+                finally:
+                    self._processes.pop(email, None)
+
+                for line in stdout.decode("utf-8", errors="replace").splitlines():
+                    if line.startswith(EVENT_PREFIX):
+                        try:
+                            candidate = json.loads(line[len(EVENT_PREFIX) :])
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(candidate, dict):
+                            event = candidate
             result = str(event.get("status") or "error")
             detail = str(event.get("detail") or "").strip()
             session_detail = ""

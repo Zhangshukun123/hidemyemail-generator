@@ -6,9 +6,11 @@ from hidemyemail_generator.registration_tasks import generate_openai_password
 
 
 class FakeBrowserManager:
-    def __init__(self):
+    def __init__(self, *, password_confirmed=True, two_factor_enabled=True):
         self.started_accounts = []
         self.reset_count = 0
+        self.password_confirmed = password_confirmed
+        self.two_factor_enabled = two_factor_enabled
         self.state = {
             "status": "idle",
             "running": False,
@@ -39,7 +41,17 @@ class FakeBrowserManager:
 
     async def wait(self):
         await asyncio.sleep(0)
-        self.state.update(status="completed", running=False, succeeded=1)
+        self.state.update(
+            status="completed",
+            running=False,
+            succeeded=1,
+            accounts=[
+                {
+                    "passwordConfirmed": self.password_confirmed,
+                    "twoFactorEnabled": self.two_factor_enabled,
+                }
+            ],
+        )
         return self.snapshot()
 
     async def stop(self):
@@ -67,10 +79,14 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         async def confirm(email):
             events.append(("confirm", email))
 
+        async def save_password(email, password):
+            events.append(("save_password", email, password))
+
         manager = RegistrationTaskManager(
             browser_manager=browser,
             generate_email=generate,
             confirm_email=confirm,
+            save_password=save_password,
         )
         state = manager.start(label="OpenAI 一键注册", headless=True)
         self.assertTrue(state["running"])
@@ -82,14 +98,41 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["email"], "new-alias@icloud.com")
         self.assertEqual(events[0], ("generate", "OpenAI 一键注册"))
         self.assertEqual(events[1], ("confirm", "new-alias@icloud.com"))
+        self.assertEqual(events[2][0:2], ("save_password", "new-alias@icloud.com"))
         self.assertEqual(browser.started_accounts[0]["email"], "new-alias@icloud.com")
-        self.assertFalse(browser.started_accounts[0]["enable_2fa"])
-        self.assertFalse(browser.started_accounts[0]["ensure_password"])
-        self.assertEqual(browser.started_accounts[0]["password"], "")
-        self.assertIn("未设置密码和 2FA", snapshot["message"])
+        self.assertTrue(browser.started_accounts[0]["enable_2fa"])
+        self.assertTrue(browser.started_accounts[0]["ensure_password"])
+        self.assertFalse(browser.started_accounts[0]["force_reset_password"])
+        self.assertEqual(browser.started_accounts[0]["password"], events[2][2])
+        self.assertIn("唯一密码已设置", snapshot["message"])
+        self.assertIn("2FA 已开启", snapshot["message"])
         self.assertIn("未执行账号验证", snapshot["message"])
         self.assertTrue(browser.state["headless"])
         self.assertEqual(browser.reset_count, 1)
+
+    async def test_skips_two_factor_when_password_was_not_confirmed(self):
+        browser = FakeBrowserManager(
+            password_confirmed=False,
+            two_factor_enabled=False,
+        )
+
+        async def generate(_label):
+            return "pending-password@icloud.com"
+
+        async def confirm(_email):
+            return None
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            generate_email=generate,
+            confirm_email=confirm,
+        )
+        manager.start(label="OpenAI 一键注册", headless=True)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertIn("已跳过 2FA（密码未成功）", snapshot["message"])
 
 
 if __name__ == "__main__":

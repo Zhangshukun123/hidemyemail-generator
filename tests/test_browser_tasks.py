@@ -14,6 +14,7 @@ from hidemyemail_generator.browser_tasks import (
     BrowserTaskManager,
     _save_account_record,
     access_token_is_expired,
+    jwt_account_type,
     load_account_record,
     set_manual_account_type,
 )
@@ -30,7 +31,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _fontconfig_generator_with_home,
     _mfa_token_was_invalidated,
     _open_settings_from_profile,
-    configure_passwordless_email_code_login,
+    configure_password_first_login,
     configure_post_registration_password_setup,
     configure_registration_profile_capture,
     configure_resilient_registration_navigation,
@@ -51,6 +52,34 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_reads_chatgpt_plan_from_jwt_without_a_request(self):
+        payload = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "exp": int(time.time()) + 3600,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "plus"
+                    },
+                }
+            ).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+
+        self.assertEqual(
+            jwt_account_type(f"header.{payload}.signature"),
+            ("plus", "plus"),
+        )
+
+    def test_reads_top_level_free_plan_and_ignores_invalid_tokens(self):
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"chatgpt_plan_type": "free"}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+
+        self.assertEqual(
+            jwt_account_type(f"header.{payload}.signature"),
+            ("free", "free"),
+        )
+        self.assertEqual(jwt_account_type("not-a-jwt"), ("", ""))
+
     def test_japanese_completed_onboarding_is_dismissed_before_settings(self):
         actions = []
         logs = []
@@ -123,7 +152,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
             _mfa_token_was_invalidated(RuntimeError("创建 2FA 验证器失败：HTTP 500"))
         )
 
-    def test_existing_password_page_switches_to_email_code_login(self):
+    def test_japanese_email_code_page_switches_to_password(self):
         actions = []
 
         class Candidate:
@@ -134,7 +163,11 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 return None
 
             def click(self, **_kwargs):
-                actions.append("email_code")
+                actions.append("password")
+                self.page.state = "password"
+
+            def __init__(self, page):
+                self.page = page
 
         class Collection:
             def __init__(self, items):
@@ -147,15 +180,28 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 return self.items[index]
 
         class Page:
+            def __init__(self):
+                self.state = "otp"
+
             def locator(self, selector):
-                if "ワンタイムコードでログインする" in selector:
-                    return Collection([Candidate()])
+                if self.state == "otp" and "パスワードで続行" in selector:
+                    return Collection([Candidate(self)])
+                if self.state == "password" and selector == 'input[type="password"]':
+                    return Collection([Candidate(self)])
                 return Collection([])
 
         class Worker:
             def __init__(self):
                 self.original_calls = 0
+                self.continue_calls = 0
                 self.logs = []
+
+            def _continue_chatgpt_registration_complete(self, _page):
+                self.continue_calls += 1
+                return False
+
+            def _has_otp_input(self, page):
+                return page.state in {"otp", "post_password_otp"}
 
             def _fill_password_step(self, _page):
                 self.original_calls += 1
@@ -164,84 +210,51 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 self.logs.append(message)
 
         worker = Worker()
-        self.assertTrue(
-            configure_passwordless_email_code_login(worker, enabled=True)
-        )
-        worker._fill_password_step(Page())
+        page = Page()
+        self.assertTrue(configure_password_first_login(worker, enabled=True))
+        worker._continue_chatgpt_registration_complete(page)
+        worker._fill_password_step(page)
 
-        self.assertEqual(actions, ["email_code"])
-        self.assertEqual(worker.original_calls, 0)
-        self.assertIn("一次性邮箱验证码登录", worker.logs[-1])
+        self.assertEqual(actions, ["password"])
+        self.assertEqual(worker.continue_calls, 1)
+        self.assertEqual(worker.original_calls, 1)
+        self.assertTrue(worker._password_step_submitted)
+        self.assertIn("唯一密码", worker.logs[-1])
 
-    def test_password_only_login_uses_forgot_password_then_saved_password(self):
-        actions = []
+        page.state = "post_password_otp"
+        worker._continue_chatgpt_registration_complete(page)
+        self.assertTrue(worker._has_otp_input(page))
+        self.assertEqual(actions, ["password"])
 
-        class Candidate:
-            def __init__(self, page, kind):
-                self.page = page
-                self.kind = kind
-
-            def is_visible(self, **_kwargs):
-                return True
-
-            def scroll_into_view_if_needed(self, **_kwargs):
-                return None
-
-            def click(self, **_kwargs):
-                actions.append(self.kind)
-                if self.kind == "forgot_password":
-                    self.page.state = "reset_password"
-                    self.page.url = "https://auth.openai.com/password-reset"
-
+    def test_email_code_page_without_password_option_uses_email_code(self):
         class Collection:
-            def __init__(self, items):
-                self.items = items
-
             def count(self):
-                return len(self.items)
+                return 0
 
-            def nth(self, index):
-                return self.items[index]
+            def nth(self, _index):
+                raise IndexError
 
         class Page:
-            def __init__(self):
-                self.state = "login_password"
-                self.url = "https://auth.openai.com/log-in/password"
-
-            def locator(self, selector):
-                if (
-                    self.state == "login_password"
-                    and selector == 'a:has-text("Forgot password")'
-                ):
-                    return Collection([Candidate(self, "forgot_password")])
-                if (
-                    self.state == "reset_password"
-                    and selector == 'input[autocomplete="new-password"]'
-                ):
-                    return Collection([Candidate(self, "new_password")])
-                return Collection([])
+            def locator(self, _selector):
+                return Collection()
 
         class Worker:
             def __init__(self):
-                self.original_calls = []
                 self.logs = []
 
-            def _fill_password_step(self, page):
-                self.original_calls.append(page.state)
+            def _has_otp_input(self, _page):
+                return True
+
+            def _fill_password_step(self, _page):
+                raise AssertionError("password form was not reached")
 
             def log(self, message):
                 self.logs.append(message)
 
         worker = Worker()
-        page = Page()
-        self.assertTrue(configure_passwordless_email_code_login(worker, enabled=True))
-
-        worker._fill_password_step(page)
-        worker._fill_password_step(page)
-
-        self.assertEqual(actions, ["forgot_password"])
-        self.assertEqual(worker.original_calls, ["reset_password"])
-        self.assertTrue(worker._hme_password_reset_submitted)
+        self.assertTrue(configure_password_first_login(worker, enabled=True))
+        self.assertTrue(worker._has_otp_input(Page()))
+        self.assertIn("继续读取邮箱验证码", worker.logs[-1])
 
     def test_registration_profile_name_is_captured_for_account_menu(self):
         backend = SimpleNamespace(

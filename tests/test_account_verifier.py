@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -47,7 +49,89 @@ def save_record(
         conn.close()
 
 
+def token_with_plan(plan: str, *, expires_in: int = 3600) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "exp": int(time.time()) + expires_in,
+                "https://api.openai.com/auth": {
+                    "chatgpt_plan_type": plan,
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_valid_jwt_plus_is_classified_without_running_online_bridge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "must_not_run.py"
+            bridge.write_text(
+                "raise AssertionError('online bridge must not run')\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "fast-plus@icloud.com", token_with_plan("plus"))
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["plus"], 1)
+            self.assertEqual(snapshot["failed"], 0)
+            record = load_account_record(db_file, "fast-plus@icloud.com")
+            self.assertEqual(record["account_type"], "plus")
+            self.assertIn("本地快速验证", record["verification_detail"])
+
+    async def test_jwt_free_still_uses_online_check_to_detect_an_upgrade(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "online_check.py"
+            bridge.write_text(
+                "import json\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'plus','detail':'online upgrade'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "upgraded@icloud.com", token_with_plan("free"))
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["plus"], 1)
+            self.assertEqual(snapshot["failed"], 0)
+            self.assertIn(
+                "online upgrade",
+                load_account_record(db_file, "upgraded@icloud.com")[
+                    "verification_detail"
+                ],
+            )
+
     def test_top_level_token_without_session_is_not_verifiable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"

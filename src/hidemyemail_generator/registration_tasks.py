@@ -12,6 +12,7 @@ from .browser_tasks import BrowserTaskManager
 
 GenerateEmail = Callable[[str], Awaitable[str]]
 ConfirmEmail = Callable[[str], Awaitable[None]]
+SavePassword = Callable[[str, str], Awaitable[None]]
 
 
 def utc_now() -> str:
@@ -41,10 +42,12 @@ class RegistrationTaskManager:
         browser_manager: BrowserTaskManager,
         generate_email: GenerateEmail,
         confirm_email: ConfirmEmail,
+        save_password: SavePassword | None = None,
     ) -> None:
         self.browser_manager = browser_manager
         self.generate_email = generate_email
         self.confirm_email = confirm_email
+        self.save_password = save_password
         self._task: asyncio.Task | None = None
         self._state: dict[str, Any] = self._idle_state()
 
@@ -111,18 +114,23 @@ class RegistrationTaskManager:
             )
             self._append_log(f"已生成邮箱：{email}")
             await self.confirm_email(email)
+            password = generate_openai_password()
+            if self.save_password is not None:
+                await self.save_password(email, password)
+            self._append_log("已生成并保存唯一密码")
             self._state.update(
                 phase="registering_openai",
-                message="邮箱已加入列表，正在注册 OpenAI 并保存 Session",
+                message="邮箱和密码已保存，正在选择使用密码继续注册 OpenAI",
             )
             self._append_log("iCloud 邮箱已确认，启动 Camoufox")
             self.browser_manager.start(
                 [
                     {
                         "email": email,
-                        "password": "",
-                        "ensure_password": False,
-                        "enable_2fa": False,
+                        "password": password,
+                        "ensure_password": True,
+                        "force_reset_password": False,
+                        "enable_2fa": True,
                     }
                 ],
                 headless=headless,
@@ -133,9 +141,26 @@ class RegistrationTaskManager:
                 await asyncio.sleep(0.4)
             browser_result = await browser_wait
             if browser_result.get("succeeded") == 1:
+                accounts = browser_result.get("accounts") or []
+                account = accounts[0] if accounts else {}
+                password_confirmed = bool(
+                    account.get("passwordConfirmed")
+                )
+                two_factor_enabled = bool(account.get("twoFactorEnabled"))
                 detail = [
                     "注册成功，Session 已保存",
-                    "未设置密码和 2FA",
+                    (
+                        "唯一密码已设置"
+                        if password_confirmed
+                        else "唯一密码已保存，自动设置待完成"
+                    ),
+                    (
+                        "2FA 已开启"
+                        if two_factor_enabled
+                        else "2FA 未开启"
+                        if password_confirmed
+                        else "已跳过 2FA（密码未成功）"
+                    ),
                     "未执行账号验证",
                 ]
                 self._state.update(

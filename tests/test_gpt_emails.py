@@ -3,9 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from hidemyemail_generator.browser_tasks import _save_account_record
 from hidemyemail_generator.inbox import connect_db, insert_message
 from hidemyemail_generator.webapp import (
     _account_has_confirmed_password,
+    _browser_email_items,
     GPT_INDEX_HTML,
     _gpt_account_export,
     _gpt_email_items,
@@ -14,6 +16,7 @@ from hidemyemail_generator.webapp import (
     _latest_gpt_code,
     _inbox_error_message,
     _match_relay_identity,
+    _save_account_card_link,
     _workbench_import_payload,
 )
 
@@ -38,6 +41,78 @@ IDENTITIES = [
 
 
 class GptEmailTests(unittest.TestCase):
+    def test_card_link_is_saved_and_exposed_on_account_item(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:wombat-uneasy04@icloud.com",
+                        json.dumps(
+                            {
+                                "session": {"accessToken": "at-test"},
+                                "access_token": "at-test",
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            saved = _save_account_card_link(
+                db_file,
+                "wombat-uneasy04@icloud.com",
+                url="https://chatgpt.com/checkout/openai_llc/cs_test_card_link",
+                country="US",
+                currency="USD",
+            )
+            items = _browser_email_items(db_file, IDENTITIES[:1])
+
+            self.assertEqual(saved["country"], "US")
+            self.assertEqual(
+                items[0]["cardLink"],
+                "https://chatgpt.com/checkout/openai_llc/cs_test_card_link",
+            )
+            self.assertEqual(items[0]["cardLinkCurrency"], "USD")
+
+    def test_ph_hosted_card_link_metadata_is_exposed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            _save_account_record(
+                db_file,
+                "wombat-uneasy04@icloud.com",
+                result={
+                    "session": {"accessToken": "at-test"},
+                    "access_token": "at-test",
+                },
+            )
+
+            _save_account_card_link(
+                db_file,
+                "wombat-uneasy04@icloud.com",
+                url="https://chatgpt.com/checkout/openai_ie/oaics_test_hosted",
+                country="PH",
+                currency="PHP",
+                method="ph_hosted",
+                payment_link_type="chatgpt_checkout_short",
+                checkout_ui_mode="hosted",
+                amount="0",
+                amount_currency="PHP",
+                amount_verification="checkout_update",
+                promotion_applied=True,
+                promotion_strategy="gpt_link_hosted_create_and_update",
+            )
+            item = _browser_email_items(db_file, IDENTITIES[:1])[0]
+
+            self.assertEqual(item["cardLinkMethod"], "ph_hosted")
+            self.assertEqual(item["cardLinkCountry"], "PH")
+            self.assertEqual(item["cardLinkAmount"], "0")
+            self.assertEqual(item["cardLinkCheckoutUiMode"], "hosted")
+            self.assertTrue(item["cardLinkPromotionApplied"])
+
     def test_imap_connection_error_explains_registration_code_dependency(self):
         message = _inbox_error_message(TimeoutError())
 
@@ -496,6 +571,31 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("浏览器获取", GPT_INDEX_HTML)
         self.assertIn("复制密码", GPT_INDEX_HTML)
         self.assertIn("一键导入工作台", GPT_INDEX_HTML)
+        self.assertIn("直卡支付", GPT_INDEX_HTML)
+        self.assertIn("直卡支付链接", GPT_INDEX_HTML)
+        self.assertIn("生成并复制", GPT_INDEX_HTML)
+        self.assertIn("打开支付页", GPT_INDEX_HTML)
+        self.assertIn("/api/account/card-link", GPT_INDEX_HTML)
+        self.assertIn('class="side-nav"', GPT_INDEX_HTML)
+        self.assertIn('data-view="accounts"', GPT_INDEX_HTML)
+        self.assertIn('data-view="card-links"', GPT_INDEX_HTML)
+        self.assertIn('id="accountsView"', GPT_INDEX_HTML)
+        self.assertIn('id="cardLinksView"', GPT_INDEX_HTML)
+        self.assertIn('id="cardLinkList"', GPT_INDEX_HTML)
+        self.assertIn("function renderCardLinks(items)", GPT_INDEX_HTML)
+        self.assertIn("直卡提链接", GPT_INDEX_HTML)
+        self.assertIn(
+            "gpt-link · PH / PHP hosted · 双代理严格 0", GPT_INDEX_HTML
+        )
+        self.assertIn('id="cardLinkCreateProxy"', GPT_INDEX_HTML)
+        self.assertIn('id="cardLinkPromotionProxy"', GPT_INDEX_HTML)
+        self.assertIn('method: hosted ? "ph_hosted" : "standard"', GPT_INDEX_HTML)
+        self.assertIn("cardLinkExtractionModes", GPT_INDEX_HTML)
+        self.assertIn("重新提取严格 0", GPT_INDEX_HTML)
+        self.assertNotIn("ph_paypal", GPT_INDEX_HTML)
+        self.assertIn("账号、Session 与支付链接分区展示", GPT_INDEX_HTML)
+        self.assertNotIn("payment-panel", GPT_INDEX_HTML)
+        self.assertNotIn("quick-pay", GPT_INDEX_HTML)
         self.assertIn("/api/account/import-workbench", GPT_INDEX_HTML)
         self.assertIn('data.group === "Plus"', GPT_INDEX_HTML)
         self.assertIn("已导入工作台 Plus 分组", GPT_INDEX_HTML)
@@ -531,13 +631,13 @@ class GptEmailTests(unittest.TestCase):
         self.assertIn("一键验证账号", GPT_INDEX_HTML)
         self.assertIn("一键注册新账号", GPT_INDEX_HTML)
         self.assertIn(
-            "注册阶段只保存 Session/AT，不设置密码、2FA，也不执行账号验证",
+            "密码成功后自动开启 2FA，不再进入设置添加密码",
             GPT_INDEX_HTML,
         )
         self.assertNotIn("将创建新的 iCloud 隐藏邮箱", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 密钥", GPT_INDEX_HTML)
         self.assertIn("复制 2FA 码", GPT_INDEX_HTML)
-        self.assertNotIn("开启 2FA", GPT_INDEX_HTML)
+        self.assertNotIn('actionButton("开启 2FA"', GPT_INDEX_HTML)
         self.assertNotIn("enableTwoFactor", GPT_INDEX_HTML)
         self.assertIn("删除邮箱", GPT_INDEX_HTML)
         self.assertIn("Plus 账号", GPT_INDEX_HTML)
@@ -574,6 +674,13 @@ class GptEmailTests(unittest.TestCase):
             'moreButton.querySelector(".more-action-label").textContent = selected ? "收起操作" : "更多操作"',
             GPT_INDEX_HTML,
         )
+
+    def test_long_account_list_uses_scroll_friendly_rendering(self):
+        self.assertIn("scrollbar-gutter: stable", GPT_INDEX_HTML)
+        self.assertIn("content-visibility: auto", GPT_INDEX_HTML)
+        self.assertIn("contain-intrinsic-size: auto 72px", GPT_INDEX_HTML)
+        self.assertNotIn("backdrop-filter", GPT_INDEX_HTML)
+        self.assertNotIn("body::before", GPT_INDEX_HTML)
 
 
 if __name__ == "__main__":

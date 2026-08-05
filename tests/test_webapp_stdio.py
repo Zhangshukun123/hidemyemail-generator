@@ -10,7 +10,10 @@ from unittest import mock
 from aiohttp.test_utils import TestClient, TestServer
 from rich.console import Console
 
-from hidemyemail_generator.browser_tasks import _save_account_record
+from hidemyemail_generator.browser_tasks import (
+    _save_account_record,
+    load_account_record,
+)
 from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.webapp import (
     WORKBENCH_OPENAI_CODE_PATH,
@@ -170,6 +173,148 @@ class WorkbenchOpenAICodeEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 401)
         self.assertEqual((await response.json())["error"], "请先登录")
+
+
+class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        target = root / "openai-runtime"
+        target.mkdir()
+        (target / "app_backend.py").write_text("# fake runtime\n", encoding="utf-8")
+        self.app = create_app(
+            base_dir=root,
+            target_project_dir=str(target),
+            target_python=sys.executable,
+        )
+        _save_account_record(
+            self.app["db_file"],
+            "card-link@icloud.com",
+            result={
+                "access_token": "at-card-link",
+                "session_json": '{"accessToken":"at-card-link"}',
+            },
+        )
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp_dir.cleanup()
+
+    async def test_generates_and_persists_card_link(self):
+        generated = {
+            "status": "success",
+            "url": "https://chatgpt.com/checkout/openai_llc/cs_test_endpoint",
+            "country": "JP",
+            "currency": "JPY",
+        }
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(return_value=generated),
+            ) as bridge,
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={"email": "card-link@icloud.com", "country": "JP"},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["currency"], "JPY")
+        self.assertEqual(
+            load_account_record(
+                self.app["db_file"], "card-link@icloud.com"
+            )["card_link"]["url"],
+            generated["url"],
+        )
+        self.assertEqual(bridge.await_args.kwargs["locale"], "ja-JP")
+
+    async def test_rejects_unsupported_card_region(self):
+        response = await self.client.post(
+            "/api/account/card-link",
+            json={"email": "card-link@icloud.com", "country": "ZZ"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("不支持", (await response.json())["error"])
+
+    async def test_generates_ph_hosted_strict_zero_link_with_two_proxies(self):
+        generated = {
+            "status": "success",
+            "url": "https://chatgpt.com/checkout/openai_ie/oaics_test_ph_hosted",
+            "method": "ph_hosted",
+            "country": "PH",
+            "currency": "PHP",
+            "payment_link_type": "chatgpt_checkout_short",
+            "checkout_ui_mode": "hosted",
+            "amount": "0",
+            "amount_currency": "PHP",
+            "amount_verification": "checkout_update",
+            "promotion_applied": True,
+            "promotion_strategy": "gpt_link_hosted_create_and_update",
+        }
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(return_value=generated),
+            ) as bridge,
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "ph_hosted",
+                    "create_proxy": "create.example:8000:user:pass",
+                    "promotion_proxy": "socks5://promo.example:9000",
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        saved = load_account_record(
+            self.app["db_file"], "card-link@icloud.com"
+        )["card_link"]
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["method"], "ph_hosted")
+        self.assertEqual(saved["amount"], "0")
+        self.assertEqual(saved["checkout_ui_mode"], "hosted")
+        self.assertNotIn("proxy", saved)
+        self.assertEqual(bridge.await_args.kwargs["country"], "PH")
+        self.assertEqual(bridge.await_args.kwargs["currency"], "PHP")
+        self.assertEqual(
+            bridge.await_args.kwargs["create_proxy_url"],
+            "http://user:pass@create.example:8000",
+        )
+        self.assertEqual(
+            bridge.await_args.kwargs["promotion_proxy_url"],
+            "socks5://promo.example:9000",
+        )
+
+    async def test_rejects_invalid_card_link_proxy(self):
+        response = await self.client.post(
+            "/api/account/card-link",
+            json={
+                "email": "card-link@icloud.com",
+                "method": "ph_hosted",
+                "create_proxy": "file:///tmp/not-a-proxy",
+            },
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("代理", (await response.json())["error"])
 
 
 class CodePortalTests(unittest.IsolatedAsyncioTestCase):

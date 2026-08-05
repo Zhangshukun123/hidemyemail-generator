@@ -34,6 +34,38 @@ def decode_jwt_payload(token: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def jwt_account_type(token: str) -> tuple[str, str]:
+    """Read ChatGPT's plan claim from a saved JWT without making a request."""
+
+    payload = decode_jwt_payload(token)
+    auth_claim = payload.get("https://api.openai.com/auth")
+    candidates: list[Any] = []
+    if isinstance(auth_claim, dict):
+        candidates.extend(
+            (
+                auth_claim.get("chatgpt_plan_type"),
+                auth_claim.get("plan_type"),
+            )
+        )
+    candidates.extend(
+        (
+            payload.get("chatgpt_plan_type"),
+            payload.get("plan_type"),
+        )
+    )
+    for value in candidates:
+        raw_plan = str(value or "").strip()
+        plan = raw_plan.casefold()
+        if not plan:
+            continue
+        if any(marker in plan for marker in ("plus", "pro", "team", "enterprise")):
+            return "plus", raw_plan
+        if plan in {"free", "none", "no_plan", "chatgptfreeplan"}:
+            return "free", raw_plan
+        return "", raw_plan
+    return "", ""
+
+
 def access_token_is_expired(
     token: str, *, now: float | None = None, skew_seconds: int = 60
 ) -> bool:
@@ -761,6 +793,7 @@ __all__ = [
     "BrowserTaskManager",
     "access_token_is_expired",
     "decode_jwt_payload",
+    "jwt_account_type",
     "load_account_record",
     "set_manual_account_type",
 ]

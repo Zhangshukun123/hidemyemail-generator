@@ -5,12 +5,14 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 import webbrowser
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -50,6 +52,16 @@ SESSION_MAX_AGE = 12 * 60 * 60
 PUBLIC_PATHS = {"/login", "/api/login", "/access", "/healthz"}
 WORKBENCH_OPENAI_CODE_PATH = "/api/integrations/workbench/openai-code"
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
+CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
+CARD_LINK_REGIONS = {
+    "US": {"label": "美国", "currency": "USD", "locale": "en-US"},
+    "JP": {"label": "日本", "currency": "JPY", "locale": "ja-JP"},
+    "DE": {"label": "德国", "currency": "EUR", "locale": "de-DE"},
+    "GB": {"label": "英国", "currency": "GBP", "locale": "en-GB"},
+    "CA": {"label": "加拿大", "currency": "CAD", "locale": "en-CA"},
+    "AU": {"label": "澳大利亚", "currency": "AUD", "locale": "en-AU"},
+}
+CARD_LINK_METHODS = {"standard", "ph_hosted"}
 
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -730,9 +742,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       --pico-primary-focus: rgba(255, 255, 255, .16);
       --pico-border-radius: 13px;
       --canvas: #0f0f10;
-      --surface: rgba(24, 24, 25, .95);
+      --surface: #19191a;
       --surface-strong: #1f1f20;
-      --surface-soft: rgba(39, 39, 41, .78);
+      --surface-soft: #242426;
       --border: rgba(255, 255, 255, .1);
       --text: #f3f3f4;
       --muted: #9b9b9f;
@@ -753,9 +765,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       --primary: #ececec;
       --primary-hover: #ffffff;
       --primary-text: #151515;
-      --stat-bg: rgba(27, 27, 28, .88);
-      --row-bg: rgba(17, 17, 18, .76);
-      --row-hover: rgba(35, 35, 37, .9);
+      --stat-bg: #1a1a1b;
+      --row-bg: #151516;
+      --row-hover: #202022;
       --success-soft: rgba(85, 185, 146, .1);
       --warning-soft: rgba(210, 161, 78, .1);
       --danger-soft: rgba(230, 117, 132, .1);
@@ -763,7 +775,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       --brand: linear-gradient(145deg, #39393c, #19191a);
       --brand-border: rgba(255, 255, 255, .13);
       --brand-copy: #a5a5a8;
-      --card-shadow: 0 22px 70px rgba(0, 0, 0, .3), inset 0 1px 0 rgba(255, 255, 255, .018);
+      --card-shadow: 0 12px 34px rgba(0, 0, 0, .22), inset 0 1px 0 rgba(255, 255, 255, .025);
       --toast: rgba(31, 31, 33, .98);
     }
     html[data-theme="light"] {
@@ -773,9 +785,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       --pico-primary-hover-background: #0d0d0e;
       --pico-primary-focus: rgba(32, 32, 33, .16);
       --canvas: #f7f7f5;
-      --surface: rgba(255, 255, 255, .97);
+      --surface: #ffffff;
       --surface-strong: #ffffff;
-      --surface-soft: rgba(242, 242, 240, .92);
+      --surface-soft: #f2f2f0;
       --border: rgba(0, 0, 0, .1);
       --text: #222223;
       --muted: #6b6b6e;
@@ -796,8 +808,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
       --primary: #202021;
       --primary-hover: #0d0d0e;
       --primary-text: #ffffff;
-      --stat-bg: rgba(255, 255, 255, .94);
-      --row-bg: rgba(250, 250, 248, .95);
+      --stat-bg: #ffffff;
+      --row-bg: #fafaf8;
       --row-hover: #f1f1ef;
       --success-soft: rgba(20, 122, 91, .09);
       --warning-soft: rgba(148, 100, 21, .09);
@@ -806,21 +818,46 @@ GPT_INDEX_HTML = r"""<!doctype html>
       --brand: linear-gradient(145deg, #363638, #171718);
       --brand-border: rgba(0, 0, 0, .08);
       --brand-copy: #6d6d70;
-      --card-shadow: 0 18px 48px rgba(0, 0, 0, .08), inset 0 1px 0 rgba(255, 255, 255, .7);
+      --card-shadow: 0 10px 28px rgba(0, 0, 0, .075), inset 0 1px 0 rgba(255, 255, 255, .7);
       --toast: rgba(255, 255, 255, .98);
     }
     * { box-sizing: border-box; }
-    html { background: var(--canvas); }
+    html { background: var(--canvas); scrollbar-gutter: stable; }
     body {
-      margin: 0; min-height: 100vh; color: var(--text);
-      background: radial-gradient(circle at 8% -5%, var(--page-glow), transparent 34rem), var(--canvas);
+      margin: 0; min-height: 100vh; color: var(--text); overscroll-behavior-y: none;
+      background: radial-gradient(circle at 7% 0%, var(--page-glow), transparent 29rem), var(--canvas);
       transition: color .2s ease, background-color .2s ease;
     }
-    body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .15;
-      background-image: linear-gradient(var(--grid) 1px, transparent 1px),
-                        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-      background-size: 36px 36px; mask-image: linear-gradient(to bottom, black, transparent 72%); }
-    main.app-shell { width: min(1360px, calc(100% - 40px)); margin: 0 auto; padding: 34px 0 64px; position: relative; z-index: 1; }
+    .app-shell {
+      width: min(1480px, calc(100% - 40px)); margin: 0 auto; position: relative; z-index: 1;
+      display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; align-items: start;
+    }
+    .side-nav {
+      position: sticky; top: 20px; min-height: calc(100vh - 40px); padding: 17px 14px;
+      display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 20px;
+      background: var(--surface); box-shadow: var(--card-shadow);
+    }
+    .side-brand { display: flex; align-items: center; gap: 11px; padding: 4px 5px 20px; border-bottom: 1px solid var(--border); }
+    .side-brand .brand-mark { width: 40px; height: 40px; border-radius: 13px; }
+    .side-brand .brand-mark svg { width: 19px; height: 19px; }
+    .side-brand-title { color: var(--text); font-size: 13px; font-weight: 780; }
+    .side-brand-copy { margin-top: 2px; color: var(--muted); font-size: 9px; letter-spacing: .11em; text-transform: uppercase; }
+    .side-nav-label { margin: 19px 9px 8px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
+    .side-nav-list { display: grid; gap: 7px; }
+    .nav-item {
+      width: 100%; min-height: 44px; padding: 9px 11px; justify-content: flex-start; gap: 10px;
+      border-color: transparent; border-radius: 12px; color: var(--muted); background: transparent;
+    }
+    .nav-item:hover:not(:disabled) { color: var(--text); background: var(--subtle-hover); transform: none; }
+    .nav-item.active { color: var(--accent-contrast); background: var(--accent); }
+    .nav-item svg { width: 17px; height: 17px; flex: 0 0 auto; }
+    .nav-item-label { text-align: left; }
+    .nav-badge { min-width: 22px; margin-left: auto; padding: 2px 6px; border-radius: 999px; color: inherit; background: color-mix(in srgb, currentColor 11%, transparent); font-size: 9px; text-align: center; }
+    .nav-item.active .nav-badge { background: color-mix(in srgb, var(--accent-contrast) 12%, transparent); }
+    .side-nav-note { margin-top: auto; padding: 15px 9px 3px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+    .side-nav-note strong { display: block; margin-bottom: 4px; color: var(--label); font-size: 10px; }
+    main.app-main { min-width: 0; padding: 34px 0 64px; }
+    .view-panel[hidden] { display: none; }
     .app-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
     .brand { display: flex; align-items: center; gap: 15px; }
     .brand-mark { width: 48px; height: 48px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 15px;
@@ -840,10 +877,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
       width: auto; min-height: 40px; margin: 0; border: 1px solid transparent; padding: 9px 14px; display: inline-flex;
       align-items: center; justify-content: center; line-height: 1.2; font-size: 13px;
       font-weight: 720; cursor: pointer; color: var(--button-text); background: var(--button); box-shadow: none;
-      transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
+      transition: border-color .16s ease, background-color .16s ease, opacity .16s ease;
     }
     button[type="button"], button[type="submit"], button[type="reset"] { margin-block: 0; }
-    button:hover:not(:disabled) { transform: translateY(-1px); }
     button:disabled { opacity: .48; cursor: wait; }
     .icon-button { width: 40px; padding: 0; display: grid; place-items: center; border-color: var(--border); background: var(--subtle); }
     .icon-button:hover:not(:disabled) { background: var(--subtle-hover); }
@@ -853,7 +889,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     html[data-theme="light"] .theme-icon-moon { display: block; }
     .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
     .stat-card { margin: 0; padding: 17px 18px; display: flex; align-items: center; gap: 14px; border: 1px solid var(--border);
-      border-radius: 17px; background: var(--stat-bg); box-shadow: 0 10px 28px rgba(0,0,0,.08), inset 0 1px 0 var(--subtle); backdrop-filter: blur(14px); }
+      border-radius: 17px; background: var(--stat-bg); box-shadow: 0 7px 20px rgba(0,0,0,.07), inset 0 1px 0 var(--subtle); }
     .stat-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: var(--text); background: var(--accent-soft); }
     .stat-icon.success { color: var(--success); background: var(--success-soft); }
     .stat-icon.warning { color: var(--warning); background: var(--warning-soft); }
@@ -863,7 +899,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .stat-label { margin-top: 5px; color: var(--muted); font-size: 11px; }
     .card {
       margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 20px; box-shadow: var(--card-shadow); overflow: hidden; backdrop-filter: blur(18px);
+      border-radius: 20px; box-shadow: var(--card-shadow); overflow: hidden;
     }
     .card + .card { margin-top: 16px; }
     .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 21px 22px; border-bottom: 1px solid var(--border); }
@@ -897,7 +933,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .list-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     #verifySummary { max-width: 440px; color: var(--muted); font-size: 11px; text-align: right; }
     .list-head h2 { margin: 0; font-size: 17px; color: var(--text); }
-    #summary { color: var(--muted); font-size: 12px; margin-top: 5px; }
+    #summary, #cardLinkSummary { color: var(--muted); font-size: 12px; margin-top: 5px; }
     .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 135px 150px 140px auto; gap: 9px; padding: 0 22px 17px; }
     .search-wrap { position: relative; }
     .search-wrap svg { position: absolute; top: 50%; left: 12px; width: 16px; height: 16px; color: var(--muted); transform: translateY(-50%); pointer-events: none; }
@@ -908,9 +944,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
       position: relative;
       display: grid; grid-template-columns: minmax(280px, .9fr) minmax(220px, 1.1fr) auto; align-items: center; gap: 14px;
       padding: 15px 16px; background: var(--row-bg); border: 1px solid var(--border); border-radius: 14px;
-      transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
+      content-visibility: auto; contain-intrinsic-size: auto 72px;
+      transition: border-color .12s ease, box-shadow .12s ease;
     }
-    .email-row:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); background: var(--row-hover); transform: translateY(-1px); }
+    .email-row:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); }
     .email-row.operation-selected {
       border-color: var(--accent);
       background: color-mix(in srgb, var(--accent) 9%, var(--row-bg));
@@ -941,6 +978,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .status-badge.ready { color: var(--success); background: var(--success-soft); }
     .status-badge.expired { color: var(--warning); background: var(--warning-soft); }
     .status-badge.pending { color: var(--muted); background: var(--subtle); }
+    .payment-link-badge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border-radius: 999px;
+      color: var(--warning); background: var(--warning-soft); font-size: 10px; font-weight: 720; white-space: nowrap; }
     .plan-badge { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 760; }
     .plan-badge.plus { color: var(--warning); background: var(--warning-soft); }
     .plan-badge.free { color: var(--success); background: var(--success-soft); }
@@ -976,6 +1015,44 @@ GPT_INDEX_HTML = r"""<!doctype html>
     .account-code-status { flex: 1; color: var(--success); font-size: 10px; white-space: nowrap; }
     .account-code button { width: 30px; height: 30px; min-height: 30px; flex: 0 0 30px; padding: 0; border-color: var(--border); background: var(--subtle); }
     .account-code button svg { width: 14px; height: 14px; }
+    .card-link-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+    .card-link-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 170px auto; gap: 9px; padding: 0 22px 17px; }
+    .card-link-toolbar input, .card-link-toolbar select {
+      height: 40px; margin: 0; border-color: var(--input-border); background: var(--input); color: var(--text); font-size: 12px;
+    }
+    .card-link-toolbar input { padding-left: 37px; }
+    .ph-flow-panel {
+      display: grid; grid-template-columns: minmax(250px, .8fr) minmax(430px, 1.2fr); gap: 18px;
+      align-items: center; margin: 0 22px 16px; padding: 14px 15px; border: 1px solid var(--warning-soft);
+      border-radius: 14px; background: var(--warning-soft);
+    }
+    .ph-flow-copy strong { display: block; color: var(--warning); font-size: 12px; }
+    .ph-flow-copy span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+    .ph-proxy-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    .ph-proxy-field { margin: 0; color: var(--label); font-size: 10px; font-weight: 680; }
+    .ph-proxy-field input {
+      height: 36px; margin: 5px 0 0; padding: 7px 10px; border-color: var(--input-border);
+      background: var(--input); color: var(--text); font: 11px/1.2 "SFMono-Regular", Consolas, monospace;
+    }
+    .card-link-list { padding: 0 14px 14px; display: grid; gap: 9px; }
+    .card-link-row {
+      display: grid; grid-template-columns: minmax(250px, 1fr) minmax(190px, .65fr) auto;
+      align-items: center; gap: 18px; padding: 17px 18px; border: 1px solid var(--border);
+      border-radius: 15px; background: var(--row-bg); content-visibility: auto; contain-intrinsic-size: auto 78px;
+      transition: border-color .12s ease;
+    }
+    .card-link-row:hover { border-color: color-mix(in srgb, var(--warning) 32%, transparent); }
+    .card-link-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .card-link-avatar { width: 40px; height: 40px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; color: var(--warning); background: var(--warning-soft); }
+    .card-link-avatar svg { width: 19px; height: 19px; }
+    .card-link-address { color: var(--text); font-size: 13px; font-weight: 730; overflow-wrap: anywhere; }
+    .card-link-meta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 6px; }
+    .card-link-state { min-width: 0; }
+    .card-link-state strong { display: block; color: var(--text); font-size: 12px; }
+    .card-link-state span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+    .card-link-controls { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+    .card-link-mode { width: auto; min-width: 240px; height: 34px; min-height: 34px; margin: 0; padding: 5px 28px 5px 9px; border-color: var(--input-border); background: var(--input); color: var(--text); font-size: 11px; }
+    .card-link-controls .action.generate-link { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
     .empty { padding: 66px 20px; text-align: center; color: var(--muted); }
     .empty-icon { width: 44px; height: 44px; display: grid; place-items: center; margin: 0 auto 12px; border-radius: 14px; color: var(--muted); background: var(--subtle); }
     .empty-icon svg { width: 21px; height: 21px; }
@@ -986,11 +1063,23 @@ GPT_INDEX_HTML = r"""<!doctype html>
       font-size: 12px; opacity: 0; transform: translateY(10px); pointer-events: none; transition: .2s ease; }
     .toast.show { opacity: 1; transform: translateY(0); }
     .toast.error { border-color: var(--danger-soft); }
+    @media (max-width: 1020px) {
+      .app-shell { grid-template-columns: 190px minmax(0, 1fr); gap: 14px; }
+      .card-link-row { grid-template-columns: minmax(220px, 1fr) minmax(180px, .7fr); }
+      .card-link-controls { grid-column: 1 / -1; justify-content: flex-start; padding-top: 12px; border-top: 1px solid var(--border); }
+    }
     @media (max-width: 760px) {
-      main.app-shell { width: min(100% - 24px, 1360px); padding-top: 22px; }
+      .app-shell { width: min(100% - 24px, 1360px); display: block; padding-top: 12px; }
+      .side-nav { position: relative; top: auto; min-height: 0; padding: 10px; margin-bottom: 12px; }
+      .side-brand, .side-nav-label, .side-nav-note { display: none; }
+      .side-nav-list { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .nav-item { justify-content: center; }
+      .nav-badge { margin-left: 0; }
+      main.app-main { padding: 10px 0 48px; }
       .app-header { align-items: flex-start; }
       .runtime-pill { display: none; }
       .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+      .card-link-stats { grid-template-columns: repeat(3, 1fr); gap: 8px; }
       .stat-card { padding: 13px 15px; }
       .section-head { padding: 18px; }
       .automation-body { padding: 16px 18px 18px; }
@@ -1001,6 +1090,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
       .email-row { grid-template-columns: minmax(0, 1fr); }
       .identity, .account-state, .quick-actions, .secondary-actions { grid-column: 1; }
       .quick-actions { justify-content: flex-start; }
+      .card-link-toolbar { padding-inline: 18px; }
+      .ph-flow-panel { grid-template-columns: 1fr; margin-inline: 18px; }
+      .card-link-row { grid-template-columns: minmax(0, 1fr); gap: 13px; }
+      .card-link-state, .card-link-controls { grid-column: 1; }
+      .card-link-controls { justify-content: flex-start; }
       .task-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 520px) {
@@ -1028,21 +1122,49 @@ GPT_INDEX_HTML = r"""<!doctype html>
       .list-head { padding-inline: 18px; }
       .quick-actions { width: 100%; }
       .quick-actions .action { flex: 1; }
+      .card-link-stats { grid-template-columns: 1fr; }
+      .card-link-toolbar { grid-template-columns: 1fr 44px; }
+      .card-link-toolbar .search-wrap { grid-column: 1; grid-row: 1; }
+      #cardLinkStatusFilter { grid-column: 1; grid-row: 2; }
+      .card-link-toolbar .icon-button { grid-column: 2; grid-row: 1 / span 2; height: 100%; }
+      .ph-proxy-fields { grid-template-columns: 1fr; }
+      .card-link-mode { width: 100%; min-width: 0; }
+      .card-link-controls .action { flex: 1 1 calc(50% - 7px); }
       .secondary-actions .action { flex: 1 1 calc(50% - 7px); }
     }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
   </style>
 </head>
 <body>
-  <main class="app-shell">
-    <header class="app-header">
-      <div class="brand">
+  <div class="app-shell">
+    <aside class="side-nav" aria-label="主导航">
+      <div class="side-brand">
         <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m4 7 8 6 8-6"></path></svg></div>
         <div>
-          <div class="eyebrow">Private Relay Console</div>
-          <h1>隐藏邮箱控制台</h1>
-          <div class="subtitle">统一管理 iCloud 邮箱与 OpenAI Session</div>
+          <div class="side-brand-title">隐藏邮箱控制台</div>
+          <div class="side-brand-copy">Private Relay</div>
         </div>
+      </div>
+      <div class="side-nav-label">工作区</div>
+      <nav class="side-nav-list">
+        <button class="nav-item active" type="button" data-view="accounts" aria-controls="accountsView" aria-current="page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m4 7 8 6 8-6"></path></svg>
+          <span class="nav-item-label">账号管理</span><span id="accountNavCount" class="nav-badge">—</span>
+        </button>
+        <button class="nav-item" type="button" data-view="card-links" aria-controls="cardLinksView">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="M3 10h18M7 15h3"></path></svg>
+          <span class="nav-item-label">直卡提链接</span><span id="cardLinkNavCount" class="nav-badge">—</span>
+        </button>
+      </nav>
+      <div class="side-nav-note"><strong>直卡链接独立管理</strong>账号、Session 与支付链接分区展示，避免操作混在同一张卡片。</div>
+    </aside>
+
+    <main class="app-main">
+    <header class="app-header">
+      <div>
+        <div id="viewEyebrow" class="eyebrow">Account Workspace</div>
+        <h1 id="viewTitle">账号管理</h1>
+        <div id="viewSubtitle" class="subtitle">管理 iCloud 邮箱、OpenAI Session 与账号凭据</div>
       </div>
       <div class="header-actions">
         <div class="runtime-pill"><span id="runtimeDot" class="runtime-dot"></span><span id="runtimeLabel">正在连接运行环境</span></div>
@@ -1054,6 +1176,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       </div>
     </header>
 
+    <div id="accountsView" class="view-panel">
     <section class="stats-grid" aria-label="邮箱概览">
       <article class="stat-card">
         <div class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m4 7 8 6 8-6"></path></svg></div>
@@ -1079,7 +1202,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
           <div class="section-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"></rect><path d="M8 21h8M12 18v3M7 9h.01M10 9h7M7 13h.01M10 13h5"></path></svg></div>
           <div>
           <h2>浏览器获取 Session</h2>
-            <div class="section-copy">注册阶段只保存 Session/AT，不设置密码、2FA，也不执行账号验证。</div>
+            <div class="section-copy">创建并保存唯一密码；验证码页有密码入口时优先使用，否则自动填写邮箱验证码。密码成功后自动开启 2FA，不再进入设置添加密码。</div>
           </div>
         </div>
       </div>
@@ -1144,7 +1267,64 @@ GPT_INDEX_HTML = r"""<!doctype html>
       </div>
       <div id="list" class="list"><div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m4 7 8 6 8-6"></path></svg></div><strong>正在加载邮箱</strong>请稍候…</div></div>
     </section>
-  </main>
+    </div>
+
+    <div id="cardLinksView" class="view-panel" hidden>
+      <section class="card-link-stats" aria-label="直卡链接概览">
+        <article class="stat-card">
+          <div class="stat-icon plus"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"></path><path d="M7 15h4"></path></svg></div>
+          <div><div id="payableCount" class="stat-value">—</div><div class="stat-label">可提链接账号</div></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-icon success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.1-1.1"></path></svg></div>
+          <div><div id="generatedLinkCount" class="stat-value">—</div><div class="stat-label">已生成链接</div></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-icon warning"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 8v4l2.5 2.5"></path></svg></div>
+          <div><div id="cardLinkPendingCount" class="stat-value">—</div><div class="stat-label">等待 Session</div></div>
+        </article>
+      </section>
+
+      <section class="card">
+        <div class="list-head">
+          <div>
+            <h2>直卡提链接</h2>
+            <div id="cardLinkSummary">正在加载…</div>
+          </div>
+          <div class="section-copy">默认使用 PH/PHP hosted 双代理严格零元提取；不会启动 Camoufox，也不会自动付款。</div>
+        </div>
+        <div class="ph-flow-panel">
+          <div class="ph-flow-copy">
+            <strong>gpt-link · PH / PHP hosted · 双代理严格 0</strong>
+            <span>阶段 1 用建单代理创建带优惠的 Checkout；阶段 2 用优惠代理更新同一 Checkout，并强制校验 oaics_ 与零金额。</span>
+          </div>
+          <div class="ph-proxy-fields">
+            <label class="ph-proxy-field">建单代理
+              <input id="cardLinkCreateProxy" type="password" placeholder="代理 1（留空则直连）" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="ph-proxy-field">优惠代理
+              <input id="cardLinkPromotionProxy" type="password" placeholder="代理 2（留空则复用代理 1）" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+        </div>
+        <div class="card-link-toolbar">
+          <div class="search-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
+            <input id="cardLinkSearch" type="search" placeholder="搜索可提链接账号" autocomplete="off" aria-label="搜索直卡链接账号">
+          </div>
+          <select id="cardLinkStatusFilter" aria-label="按直卡链接状态筛选">
+            <option value="all">全部账号</option>
+            <option value="generated">已生成链接</option>
+            <option value="available">可生成链接</option>
+            <option value="unavailable">等待 Session</option>
+          </select>
+          <button id="cardLinkRefresh" class="icon-button" aria-label="刷新直卡链接列表" title="刷新"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66"></path><path d="M20 4v7h-7"></path></svg></button>
+        </div>
+        <div id="cardLinkList" class="card-link-list"><div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="M3 10h18M7 15h3"></path></svg></div><strong>正在加载账号</strong>请稍候…</div></div>
+      </section>
+    </div>
+    </main>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script>
@@ -1167,6 +1347,46 @@ GPT_INDEX_HTML = r"""<!doctype html>
     let browserRuntimeAvailable = false;
     let toastTimer = null;
     let selectedOperationEmail = "";
+    const cardLinkExtractionModes = [
+      ["ph_hosted", "gpt-link · PH / PHP hosted · 双代理严格 0"],
+      ["standard:US", "标准直卡 · 美国 · USD"],
+      ["standard:JP", "标准直卡 · 日本 · JPY"],
+      ["standard:DE", "标准直卡 · 德国 · EUR"],
+      ["standard:GB", "标准直卡 · 英国 · GBP"],
+      ["standard:CA", "标准直卡 · 加拿大 · CAD"],
+      ["standard:AU", "标准直卡 · 澳大利亚 · AUD"],
+    ];
+    const viewDetails = {
+      accounts: {
+        eyebrow: "Account Workspace",
+        title: "账号管理",
+        subtitle: "管理 iCloud 邮箱、OpenAI Session 与账号凭据",
+      },
+      "card-links": {
+        eyebrow: "Checkout Workspace",
+        title: "直卡提链接",
+        subtitle: "集中生成、复制和打开 ChatGPT Plus 直卡支付链接",
+      },
+    };
+
+    function setView(view, updateHash = true) {
+      const target = viewDetails[view] ? view : "accounts";
+      $("accountsView").hidden = target !== "accounts";
+      $("cardLinksView").hidden = target !== "card-links";
+      for (const button of document.querySelectorAll(".nav-item[data-view]")) {
+        const active = button.dataset.view === target;
+        button.classList.toggle("active", active);
+        if (active) button.setAttribute("aria-current", "page");
+        else button.removeAttribute("aria-current");
+      }
+      $("viewEyebrow").textContent = viewDetails[target].eyebrow;
+      $("viewTitle").textContent = viewDetails[target].title;
+      $("viewSubtitle").textContent = viewDetails[target].subtitle;
+      document.title = `${viewDetails[target].title} · 隐藏邮箱控制台`;
+      if (updateHash && location.hash !== `#${target}`) {
+        history.replaceState(null, "", `#${target}`);
+      }
+    }
 
     function applyTheme(theme, persist = false) {
       document.documentElement.dataset.theme = theme;
@@ -1341,6 +1561,54 @@ GPT_INDEX_HTML = r"""<!doctype html>
       return {
         successLabel: data.updated ? "工作台账号已更新" : "已导入工作台",
       };
+    }
+
+    function cardLinkDateLabel(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      return date.toLocaleString("zh-CN", {
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+        hour12: false,
+      });
+    }
+
+    async function generateCardLink(item, extractionMode) {
+      const hosted = extractionMode === "ph_hosted";
+      const country = hosted ? "PH" : extractionMode.split(":", 2)[1] || "US";
+      const data = await api("/api/account/card-link", {
+        method: "POST",
+        body: JSON.stringify({
+          email: item.email,
+          method: hosted ? "ph_hosted" : "standard",
+          country,
+          create_proxy: hosted ? $("cardLinkCreateProxy").value.trim() : "",
+          promotion_proxy: hosted ? $("cardLinkPromotionProxy").value.trim() : "",
+        }),
+      });
+      if (!await copyText(data.url)) {
+        throw new Error("链接已生成，但浏览器拒绝复制，请使用打开支付页");
+      }
+      await load();
+      return {
+        successLabel: hosted
+          ? "PH/PHP hosted 严格 0 链接已提取并复制"
+          : "直卡链接已生成并复制",
+      };
+    }
+
+    async function copyCardLink(item) {
+      if (!item.cardLink) throw new Error("请先生成直卡支付链接");
+      if (!await copyText(item.cardLink)) {
+        throw new Error("浏览器拒绝复制，请检查剪贴板权限");
+      }
+      return { successLabel: "直卡链接已复制" };
+    }
+
+    function openCardLink(item) {
+      if (!item.cardLink) throw new Error("请先生成直卡支付链接");
+      window.open(item.cardLink, "_blank", "noopener,noreferrer");
+      return { successLabel: "支付页已打开" };
     }
 
     async function deleteEmail(email) {
@@ -1886,6 +2154,136 @@ GPT_INDEX_HTML = r"""<!doctype html>
       syncOperationSelection();
     }
 
+    function renderCardLinks(items) {
+      const root = $("cardLinkList");
+      root.replaceChildren();
+      if (!items.length) {
+        const filtered = currentItems.length > 0;
+        root.append(renderEmpty(
+          filtered ? "没有匹配的账号" : "暂无可提链接账号",
+          filtered ? "尝试更换搜索词或链接状态" : "账号保存有效 Session 后会显示在这里"
+        ));
+        return;
+      }
+      const planLabels = { plus: "Plus", free: "Free", unverified: "等待验证" };
+      for (const item of items) {
+        const row = document.createElement("article");
+        row.className = "card-link-row";
+        row.dataset.cardLinkEmail = item.email;
+
+        const identity = document.createElement("div");
+        identity.className = "card-link-identity";
+        const avatar = document.createElement("div");
+        avatar.className = "card-link-avatar";
+        avatar.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="M3 10h18M7 15h3"></path></svg>';
+        const identityCopy = document.createElement("div");
+        identityCopy.className = "identity-copy";
+        const address = document.createElement("div");
+        address.className = "card-link-address";
+        address.textContent = item.email;
+        const meta = document.createElement("div");
+        meta.className = "card-link-meta";
+        const planBadge = document.createElement("span");
+        planBadge.className = `plan-badge ${item.accountType}`;
+        planBadge.textContent = planLabels[item.accountType] || "等待验证";
+        const sessionBadge = document.createElement("span");
+        sessionBadge.className = `status-badge ${item.sessionStatus}`;
+        sessionBadge.textContent = sessionLabel(item.sessionStatus);
+        meta.append(planBadge, sessionBadge);
+        if (item.cardLink) {
+          const linkBadge = document.createElement("span");
+          linkBadge.className = "payment-link-badge";
+          linkBadge.textContent = item.cardLinkMethod === "ph_hosted"
+            ? "hosted 严格 0" : "已生成";
+          meta.append(linkBadge);
+        }
+        identityCopy.append(address, meta);
+        identity.append(avatar, identityCopy);
+
+        const state = document.createElement("div");
+        state.className = "card-link-state";
+        const stateTitle = document.createElement("strong");
+        const stateDetail = document.createElement("span");
+        const generatedLabel = cardLinkDateLabel(item.cardLinkGeneratedAt);
+        if (item.cardLink) {
+          if (item.cardLinkMethod === "ph_hosted") {
+            const zeroVerified = item.cardLinkAmount === "0";
+            stateTitle.textContent = "PH/PHP hosted 严格 0 已提取";
+            stateDetail.textContent = `oaics_ · ${zeroVerified ? "零金额已校验" : "严格零元流程"}${generatedLabel ? ` · ${generatedLabel} 生成` : ""} · 建议尽快使用`;
+          } else {
+            stateTitle.textContent = "标准直卡链接已生成";
+            stateDetail.textContent = `${item.cardLinkCountry} · ${item.cardLinkCurrency}${generatedLabel ? ` · ${generatedLabel} 生成` : ""} · 建议尽快使用`;
+          }
+        } else if (item.sessionStatus === "ready") {
+          stateTitle.textContent = "可以提取 hosted 短链";
+          stateDetail.textContent = "默认使用 PH/PHP 双代理严格 0，也可切换标准直卡";
+        } else {
+          stateTitle.textContent = "等待有效 Session";
+          stateDetail.textContent = "请先在账号管理页面获取 Session，再生成支付链接";
+        }
+        state.append(stateTitle, stateDetail);
+
+        const controls = document.createElement("div");
+        controls.className = "card-link-controls";
+        const modeSelect = document.createElement("select");
+        modeSelect.className = "card-link-mode";
+        modeSelect.setAttribute("aria-label", `选择 ${item.email} 的提取方式`);
+        for (const [value, label] of cardLinkExtractionModes) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          modeSelect.append(option);
+        }
+        const storedStandardMode = `standard:${item.cardLinkCountry || "US"}`;
+        modeSelect.value = item.cardLink && item.cardLinkMethod === "ph_hosted"
+          ? "ph_hosted"
+          : item.cardLink && cardLinkExtractionModes.some(([value]) => value === storedStandardMode)
+          ? storedStandardMode
+          : "ph_hosted";
+        const generateButton = actionButton(
+          modeSelect.value === "ph_hosted"
+            ? item.cardLink ? "重新提取严格 0" : "提取严格 0"
+            : item.cardLink ? "重新生成并复制" : "生成并复制",
+          () => generateCardLink(item, modeSelect.value),
+          "链接已生成并复制"
+        );
+        generateButton.classList.add("generate-link");
+        generateButton.disabled = item.sessionStatus !== "ready";
+        if (generateButton.disabled) generateButton.title = "请先获取有效 Session";
+        modeSelect.addEventListener("change", () => {
+          generateButton.textContent = modeSelect.value === "ph_hosted"
+            ? item.cardLink ? "重新提取严格 0" : "提取严格 0"
+            : item.cardLink ? "重新生成并复制" : "生成并复制";
+        });
+        controls.append(modeSelect, generateButton);
+        if (item.cardLink) {
+          controls.append(
+            actionButton("复制链接", () => copyCardLink(item), "直卡链接已复制"),
+            actionButton("打开支付页", () => openCardLink(item), "支付页已打开")
+          );
+        }
+        row.append(identity, state, controls);
+        root.append(row);
+      }
+    }
+
+    function applyCardLinkFilters() {
+      const query = $("cardLinkSearch").value.trim().toLowerCase();
+      const status = $("cardLinkStatusFilter").value;
+      const items = currentItems.filter((item) =>
+        (!query || item.email.toLowerCase().includes(query)) &&
+        (status === "all" ||
+          (status === "generated" && Boolean(item.cardLink)) ||
+          (status === "available" && item.sessionStatus === "ready") ||
+          (status === "unavailable" && item.sessionStatus !== "ready"))
+      );
+      renderCardLinks(items);
+      const generated = currentItems.filter((item) => item.cardLink).length;
+      $("cardLinkSummary").textContent = items.length === currentItems.length
+        ? `${currentItems.length} 个账号 · ${generated} 个链接已生成`
+        : `显示 ${items.length} / ${currentItems.length} 个账号`;
+    }
+
     function applyFilters() {
       const query = $("search").value.trim().toLowerCase();
       const plan = $("planFilter").value;
@@ -1912,18 +2310,29 @@ GPT_INDEX_HTML = r"""<!doctype html>
 
     async function load() {
       $("refresh").disabled = true;
+      $("cardLinkRefresh").disabled = true;
       $("summary").className = "";
       $("summary").textContent = "正在加载…";
+      $("cardLinkSummary").className = "";
+      $("cardLinkSummary").textContent = "正在加载…";
       try {
         const data = await api("/api/gpt-emails");
         currentItems = data.items;
         const plus = data.items.filter((item) => item.accountType === "plus").length;
         const free = data.items.filter((item) => item.accountType === "free").length;
+        const payable = data.items.filter((item) => item.sessionStatus === "ready").length;
+        const generated = data.items.filter((item) => item.cardLink).length;
         $("totalCount").textContent = data.items.length;
         $("plusCount").textContent = plus;
         $("freeCount").textContent = free;
         $("unverifiedCount").textContent = data.items.length - plus - free;
+        $("payableCount").textContent = payable;
+        $("generatedLinkCount").textContent = generated;
+        $("cardLinkPendingCount").textContent = data.items.length - payable;
+        $("accountNavCount").textContent = data.items.length;
+        $("cardLinkNavCount").textContent = generated;
         applyFilters();
+        applyCardLinkFilters();
       } catch (error) {
         currentItems = [];
         visibleItems = [];
@@ -1931,11 +2340,20 @@ GPT_INDEX_HTML = r"""<!doctype html>
         $("plusCount").textContent = "—";
         $("freeCount").textContent = "—";
         $("unverifiedCount").textContent = "—";
+        $("payableCount").textContent = "—";
+        $("generatedLinkCount").textContent = "—";
+        $("cardLinkPendingCount").textContent = "—";
+        $("accountNavCount").textContent = "—";
+        $("cardLinkNavCount").textContent = "—";
         render([]);
+        renderCardLinks([]);
         $("summary").className = "error";
         $("summary").textContent = error.message;
+        $("cardLinkSummary").className = "error";
+        $("cardLinkSummary").textContent = error.message;
       } finally {
         $("refresh").disabled = false;
+        $("cardLinkRefresh").disabled = false;
       }
     }
 
@@ -1945,10 +2363,17 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     $("refresh").addEventListener("click", load);
+    $("cardLinkRefresh").addEventListener("click", load);
     $("search").addEventListener("input", applyFilters);
     $("planFilter").addEventListener("change", applyFilters);
     $("statusFilter").addEventListener("change", applyFilters);
     $("dateFilter").addEventListener("change", applyFilters);
+    $("cardLinkSearch").addEventListener("input", applyCardLinkFilters);
+    $("cardLinkStatusFilter").addEventListener("change", applyCardLinkFilters);
+    for (const button of document.querySelectorAll(".nav-item[data-view]")) {
+      button.addEventListener("click", () => setView(button.dataset.view));
+    }
+    window.addEventListener("hashchange", () => setView(location.hash.slice(1), false));
     $("registerOne").addEventListener("click", async () => {
       try { await startRegistration(); } catch (error) { showToast(error.message, "error"); }
     });
@@ -1983,6 +2408,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
     });
     $("logout").addEventListener("click", logout);
+    setView(location.hash.slice(1), false);
     Promise.all([load(), loadTask(), loadRegistration(), loadVerification()]);
   </script>
 </body>
@@ -2328,6 +2754,229 @@ def _account_has_confirmed_password(record: dict) -> bool:
     )
 
 
+def _account_card_link(record: dict) -> dict:
+    value = record.get("card_link")
+    if not isinstance(value, dict):
+        return {}
+    url = str(value.get("url") or "").strip()
+    if not _valid_card_link(url):
+        return {}
+    method = str(value.get("method") or "standard").strip().lower()
+    if method not in CARD_LINK_METHODS:
+        method = "standard"
+    return {
+        "url": url,
+        "method": method,
+        "country": str(value.get("country") or "US").strip().upper(),
+        "currency": str(value.get("currency") or "USD").strip().upper(),
+        "generated_at": str(value.get("generated_at") or "").strip(),
+        "payment_link_type": str(value.get("payment_link_type") or "").strip(),
+        "checkout_ui_mode": str(value.get("checkout_ui_mode") or "").strip(),
+        "amount": str(value.get("amount") or "").strip(),
+        "amount_currency": str(value.get("amount_currency") or "").strip().upper(),
+        "amount_verification": str(
+            value.get("amount_verification") or ""
+        ).strip(),
+        "promotion_applied": bool(value.get("promotion_applied")),
+        "promotion_strategy": str(value.get("promotion_strategy") or "").strip(),
+    }
+
+
+def _valid_card_link(value: str) -> bool:
+    match = re.fullmatch(
+        r"https://chatgpt\.com/checkout/[A-Za-z0-9_-]+/(?:cs_|oaics_)[A-Za-z0-9_-]+",
+        str(value or "").strip(),
+    )
+    return bool(match)
+
+
+def _normalize_card_link_proxy_url(value: str) -> str:
+    text = str(value or "").strip().strip("\"'")
+    if not text:
+        return ""
+    if len(text) > 1000 or any(character.isspace() for character in text):
+        raise RuntimeError("提链代理格式无效")
+    prefixed_four_part = re.match(
+        r"^(?P<scheme>https?|socks4a?|socks5h?)://"
+        r"(?P<host>\[[^\]]+\]|[^:/\s]+):(?P<port>\d+):"
+        r"(?P<user>[^:\s]+):(?P<password>.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if prefixed_four_part:
+        item = prefixed_four_part.groupdict()
+        text = (
+            f"{item['scheme'].lower()}://{item['user']}:{item['password']}"
+            f"@{item['host']}:{item['port']}"
+        )
+    if "://" not in text:
+        parts = text.split(":")
+        if len(parts) >= 4 and parts[1].isdigit():
+            host, port, username = parts[0], parts[1], parts[2]
+            password = ":".join(parts[3:])
+            text = f"http://{username}:{password}@{host}:{port}"
+        else:
+            text = f"http://{text}"
+    try:
+        parsed = urlsplit(text)
+        _ = parsed.port
+    except ValueError as error:
+        raise RuntimeError("提链代理格式无效") from error
+    scheme = {"socks": "socks5h"}.get(parsed.scheme.lower(), parsed.scheme.lower())
+    if scheme not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
+        raise RuntimeError("提链代理协议不受支持")
+    if not parsed.hostname or parsed.query or parsed.fragment:
+        raise RuntimeError("提链代理格式无效")
+    if parsed.path not in {"", "/"}:
+        raise RuntimeError("提链代理不能包含路径")
+    if scheme != parsed.scheme.lower():
+        text = f"{scheme}://{text.split('://', 1)[1]}"
+    return text
+
+
+def _save_account_card_link(
+    db_file: Path,
+    email: str,
+    *,
+    url: str,
+    country: str,
+    currency: str,
+    method: str = "standard",
+    payment_link_type: str = "",
+    checkout_ui_mode: str = "",
+    amount: str = "",
+    amount_currency: str = "",
+    amount_verification: str = "",
+    promotion_applied: bool = False,
+    promotion_strategy: str = "",
+) -> dict:
+    target = str(email or "").strip().lower()
+    record = load_account_record(db_file, target)
+    if not record:
+        raise RuntimeError("未找到账号记录")
+    if not _valid_card_link(url):
+        raise RuntimeError("直卡支付链接格式无效")
+    normalized_method = str(method or "standard").strip().lower()
+    if normalized_method not in CARD_LINK_METHODS:
+        raise RuntimeError("不支持该直卡提取方式")
+    now = datetime.now(timezone.utc).isoformat()
+    card_link = {
+        "url": str(url).strip(),
+        "method": normalized_method,
+        "country": str(country or "US").strip().upper(),
+        "currency": str(currency or "USD").strip().upper(),
+        "generated_at": now,
+        "payment_link_type": str(payment_link_type or "").strip(),
+        "checkout_ui_mode": str(checkout_ui_mode or "").strip(),
+        "amount": str(amount or "").strip(),
+        "amount_currency": str(amount_currency or "").strip().upper(),
+        "amount_verification": str(amount_verification or "").strip(),
+        "promotion_applied": bool(promotion_applied),
+        "promotion_strategy": str(promotion_strategy or "").strip(),
+    }
+    record["card_link"] = card_link
+    record["updated_at"] = now
+    conn = connect_db(str(db_file))
+    try:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"gpt_account:{target}", json.dumps(record, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return card_link
+
+
+async def _run_card_link_bridge(
+    *,
+    target_project_dir: Path,
+    python_executable: Path,
+    bridge_file: Path,
+    access_token: str,
+    method: str,
+    country: str,
+    currency: str,
+    locale: str,
+    create_proxy_url: str = "",
+    promotion_proxy_url: str = "",
+) -> dict:
+    token = str(access_token or "").strip()
+    create_proxy = str(create_proxy_url or "").strip()
+    promotion_proxy = str(promotion_proxy_url or "").strip()
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "HME_OPENAI_ACCESS_TOKEN": token,
+            "HME_CARD_LINK_CREATE_PROXY_URL": create_proxy,
+            "HME_CARD_LINK_PROMO_PROXY_URL": promotion_proxy,
+        }
+    )
+    command = [
+        str(python_executable),
+        str(bridge_file),
+        "--source-dir",
+        str(target_project_dir),
+        "--method",
+        method,
+        "--country",
+        country,
+        "--currency",
+        currency,
+        "--locale",
+        locale,
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(target_project_dir),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=creationflags,
+        limit=1024 * 1024,
+    )
+    try:
+        timeout = 150 if method == "ph_hosted" else 75
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=timeout
+        )
+    except asyncio.TimeoutError as error:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise RuntimeError("生成直卡支付链接超时，请稍后重试") from error
+
+    event: dict = {}
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith(CARD_LINK_EVENT_PREFIX):
+            continue
+        try:
+            candidate = json.loads(line[len(CARD_LINK_EVENT_PREFIX) :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            event = candidate
+    if process.returncode != 0 or event.get("status") != "success":
+        detail = str(event.get("detail") or "").strip()
+        if not detail:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+        if token:
+            detail = detail.replace(token, "[REDACTED]")
+        for proxy in (create_proxy, promotion_proxy):
+            if proxy:
+                detail = detail.replace(proxy, "[REDACTED_PROXY]")
+        raise RuntimeError((detail or "直卡支付链接生成失败")[:1000])
+    if not _valid_card_link(str(event.get("url") or "")):
+        raise RuntimeError("生成器没有返回有效的 ChatGPT 直卡支付链接")
+    return event
+
+
 def _remove_deleted_email_records(db_file: Path, email: str) -> None:
     target = email.strip().lower()
     now = datetime.now(timezone.utc).isoformat()
@@ -2535,6 +3184,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         account = load_account_record(db_file, email)
         session = account_session(account)
         access_token = account_session_access_token(account)
+        card_link = _account_card_link(account)
         token_expired = bool(access_token) and access_token_is_expired(access_token)
         account_type = str(account.get("account_type") or "").lower()
         if account_type not in {"plus", "free"}:
@@ -2572,6 +3222,30 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 "accountType": account_type,
                 "accountTypeSource": str(account.get("account_type_source") or ""),
                 "verifiedAt": str(account.get("verified_at") or ""),
+                "cardLink": str(card_link.get("url") or ""),
+                "cardLinkMethod": str(card_link.get("method") or ""),
+                "cardLinkCountry": str(card_link.get("country") or "US"),
+                "cardLinkCurrency": str(card_link.get("currency") or "USD"),
+                "cardLinkGeneratedAt": str(card_link.get("generated_at") or ""),
+                "cardLinkPaymentType": str(
+                    card_link.get("payment_link_type") or ""
+                ),
+                "cardLinkCheckoutUiMode": str(
+                    card_link.get("checkout_ui_mode") or ""
+                ),
+                "cardLinkAmount": str(card_link.get("amount") or ""),
+                "cardLinkAmountCurrency": str(
+                    card_link.get("amount_currency") or ""
+                ),
+                "cardLinkAmountVerification": str(
+                    card_link.get("amount_verification") or ""
+                ),
+                "cardLinkPromotionApplied": bool(
+                    card_link.get("promotion_applied")
+                ),
+                "cardLinkPromotionStrategy": str(
+                    card_link.get("promotion_strategy") or ""
+                ),
             }
         )
         items.append(current)
@@ -2621,6 +3295,7 @@ def create_app(
     app["delete_lock"] = asyncio.Lock()
     app["inbox_sync_lock"] = asyncio.Lock()
     app["identity_lock"] = asyncio.Lock()
+    app["card_link_lock"] = asyncio.Lock()
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
     browser_source = (
@@ -2636,6 +3311,9 @@ def create_app(
         python_executable=Path(target_python) if target_python else None,
         force_headless=force_browser_headless,
     )
+    app["card_link_bridge_file"] = Path(__file__).with_name(
+        "openai_card_link_bridge.py"
+    ).resolve()
     app["verification_manager"] = AccountVerificationManager(
         target_project_dir=browser_source,
         db_file=app["db_file"],
@@ -2702,10 +3380,20 @@ def create_app(
             raise RuntimeError(f"新邮箱列表同步失败：{last_error}")
         raise RuntimeError("新邮箱在 30 秒内未出现在 iCloud 列表")
 
+    async def save_registration_password(email: str, password: str) -> None:
+        await asyncio.to_thread(
+            _save_account_record,
+            app["db_file"],
+            email,
+            password=password,
+            password_confirmed=False,
+        )
+
     app["registration_manager"] = RegistrationTaskManager(
         browser_manager=app["browser_manager"],
         generate_email=generate_registration_email,
         confirm_email=confirm_registration_email,
+        save_password=save_registration_password,
     )
 
     async def background_inbox_sync() -> None:
@@ -3377,6 +4065,128 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def create_card_link(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(body.get("email") or "").strip().lower()
+        method = str(body.get("method") or "standard").strip().lower()
+        if not email.endswith("@icloud.com") or len(email) > 320:
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        if method not in CARD_LINK_METHODS:
+            return web.json_response(
+                {"ok": False, "error": "不支持该直卡提取方式"}, status=400
+            )
+        if method == "ph_hosted":
+            country = "PH"
+            region = {"currency": "PHP", "locale": "en-US"}
+        else:
+            country = str(body.get("country") or "US").strip().upper()
+            region = CARD_LINK_REGIONS.get(country)
+            if region is None:
+                return web.json_response(
+                    {"ok": False, "error": "不支持该直卡支付地区"},
+                    status=400,
+                )
+        try:
+            create_proxy = _normalize_card_link_proxy_url(
+                str(body.get("create_proxy") or "")
+            )
+            promotion_proxy = _normalize_card_link_proxy_url(
+                str(body.get("promotion_proxy") or "")
+            )
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=400
+            )
+        if method == "standard":
+            create_proxy = ""
+            promotion_proxy = ""
+        record = await asyncio.to_thread(
+            load_account_record, app["db_file"], email
+        )
+        session = account_session(record)
+        access_token = account_session_access_token(record)
+        if not session or not access_token:
+            return web.json_response(
+                {"ok": False, "error": "该账号尚未保存 Session / AT"},
+                status=409,
+            )
+        if access_token_is_expired(access_token):
+            return web.json_response(
+                {"ok": False, "error": "Access Token 已过期，请先重新获取 Session"},
+                status=409,
+            )
+        browser_manager: BrowserTaskManager = app["browser_manager"]
+        if not browser_manager.target_project_dir.is_dir():
+            return web.json_response(
+                {"ok": False, "error": "OpenAI 支付运行目录不存在"}, status=503
+            )
+        if not browser_manager.python_executable.is_file():
+            return web.json_response(
+                {"ok": False, "error": "OpenAI 支付运行环境不可用"}, status=503
+            )
+        try:
+            async with app["card_link_lock"]:
+                result = await _run_card_link_bridge(
+                    target_project_dir=browser_manager.target_project_dir,
+                    python_executable=browser_manager.python_executable,
+                    bridge_file=app["card_link_bridge_file"],
+                    access_token=access_token,
+                    method=method,
+                    country=country,
+                    currency=str(region["currency"]),
+                    locale=str(region["locale"]),
+                    create_proxy_url=create_proxy,
+                    promotion_proxy_url=promotion_proxy,
+                )
+                saved = await asyncio.to_thread(
+                    _save_account_card_link,
+                    app["db_file"],
+                    email,
+                    url=str(result.get("url") or ""),
+                    country=str(result.get("country") or country),
+                    currency=str(result.get("currency") or region["currency"]),
+                    method=str(result.get("method") or method),
+                    payment_link_type=str(
+                        result.get("payment_link_type") or ""
+                    ),
+                    checkout_ui_mode=str(
+                        result.get("checkout_ui_mode") or ""
+                    ),
+                    amount=str(result.get("amount") or ""),
+                    amount_currency=str(
+                        result.get("amount_currency") or ""
+                    ),
+                    amount_verification=str(
+                        result.get("amount_verification") or ""
+                    ),
+                    promotion_applied=bool(
+                        result.get("promotion_applied")
+                    ),
+                    promotion_strategy=str(
+                        result.get("promotion_strategy") or ""
+                    ),
+                )
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": f"生成直卡支付链接失败：{error}"},
+                status=502,
+            )
+        return web.json_response(
+            {"ok": True, "email": email, **saved},
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def browser_status(_: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, **app["browser_manager"].snapshot()},
@@ -3956,6 +4766,7 @@ def create_app(
     app.router.add_post(
         "/api/account/import-workbench", import_workbench_account
     )
+    app.router.add_post("/api/account/card-link", create_card_link)
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_post(WORKBENCH_OPENAI_CODE_PATH, workbench_openai_code)

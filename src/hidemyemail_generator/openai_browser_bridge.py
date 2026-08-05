@@ -129,6 +129,20 @@ ONE_TIME_CODE_LOGIN_SELECTORS = (
     '[role="button"]:has-text("ワンタイムコードでログインする")',
     'text="ワンタイムコードでログインする"',
 )
+PASSWORD_CONTINUE_SELECTORS = (
+    'button:has-text("Continue with password")',
+    '[role="button"]:has-text("Continue with password")',
+    'a:has-text("Continue with password")',
+    'button:has-text("使用密码继续")',
+    '[role="button"]:has-text("使用密码继续")',
+    'a:has-text("使用密码继续")',
+    'button:has-text("使用密碼繼續")',
+    '[role="button"]:has-text("使用密碼繼續")',
+    'a:has-text("使用密碼繼續")',
+    'button:has-text("パスワードで続行")',
+    '[role="button"]:has-text("パスワードで続行")',
+    'a:has-text("パスワードで続行")',
+)
 FORGOT_PASSWORD_SELECTORS = (
     'a:has-text("Forgot password")',
     'button:has-text("Forgot password")',
@@ -487,74 +501,83 @@ def configure_registration_profile_capture(app_backend, worker) -> bool:
     return True
 
 
-def configure_passwordless_email_code_login(worker, *, enabled: bool) -> bool:
-    """Prefer email OTP when an existing account asks for an unknown password."""
+def configure_password_first_login(worker, *, enabled: bool) -> bool:
+    """Choose password on the initial email-code page and submit the saved password."""
 
-    original = getattr(worker, "_fill_password_step", None)
-    if not enabled or not callable(original):
+    original_has_otp = getattr(worker, "_has_otp_input", None)
+    original_fill_password = getattr(worker, "_fill_password_step", None)
+    original_continue_registration = getattr(
+        worker, "_continue_chatgpt_registration_complete", None
+    )
+    if (
+        not enabled
+        or not callable(original_has_otp)
+        or not callable(original_fill_password)
+    ):
         return False
-    if getattr(worker, "_hme_email_code_login_configured", False):
+    if getattr(worker, "_hme_password_first_login_configured", False):
         return True
 
-    def password_reset_form_ready(page) -> bool:
-        if _first_visible(page, FORGOT_PASSWORD_SELECTORS, timeout=250) is not None:
+    def choose_password_if_available(self, page) -> bool:
+        if getattr(self, "_hme_password_entry_selected", False):
             return False
-        url = str(getattr(page, "url", "") or "").casefold()
-        if any(marker in url for marker in ("password-reset", "reset-password", "new-password")):
-            return True
-        if _first_visible(
-            page,
-            (
-                'input[autocomplete="new-password"]',
-                'input[name*="new-password" i]',
-                'input[name*="new_password" i]',
-            ),
-            timeout=300,
-        ) is not None:
-            return True
-        try:
-            body = str(page.locator("body").inner_text(timeout=500) or "").casefold()
-        except Exception:
-            body = ""
-        return any(
-            marker in body
-            for marker in (
-                "reset your password",
-                "create a new password",
-                "set a new password",
-                "重置密码",
-                "设置新密码",
-                "重設密碼",
-                "設定新密碼",
-                "パスワードをリセット",
-                "新しいパスワード",
-            )
+        if not _click_first_visible(page, PASSWORD_CONTINUE_SELECTORS, timeout=500):
+            return False
+        self._hme_password_entry_selected = True
+        self._hme_password_entry_pending = True
+        self._hme_password_entry_started_at = time.monotonic()
+        self.log("[认证] 已选择使用密码继续，等待密码输入页面")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if _first_visible(page, PASSWORD_INPUT_SELECTORS, timeout=250) is not None:
+                return True
+            _page_wait(page, 200)
+        raise RuntimeError("已点击使用密码继续，但 15 秒内没有进入密码页面")
+
+    def continue_registration_and_choose_password(self, page):
+        result = original_continue_registration(page)
+        if choose_password_if_available(self, page):
+            return result
+        if (
+            not getattr(self, "_hme_password_entry_selected", False)
+            and original_has_otp(page)
+            and not getattr(self, "_hme_password_entry_unavailable_logged", False)
+        ):
+            self._hme_password_entry_unavailable_logged = True
+            self.log("[认证] 当前验证码页面没有使用密码入口，继续读取邮箱验证码")
+        return result
+
+    def has_otp_or_choose_password(self, page):
+        has_otp = bool(original_has_otp(page))
+        if not has_otp:
+            return False
+        if getattr(self, "_hme_password_entry_pending", False):
+            started_at = float(getattr(self, "_hme_password_entry_started_at", 0) or 0)
+            if time.monotonic() - started_at <= 15:
+                return False
+            raise RuntimeError("已点击使用密码继续，但 15 秒内没有进入密码页面")
+        if getattr(self, "_hme_password_entry_selected", False):
+            return has_otp
+        if not choose_password_if_available(self, page):
+            if not getattr(self, "_hme_password_entry_unavailable_logged", False):
+                self._hme_password_entry_unavailable_logged = True
+                self.log("[认证] 当前验证码页面没有使用密码入口，继续读取邮箱验证码")
+            return has_otp
+        return False
+
+    def fill_saved_password(self, page):
+        original_fill_password(page)
+        self._hme_password_entry_pending = False
+        self._password_step_submitted = True
+        self.log("[认证] 已提交创建邮箱时保存的唯一密码")
+
+    worker._has_otp_input = types.MethodType(has_otp_or_choose_password, worker)
+    worker._fill_password_step = types.MethodType(fill_saved_password, worker)
+    if callable(original_continue_registration):
+        worker._continue_chatgpt_registration_complete = types.MethodType(
+            continue_registration_and_choose_password, worker
         )
-
-    def fill_password_or_choose_code(self, page):
-        if getattr(self, "_hme_password_reset_requested", False):
-            if password_reset_form_ready(page):
-                original(page)
-                self._hme_password_reset_submitted = True
-                self.log("[认证] 已在邮箱重置流程提交保存的唯一密码")
-            else:
-                self.log("[认证] 已请求重置密码，等待验证码或新密码页面")
-            return None
-        if _click_first_visible(page, ONE_TIME_CODE_LOGIN_SELECTORS, timeout=900):
-            self._hme_email_code_login_selected = True
-            self.log("[认证] 当前账号进入密码页，已改用一次性邮箱验证码登录")
-            return None
-        if _click_first_visible(page, FORGOT_PASSWORD_SELECTORS, timeout=700):
-            self._hme_password_reset_requested = True
-            self.log("[认证] 当前账号只有密码登录入口，已点击忘记密码")
-            return None
-        if getattr(self, "_hme_email_code_login_selected", False):
-            self.log("[认证] 已选择邮箱验证码登录，等待验证码页面加载")
-            return None
-        return original(page)
-
-    worker._fill_password_step = types.MethodType(fill_password_or_choose_code, worker)
-    worker._hme_email_code_login_configured = True
+    worker._hme_password_first_login_configured = True
     return True
 
 
@@ -1709,9 +1732,6 @@ def main() -> int:
 
     password = os.environ.get("HME_OPENAI_PASSWORD", "")
     ensure_password = os.environ.get("HME_ENSURE_OPENAI_PASSWORD", "") == "1"
-    force_reset_password = (
-        os.environ.get("HME_FORCE_RESET_OPENAI_PASSWORD", "") == "1"
-    )
     enable_2fa = os.environ.get("HME_ENABLE_OPENAI_2FA", "") == "1"
     saved_storage_state = (
         load_saved_storage_state(
@@ -1763,7 +1783,7 @@ def main() -> int:
             log,
             browser_engine="camoufox",
         )
-        configure_passwordless_email_code_login(worker, enabled=ensure_password)
+        configure_password_first_login(worker, enabled=ensure_password)
         configure_worker_login_totp(worker, pending_2fa)
         configure_registration_profile_capture(app_backend, worker)
         configure_resilient_registration_navigation(worker)
@@ -1772,15 +1792,6 @@ def main() -> int:
         # stall indefinitely while exporting a complete browser storage snapshot;
         # the database merge keeps any previously saved snapshot intact.
         worker.skip_storage_state_capture = True
-        configure_post_registration_password_setup(
-            app_backend,
-            worker,
-            str(account.password or ""),
-            enabled=ensure_password,
-            force_reset_password=force_reset_password,
-            enable_2fa=bool(enable_2fa and ensure_password),
-            pending_two_factor=pending_2fa,
-        )
         result = worker.run()
         password_confirmed = bool(
             getattr(worker, "_password_step_submitted", False)
