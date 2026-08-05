@@ -72,6 +72,35 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("task-log-row", page)
         self.assertIn("data-task-tone", page)
 
+    def test_hourly_inventory_panel_waits_before_generating_without_registration(self):
+        page = build_app_page()
+
+        for element_id in (
+            "scheduledGenerationPanel",
+            "scheduledGenerationBadge",
+            "scheduledGenerationCountdown",
+            "scheduledGenerationLog",
+            "toggleScheduledGenerationButton",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("等待完整 1 小时", page)
+        self.assertIn("只入库，不注册", page)
+        self.assertIn('data-action="toggle-scheduled-generation"', page)
+        self.assertIn("/api/scheduled-generation/status", page)
+        self.assertIn("/api/scheduled-generation/config", page)
+
+    def test_one_click_registration_uses_generated_inventory(self):
+        page = build_app_page()
+
+        self.assertIn('id="registerFromInventoryButton"', page)
+        self.assertIn("从库存注册账号（--）", page)
+        self.assertIn('id="registrationInventoryAvailable"', page)
+        self.assertIn("可注册库存", page)
+        self.assertIn("claiming_inventory", page)
+        self.assertIn("正在领取库存", page)
+        self.assertIn("已按并发", page)
+        self.assertIn("inventoryAvailable", page)
+
     def test_verification_results_keep_every_account_visible(self):
         page = build_app_page()
 

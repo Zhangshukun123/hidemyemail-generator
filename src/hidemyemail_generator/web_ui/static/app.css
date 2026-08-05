@@ -66,7 +66,7 @@ html[data-theme="light"] .sidebar { background: #ffffff; }
 .action-cluster { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; align-items: center; justify-content: flex-end; gap: 9px; background: var(--surface); }
 .switch { display: flex; align-items: center; gap: 8px; color: var(--text-soft); font-size: 11px; white-space: nowrap; }
 .switch input { width: 17px; min-height: 17px; accent-color: var(--blue); }
-.mini-field { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }.mini-field input { width: 58px; }
+.mini-field { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }.mini-field input { width: 58px; }.mini-field select { width: 90px; min-height: 34px; padding: 6px 8px; }
 .task-panel {
   --task-tone: var(--muted); --task-tone-soft: var(--surface-muted);
   margin-bottom: 16px; padding: 22px 24px 24px; border-radius: 14px;
@@ -76,6 +76,8 @@ html[data-theme="light"] .sidebar { background: #ffffff; }
 .task-panel[data-task-tone="completed"] { --task-tone: var(--green); --task-tone-soft: var(--green-soft); }
 .task-panel[data-task-tone="failed"] { --task-tone: var(--red); --task-tone-soft: var(--red-soft); }
 .task-panel[data-task-tone="cancelling"], .task-panel[data-task-tone="cancelled"] { --task-tone: var(--amber); --task-tone-soft: var(--amber-soft); }
+.schedule-panel .task-stat-icon { font: 800 11px/1 sans-serif; }
+.schedule-panel[data-task-tone="running"] .task-status-icon { animation: task-pulse 1.8s ease-in-out infinite; }
 .task-panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .task-title-group { min-width: 0; display: flex; align-items: flex-start; gap: 14px; }
 .task-status-icon {

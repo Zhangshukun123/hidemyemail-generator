@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .inbox import connect_db, mark_address
+from .registration_proxy import RegistrationProxyStore
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
@@ -278,6 +279,7 @@ class BrowserTaskManager:
         python_executable: Path | None = None,
         bridge_file: Path | None = None,
         force_headless: bool = False,
+        registration_proxy_store: RegistrationProxyStore | None = None,
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.python_executable = (
@@ -291,6 +293,7 @@ class BrowserTaskManager:
         self.worker_token = worker_token
         self.db_file = db_file.resolve()
         self.force_headless = bool(force_headless)
+        self.registration_proxy_store = registration_proxy_store
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._state: dict[str, Any] = self._idle_state()
@@ -361,6 +364,7 @@ class BrowserTaskManager:
         headless: bool,
         concurrency: int,
         skipped: int = 0,
+        use_registration_proxy: bool = False,
     ) -> dict[str, Any]:
         if self._batch_task and not self._batch_task.done():
             raise RuntimeError("浏览器获取任务正在运行")
@@ -394,6 +398,16 @@ class BrowserTaskManager:
 
         concurrency = max(1, min(10, int(concurrency)))
         headless = bool(headless or self.force_headless)
+        proxy_state = (
+            self.registration_proxy_store.public_state()
+            if self.registration_proxy_store is not None
+            else {"enabled": False, "configured": False}
+        )
+        proxy_active = bool(
+            use_registration_proxy
+            and proxy_state.get("enabled")
+            and proxy_state.get("configured")
+        )
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -426,12 +440,20 @@ class BrowserTaskManager:
             "logs": [],
             "startedAt": utc_now(),
             "finishedAt": "",
+            "useRegistrationProxy": proxy_active,
+            "registrationProxy": proxy_state,
         }
         self._append_log(
             f"浏览器取全部已启动：待处理 {len(deduplicated)}，"
             f"跳过 {skipped}，并发 {concurrency}，"
             f"{'无头' if headless else '显示浏览器'}"
         )
+        if proxy_active:
+            self._append_log(
+                "注册动态代理已启用："
+                f"{proxy_state.get('countryLabel') or proxy_state.get('country')} "
+                "出口；每个账号使用独立 SID"
+            )
         self._batch_task = asyncio.create_task(
             self._run_batch(headless=headless, concurrency=concurrency)
         )
@@ -503,6 +525,35 @@ class BrowserTaskManager:
             item["message"] = "正在启动 Camoufox"
             self._append_log("开始浏览器注册或登录", email=email)
 
+            proxy_url = ""
+            proxy_state: dict[str, Any] = {}
+            if self._state.get("useRegistrationProxy"):
+                if self.registration_proxy_store is None:
+                    item["status"] = "failed"
+                    item["message"] = "注册代理配置不可用"
+                    self._state["failed"] += 1
+                    self._state["completed"] += 1
+                    self._append_log(item["message"], email=email)
+                    return
+                proxy_url, proxy_state = await asyncio.to_thread(
+                    self.registration_proxy_store.next_proxy
+                )
+                if not proxy_url:
+                    item["status"] = "failed"
+                    item["message"] = "注册动态代理已启用但未配置"
+                    self._state["failed"] += 1
+                    self._state["completed"] += 1
+                    self._append_log(item["message"], email=email)
+                    return
+                item["proxyCountry"] = str(proxy_state.get("country") or "")
+                item["proxyEndpoint"] = str(proxy_state.get("endpoint") or "")
+                self._append_log(
+                    "已分配新的粘性代理会话："
+                    f"{proxy_state.get('countryLabel') or proxy_state.get('country')}；"
+                    "注册、2FA 与 Session 获取全程保持同一出口",
+                    email=email,
+                )
+
             env = os.environ.copy()
             env.update(
                 {
@@ -524,6 +575,11 @@ class BrowserTaskManager:
                     "HME_OPENAI_2FA_STATE": json.dumps(
                         item.get("_two_factor") or {}, ensure_ascii=False
                     ),
+                    "HME_REGISTRATION_PROXY_URL": proxy_url,
+                    "HME_REGISTRATION_PROXY_COUNTRY": str(
+                        proxy_state.get("country") or ""
+                    ),
+                    "HME_REGISTRATION_PROXY_REQUIRED": "1" if proxy_url else "0",
                 }
             )
             command = [

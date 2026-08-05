@@ -59,8 +59,44 @@
       <section class="view" id="accountsView" data-view="accounts" hidden>
         <div class="view-actions">
           <div id="accountMetrics" class="metric-grid compact"></div>
-          <div class="action-cluster"><label class="switch"><input id="headless" type="checkbox"><span></span>无头浏览器</label><label class="mini-field">并发<input id="concurrency" type="number" min="1" max="10" value="3"></label><button class="button primary" data-action="register">一键注册新账号</button><button class="button" data-action="fetch-all">获取全部 Session</button></div>
+          <div class="action-cluster"><label class="switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册动态代理</label><label class="mini-field">出口<select id="registrationProxyCountry"><option value="NL">荷兰 NL</option><option value="US">美国 US</option><option value="JP">日本 JP</option><option value="DE">德国 DE</option><option value="GB">英国 GB</option><option value="FR">法国 FR</option><option value="CA">加拿大 CA</option><option value="AU">澳大利亚 AU</option><option value="SG">新加坡 SG</option><option value="HK">香港 HK</option><option value="TW">台湾 TW</option><option value="KR">韩国 KR</option><option value="BR">巴西 BR</option><option value="IN">印度 IN</option><option value="TR">土耳其 TR</option></select></label><button class="button" data-action="set-registration-proxy-credential">代理连接</button><label class="switch"><input id="headless" type="checkbox"><span></span>无头浏览器</label><label class="mini-field">并发<input id="concurrency" type="number" min="1" max="10" value="3"></label><button id="registerFromInventoryButton" class="button primary" data-action="register">从库存注册账号（--）</button><button class="button" data-action="fetch-all">获取全部 Session</button></div>
         </div>
+        <article id="scheduledGenerationPanel" class="panel task-panel schedule-panel" data-task-tone="running">
+          <div class="task-panel-header">
+            <div class="task-title-group">
+              <span id="scheduledGenerationIcon" class="task-status-icon" aria-hidden="true">◷</span>
+              <div class="task-title-copy">
+                <div class="task-title-line">
+                  <h2>邮箱库存定时生成</h2>
+                  <span id="scheduledGenerationBadge" class="task-state-badge">计时中</span>
+                </div>
+                <p id="scheduledGenerationMessage">设置后等待完整 1 小时，再生成第一批 5 个邮箱；只入库，不注册。</p>
+              </div>
+            </div>
+            <button id="toggleScheduledGenerationButton" class="button danger small" data-action="toggle-scheduled-generation">暂停定时生成</button>
+          </div>
+          <div class="task-metrics" aria-label="定时生成摘要">
+            <div class="task-stat">
+              <span class="task-stat-icon" aria-hidden="true">5</span>
+              <span><small>每批生成</small><strong id="scheduledGenerationBatch">5 个</strong></span>
+            </div>
+            <div class="task-stat success">
+              <span class="task-stat-icon" aria-hidden="true">1h</span>
+              <span><small>固定间隔</small><strong id="scheduledGenerationInterval">1 小时</strong></span>
+            </div>
+            <div class="task-stat success">
+              <span class="task-stat-icon" aria-hidden="true">库</span>
+              <span><small>可注册库存</small><strong id="registrationInventoryAvailable">-- 个</strong></span>
+            </div>
+            <div class="task-stat elapsed">
+              <span class="task-stat-icon" aria-hidden="true">◷</span>
+              <span><small>距离下次</small><strong id="scheduledGenerationCountdown">--:--:--</strong></span>
+            </div>
+          </div>
+          <div id="scheduledGenerationLog" class="inline-log" role="log" aria-live="polite">
+            <div class="task-log-empty">正在加载定时生成检查日志…</div>
+          </div>
+        </article>
         <article id="taskPanel" class="panel task-panel" data-task-tone="idle">
           <div class="task-panel-header">
             <div class="task-title-group">

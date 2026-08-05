@@ -1722,6 +1722,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def require_registration_proxy_country(health, expected_country: str) -> str:
+    expected = str(expected_country or "").strip().upper()
+    actual = str(getattr(health, "country", "") or "").strip().upper()
+    if expected and actual != expected:
+        raise RuntimeError(
+            f"注册代理出口国家不符：要求 {expected}，实际 {actual or '未知'}；已拒绝直连或跨区注册"
+        )
+    return actual
+
+
 def main() -> int:
     args = build_parser().parse_args()
     source_dir = Path(args.source_dir).resolve()
@@ -1767,8 +1777,17 @@ def main() -> int:
             refresh_token="icloud",
             raw="",
         )
+        proxy_url = str(os.environ.get("HME_REGISTRATION_PROXY_URL") or "").strip()
+        required_proxy = str(
+            os.environ.get("HME_REGISTRATION_PROXY_REQUIRED") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        expected_proxy_country = str(
+            os.environ.get("HME_REGISTRATION_PROXY_COUNTRY") or ""
+        ).strip().upper()
+        if required_proxy and not proxy_url:
+            raise RuntimeError("注册动态代理已设为必需，但未分配代理")
         proxy = app_backend.ProxyConfig(
-            local_proxy="", dynamic_proxy="", chain_url=""
+            local_proxy="", dynamic_proxy=proxy_url, chain_url=""
         )
 
         def log(message: str) -> None:
@@ -1783,6 +1802,22 @@ def main() -> int:
             log,
             browser_engine="camoufox",
         )
+        if proxy_url:
+            health = worker._prepare_fingerprint_for_proxy(
+                proxy, "注册", check_stripe=False
+            )
+            actual_country = require_registration_proxy_country(
+                health, expected_proxy_country
+            )
+            emit(
+                "log",
+                message=(
+                    f"[代理] 注册出口国家已确认：{actual_country or '未知'}；"
+                    "本账号注册、2FA 与 Session 获取保持同一粘性代理"
+                ),
+            )
+        else:
+            emit("log", message="[代理] 注册动态代理未启用，使用本地直连")
         configure_password_first_login(worker, enabled=ensure_password)
         configure_worker_login_totp(worker, pending_2fa)
         configure_registration_profile_capture(app_backend, worker)

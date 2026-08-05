@@ -184,8 +184,14 @@ def upsert_address(
                 WHEN addresses.state = 'unused' THEN excluded.state
                 ELSE addresses.state
             END,
-            source = excluded.source,
-            note = COALESCE(NULLIF(excluded.note, ''), addresses.note),
+            source = CASE
+                WHEN addresses.source = 'generated' THEN addresses.source
+                ELSE excluded.source
+            END,
+            note = CASE
+                WHEN addresses.source = 'generated' THEN addresses.note
+                ELSE COALESCE(NULLIF(excluded.note, ''), addresses.note)
+            END,
             updated_at = excluded.updated_at
         """,
         (email, label, state, source, note, now, now),

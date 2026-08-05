@@ -38,10 +38,12 @@ from hidemyemail_generator.openai_browser_bridge import (
     configure_windowed_camoufox,
     ensure_password_in_security_settings,
     extract_session_without_navigation,
+    require_registration_proxy_country,
     resilient_force_fill_locator,
     safe_log_message,
 )
 from hidemyemail_generator.openai_mfa import MfaSetupError
+from hidemyemail_generator.registration_proxy import RegistrationProxyStore
 
 
 def token_with_exp(expires_at: int) -> str:
@@ -52,6 +54,14 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_registration_proxy_country_must_match_detected_exit(self):
+        self.assertEqual(
+            require_registration_proxy_country(SimpleNamespace(country="NL"), "NL"),
+            "NL",
+        )
+        with self.assertRaisesRegex(RuntimeError, "NL"):
+            require_registration_proxy_country(SimpleNamespace(country="BR"), "NL")
+
     def test_reads_chatgpt_plan_from_jwt_without_a_request(self):
         payload = base64.urlsafe_b64encode(
             json.dumps(
@@ -1503,6 +1513,69 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_registration_uses_unique_country_proxy_without_exposing_secret(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json, os\n"
+                "from urllib.parse import unquote, urlsplit\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "proxy = urlsplit(os.environ['HME_REGISTRATION_PROXY_URL'])\n"
+                "username = unquote(proxy.username or '')\n"
+                "marker = username.rsplit('-sid-', 1)[-1].split('-t-', 1)[0]\n"
+                "print(prefix + json.dumps({'type':'log','message':'proxy-country=' + os.environ.get('HME_REGISTRATION_PROXY_COUNTRY','') + ';sid=' + marker}), flush=True)\n"
+                "result = {'access_token':'at-test','session_json':'{}'}\n"
+                "print(prefix + json.dumps({'type':'result','result':result}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            proxy_store = RegistrationProxyStore(db_file)
+            proxy_store.configure(
+                enabled=True,
+                country="NL",
+                proxy_line="proxy.example:3010:private-user:private-password",
+            )
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                registration_proxy_store=proxy_store,
+            )
+            manager.start(
+                [
+                    {"email": "one@icloud.com", "password": ""},
+                    {"email": "two@icloud.com", "password": ""},
+                ],
+                headless=True,
+                concurrency=2,
+                use_registration_proxy=True,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            serialized = json.dumps(snapshot)
+            proxy_logs = [
+                entry["message"]
+                for entry in snapshot["logs"]
+                if "proxy-country=" in entry["message"]
+            ]
+            sids = {message.rsplit("sid=", 1)[-1] for message in proxy_logs}
+
+            self.assertEqual(snapshot["succeeded"], 2)
+            self.assertTrue(snapshot["useRegistrationProxy"])
+            self.assertEqual(snapshot["registrationProxy"]["country"], "NL")
+            self.assertEqual(len(sids), 2)
+            self.assertNotIn("private-user", serialized)
+            self.assertNotIn("private-password", serialized)
+            self.assertNotIn("HME_REGISTRATION_PROXY_URL", serialized)
+
     async def test_unconfirmed_password_result_still_saves_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

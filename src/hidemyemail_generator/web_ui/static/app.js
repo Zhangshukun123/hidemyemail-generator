@@ -51,6 +51,16 @@
     return parts.join(":");
   }
 
+  function formatCountdown(value) {
+    const seconds = Math.max(0, Number(value || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remaining = Math.floor(seconds % 60);
+    return [hours, minutes, remaining]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":");
+  }
+
   function abbreviateEmail(value) {
     const email = String(value || "");
     const at = email.indexOf("@");
@@ -303,13 +313,22 @@
         metricCard("Session 可用", sessions, "可直接验证与提链", "", "S"),
         metricCard("已开启 2FA", twoFactor, "双重验证", "amber", "2"),
       ].join("");
+      const registrationProxy = state.registrationProxy || {};
+      $("registrationProxyEnabled").checked = Boolean(registrationProxy.enabled);
+      $("registrationProxyEnabled").disabled = !registrationProxy.configured;
+      $("registrationProxyEnabled").title = registrationProxy.configured
+        ? "注册全程使用所选国家的粘性动态代理"
+        : "请先设置代理连接";
+      if (registrationProxy.country) {
+        $("registrationProxyCountry").value = registrationProxy.country;
+      }
       const task = state.browserTask;
       const registration = state.registrationTask;
       const hasRegistration = Boolean(registration.id && registration.status !== "idle");
       const primaryTask = hasRegistration ? registration : task;
       const status = primaryTask.status || "idle";
       const statusMeta = taskStatusMeta(status);
-      const taskTotal = Number(task.total || (hasRegistration ? 1 : 0));
+      const taskTotal = Number(task.total || (hasRegistration ? registration.requested || 1 : 0));
       const taskCompleted = Number(task.total
         ? task.completed || 0
         : (hasRegistration && !registration.running ? 1 : 0));
@@ -318,6 +337,7 @@
       if (hasRegistration && registration.running && !task.total) {
         progress = {
           generating_email: 12,
+          claiming_inventory: 12,
           confirming_email: 28,
           registering_openai: 40,
           cancelling: 40,
@@ -377,9 +397,48 @@
       ).join("") : '<tr><td colspan="6"><div class="empty-state compact">没有匹配的账号</div></td></tr>';
     }
 
+    renderScheduledGeneration(state) {
+      const schedule = state.scheduledGeneration || {};
+      const enabled = Boolean(schedule.enabled);
+      const running = Boolean(schedule.running);
+      const hasError = Boolean(schedule.lastError);
+      const panel = $("scheduledGenerationPanel");
+      panel.dataset.taskTone = running || enabled ? (hasError ? "failed" : "running") : "cancelled";
+      $("scheduledGenerationIcon").textContent = running ? "↻" : enabled ? "◷" : "×";
+      $("scheduledGenerationBadge").textContent = running ? "生成中" : enabled ? "计时中" : "已暂停";
+      $("scheduledGenerationMessage").textContent = running
+        ? "正在生成 5 个邮箱并存入库存；不会启动 OpenAI 注册。"
+        : enabled
+          ? "下次执行：" + formatDate(schedule.nextRunAt) + "；每轮只生成邮箱，不注册。"
+          : "定时生成已暂停；重新启用后会从完整 1 小时重新计时。";
+      $("scheduledGenerationBatch").textContent = Number(schedule.batchSize || 5) + " 个";
+      $("scheduledGenerationInterval").textContent = "1 小时";
+      const inventoryAvailable = Math.max(0, Number(schedule.inventoryAvailable || 0));
+      $("registrationInventoryAvailable").textContent = inventoryAvailable + " 个";
+      $("registerFromInventoryButton").textContent = "从库存注册账号（" + inventoryAvailable + "）";
+      $("registerFromInventoryButton").title = "当前可领取 " + inventoryAvailable + " 个生成邮箱";
+      $("scheduledGenerationCountdown").textContent = enabled
+        ? formatCountdown(schedule.secondsUntilNext)
+        : "已暂停";
+      const toggle = $("toggleScheduledGenerationButton");
+      toggle.textContent = enabled ? "暂停定时生成" : "启用并开始 1 小时计时";
+      toggle.className = "button " + (enabled ? "danger" : "primary") + " small";
+
+      const logs = Array.isArray(schedule.logs) ? schedule.logs.slice(-8) : [];
+      $("scheduledGenerationLog").innerHTML = logs.length ? logs.map((item) => {
+        const level = item.level === "error" ? "error" : item.level === "warning" ? "warning" : "success";
+        const glyph = level === "error" ? "!" : level === "warning" ? "×" : "✓";
+        return '<div class="task-log-row"><span class="task-log-icon ' + level + '">' + glyph +
+          '</span><time datetime="' + escapeHtml(item.at || "") + '">' + formatClock(item.at) +
+          '</time><span class="task-log-email">定时检查</span><span class="task-log-message">' +
+          escapeHtml(item.message || "") + "</span></div>";
+      }).join("") : '<div class="task-log-empty">暂无定时生成检查日志</div>';
+      $("scheduledGenerationLog").scrollTop = $("scheduledGenerationLog").scrollHeight;
+    }
+
     registrationLabel(task) {
       const labels = {
-        idle: "空闲", generating_email: "正在创建邮箱", confirming_email: "正在同步邮箱",
+        idle: "空闲", generating_email: "正在创建邮箱", claiming_inventory: "正在领取库存", confirming_email: "正在确认邮箱",
         registering_openai: "正在注册 OpenAI", completed: "注册成功",
         failed: "注册失败", cancelling: "正在停止", cancelled: "已停止",
       };
@@ -632,6 +691,7 @@
 
     renderBrowserSettings(state) {
       const runtime = state.browserTask.runtime || {};
+      const proxy = state.registrationProxy || {};
       $("settingsStatus").className = "badge " + (runtime.available ? "success" : "error");
       $("settingsStatus").textContent = runtime.available ? "运行环境可用" : "运行环境不可用";
       $("settingsPanel").innerHTML =
@@ -640,7 +700,9 @@
         escapeHtml($("concurrency").value) + '"></label></section><section class="form-section"><h3>运行环境</h3><div class="connection-card"><strong>' +
         (runtime.available ? "✓ Camoufox 运行环境已连接" : "× Camoufox 运行环境不可用") +
         '</strong><span>' + escapeHtml(runtime.targetProject || (runtime.errors || []).join("；") || "未返回运行目录") +
-        '</span></div></section><div class="settings-actions"><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
+        '</span></div></section><section class="form-section"><h3>注册动态代理</h3><div class="connection-card"><strong>' +
+        (proxy.enabled ? "✓ 已启用 " + escapeHtml(proxy.countryLabel || proxy.country || "") + " 出口" : proxy.configured ? "已配置但暂停" : "尚未配置") +
+        '</strong><span>连接：' + escapeHtml(proxy.endpoint || "未保存") + '</span><span>每个账号自动生成独立 SID；单账号注册、2FA 和 Session 获取全程保持同一出口。</span></div></section><div class="settings-actions"><button class="button" data-action="set-registration-proxy-credential">更新代理连接</button><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
     }
 
     renderWorkbenchSettings() {
@@ -654,7 +716,7 @@
       $("settingsStatus").className = "badge success";
       $("settingsStatus").textContent = "本地保护";
       $("settingsPanel").innerHTML =
-        '<div class="settings-form"><section class="form-section"><h3>访问策略</h3><div class="toggle-row"><span>本地请求令牌<small style="display:block;color:var(--muted)">所有写操作均验证本地令牌</small></span><span class="badge success">已启用</span></div><div class="toggle-row"><span>登录 Cookie<small style="display:block;color:var(--muted)">HttpOnly · SameSite=Strict</small></span><span class="badge success">已启用</span></div></section><section class="form-section"><h3>敏感信息</h3><div class="connection-card"><strong>密码、Session、2FA 与代理默认隐藏</strong><span>代理仅通过子进程环境变量传递，不写入账号数据库。</span></div></section></div>';
+        '<div class="settings-form"><section class="form-section"><h3>访问策略</h3><div class="toggle-row"><span>本地请求令牌<small style="display:block;color:var(--muted)">所有写操作均验证本地令牌</small></span><span class="badge success">已启用</span></div><div class="toggle-row"><span>登录 Cookie<small style="display:block;color:var(--muted)">HttpOnly · SameSite=Strict</small></span><span class="badge success">已启用</span></div></section><section class="form-section"><h3>敏感信息</h3><div class="connection-card"><strong>密码、Session、2FA 与代理默认隐藏</strong><span>注册代理凭据仅保存在本地数据库，接口不回传密码，日志只显示出口国家和脱敏连接。</span></div></section></div>';
     }
 
     renderAppearanceSettings() {
@@ -672,6 +734,8 @@
         accounts: [],
         browserTask: { status: "idle", runtime: {} },
         registrationTask: { status: "idle", phase: "idle" },
+        scheduledGeneration: { enabled: true, running: false, batchSize: 5, intervalSeconds: 3600, logs: [] },
+        registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
         verificationTask: { status: "idle", runtime: {} },
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
@@ -697,6 +761,7 @@
       this.renderer.renderShell(state);
       this.renderer.renderOverview(state);
       this.renderer.renderAccounts(state);
+      this.renderer.renderScheduledGeneration(state);
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
       if (this.router.current === "settings") this.renderer.renderSettings(state);
@@ -758,7 +823,9 @@
         const wasRunning = Boolean(this.store.state.registrationTask.running);
         this.store.patch({ registrationTask: data });
         if (data.running) this.schedule("registration", () => this.loadRegistrationTask(), 1200);
-        else if (wasRunning) await Promise.all([this.loadAccounts(), this.loadBrowserTask()]);
+        else if (wasRunning) await Promise.all([
+          this.loadAccounts(), this.loadBrowserTask(), this.loadScheduledGeneration(),
+        ]);
       } catch (error) {
         this.toast(error.message, "error");
         this.schedule("registration", () => this.loadRegistrationTask(), 2500);
@@ -781,6 +848,24 @@
     async loadInbox() {
       const data = await this.api.get("/api/inbox/status");
       this.store.patch({ inbox: data });
+    }
+
+    async loadScheduledGeneration() {
+      try {
+        const previousTotal = Number(this.store.state.scheduledGeneration.totalGenerated || 0);
+        const data = await this.api.get("/api/scheduled-generation/status");
+        this.store.patch({ scheduledGeneration: data });
+        if (Number(data.totalGenerated || 0) > previousTotal) await this.loadAccounts();
+        this.schedule("scheduled-generation", () => this.loadScheduledGeneration(), 10000);
+      } catch (error) {
+        this.toast(error.message, "error");
+        this.schedule("scheduled-generation", () => this.loadScheduledGeneration(), 15000);
+      }
+    }
+
+    async loadRegistrationProxy() {
+      const data = await this.api.get("/api/registration-proxy/status");
+      this.store.patch({ registrationProxy: data });
     }
 
     browserOptions() {
@@ -825,7 +910,7 @@
 
     bindCommands() {
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox()]);
+        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadScheduledGeneration(), this.loadRegistrationProxy()]);
         return "数据已刷新";
       });
       this.commands.register("toggle-theme", async () => {
@@ -840,12 +925,34 @@
         finally { location.replace("/login"); }
       });
       this.commands.register("register", async () => {
+        const options = this.browserOptions();
         const data = await this.api.post("/api/registration/start", {
-          label: "OpenAI 一键注册", headless: $("headless").checked,
+          label: "OpenAI 一键注册", ...options,
         });
         this.store.patch({ registrationTask: data.task });
         this.schedule("registration", () => this.loadRegistrationTask(), 800);
-        return "一键注册已启动";
+        return "已按并发 " + options.concurrency + " 从生成邮箱库存启动注册";
+      });
+      this.commands.register("toggle-scheduled-generation", async () => {
+        const enabled = Boolean(this.store.state.scheduledGeneration.enabled);
+        if (enabled && !confirm("暂停每小时生成 5 个邮箱？已生成的邮箱会保留，且不会启动注册。")) {
+          throw Object.assign(new Error(), { name: "AbortError" });
+        }
+        const data = await this.api.post("/api/scheduled-generation/config", { enabled: !enabled });
+        this.store.patch({ scheduledGeneration: data });
+        this.schedule("scheduled-generation", () => this.loadScheduledGeneration(), 1000);
+        return enabled ? "定时生成已暂停" : "已开始计时，1 小时后生成第一批 5 个邮箱";
+      });
+      this.commands.register("set-registration-proxy-credential", async () => {
+        const proxyLine = prompt("输入动态代理连接（host:port:username:password）。凭据只保存在本地，不会显示在日志中：", "");
+        if (proxyLine === null) throw Object.assign(new Error(), { name: "AbortError" });
+        if (!proxyLine.trim()) throw new Error("代理连接不能为空");
+        const country = $("registrationProxyCountry").value || "NL";
+        const data = await this.api.post("/api/registration-proxy/config", {
+          proxyLine, country, enabled: true,
+        });
+        this.store.patch({ registrationProxy: data });
+        return "动态代理已保存并启用：" + (data.countryLabel || data.country);
       });
       this.commands.register("fetch-all", async () => {
         const options = this.browserOptions();
@@ -1027,6 +1134,30 @@
       $("verificationAccountSelect").addEventListener("change", (event) => {
         this.store.patch({ selectedVerificationEmail: event.target.value });
       });
+      $("registrationProxyEnabled").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/registration-proxy/config", {
+            enabled: event.target.checked,
+          });
+          this.store.patch({ registrationProxy: data });
+          this.toast(data.enabled ? "注册动态代理已启用" : "注册动态代理已关闭");
+        } catch (error) {
+          event.target.checked = !event.target.checked;
+          this.toast(error.message, "error");
+        }
+      });
+      $("registrationProxyCountry").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/registration-proxy/config", {
+            country: event.target.value,
+          });
+          this.store.patch({ registrationProxy: data });
+          this.toast("注册代理出口已切换为 " + (data.countryLabel || data.country));
+        } catch (error) {
+          await this.loadRegistrationProxy();
+          this.toast(error.message, "error");
+        }
+      });
     }
 
     async start() {
@@ -1037,7 +1168,7 @@
       this.router.start();
       const results = await Promise.allSettled([
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(),
+        this.loadVerificationTask(), this.loadInbox(), this.loadScheduledGeneration(), this.loadRegistrationProxy(),
       ]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");

@@ -44,7 +44,15 @@ from .inbox import (
 from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
+from .registration_inventory import (
+    available_generated_inventory_count,
+    claim_generated_inventory_email,
+    clear_generated_inventory_claims,
+    release_generated_inventory_email,
+)
 from .registration_tasks import RegistrationTaskManager, generate_openai_password
+from .registration_proxy import RegistrationProxyStore
+from .scheduled_generation import ScheduledGenerationManager
 from .web_ui import build_app_page, build_login_page
 
 
@@ -1817,15 +1825,16 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     async function startRegistration() {
+      const options = browserOptions();
       const data = await api("/api/registration/start", {
         method: "POST",
         body: JSON.stringify({
           label: "OpenAI 一键注册",
-          headless: $("headless").checked,
+          ...options,
         }),
       });
       renderRegistration(data.task);
-      showToast("一键注册已启动");
+      showToast(`已按并发 ${options.concurrency} 启动库存注册`);
     }
 
     function renderVerification(data) {
@@ -3320,6 +3329,7 @@ def create_app(
     app["card_link_lock"] = asyncio.Lock()
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
+    app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
     browser_source = (
         Path(target_project_dir).resolve()
         if target_project_dir
@@ -3332,6 +3342,7 @@ def create_app(
         db_file=app["db_file"],
         python_executable=Path(target_python) if target_python else None,
         force_headless=force_browser_headless,
+        registration_proxy_store=app["registration_proxy_store"],
     )
     app["card_link_bridge_file"] = Path(__file__).with_name(
         "openai_card_link_bridge.py"
@@ -3364,26 +3375,18 @@ def create_app(
             if row.get("isActive") and row.get("hme") and row.get("anonymousId")
         ]
 
-    async def generate_registration_email(label: str) -> str:
-        cookie_path: Path = app["cookie_file"]
-        if not cookie_path.exists() or cookie_path.stat().st_size == 0:
-            raise RuntimeError("iCloud Cookie 尚未准备好")
-        async with app["generate_lock"]:
-            account = await fetch_account_info(str(cookie_path), app["region"])
-            if account.get("error"):
-                raise RuntimeError("iCloud Cookie 已失效，请重新获取")
-            generated = await _generate(
-                label=label,
-                count=1,
-                cookie_file=str(cookie_path),
-                output_file=str(app["output_file"]),
-                region=app["region"],
-                db_file=str(app["db_file"]),
-            )
-        emails = generated.get("emails", [])
-        if not generated.get("ok") or not emails:
-            raise RuntimeError(_generation_failure_message(generated))
-        return str(emails[0] or "").strip().lower()
+    if app["db_file"].exists():
+        clear_generated_inventory_claims(app["db_file"])
+
+    async def acquire_registration_inventory_email(_label: str) -> str:
+        return await asyncio.to_thread(
+            claim_generated_inventory_email, app["db_file"]
+        )
+
+    async def release_registration_inventory_email(email: str) -> None:
+        await asyncio.to_thread(
+            release_generated_inventory_email, app["db_file"], email
+        )
 
     async def confirm_registration_email(email: str) -> None:
         last_error = ""
@@ -3413,9 +3416,34 @@ def create_app(
 
     app["registration_manager"] = RegistrationTaskManager(
         browser_manager=app["browser_manager"],
-        generate_email=generate_registration_email,
+        acquire_email=acquire_registration_inventory_email,
         confirm_email=confirm_registration_email,
         save_password=save_registration_password,
+        release_email=release_registration_inventory_email,
+    )
+
+    async def generate_inventory_batch(label: str, count: int) -> dict:
+        """Generate aliases for inventory without starting any registration flow."""
+
+        cookie_path: Path = app["cookie_file"]
+        if not cookie_path.exists() or cookie_path.stat().st_size == 0:
+            raise RuntimeError("Cookie 尚未准备好")
+        async with app["generate_lock"]:
+            account = await fetch_account_info(str(cookie_path), app["region"])
+            if account.get("error"):
+                raise RuntimeError("Cookie 已失效，请重新获取")
+            return await _generate(
+                label=label,
+                count=count,
+                cookie_file=str(cookie_path),
+                output_file=str(app["output_file"]),
+                region=app["region"],
+                db_file=str(app["db_file"]),
+            )
+
+    app["scheduled_generation_manager"] = ScheduledGenerationManager(
+        db_file=app["db_file"],
+        generate_batch=generate_inventory_batch,
     )
 
     async def background_inbox_sync() -> None:
@@ -3475,6 +3503,15 @@ def create_app(
             await app["registration_manager"].close()
 
     app.cleanup_ctx.append(registration_manager_context)
+
+    async def scheduled_generation_context(_: web.Application):
+        await app["scheduled_generation_manager"].start()
+        try:
+            yield
+        finally:
+            await app["scheduled_generation_manager"].close()
+
+    app.cleanup_ctx.append(scheduled_generation_context)
 
     async def login_page(request: web.Request) -> web.Response:
         if not app["web_password"] or _session_valid(request):
@@ -4240,9 +4277,21 @@ def create_app(
                 {"ok": False, "error": "邮箱标签长度必须是 1–100 个字符"},
                 status=400,
             )
+        concurrency = payload.get("concurrency", 3)
+        if (
+            isinstance(concurrency, bool)
+            or not isinstance(concurrency, int)
+            or not 1 <= concurrency <= 10
+        ):
+            return web.json_response(
+                {"ok": False, "error": "并发数必须是 1–10 的整数"},
+                status=400,
+            )
         try:
             task = app["registration_manager"].start(
-                label=label, headless=bool(payload.get("headless", False))
+                label=label,
+                headless=bool(payload.get("headless", False)),
+                concurrency=concurrency,
             )
         except RuntimeError as error:
             return web.json_response(
@@ -4646,6 +4695,95 @@ def create_app(
             )
         return web.json_response({"ok": True, "emails": list(emails)})
 
+    async def scheduled_generation_status(_: web.Request) -> web.Response:
+        await app["scheduled_generation_manager"].initialize()
+        inventory_available = await asyncio.to_thread(
+            available_generated_inventory_count, app["db_file"]
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                **app["scheduled_generation_manager"].snapshot(),
+                "inventoryAvailable": inventory_available,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def scheduled_generation_config(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            return web.json_response(
+                {"ok": False, "error": "enabled 必须是布尔值"}, status=400
+            )
+        state = await app["scheduled_generation_manager"].configure(
+            enabled=enabled
+        )
+        inventory_available = await asyncio.to_thread(
+            available_generated_inventory_count, app["db_file"]
+        )
+        return web.json_response(
+            {"ok": True, **state, "inventoryAvailable": inventory_available}
+        )
+
+    async def registration_proxy_status(_: web.Request) -> web.Response:
+        state = await asyncio.to_thread(
+            app["registration_proxy_store"].public_state
+        )
+        return web.json_response(
+            {"ok": True, **state}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def registration_proxy_config(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        enabled = payload.get("enabled") if "enabled" in payload else None
+        country = payload.get("country") if "country" in payload else None
+        proxy_line = payload.get("proxyLine") if "proxyLine" in payload else None
+        if enabled is not None and not isinstance(enabled, bool):
+            return web.json_response(
+                {"ok": False, "error": "enabled 必须是布尔值"}, status=400
+            )
+        if country is not None and not isinstance(country, str):
+            return web.json_response(
+                {"ok": False, "error": "country 必须是国家代码"}, status=400
+            )
+        if proxy_line is not None and (
+            not isinstance(proxy_line, str) or len(proxy_line) > 1000
+        ):
+            return web.json_response(
+                {"ok": False, "error": "代理连接信息无效"}, status=400
+            )
+        try:
+            state = await asyncio.to_thread(
+                app["registration_proxy_store"].configure,
+                enabled=enabled,
+                country=country,
+                proxy_line=proxy_line,
+            )
+        except ValueError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=400
+            )
+        return web.json_response({"ok": True, **state})
+
     async def inbox_status(_: web.Request) -> web.Response:
         config_path: Path = app["inbox_config_file"]
         if not config_path.exists():
@@ -4802,6 +4940,14 @@ def create_app(
     app.router.add_get("/api/registration/status", registration_status)
     app.router.add_post("/api/registration/start", registration_start)
     app.router.add_post("/api/registration/stop", registration_stop)
+    app.router.add_get(
+        "/api/scheduled-generation/status", scheduled_generation_status
+    )
+    app.router.add_post(
+        "/api/scheduled-generation/config", scheduled_generation_config
+    )
+    app.router.add_get("/api/registration-proxy/status", registration_proxy_status)
+    app.router.add_post("/api/registration-proxy/config", registration_proxy_config)
     app.router.add_get("/api/account-verification/status", verification_status)
     app.router.add_post("/api/account-verification/start", verification_start)
     app.router.add_post("/api/account-verification/stop", verification_stop)
