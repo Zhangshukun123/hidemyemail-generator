@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -19,7 +20,6 @@ except ImportError:
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
-CAMOUFOX_WINDOW_SIZE = (1280, 800)
 CAMOUFOX_PERSISTENT_STORAGE_PREFS = {
     "dom.storageManager.prompt.testing": True,
     "dom.storageManager.prompt.testing.allow": True,
@@ -864,12 +864,28 @@ def _camoufox_window_layout(
     slot_count: int,
     *,
     screen_size: tuple[int, int] | None = None,
+    randomizer=None,
 ) -> dict[str, int]:
     screen_width, screen_height = screen_size or _primary_screen_size()
     count = max(1, min(10, int(slot_count)))
     index = max(0, min(count - 1, int(slot_index)))
+
+    def random_dimension(minimum: int, maximum: int) -> int:
+        lower = max(1, min(int(minimum), int(maximum)))
+        upper = max(lower, int(maximum))
+        if callable(randomizer):
+            return max(lower, min(upper, int(randomizer(lower, upper))))
+        if lower == upper:
+            return lower
+        return lower + secrets.randbelow(upper - lower + 1)
+
     if count == 1:
-        width, height = CAMOUFOX_WINDOW_SIZE
+        maximum_width = max(900, min(1500, screen_width - 40))
+        minimum_width = min(maximum_width, max(960, int(maximum_width * 0.72)))
+        maximum_height = max(640, min(960, screen_height - 40))
+        minimum_height = min(maximum_height, max(600, int(maximum_height * 0.72)))
+        width = random_dimension(minimum_width, maximum_width)
+        height = random_dimension(minimum_height, maximum_height)
         return {
             "slot": 0,
             "slots": 1,
@@ -884,15 +900,19 @@ def _camoufox_window_layout(
     usable_height = max(720, screen_height - 60)
     tile_height = max(1, usable_height // rows)
     margin = 10
-    width = max(560, tile_width - margin * 2)
-    height = max(560, min(900, tile_height - margin * 2))
+    maximum_width = max(480, tile_width - margin * 2)
+    minimum_width = min(maximum_width, max(420, int(maximum_width * 0.78)))
+    maximum_height = max(480, min(920, tile_height - margin * 2))
+    minimum_height = min(maximum_height, max(420, int(maximum_height * 0.72)))
+    width = random_dimension(minimum_width, maximum_width)
+    height = random_dimension(minimum_height, maximum_height)
     column = index % columns
     row = index // columns
     return {
         "slot": index,
         "slots": count,
-        "x": column * tile_width + margin,
-        "y": row * tile_height + margin,
+        "x": column * tile_width + max(margin, (tile_width - width) // 2),
+        "y": row * tile_height + max(margin, (tile_height - height) // 2),
         "width": width,
         "height": height,
     }

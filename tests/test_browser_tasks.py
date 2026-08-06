@@ -748,7 +748,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertIn("/api/auth/session", request.calls[0][0])
         self.assertIn("后台获取 Session", logs[-1])
 
-    def test_camoufox_bridge_forces_non_fullscreen_window(self):
+    def test_camoufox_bridge_uses_randomized_non_fullscreen_window(self):
         calls = []
 
         def original(playwright, *args, **kwargs):
@@ -760,7 +760,11 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(configure_windowed_camoufox(backend))
         self.assertTrue(configure_windowed_camoufox(backend))
         self.assertEqual(backend.CamoufoxNewBrowser("playwright"), "browser")
-        self.assertEqual(calls[0][2]["window"], (1280, 800))
+        width, height = calls[0][2]["window"]
+        self.assertGreaterEqual(width, 960)
+        self.assertLessEqual(width, 1500)
+        self.assertGreaterEqual(height, 600)
+        self.assertLessEqual(height, 960)
         self.assertTrue(calls[0][2]["enable_cache"])
         self.assertTrue(
             calls[0][2]["firefox_user_prefs"]["browser.cache.memory.enable"]
@@ -860,13 +864,41 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
     def test_three_browser_windows_use_distinct_screen_slots(self):
         layouts = [
-            _camoufox_window_layout(index, 3, screen_size=(3200, 1800))
+            _camoufox_window_layout(
+                index,
+                3,
+                screen_size=(3200, 1800),
+                randomizer=lambda lower, upper: (lower + upper) // 2,
+            )
             for index in range(3)
         ]
 
         self.assertEqual([item["slot"] for item in layouts], [0, 1, 2])
         self.assertEqual(len({item["x"] for item in layouts}), 3)
-        self.assertTrue(all(item["width"] >= 1000 for item in layouts))
+        self.assertTrue(all(815 <= item["width"] <= 1046 for item in layouts))
+
+    def test_browser_window_size_changes_with_each_random_choice(self):
+        smallest = _camoufox_window_layout(
+            0,
+            1,
+            screen_size=(2560, 1440),
+            randomizer=lambda lower, _upper: lower,
+        )
+        largest = _camoufox_window_layout(
+            0,
+            1,
+            screen_size=(2560, 1440),
+            randomizer=lambda _lower, upper: upper,
+        )
+
+        self.assertNotEqual(
+            (smallest["width"], smallest["height"]),
+            (largest["width"], largest["height"]),
+        )
+        self.assertGreaterEqual(smallest["width"], 960)
+        self.assertLessEqual(largest["width"], 1500)
+        self.assertGreaterEqual(smallest["height"], 600)
+        self.assertLessEqual(largest["height"], 960)
 
     def test_direct_registration_reloads_unstyled_password_page(self):
         class Page:
