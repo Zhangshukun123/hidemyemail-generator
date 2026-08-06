@@ -590,6 +590,29 @@ def configure_password_first_login(worker, *, enabled: bool) -> bool:
     return True
 
 
+def configure_email_verification_priority(worker) -> bool:
+    """Keep OpenAI's email-code control out of the password branch."""
+
+    original_has_password = getattr(worker, "_has_visible_password", None)
+    if not callable(original_has_password):
+        return False
+    if getattr(worker, "_hme_email_verification_priority_configured", False):
+        return True
+
+    def has_password_outside_email_verification(self, page) -> bool:
+        url = str(getattr(page, "url", "") or "").casefold()
+        if "email-verification" in url:
+            return False
+        return bool(original_has_password(page))
+
+    worker._has_visible_password = types.MethodType(
+        has_password_outside_email_verification,
+        worker,
+    )
+    worker._hme_email_verification_priority_configured = True
+    return True
+
+
 def reusable_enabled_two_factor(two_factor: dict | None) -> dict:
     state = dict(two_factor) if isinstance(two_factor, dict) else {}
     if state.get("enabled") and str(state.get("secret") or "").strip():
@@ -2193,6 +2216,7 @@ def main() -> int:
                 app_backend, log
             )
         configure_password_first_login(worker, enabled=ensure_password)
+        configure_email_verification_priority(worker)
         if configure_direct_registration_browser(
             worker,
             enabled=not bool(proxy_url),

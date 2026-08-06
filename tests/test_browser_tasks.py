@@ -32,6 +32,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _fontconfig_generator_with_home,
     _mfa_token_was_invalidated,
     _open_settings_from_profile,
+    configure_email_verification_priority,
     configure_password_first_login,
     configure_direct_registration_browser,
     configure_post_registration_password_setup,
@@ -268,6 +269,28 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(configure_password_first_login(worker, enabled=True))
         self.assertTrue(worker._has_otp_input(Page()))
         self.assertIn("继续读取邮箱验证码", worker.logs[-1])
+
+    def test_email_verification_route_is_not_treated_as_password_form(self):
+        class Worker:
+            def __init__(self):
+                self.password_checks = 0
+
+            def _has_visible_password(self, _page):
+                self.password_checks += 1
+                return True
+
+        worker = Worker()
+        self.assertTrue(configure_email_verification_priority(worker))
+
+        verification_page = SimpleNamespace(
+            url="https://auth.openai.com/email-verification"
+        )
+        self.assertFalse(worker._has_visible_password(verification_page))
+        self.assertEqual(worker.password_checks, 0)
+
+        reset_page = SimpleNamespace(url="https://auth.openai.com/reset-password")
+        self.assertTrue(worker._has_visible_password(reset_page))
+        self.assertEqual(worker.password_checks, 1)
 
     def test_registration_profile_name_is_captured_for_account_menu(self):
         backend = SimpleNamespace(
