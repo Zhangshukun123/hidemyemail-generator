@@ -33,7 +33,10 @@ class ScheduledGenerationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append((label, count))
             return {
                 "ok": True,
-                "emails": [f"inventory-{len(self.calls)}-{index}@icloud.com" for index in range(count)],
+                "emails": [
+                    f"inventory-{len(self.calls)}-{index}@icloud.com"
+                    for index in range(count)
+                ],
                 "error": None,
             }
 
@@ -48,7 +51,7 @@ class ScheduledGenerationManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.close()
         self.temp_dir.cleanup()
 
-    async def test_first_batch_waits_a_full_hour_and_only_generates_inventory(self):
+    async def test_first_batch_runs_on_next_hour_and_generates_five_emails(self):
         state = await self.manager.initialize()
 
         self.assertTrue(state["enabled"])
@@ -75,7 +78,7 @@ class ScheduledGenerationManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_persisted_timer_survives_restart_without_resetting(self):
         first = await self.manager.initialize()
         original_next_run = first["nextRunAt"]
-        self.clock.advance(minutes=30)
+        self.clock.advance(minutes=2)
 
         restored = ScheduledGenerationManager(
             db_file=self.db_file,
@@ -88,10 +91,10 @@ class ScheduledGenerationManagerTests(unittest.IsolatedAsyncioTestCase):
             await restored.close()
 
         self.assertEqual(state["nextRunAt"], original_next_run)
-        self.assertEqual(state["secondsUntilNext"], 1800)
+        self.assertEqual(state["secondsUntilNext"], 3480)
         self.assertEqual(self.calls, [])
 
-    async def test_reenable_starts_a_new_full_hour_timer(self):
+    async def test_reenable_waits_until_next_whole_hour(self):
         await self.manager.initialize()
         self.clock.advance(minutes=20)
         paused = await self.manager.configure(enabled=False)
@@ -101,15 +104,15 @@ class ScheduledGenerationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.clock.advance(minutes=10)
         resumed = await self.manager.configure(enabled=True)
         self.assertTrue(resumed["enabled"])
-        self.assertEqual(resumed["secondsUntilNext"], 3600)
+        self.assertEqual(resumed["secondsUntilNext"], 1800)
 
-        self.clock.advance(seconds=3599)
+        self.clock.advance(seconds=1799)
         self.assertFalse(await self.manager.tick())
         self.clock.advance(seconds=1)
         self.assertTrue(await self.manager.tick())
         self.assertEqual(len(self.calls), 1)
 
-    async def test_failure_is_logged_and_next_attempt_waits_an_hour(self):
+    async def test_failure_is_logged_and_retries_at_next_whole_hour(self):
         async def fail_batch(_label: str, _count: int) -> dict:
             raise RuntimeError("iCloud temporary failure")
 
@@ -130,11 +133,46 @@ class ScheduledGenerationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["secondsUntilNext"], 3600)
         self.assertIn("iCloud temporary failure", state["logs"][-1]["message"])
 
+    async def test_old_five_minute_rule_runs_five_now_then_next_whole_hour(self):
+        legacy = ScheduledGenerationManager(
+            db_file=self.db_file,
+            generate_batch=self.generate_batch,
+            batch_size=1,
+            interval_seconds=300,
+            clock=self.clock,
+        )
+        await legacy.initialize()
+        self.clock.advance(minutes=1)
+        migrated = ScheduledGenerationManager(
+            db_file=self.db_file,
+            generate_batch=self.generate_batch,
+            clock=self.clock,
+        )
+        try:
+            state = await migrated.initialize()
+        finally:
+            await legacy.close()
+            await migrated.close()
+
+        self.assertEqual(state["batchSize"], 5)
+        self.assertEqual(state["intervalSeconds"], 3600)
+        self.assertEqual(state["secondsUntilNext"], 0)
+        self.assertIn("立即执行首轮", state["logs"][-1]["message"])
+
+        self.assertTrue(await migrated.tick())
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("Hourly inventory", self.calls[0][0])
+        self.assertEqual(self.calls[0][1], 5)
+        state = migrated.snapshot()
+        self.assertEqual(state["secondsUntilNext"], 3540)
+
 
 class ScheduledGenerationEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.app = create_app(base_dir=Path(self.temp_dir.name))
+        self.app = create_app(
+            base_dir=Path(self.temp_dir.name), inventory_server_enabled=True
+        )
         self.client = TestClient(TestServer(self.app))
         await self.client.start_server()
 
@@ -150,7 +188,11 @@ class ScheduledGenerationEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["enabled"])
         self.assertFalse(payload["running"])
         self.assertEqual(payload["batchSize"], 5)
-        self.assertGreaterEqual(payload["secondsUntilNext"], 3599)
+        self.assertEqual(payload["intervalSeconds"], 3600)
+        self.assertGreater(payload["secondsUntilNext"], 0)
+        self.assertLessEqual(payload["secondsUntilNext"], 3600)
+        next_run = datetime.fromisoformat(payload["nextRunAt"])
+        self.assertEqual((next_run.minute, next_run.second), (0, 0))
         self.assertEqual(payload["totalRuns"], 0)
         self.assertFalse(self.app["registration_manager"].snapshot()["running"])
 
@@ -174,7 +216,10 @@ class ScheduledGenerationEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         payload = await resumed.json()
         self.assertTrue(payload["enabled"])
-        self.assertGreaterEqual(payload["secondsUntilNext"], 3599)
+        self.assertGreater(payload["secondsUntilNext"], 0)
+        self.assertLessEqual(payload["secondsUntilNext"], 3600)
+        next_run = datetime.fromisoformat(payload["nextRunAt"])
+        self.assertEqual((next_run.minute, next_run.second), (0, 0))
         self.assertEqual(payload["totalRuns"], 0)
 
 

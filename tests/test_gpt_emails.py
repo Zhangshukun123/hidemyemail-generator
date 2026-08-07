@@ -41,6 +41,22 @@ IDENTITIES = [
 
 
 class GptEmailTests(unittest.TestCase):
+    def test_manual_non_icloud_account_is_visible_without_relay_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            _save_account_record(
+                db_file,
+                "352121354@qq.com",
+                password="Manual!Password123",
+                password_confirmed=True,
+            )
+
+            items = _browser_email_items(db_file, [])
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["email"], "352121354@qq.com")
+            self.assertTrue(items[0]["hasPassword"])
+
     def test_card_link_is_saved_and_exposed_on_account_item(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "messages.db"
@@ -635,12 +651,12 @@ class GptEmailTests(unittest.TestCase):
         self.assertNotIn("请先完成密码设置并开启 2FA", GPT_INDEX_HTML)
         self.assertIn("重置密码", GPT_INDEX_HTML)
         self.assertIn("reset_password", GPT_INDEX_HTML)
-        self.assertIn("验证账号", GPT_INDEX_HTML)
-        self.assertIn('actionButton("验证账号"', GPT_INDEX_HTML)
-        self.assertIn('item.sessionStatus !== "ready"', GPT_INDEX_HTML)
-        self.assertIn("启动无头浏览器重新获取 Session", GPT_INDEX_HTML)
-        self.assertIn("已保存的 Session 验证账号", GPT_INDEX_HTML)
-        self.assertIn("使用无头浏览器重新获取 Session 并验证账号", GPT_INDEX_HTML)
+        self.assertIn("Cookie 刷新状态", GPT_INDEX_HTML)
+        self.assertIn('actionButton("Cookie 刷新状态"', GPT_INDEX_HTML)
+        self.assertIn("已保存的 Cookie 重新获取 Session", GPT_INDEX_HTML)
+        self.assertIn("使用保存的 Cookie 重新获取 Session、套餐和账号状态", GPT_INDEX_HTML)
+        self.assertIn("refresh_with_cookie: !resetPassword", GPT_INDEX_HTML)
+        self.assertIn('data.mode === "refresh_cookie"', GPT_INDEX_HTML)
         self.assertIn('data.mode === "refresh_session"', GPT_INDEX_HTML)
         self.assertNotIn("请先获取 Session 后再验证账号", GPT_INDEX_HTML)
         self.assertNotIn("将启动浏览器完成账号和密码设置", GPT_INDEX_HTML)

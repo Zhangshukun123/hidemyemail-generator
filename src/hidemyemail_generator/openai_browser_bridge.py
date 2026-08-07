@@ -463,12 +463,24 @@ def load_saved_storage_state(db_file: str, email: str) -> dict:
         if not isinstance(record, dict):
             return {}
         raw_state = record.get("storage_state_json")
+        if isinstance(raw_state, str) and raw_state.strip():
+            raw_state = json.loads(raw_state)
         if isinstance(raw_state, dict):
-            return dict(raw_state)
-        if not isinstance(raw_state, str) or not raw_state.strip():
-            return {}
-        state = json.loads(raw_state)
-        return state if isinstance(state, dict) else {}
+            state = dict(raw_state)
+            if isinstance(state.get("cookies"), list) and state["cookies"]:
+                state.setdefault("origins", [])
+                return state
+
+        for key in ("cookies", "cookies_json"):
+            cookies = record.get(key)
+            if isinstance(cookies, str) and cookies.strip():
+                cookies = json.loads(cookies)
+            if isinstance(cookies, list) and cookies:
+                return {
+                    "cookies": [dict(item) for item in cookies if isinstance(item, dict)],
+                    "origins": [],
+                }
+        return {}
     except (
         OSError,
         TypeError,
@@ -783,6 +795,147 @@ def resilient_force_fill_locator(worker, locator, value: str) -> bool:
         worker.log("[认证] 已使用键盘输入方式填写密码")
         return True
     return False
+
+
+def _activate_visible_registration_page(worker, page) -> bool:
+    """Activate the visible registration tab before mouse/keyboard input."""
+
+    if bool(getattr(worker, "headless", False)):
+        return False
+    try:
+        page.bring_to_front()
+        try:
+            page.evaluate("() => window.focus()")
+        except Exception:
+            pass
+        return True
+    except Exception as error:
+        if not getattr(worker, "_hme_about_you_focus_warning_logged", False):
+            worker.log(
+                "[基础资料] 浏览器窗口激活失败，将继续使用 DOM 输入并严格核验："
+                f"{safe_log_message(error)}"
+            )
+            worker._hme_about_you_focus_warning_logged = True
+        return False
+
+
+def _about_you_profile_values_match(
+    worker,
+    page,
+    name: str,
+    birthdate: str,
+    birth_year: str,
+    age: str,
+) -> tuple[bool, list[str], str]:
+    values_reader = getattr(worker, "_visible_input_values", None)
+    context_reader = getattr(worker, "_about_you_second_field_context", None)
+    kind_reader = getattr(worker, "_about_you_second_field_kind_from_context", None)
+    value_reader = getattr(worker, "_about_you_second_field_value", None)
+    semantic_validator = getattr(worker, "_about_you_values_ok", None)
+    if not all(
+        callable(method)
+        for method in (
+            values_reader,
+            context_reader,
+            kind_reader,
+            value_reader,
+            semantic_validator,
+        )
+    ):
+        return False, [], "unknown"
+
+    try:
+        context = str(context_reader(page) or "")
+        second_kind = str(kind_reader(context) or "birth_year")
+        expected_second = str(
+            value_reader(second_kind, birth_year, age, birthdate, context) or ""
+        ).strip()
+        values = [str(value or "").strip() for value in values_reader(page)]
+    except Exception:
+        return False, [], "unknown"
+
+    if not values or values[0] != str(name or "").strip():
+        return False, values, second_kind
+    if second_kind == "birth_date":
+        return bool(semantic_validator(values, second_kind)), values, second_kind
+    if len(values) < 2 or values[1] != expected_second:
+        return False, values, second_kind
+    return bool(semantic_validator(values, second_kind)), values, second_kind
+
+
+def configure_resilient_about_you_input(worker) -> bool:
+    """Keep visible about-you input focused and reject unverified field values."""
+
+    if getattr(worker, "_hme_about_you_input_configured", False):
+        return True
+    original_keyboard_fill = getattr(worker, "_fill_visible_input_by_keyboard", None)
+    original_profile_fill = getattr(worker, "_fill_about_you_inputs", None)
+    dom_profile_fill = getattr(worker, "_fill_about_you_inputs_by_dom", None)
+    focus_submit = getattr(worker, "_focus_about_you_submit_or_body", None)
+    if not callable(original_keyboard_fill) or not callable(original_profile_fill):
+        return False
+
+    def keyboard_fill_with_foreground(self, page, index: int, value: str):
+        activated = _activate_visible_registration_page(self, page)
+        if activated and not getattr(self, "_hme_about_you_focus_logged", False):
+            self.log("[基础资料] 键盘输入前已激活当前浏览器窗口")
+            self._hme_about_you_focus_logged = True
+        return original_keyboard_fill(page, index, value)
+
+    def profile_fill_with_readback(
+        self,
+        page,
+        name: str,
+        birthdate: str,
+        birth_year: str,
+        age: str,
+    ):
+        _activate_visible_registration_page(self, page)
+        result = original_profile_fill(page, name, birthdate, birth_year, age)
+        matched, values, second_kind = _about_you_profile_values_match(
+            self, page, name, birthdate, birth_year, age
+        )
+        if matched:
+            self.log("[基础资料] 姓名与年龄/出生信息回读校验通过")
+            return result
+
+        self.log(
+            "[基础资料] 键盘输入回读不一致，改用 DOM 事件重填；"
+            f"字段类型={second_kind}，当前值={values}"
+        )
+        if callable(dom_profile_fill):
+            context_reader = getattr(self, "_about_you_second_field_context", None)
+            kind_reader = getattr(self, "_about_you_second_field_kind_from_context", None)
+            value_reader = getattr(self, "_about_you_second_field_value", None)
+            if all(callable(method) for method in (context_reader, kind_reader, value_reader)):
+                context = str(context_reader(page) or "")
+                second_kind = str(kind_reader(context) or "birth_year")
+                second_value = str(
+                    value_reader(second_kind, birth_year, age, birthdate, context) or ""
+                )
+                dom_profile_fill(page, name, second_value, second_kind)
+                if callable(focus_submit):
+                    focus_submit(page)
+
+        matched, values, second_kind = _about_you_profile_values_match(
+            self, page, name, birthdate, birth_year, age
+        )
+        if matched:
+            self.log("[基础资料] DOM 重填后回读校验通过")
+            return result
+        raise RuntimeError(
+            "基础资料自动填写未确认成功，已停止提交以避免发送错误资料；"
+            f"字段类型={second_kind}，当前值={values}"
+        )
+
+    worker._fill_visible_input_by_keyboard = types.MethodType(
+        keyboard_fill_with_foreground, worker
+    )
+    worker._fill_about_you_inputs = types.MethodType(
+        profile_fill_with_readback, worker
+    )
+    worker._hme_about_you_input_configured = True
+    return True
 
 
 def configure_windowed_camoufox(app_backend) -> bool:
@@ -1791,10 +1944,40 @@ def extract_session_without_navigation(worker, context) -> dict:
                 "access_token": access_token,
                 "session_json": json.dumps(session, ensure_ascii=False, indent=2),
             }
-            if not getattr(worker, "skip_storage_state_capture", False):
+            cookies: list[dict] = []
+            cookie_reader = getattr(context, "cookies", None)
+            if callable(cookie_reader):
+                try:
+                    raw_cookies = cookie_reader()
+                    if isinstance(raw_cookies, list):
+                        cookies = [
+                            dict(cookie)
+                            for cookie in raw_cookies
+                            if isinstance(cookie, dict)
+                        ]
+                except Exception as error:
+                    worker.log(f"[Cookie] 浏览器 Cookie 读取失败：{error}")
+            if getattr(worker, "skip_storage_state_capture", False):
+                if cookies:
+                    result["storage_state_json"] = json.dumps(
+                        {"cookies": cookies, "origins": []}, ensure_ascii=False
+                    )
+            else:
+                storage_state = context.storage_state()
                 result["storage_state_json"] = json.dumps(
-                    context.storage_state(), ensure_ascii=False
+                    storage_state, ensure_ascii=False
                 )
+                if not cookies and isinstance(storage_state, dict):
+                    stored_cookies = storage_state.get("cookies")
+                    if isinstance(stored_cookies, list):
+                        cookies = [
+                            dict(cookie)
+                            for cookie in stored_cookies
+                            if isinstance(cookie, dict)
+                        ]
+            if cookies:
+                result["cookies_json"] = json.dumps(cookies, ensure_ascii=False)
+                worker.log(f"[Cookie] 已保存 {len(cookies)} 个浏览器 Cookie")
             worker.log("[Session] 已在当前浏览器后台获取 Session 和 Access Token")
             return result
         except Exception as error:
@@ -1977,7 +2160,7 @@ def iso_timestamp(value: float) -> str:
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
-class ICloudOtpReader:
+class ManualOtpReader:
     def __init__(self, account, log, _proxy_url: str = "") -> None:
         import requests
 
@@ -1992,25 +2175,24 @@ class ICloudOtpReader:
 
     def connect(self) -> None:
         if not self.token:
-            raise RuntimeError("iCloud 浏览器工作器令牌未配置")
+            raise RuntimeError("浏览器工作器令牌未配置")
         try:
             response = self.session.get(self.service_url + "/healthz", timeout=5)
             response.raise_for_status()
         except Exception as error:
-            raise RuntimeError(f"无法连接 iCloud 邮箱服务：{error}") from error
-        self.log("iCloud 收码通道已连接")
+            raise RuntimeError(f"无法连接手动验证码服务：{error}") from error
+        self.log("手动验证码通道已连接；需要验证码时请在工作台输入")
 
-    def wait_for_code(self, min_timestamp: float) -> str:
-        deadline = time.time() + 240
-        since = iso_timestamp(min_timestamp)
+    def wait_for_code(self, _min_timestamp: float) -> str:
+        deadline = time.time() + 600
         last_error = ""
         while time.time() < deadline:
             try:
                 response = self.session.post(
-                    self.service_url + "/api/gpt-code",
+                    self.service_url + "/api/registration/code/poll",
                     headers={"X-Local-Token": self.token},
-                    json={"email": self.email, "since": since},
-                    timeout=40,
+                    json={"email": self.email},
+                    timeout=10,
                 )
                 if response.status_code == 404:
                     time.sleep(OTP_POLL_INTERVAL_SECONDS)
@@ -2019,17 +2201,21 @@ class ICloudOtpReader:
                 if response.ok and payload.get("ok"):
                     code = re.sub(r"[^A-Za-z0-9]", "", str(payload.get("code") or ""))
                     if 4 <= len(code) <= 10:
-                        self.log("已从 iCloud 转发收件箱获取对应邮箱的新验证码")
+                        self.log("已收到工作台手动输入的验证码")
                         return code
                 last_error = str(payload.get("error") or f"HTTP {response.status_code}")
             except Exception as error:
                 last_error = str(error)
             time.sleep(OTP_POLL_INTERVAL_SECONDS)
         detail = f"：{last_error}" if last_error else ""
-        raise TimeoutError(f"iCloud 在 240 秒内未收到该邮箱的新验证码{detail}")
+        raise TimeoutError(f"在 600 秒内未收到手动输入的验证码{detail}")
 
     def close(self) -> None:
         self.session.close()
+
+
+# Keep the public name used by older integrations while routing it to manual entry.
+ICloudOtpReader = ManualOtpReader
 
 
 def ensure_tkinter_importable() -> None:
@@ -2093,14 +2279,15 @@ def main() -> int:
     password = os.environ.get("HME_OPENAI_PASSWORD", "")
     ensure_password = os.environ.get("HME_ENSURE_OPENAI_PASSWORD", "") == "1"
     enable_2fa = os.environ.get("HME_ENABLE_OPENAI_2FA", "") == "1"
-    saved_storage_state = (
-        load_saved_storage_state(
-            os.environ.get("HME_BROWSER_DB_FILE", ""),
-            args.email,
-        )
-        if ensure_password
-        else {}
+    cookie_refresh_only = os.environ.get("HME_COOKIE_SESSION_REFRESH", "") == "1"
+    saved_storage_state = load_saved_storage_state(
+        os.environ.get("HME_BROWSER_DB_FILE", ""),
+        args.email,
     )
+    saved_cookie_count = len(saved_storage_state.get("cookies") or [])
+    if cookie_refresh_only and not saved_cookie_count:
+        emit("error", error="该账号尚未保存可用 Cookie，请先重新登录或注册")
+        return 2
     try:
         pending_2fa = json.loads(os.environ.get("HME_OPENAI_2FA_STATE", "{}"))
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -2115,7 +2302,7 @@ def main() -> int:
         import app_backend
         from account_models import MailAccount
 
-        app_backend.HotmailOtpReader = ICloudOtpReader
+        app_backend.HotmailOtpReader = ManualOtpReader
         configure_windowed_camoufox(app_backend)
         app_backend.OpenAIRegisterPayLinkWorker._force_fill_locator = (
             resilient_force_fill_locator
@@ -2123,8 +2310,8 @@ def main() -> int:
         account = MailAccount(
             email=args.email.strip().lower(),
             password=password,
-            client_id="icloud",
-            refresh_token="icloud",
+            client_id="manual",
+            refresh_token="manual",
             raw="",
         )
         proxy_url = str(os.environ.get("HME_REGISTRATION_PROXY_URL") or "").strip()
@@ -2152,6 +2339,19 @@ def main() -> int:
             log,
             browser_engine="camoufox",
         )
+        if saved_cookie_count:
+            emit(
+                "log",
+                message=(
+                    f"[Cookie] 已载入 {saved_cookie_count} 个保存 Cookie；"
+                    "正在重新获取 Session 与账号状态"
+                ),
+            )
+        if cookie_refresh_only:
+            def reject_cookie_fallback(*_args, **_kwargs):
+                raise RuntimeError("保存的 Cookie 已失效，请重新登录后再刷新账号")
+
+            worker._register = reject_cookie_fallback
         direct_location = {"country": "", "locale": "", "timezone": ""}
         if proxy_url:
             health = worker._prepare_fingerprint_for_proxy(
@@ -2199,6 +2399,7 @@ def main() -> int:
             )
         configure_worker_login_totp(worker, pending_2fa)
         configure_registration_profile_capture(app_backend, worker)
+        configure_resilient_about_you_input(worker)
         configure_resilient_registration_navigation(worker)
         worker.initial_storage_state = saved_storage_state or None
         # Session/AT are sufficient for this service. Camoufox can occasionally

@@ -33,6 +33,36 @@ icloud-code.8-208-13-52.sslip.io {
 		reverse_proxy 127.0.0.1:18767
 	}
 
+	@registration_inventory {
+		method GET POST
+		path /api/integrations/registration-inventory/*
+	}
+	handle @registration_inventory {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_login {
+		method GET
+		path /login
+	}
+	handle @portal_login {
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_auth_api {
+		method POST
+		path /api/login /api/logout
+	}
+	handle @portal_auth_api {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
 	@portal_access {
 		method GET
 		path /access /code

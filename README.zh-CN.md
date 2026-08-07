@@ -376,6 +376,9 @@ cookies.txt.bak
 - 有效 Access Token 自动跳过，过期 Token 自动重新获取；
 - 支持单个邮箱和全部邮箱、1–10 并发、可见或无头 Camoufox；
 - 只接受本次认证开始后、与目标隐藏邮箱匹配的 OpenAI 验证码；
+- 一键注册不再在本机定时生成邮箱；每次注册都从远端 iCloud 服务领取库存邮箱；
+- 远端每个整点尝试生成 5 个库存邮箱，领取后锁定 10 分钟；每个邮箱只会被自动领取
+  一次，成功标记为 `used`，失败、取消或超时则标记为 `trash` 并永久退出自动库存；
 - 成功后把 OpenAI 密码、Session、Access Token 和浏览器 storage state 保存在
   `hidemyemail.db` 的本地设置表中；敏感结果不会写入任务日志；
 - 可以在网页中停止当前任务。真实浏览器任务不会在测试或服务启动时自动执行。
@@ -417,6 +420,14 @@ OPENAI_REGISTER_PYTHON=D:\path\to\openai-register-project\.venv\Scripts\python.e
 | `OPENAI_REGISTER_PYTHON` | 路径 | 已安装目标项目依赖和 Camoufox 的 Python。 |
 | `HIDEMYEMAIL_BROWSER_SERVICE_URL` | URL | 浏览器工作器回调本服务读取 iCloud 验证码的本机地址。 |
 | `HIDEMYEMAIL_FORCE_BROWSER_HEADLESS` | `0`, `1` | 设为 `1` 时强制所有浏览器任务使用无头模式。 |
+| `HIDEMYEMAIL_INVENTORY_URL` | URL | 远端 iCloud 邮箱库存服务地址。 |
+| `HIDEMYEMAIL_INVENTORY_TOKEN` | 令牌 | 领取邮箱和提交注册回执使用的共享令牌。 |
+| `ACCOUNT_WORKBENCH_IMPORT_TOKEN` | 令牌 | 仅用于本地 OpenAI 账户工作台导入；必须与工作台 `.env` 的 `HME_IMPORT_TOKEN` 相同。 |
+| `HIDEMYEMAIL_REMOTE_TOKEN` | 令牌 | 仅供部署脚本和手动访问远端验证码服务使用。 |
+| `HIDEMYEMAIL_INVENTORY_SERVER` | `0`, `1` | 仅在后台服务设为 `1`，启用定时库存生成和租约 API。 |
+| `HIDEMYEMAIL_INVENTORY_LEASE_SECONDS` | 秒数 | 邮箱领取锁定时间，默认 `600` 秒。 |
+| `HIDEMYEMAIL_INVENTORY_BATCH_SIZE` | 数量 | 后台每轮生成数量，默认 `5`。 |
+| `HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS` | 秒数 | 后台生成间隔，默认 `3600` 秒；该值为 `3600` 时对齐到每个整点。 |
 | `cookies.txt` | 本地文件 | 保存捕获到的 Cookie。 |
 | `emails.txt` | 本地文件 | 保存生成的隐藏邮件地址。 |
 | `inbox_config.json` | 本地文件 | 保存接收邮箱 IMAP 配置。 |

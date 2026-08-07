@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$SshHost = "aliyun-ecs",
+    [string]$SshHost = "cac",
     [string]$RemoteDirectory = "/opt/icloud-code-server",
     [ValidateRange(1, 65535)]
     [int]$RemotePort = 18767,
@@ -23,13 +23,13 @@ function Invoke-CheckedCommand {
     }
 }
 
-function Get-SharedToken {
-    $token = [Environment]::GetEnvironmentVariable("HME_IMPORT_TOKEN", "Process")
+function Get-RemoteServiceToken {
+    $token = [Environment]::GetEnvironmentVariable("HIDEMYEMAIL_REMOTE_TOKEN", "Process")
     if (-not $token) {
-        $token = [Environment]::GetEnvironmentVariable("HME_IMPORT_TOKEN", "User")
+        $token = [Environment]::GetEnvironmentVariable("HIDEMYEMAIL_REMOTE_TOKEN", "User")
     }
     if (-not $token -or $token.Length -lt 32) {
-        throw "HME_IMPORT_TOKEN must be configured with at least 32 characters."
+        throw "HIDEMYEMAIL_REMOTE_TOKEN must be configured with at least 32 characters."
     }
     return $token
 }
@@ -55,7 +55,7 @@ if ($RemoteDirectory -notmatch '^/[A-Za-z0-9._/-]+$') {
     throw "RemoteDirectory must be an absolute Linux path using safe characters."
 }
 
-$token = Get-SharedToken
+$token = Get-RemoteServiceToken
 $tempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) (
     "icloud-code-server-" + [Guid]::NewGuid().ToString("N")
 )
@@ -65,8 +65,12 @@ try {
     $envLines = @(
         "ACCOUNT_WORKBENCH_IMPORT_TOKEN=$token"
         "HIDEMYEMAIL_WEB_PASSWORD=$token"
-        "HIDEMYEMAIL_INBOX_SYNC_INTERVAL=15"
+        "HIDEMYEMAIL_INBOX_SYNC_INTERVAL=0"
         "HIDEMYEMAIL_REGION=china"
+        "HIDEMYEMAIL_INVENTORY_SERVER=1"
+        "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS=600"
+        "HIDEMYEMAIL_INVENTORY_BATCH_SIZE=5"
+        "HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS=3600"
         "ICLOUD_CODE_SERVER_PORT=$RemotePort"
     )
     [System.IO.File]::WriteAllLines(

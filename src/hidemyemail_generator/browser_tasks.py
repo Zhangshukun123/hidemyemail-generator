@@ -129,6 +129,36 @@ def account_session_access_token(record: dict[str, Any]) -> str:
     return token
 
 
+def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return reusable browser cookies from current and legacy account fields."""
+
+    raw_state = record.get("storage_state_json")
+    if isinstance(raw_state, str) and raw_state.strip():
+        try:
+            raw_state = json.loads(raw_state)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raw_state = {}
+    if isinstance(raw_state, dict):
+        cookies = raw_state.get("cookies")
+        if isinstance(cookies, list):
+            normalized = [dict(item) for item in cookies if isinstance(item, dict)]
+            if normalized:
+                return normalized
+
+    for key in ("cookies", "cookies_json"):
+        cookies = record.get(key)
+        if isinstance(cookies, str) and cookies.strip():
+            try:
+                cookies = json.loads(cookies)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        if isinstance(cookies, list):
+            normalized = [dict(item) for item in cookies if isinstance(item, dict)]
+            if normalized:
+                return normalized
+    return []
+
+
 def session_email(session: Any) -> str:
     if not isinstance(session, dict):
         return ""
@@ -182,6 +212,7 @@ def _save_account_record(
         access_token = str(result.get("access_token") or "").strip()
         session_json = str(result.get("session_json") or "").strip()
         storage_state_json = str(result.get("storage_state_json") or "").strip()
+        cookies_json = str(result.get("cookies_json") or "").strip()
         acquisition_method = str(
             result.get("session_acquisition_method") or ""
         ).strip()
@@ -206,6 +237,14 @@ def _save_account_record(
                 )
         if storage_state_json:
             current["storage_state_json"] = storage_state_json
+        if cookies_json:
+            current["cookies_json"] = cookies_json
+            try:
+                parsed_cookies = json.loads(cookies_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed_cookies = []
+            if isinstance(parsed_cookies, list):
+                current["cookies"] = parsed_cookies
         if acquisition_method:
             current["session_acquisition_method"] = acquisition_method
         result_two_factor = result.get("two_factor")
@@ -388,6 +427,9 @@ class BrowserTaskManager:
                         account.get("force_reset_password", False)
                     ),
                     "enable_2fa": bool(account.get("enable_2fa", False)),
+                    "cookie_refresh_only": bool(
+                        account.get("cookie_refresh_only", False)
+                    ),
                     "two_factor": account.get("two_factor")
                     if isinstance(account.get("two_factor"), dict)
                     else {},
@@ -431,6 +473,7 @@ class BrowserTaskManager:
                     "_password_confirmed": False,
                     "passwordConfirmed": False,
                     "_enable_2fa": item["enable_2fa"],
+                    "_cookie_refresh_only": item["cookie_refresh_only"],
                     "_two_factor": item["two_factor"],
                     "phase": "queued",
                     "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
@@ -574,6 +617,9 @@ class BrowserTaskManager:
                     "HME_ENABLE_OPENAI_2FA": "1"
                     if item.get("_enable_2fa")
                     else "0",
+                    "HME_COOKIE_SESSION_REFRESH": "1"
+                    if item.get("_cookie_refresh_only")
+                    else "0",
                     "HME_OPENAI_2FA_STATE": json.dumps(
                         item.get("_two_factor") or {}, ensure_ascii=False
                     ),
@@ -655,7 +701,7 @@ class BrowserTaskManager:
                 )
                 item["status"] = "success"
                 item["phase"] = "completed"
-                saved_parts = ["Session / AT 已保存"]
+                saved_parts = ["Session / AT / Cookie 已保存"]
                 if item.get("_ensure_password") and not password_confirmed:
                     saved_parts.append("密码待设置")
                 if item.get("twoFactorEnabled"):

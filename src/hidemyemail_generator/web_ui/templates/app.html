@@ -59,51 +59,15 @@
       <section class="view" id="accountsView" data-view="accounts" hidden>
         <div class="view-actions">
           <div id="accountMetrics" class="metric-grid compact"></div>
-          <div class="action-cluster"><label class="switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册动态代理</label><span id="registrationNetworkMode" class="badge blue">本机 IP 直连 · 语言随出口</span><label class="mini-field">出口<select id="registrationProxyCountry"><option value="NL">荷兰 NL</option><option value="US">美国 US</option><option value="JP">日本 JP</option><option value="DE">德国 DE</option><option value="GB">英国 GB</option><option value="FR">法国 FR</option><option value="CA">加拿大 CA</option><option value="AU">澳大利亚 AU</option><option value="SG">新加坡 SG</option><option value="HK">香港 HK</option><option value="TW">台湾 TW</option><option value="KR">韩国 KR</option><option value="BR">巴西 BR</option><option value="IN">印度 IN</option><option value="TR">土耳其 TR</option></select></label><button class="button" data-action="set-registration-proxy-credential">代理连接</button><label class="switch"><input id="headless" type="checkbox"><span></span>无头浏览器</label><label class="mini-field">并发<input id="concurrency" type="number" min="1" max="10" value="3"></label><button id="registerFromInventoryButton" class="button primary" data-action="register">从库存注册账号（--）</button><button class="button" data-action="fetch-all">获取全部 Session</button></div>
+<div class="action-cluster"><label class="switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册动态代理</label><span id="registrationNetworkMode" class="badge blue">本机 IP 直连 · 语言随出口</span><label class="mini-field">出口<select id="registrationProxyCountry"><option value="NL">荷兰 NL</option><option value="US">美国 US</option><option value="JP">日本 JP</option><option value="DE">德国 DE</option><option value="GB">英国 GB</option><option value="FR">法国 FR</option><option value="CA">加拿大 CA</option><option value="AU">澳大利亚 AU</option><option value="SG">新加坡 SG</option><option value="HK">香港 HK</option><option value="TW">台湾 TW</option><option value="KR">韩国 KR</option><option value="BR">巴西 BR</option><option value="IN">印度 IN</option><option value="TR">土耳其 TR</option></select></label><button class="button" data-action="set-registration-proxy-credential">代理连接</button><label class="switch"><input id="headless" type="checkbox"><span></span>无头浏览器</label><input id="concurrency" type="hidden" value="1"><label class="mini-field registration-email-field">注册邮箱<input id="registrationEmail" type="email" placeholder="name@example.com" autocomplete="email"></label><button id="registerEmailButton" class="button primary" data-action="register">添加邮箱并注册</button><button class="button" data-action="fetch-all">获取全部 Session</button></div>
         </div>
-        <article id="scheduledGenerationPanel" class="panel task-panel schedule-panel" data-task-tone="running">
-          <div class="task-panel-header">
-            <div class="task-title-group">
-              <span id="scheduledGenerationIcon" class="task-status-icon" aria-hidden="true">◷</span>
-              <div class="task-title-copy">
-                <div class="task-title-line">
-                  <h2>邮箱库存定时生成</h2>
-                  <span id="scheduledGenerationBadge" class="task-state-badge">计时中</span>
-                </div>
-                <p id="scheduledGenerationMessage">设置后等待完整 1 小时，再生成第一批 5 个邮箱；只入库，不注册。</p>
-              </div>
-            </div>
-            <button id="toggleScheduledGenerationButton" class="button danger small" data-action="toggle-scheduled-generation">暂停定时生成</button>
-          </div>
-          <div class="task-metrics" aria-label="定时生成摘要">
-            <div class="task-stat">
-              <span class="task-stat-icon" aria-hidden="true">5</span>
-              <span><small>每批生成</small><strong id="scheduledGenerationBatch">5 个</strong></span>
-            </div>
-            <div class="task-stat success">
-              <span class="task-stat-icon" aria-hidden="true">1h</span>
-              <span><small>固定间隔</small><strong id="scheduledGenerationInterval">1 小时</strong></span>
-            </div>
-            <div class="task-stat success">
-              <span class="task-stat-icon" aria-hidden="true">库</span>
-              <span><small>可注册库存</small><strong id="registrationInventoryAvailable">-- 个</strong></span>
-            </div>
-            <div class="task-stat elapsed">
-              <span class="task-stat-icon" aria-hidden="true">◷</span>
-              <span><small>距离下次</small><strong id="scheduledGenerationCountdown">--:--:--</strong></span>
-            </div>
-          </div>
-          <div id="scheduledGenerationLog" class="inline-log" role="log" aria-live="polite">
-            <div class="task-log-empty">正在加载定时生成检查日志…</div>
-          </div>
-        </article>
         <article id="taskPanel" class="panel task-panel" data-task-tone="idle">
           <div class="task-panel-header">
             <div class="task-title-group">
               <span id="taskStatusIcon" class="task-status-icon" aria-hidden="true">—</span>
               <div class="task-title-copy">
                 <div class="task-title-line">
-                  <h2 id="registrationSummary">一键注册 · 等待开始</h2>
+                  <h2 id="registrationSummary">邮箱注册 · 等待开始</h2>
                   <span id="taskStateBadge" class="task-state-badge">空闲</span>
                 </div>
                 <p id="taskMessage">尚未启动注册或 Session 获取任务</p>
@@ -129,6 +93,11 @@
             <progress id="browserTaskProgress" value="0" max="100" aria-label="任务完成进度"></progress>
             <strong id="browserTaskProgressValue">0%</strong>
           </div>
+          <div id="registrationCodePanel" class="registration-code-panel" hidden>
+            <div><strong>输入邮箱验证码</strong><small id="registrationCodeEmail">等待注册页面请求验证码</small></div>
+            <input id="registrationCode" type="text" inputmode="numeric" maxlength="10" autocomplete="one-time-code" placeholder="4–10 位验证码">
+            <button class="button primary" data-action="submit-registration-code">提交验证码</button>
+          </div>
           <div id="taskLog" class="inline-log" role="log" aria-live="polite">
             <div class="task-log-empty">暂无任务日志</div>
           </div>
@@ -148,8 +117,9 @@
 
       <section class="view" id="verificationView" data-view="verification" hidden>
         <div id="verificationMetrics" class="metric-grid"></div>
-        <article class="panel verification-progress"><div><h2 id="verificationTaskTitle">验证任务</h2><p id="verificationSummary">可选择一个账号，检查 Plus 与 Session 状态</p></div><div class="progress-actions"><label class="verification-target" for="verificationAccountSelect"><span>选择账号</span><select id="verificationAccountSelect"><option value="">请选择一个账号</option></select></label><button id="verifySelectedButton" class="button primary" data-action="verify-selected" disabled>验证选中账号</button><button id="verifyAllButton" class="button" data-action="verify-all">验证全部账号</button><button id="stopVerificationButton" class="button danger" data-action="stop-verification" disabled>停止</button><progress id="verificationProgress" value="0" max="100"></progress></div></article>
+        <article class="panel verification-progress"><div><h2 id="verificationTaskTitle">验证任务</h2><p id="verificationSummary">选中账号时使用已保存 Cookie 重新获取 Session 和账号状态；批量验证最多并发 10 个</p></div><div class="progress-actions"><label class="verification-target" for="verificationAccountSelect"><span>选择账号</span><select id="verificationAccountSelect"><option value="">请选择一个账号</option></select></label><button id="verificationPreviousButton" class="button" data-action="previous-verification">上一个</button><button id="verificationNextButton" class="button" data-action="next-verification">下一个</button><label class="verification-target verification-concurrency" for="verificationConcurrency"><span>验证并发</span><input id="verificationConcurrency" type="number" min="1" max="10" value="10"></label><button id="verifySelectedButton" class="button primary" data-action="verify-selected" disabled>Cookie 刷新选中账号</button><button id="verifyAllButton" class="button" data-action="verify-all">验证全部账号</button><button id="stopVerificationButton" class="button danger" data-action="stop-verification" disabled>停止</button><progress id="verificationProgress" value="0" max="100"></progress></div></article>
         <div class="verification-layout"><article class="panel table-panel"><div class="panel-head"><div><h2>验证结果</h2><p>账号、套餐与 Session 状态</p></div><div class="filter-tabs" id="verificationFilters"><button class="active" data-verify-filter="all">全部结果</button><button data-verify-filter="plus">Plus</button><button data-verify-filter="free">Free</button><button data-verify-filter="error">异常</button></div></div><div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>账号状态</th><th>套餐</th><th>Session</th><th>验证时间</th></tr></thead><tbody id="verificationTableBody"></tbody></table></div></article><aside class="panel detail-panel"><div class="panel-head"><div><h2>验证详情</h2><p id="verificationDetailEmail">选择记录查看详情</p></div></div><div id="verificationDetail" class="empty-state">请选择一条验证记录</div></aside></div>
+        <article class="panel verification-log-panel"><div class="panel-head"><div><h2>验证日志</h2><p>显示验证请求、Session 刷新、接口响应和删除原因</p></div><span id="verificationLogCount" class="badge">0 条</span></div><div id="verificationLog" class="inline-log"><div class="task-log-empty">尚无验证日志</div></div></article>
       </section>
 
       <section class="view" id="settingsView" data-view="settings" hidden>

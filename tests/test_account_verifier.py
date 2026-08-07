@@ -181,6 +181,15 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             _save_account_record(
                 db_file,
                 "one@icloud.com",
+                result={
+                    "access_token": token_with_plan("free"),
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": token_with_plan("free"),
+                            "user": {"email": "one@icloud.com"},
+                        }
+                    ),
+                },
                 two_factor={
                     "secret": "JBSWY3DPEHPK3PXP",
                     "enabled": True,
@@ -242,10 +251,13 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
             state = manager.start_with_browser(
-                emails=["two@icloud.com", "one@icloud.com"], concurrency=2
+                emails=["two@icloud.com", "one@icloud.com"],
+                concurrency=2,
+                force_refresh=True,
             )
             self.assertTrue(state["headless"])
             self.assertEqual(state["concurrency"], 2)
+            self.assertEqual(state["refreshSource"], "cookie")
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
@@ -257,6 +269,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(accounts), 2)
             self.assertTrue(options["headless"])
             self.assertEqual(options["concurrency"], 2)
+            self.assertTrue(all(item["cookie_refresh_only"] for item in accounts))
             browser_accounts = {item["email"]: item for item in accounts}
             self.assertEqual(
                 browser_accounts["one@icloud.com"]["two_factor"]["secret"],
@@ -336,7 +349,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([item["email"] for item in items], ["restored@icloud.com"])
             self.assertFalse(items[0]["hasPassword"])
 
-    async def test_classifies_valid_accounts_and_preserves_invalid_credentials(self):
+    async def test_classifies_valid_accounts_and_deletes_invalid_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -370,7 +383,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["plus"], 1)
             self.assertEqual(snapshot["free"], 1)
             self.assertEqual(snapshot["expired"], 1)
-            self.assertEqual(snapshot["deleted"], 0)
+            self.assertEqual(snapshot["deleted"], 1)
             self.assertNotIn("access_token", json.dumps(snapshot))
             self.assertEqual(
                 load_account_record(db_file, "plus@icloud.com")["account_type"],
@@ -380,28 +393,25 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 load_account_record(db_file, "free@icloud.com")["account_type"],
                 "free",
             )
-            preserved = load_account_record(db_file, "bad@icloud.com")
-            self.assertEqual(preserved["password"], "Secret!A7")
-            self.assertEqual(preserved["access_token"], "at-bad")
-            self.assertEqual(preserved["session"]["accessToken"], "at-bad")
-            self.assertIn("session_invalid_at", preserved)
-            self.assertNotIn("bad@icloud.com", removed_account_emails(db_file))
+            self.assertEqual(load_account_record(db_file, "bad@icloud.com"), {})
+            self.assertIn("bad@icloud.com", removed_account_emails(db_file))
+            invalid_result = next(
+                item for item in snapshot["accounts"] if item["email"] == "bad@icloud.com"
+            )
+            self.assertEqual(invalid_result["status"], "deleted")
+            log_text = "\n".join(item["message"] for item in snapshot["historyLogs"])
+            self.assertIn("验证响应：status=invalid", log_text)
+            self.assertIn("本地邮箱记录及账号凭据已删除", log_text)
 
             identities = [
                 {"hme": "plus@icloud.com", "anonymousId": "plus", "isActive": True},
                 {"hme": "free@icloud.com", "anonymousId": "free", "isActive": True},
-                {"hme": "bad@icloud.com", "anonymousId": "bad", "isActive": True},
             ]
             items = _browser_email_items(db_file, identities)
             self.assertEqual(
                 {item["email"] for item in items},
-                {"plus@icloud.com", "free@icloud.com", "bad@icloud.com"},
+                {"plus@icloud.com", "free@icloud.com"},
             )
-            invalid_item = next(
-                item for item in items if item["email"] == "bad@icloud.com"
-            )
-            self.assertEqual(invalid_item["sessionStatus"], "expired")
-            self.assertFalse(invalid_item["hasImportableSession"])
 
     async def test_invalid_token_automatically_refreshes_in_headless_browser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -553,10 +563,12 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
 
             snapshot = manager.snapshot()
             self.assertEqual(snapshot["expired"], 1)
+            self.assertEqual(snapshot["deleted"], 1)
             self.assertEqual(len(browser_manager.started), 1)
-            self.assertIn("新 Token 仍失效", snapshot["accounts"][0]["message"])
+            self.assertIn("Token 已确认失效", snapshot["accounts"][0]["message"])
+            self.assertEqual(load_account_record(db_file, "retry-once@icloud.com"), {})
 
-    async def test_preserves_known_plus_account_when_token_is_rejected(self):
+    async def test_deletes_known_plus_account_when_token_is_confirmed_invalid(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -586,17 +598,11 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
-            self.assertEqual(snapshot["plus"], 1)
-            self.assertEqual(snapshot["deleted"], 0)
-            self.assertEqual(
-                load_account_record(db_file, "paid@icloud.com")["password"],
-                "Secret!A7",
-            )
-            self.assertEqual(
-                load_account_record(db_file, "paid@icloud.com")["access_token"],
-                "at-expired-plus",
-            )
-            self.assertNotIn("paid@icloud.com", removed_account_emails(db_file))
+            self.assertEqual(snapshot["plus"], 0)
+            self.assertEqual(snapshot["expired"], 1)
+            self.assertEqual(snapshot["deleted"], 1)
+            self.assertEqual(load_account_record(db_file, "paid@icloud.com"), {})
+            self.assertIn("paid@icloud.com", removed_account_emails(db_file))
 
     async def test_protocol_relogin_replaces_session_without_browser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -854,6 +860,32 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 load_account_record(db_file, "free@icloud.com")["account_type"],
                 "free",
             )
+
+    async def test_direct_verification_accepts_concurrency_ten(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "fake_check_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'free','detail':'ok'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            save_record(db_file, "ten@icloud.com", "at-ten")
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+
+            state = manager.start(concurrency=10)
+            self.assertEqual(state["concurrency"], 10)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+            self.assertEqual(manager.snapshot()["free"], 1)
 
     async def test_selected_account_requires_saved_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:

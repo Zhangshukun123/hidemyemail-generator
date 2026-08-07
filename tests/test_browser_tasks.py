@@ -13,6 +13,7 @@ from unittest.mock import patch
 from hidemyemail_generator.browser_tasks import (
     BrowserTaskManager,
     _save_account_record,
+    account_saved_cookies,
     access_token_is_expired,
     jwt_account_type,
     load_account_record,
@@ -33,6 +34,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _mfa_token_was_invalidated,
     _open_settings_from_profile,
     configure_password_first_login,
+    configure_resilient_about_you_input,
     configure_direct_registration_browser,
     configure_post_registration_password_setup,
     configure_registration_profile_capture,
@@ -41,6 +43,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     ensure_password_in_security_settings,
     detect_direct_registration_location,
     extract_session_without_navigation,
+    load_saved_storage_state,
     require_registration_proxy_country,
     resilient_force_fill_locator,
     safe_log_message,
@@ -747,6 +750,102 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertEqual(len(request.calls), 1)
         self.assertIn("/api/auth/session", request.calls[0][0])
         self.assertIn("后台获取 Session", logs[-1])
+
+    def test_registration_session_saves_browser_cookies_without_full_snapshot(self):
+        class Response:
+            ok = True
+            status = 200
+
+            def json(self):
+                return {
+                    "accessToken": "at-cookie-test",
+                    "user": {"email": "manual@qq.com"},
+                }
+
+        context = SimpleNamespace(
+            request=SimpleNamespace(get=lambda *_args, **_kwargs: Response()),
+            cookies=lambda: [
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": "cookie-value",
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                }
+            ],
+        )
+        worker = SimpleNamespace(
+            account=SimpleNamespace(email="manual@qq.com"),
+            skip_storage_state_capture=True,
+            _chatgpt_session_email=lambda session: session["user"]["email"],
+            log=lambda _message: None,
+        )
+
+        result = extract_session_without_navigation(worker, context)
+
+        self.assertEqual(json.loads(result["cookies_json"])[0]["value"], "cookie-value")
+        self.assertEqual(
+            json.loads(result["storage_state_json"])["cookies"][0]["name"],
+            "__Secure-next-auth.session-token",
+        )
+
+    def test_account_record_persists_registration_cookies(self):
+        cookies = [
+            {
+                "name": "session",
+                "value": "saved-cookie",
+                "domain": "chatgpt.com",
+                "path": "/",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            _save_account_record(
+                db_file,
+                "manual@qq.com",
+                result={
+                    "access_token": "at-cookie-test",
+                    "cookies_json": json.dumps(cookies),
+                    "storage_state_json": json.dumps(
+                        {"cookies": cookies, "origins": []}
+                    ),
+                },
+            )
+
+            record = load_account_record(db_file, "manual@qq.com")
+
+        self.assertEqual(record["cookies"][0]["value"], "saved-cookie")
+        self.assertEqual(json.loads(record["cookies_json"]), cookies)
+        self.assertEqual(account_saved_cookies(record), cookies)
+
+    def test_saved_storage_state_falls_back_to_legacy_cookie_fields(self):
+        cookies = [
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": "legacy-cookie",
+                "domain": "chatgpt.com",
+                "path": "/",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:legacy-cookie@icloud.com",
+                        json.dumps({"cookies_json": json.dumps(cookies)}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            state = load_saved_storage_state(
+                str(db_file), "legacy-cookie@icloud.com"
+            )
+
+        self.assertEqual(state, {"cookies": cookies, "origins": []})
 
     def test_camoufox_bridge_forces_non_fullscreen_window(self):
         calls = []
@@ -1642,6 +1741,119 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(resilient_force_fill_locator(worker, locator, "Strong!Pass123"))
         self.assertEqual(locator.value, "Strong!Pass123")
         self.assertEqual(worker.logs, ["[认证] 已使用键盘输入方式填写密码"])
+
+    def test_visible_about_you_input_is_activated_and_dom_repaired(self):
+        events = []
+
+        class Page:
+            def __init__(self):
+                self.values = ["Wrong Name", "27"]
+
+            def bring_to_front(self):
+                events.append("front")
+
+            def evaluate(self, script, *_args):
+                if "window.focus" in script:
+                    events.append("window-focus")
+                return None
+
+        class Worker:
+            headless = False
+
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _fill_visible_input_by_keyboard(self, _page, index, value):
+                events.append(f"keyboard:{index}:{value}")
+
+            def _fill_about_you_inputs(
+                self, page, name, _birthdate, _birth_year, age
+            ):
+                self._fill_visible_input_by_keyboard(page, 0, name)
+                self._fill_visible_input_by_keyboard(page, 1, age)
+
+            def _fill_about_you_inputs_by_dom(
+                self, page, name, second_value, _second_kind
+            ):
+                events.append("dom-repair")
+                page.values = [name, second_value]
+                return list(page.values)
+
+            def _visible_input_values(self, page):
+                return list(page.values)
+
+            def _about_you_second_field_context(self, _page):
+                return "Age"
+
+            def _about_you_second_field_kind_from_context(self, _context):
+                return "age"
+
+            def _about_you_second_field_value(
+                self, _kind, _birth_year, age, _birthdate, _context
+            ):
+                return age
+
+            def _about_you_values_ok(self, values, _kind):
+                return len(values) >= 2 and values[0] == "Noah Scott" and values[1] == "27"
+
+            def _focus_about_you_submit_or_body(self, _page):
+                events.append("focus-submit")
+
+        worker = Worker()
+        page = Page()
+
+        self.assertTrue(configure_resilient_about_you_input(worker))
+        worker._fill_about_you_inputs(page, "Noah Scott", "1999-01-01", "1999", "27")
+
+        self.assertEqual(page.values, ["Noah Scott", "27"])
+        self.assertEqual(events.count("front"), 3)
+        self.assertLess(events.index("front"), events.index("keyboard:0:Noah Scott"))
+        self.assertIn("dom-repair", events)
+        self.assertTrue(any("DOM 重填后回读校验通过" in item for item in worker.logs))
+
+    def test_about_you_input_stops_before_submit_when_readback_stays_wrong(self):
+        class Page:
+            values = ["Wrong Name", "27"]
+
+            def bring_to_front(self):
+                return None
+
+            def evaluate(self, *_args):
+                return None
+
+        class Worker:
+            headless = False
+            log = staticmethod(lambda _message: None)
+            _fill_visible_input_by_keyboard = staticmethod(
+                lambda _page, _index, _value: None
+            )
+            _fill_about_you_inputs = staticmethod(
+                lambda _page, _name, _birthdate, _birth_year, _age: None
+            )
+            _fill_about_you_inputs_by_dom = staticmethod(
+                lambda _page, _name, _second, _kind: None
+            )
+            _visible_input_values = staticmethod(lambda page: list(page.values))
+            _about_you_second_field_context = staticmethod(lambda _page: "Age")
+            _about_you_second_field_kind_from_context = staticmethod(
+                lambda _context: "age"
+            )
+            _about_you_second_field_value = staticmethod(
+                lambda _kind, _birth_year, age, _birthdate, _context: age
+            )
+            _about_you_values_ok = staticmethod(lambda _values, _kind: True)
+            _focus_about_you_submit_or_body = staticmethod(lambda _page: None)
+
+        worker = Worker()
+        self.assertTrue(configure_resilient_about_you_input(worker))
+
+        with self.assertRaisesRegex(RuntimeError, "已停止提交"):
+            worker._fill_about_you_inputs(
+                Page(), "Noah Scott", "1999-01-01", "1999", "27"
+            )
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):

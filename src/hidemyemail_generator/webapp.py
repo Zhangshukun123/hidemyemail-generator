@@ -21,6 +21,7 @@ from .account_verifier import AccountVerificationManager, removed_account_emails
 from .browser_tasks import (
     BrowserTaskManager,
     _save_account_record,
+    account_saved_cookies,
     account_session,
     account_session_access_token,
     access_token_is_expired,
@@ -45,23 +46,47 @@ from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
 from .registration_inventory import (
+    DEFAULT_LEASE_SECONDS,
     available_generated_inventory_count,
-    claim_generated_inventory_email,
-    clear_generated_inventory_claims,
-    release_generated_inventory_email,
+    complete_generated_inventory_lease,
+    expire_inventory_leases,
+    lease_generated_inventory_email,
+    registration_inventory_status as stored_registration_inventory_status,
+)
+from .registration_inventory_client import (
+    INVENTORY_INTEGRATION_PATHS,
+    INVENTORY_LEASE_PATH,
+    INVENTORY_RESULT_PATH,
+    INVENTORY_STATUS_PATH,
+    RemoteRegistrationInventoryClient,
 )
 from .registration_tasks import RegistrationTaskManager, generate_openai_password
 from .registration_proxy import RegistrationProxyStore
-from .scheduled_generation import ScheduledGenerationManager
+from .scheduled_generation import (
+    DEFAULT_BATCH_SIZE as DEFAULT_INVENTORY_BATCH_SIZE,
+    DEFAULT_INTERVAL_SECONDS as DEFAULT_INVENTORY_INTERVAL_SECONDS,
+    ScheduledGenerationManager,
+)
 from .web_ui import build_app_page, build_login_page
 
 
 SESSION_COOKIE_NAME = "hme_session"
 SESSION_MAX_AGE = 12 * 60 * 60
-PUBLIC_PATHS = {"/login", "/api/login", "/access", "/healthz"}
+PUBLIC_PATHS = {
+    "/login",
+    "/api/login",
+    "/access",
+    "/code",
+    "/api/code/latest",
+    "/healthz",
+}
 WORKBENCH_OPENAI_CODE_PATH = "/api/integrations/workbench/openai-code"
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
+ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 15
+ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS = 60
+ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS = 15 * 60
+ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS = 60 * 60
 CARD_LINK_REGIONS = {
     "US": {"label": "美国", "currency": "USD", "locale": "en-US"},
     "JP": {"label": "日本", "currency": "JPY", "locale": "ja-JP"},
@@ -71,6 +96,14 @@ CARD_LINK_REGIONS = {
     "AU": {"label": "澳大利亚", "currency": "AUD", "locale": "en-AU"},
 }
 CARD_LINK_METHODS = {"standard", "ph_hosted"}
+
+
+class InboxSyncDeferredError(RuntimeError):
+    """Reuse a recent IMAP failure without opening another connection."""
+
+    def __init__(self, public_message: str):
+        super().__init__(public_message)
+        self.public_message = public_message
 
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -1661,10 +1694,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
         error.name = "AbortError";
         throw error;
       }
-      const needsSessionRefresh = item.sessionStatus !== "ready";
-      const verifyPrompt = needsSessionRefresh
-        ? `当前没有可用 Session，将为 ${item.email} 启动无头浏览器重新获取 Session 并验证账号。是否继续？`
-        : `将使用 ${item.email} 已保存的 Session 验证账号；不会设置密码或 2FA。是否继续？`;
+      if (!resetPassword && !item.hasCookies) {
+        throw new Error("该账号尚未保存 Cookie，请先重新登录或注册获取 Cookie");
+      }
+      const verifyPrompt = `将使用 ${item.email} 已保存的 Cookie 重新获取 Session、套餐和账号状态；不会设置密码或 2FA。是否继续？`;
       if (!resetPassword && !confirm(verifyPrompt)) {
         const error = new Error("已取消验证账号");
         error.name = "AbortError";
@@ -1676,11 +1709,12 @@ GPT_INDEX_HTML = r"""<!doctype html>
           email: item.email,
           headless: $("headless").checked,
           reset_password: resetPassword,
+          refresh_with_cookie: !resetPassword,
         }),
       });
-      if (data.mode === "verify") {
+      if (data.mode === "refresh_cookie") {
         await loadVerification();
-        return { successLabel: "验证已启动" };
+        return { successLabel: "正在使用 Cookie 刷新账号状态" };
       }
       if (data.mode === "refresh_session") {
         await loadVerification();
@@ -2119,10 +2153,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
         secondaryActions.append(importWorkbenchButton);
-        const verifyAccountButton = actionButton("验证账号", () => verifyOrRegisterAccount(item), "验证已启动");
-        verifyAccountButton.title = item.sessionStatus === "ready"
-          ? "使用现有 Session 验证账号"
-          : "使用无头浏览器重新获取 Session 并验证账号";
+        const verifyAccountButton = actionButton("Cookie 刷新状态", () => verifyOrRegisterAccount(item), "刷新已启动");
+        verifyAccountButton.disabled = !item.hasCookies;
+        verifyAccountButton.title = item.hasCookies
+          ? "使用保存的 Cookie 重新获取 Session、套餐和账号状态"
+          : "该账号尚未保存 Cookie";
         secondaryActions.append(verifyAccountButton);
         if (!item.hasPassword) {
           secondaryActions.append(actionButton("设置密码", () => verifyOrRegisterAccount(item, true), "密码设置已启动"));
@@ -2500,7 +2535,8 @@ async def auth_middleware(
     if (
         request.path in PUBLIC_PATHS
         or (
-            request.path == WORKBENCH_OPENAI_CODE_PATH
+            request.path
+            in ({WORKBENCH_OPENAI_CODE_PATH} | INVENTORY_INTEGRATION_PATHS)
             and _workbench_import_token_valid(request, request.app)
         )
         or _session_valid(request)
@@ -2516,6 +2552,8 @@ async def auth_middleware(
 
 
 def _inbox_error_message(error: Exception) -> str:
+    if isinstance(error, InboxSyncDeferredError):
+        return error.public_message
     message = str(error).lower()
     if "authentication" in message or "login" in message or "auth" in message:
         return "IMAP 登录失败，请确认已开启 IMAP，并使用授权码或应用专用密码"
@@ -3192,11 +3230,27 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
     activity = {
         item["email"]: item for item in _gpt_email_items(db_file, identities)
     }
+    identities_by_email = {
+        str(identity.get("hme") or "").strip().lower(): identity
+        for identity in identities
+        if str(identity.get("hme") or "").strip()
+    }
+    conn = connect_db(str(db_file))
+    try:
+        rows = conn.execute(
+            "SELECT key FROM settings WHERE key LIKE 'gpt_account:%'"
+        ).fetchall()
+    finally:
+        conn.close()
+    stored_emails = {
+        str(row["key"] or "").removeprefix("gpt_account:").strip().lower()
+        for row in rows
+    }
     items: list[dict] = []
-    for identity in identities:
-        email = str(identity.get("hme") or "").strip().lower()
+    for email in sorted(set(identities_by_email) | stored_emails):
         if not email:
             continue
+        identity = identities_by_email.get(email, {})
         current = dict(
             activity.get(email)
             or {
@@ -3219,7 +3273,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         if account_type not in {"plus", "free"}:
             account_type = "unverified"
         timestamp = identity.get("createTimestamp")
-        created_at = ""
+        created_at = str(account.get("created_at") or account.get("updated_at") or "")
         if isinstance(timestamp, (int, float)):
             created_at = datetime.fromtimestamp(
                 timestamp / 1000, timezone.utc
@@ -3239,6 +3293,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 if isinstance(account.get("two_factor"), dict)
                 else "",
                 "hasSession": bool(session and access_token),
+                "hasCookies": bool(account_saved_cookies(account)),
                 "hasImportableSession": bool(
                     session and access_token and not token_expired
                 ),
@@ -3299,13 +3354,18 @@ def create_app(
     inbox_config_file: str = DEFAULT_INBOX_CONFIG_FILE,
     region: str = "china",
     web_password: str = "",
-    inbox_sync_interval: int = 30,
     target_project_dir: str = "",
     target_python: str = "",
     browser_service_url: str = "http://127.0.0.1:8765",
     force_browser_headless: bool = False,
     workbench_url: str = "",
     workbench_import_token: str = "",
+    inventory_server_enabled: bool = False,
+    inventory_service_url: str = "",
+    inventory_service_token: str = "",
+    inventory_lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    inventory_batch_size: int = DEFAULT_INVENTORY_BATCH_SIZE,
+    inventory_interval_seconds: int = DEFAULT_INVENTORY_INTERVAL_SECONDS,
 ) -> web.Application:
     app = web.Application(
         client_max_size=16 * 1024, middlewares=[auth_middleware]
@@ -3319,9 +3379,11 @@ def create_app(
     app["db_file"] = _resolve_data_path(base_dir, db_file)
     app["inbox_config_file"] = _resolve_data_path(base_dir, inbox_config_file)
     app["region"] = region
-    app["inbox_sync_interval"] = max(15, inbox_sync_interval)
     app["inbox_background_last_sync"] = ""
     app["inbox_background_error"] = ""
+    app["inbox_on_demand_next_attempt"] = 0.0
+    app["inbox_on_demand_failures"] = 0
+    app["inbox_on_demand_retry_after"] = 0
     app["generate_lock"] = asyncio.Lock()
     app["delete_lock"] = asyncio.Lock()
     app["inbox_sync_lock"] = asyncio.Lock()
@@ -3329,6 +3391,12 @@ def create_app(
     app["card_link_lock"] = asyncio.Lock()
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
+    app["inventory_server_enabled"] = bool(inventory_server_enabled)
+    app["inventory_lease_seconds"] = max(1, int(inventory_lease_seconds))
+    app["inventory_client"] = RemoteRegistrationInventoryClient(
+        service_url=inventory_service_url,
+        token=inventory_service_token,
+    )
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
     browser_source = (
         Path(target_project_dir).resolve()
@@ -3347,18 +3415,10 @@ def create_app(
     app["card_link_bridge_file"] = Path(__file__).with_name(
         "openai_card_link_bridge.py"
     ).resolve()
-    app["verification_manager"] = AccountVerificationManager(
-        target_project_dir=browser_source,
-        db_file=app["db_file"],
-        python_executable=app["browser_manager"].python_executable,
-        code_service_url=browser_service_url,
-        code_service_token=app["local_token"],
-        browser_manager=app["browser_manager"],
-    )
     gpt_code_identity_cache: list[dict] = []
     gpt_code_identity_cache_at = 0.0
 
-    async def active_icloud_identities() -> list[dict]:
+    async def icloud_identities() -> list[dict]:
         cookie_path: Path = app["cookie_file"]
         if not cookie_path.exists() or cookie_path.stat().st_size == 0:
             raise RuntimeError("iCloud Cookie 尚未准备好")
@@ -3372,38 +3432,94 @@ def create_app(
         return [
             row
             for row in result.get("result", {}).get("hmeEmails", [])
-            if row.get("isActive") and row.get("hme") and row.get("anonymousId")
+            if row.get("hme") and row.get("anonymousId")
         ]
 
-    if app["db_file"].exists():
-        clear_generated_inventory_claims(app["db_file"])
+    async def active_icloud_identities() -> list[dict]:
+        return [row for row in await icloud_identities() if row.get("isActive")]
 
-    async def acquire_registration_inventory_email(_label: str) -> str:
-        return await asyncio.to_thread(
-            claim_generated_inventory_email, app["db_file"]
-        )
+    async def delete_invalid_icloud_email(email: str, _reason: str) -> str:
+        """Delete a confirmed-invalid alias and its local credentials."""
+        target = str(email or "").strip().lower()
+        async with app["delete_lock"]:
+            identities = await icloud_identities()
+            identity = next(
+                (
+                    item
+                    for item in identities
+                    if str(item.get("hme") or "").strip().lower() == target
+                ),
+                None,
+            )
+            if identity is None:
+                await asyncio.to_thread(
+                    _remove_deleted_email_records, app["db_file"], target
+                )
+                return "Apple 邮箱列表中已不存在，已清理本地账号凭据"
 
-    async def release_registration_inventory_email(email: str) -> None:
-        await asyncio.to_thread(
-            release_generated_inventory_email, app["db_file"], email
-        )
+            anonymous_id = str(identity.get("anonymousId") or "").strip()
+            cookie_path: Path = app["cookie_file"]
+            async with app["identity_lock"]:
+                async with RichHideMyEmail(
+                    cookie_file=str(cookie_path), region=app["region"]
+                ) as hme:
+                    if identity.get("isActive"):
+                        deactivated = await hme.deactivate_email(anonymous_id)
+                        if not deactivated or not deactivated.get("success"):
+                            raise RuntimeError(
+                                f"停用邮箱失败：{_error_reason(deactivated)}"
+                            )
+                    deleted = await hme.delete_email(anonymous_id)
+
+            await asyncio.to_thread(
+                _remove_deleted_email_records, app["db_file"], target
+            )
+            if not deleted or not deleted.get("success"):
+                return (
+                    "邮箱已停用并清理本地凭据，但 Apple 永久删除未完成："
+                    f"{_error_reason(deleted)}"
+                )
+            return "iCloud 邮箱及本地账号凭据已删除"
+
+    app["verification_manager"] = AccountVerificationManager(
+        target_project_dir=browser_source,
+        db_file=app["db_file"],
+        python_executable=app["browser_manager"].python_executable,
+        code_service_url=browser_service_url,
+        code_service_token=app["local_token"],
+        browser_manager=app["browser_manager"],
+        delete_invalid_email=delete_invalid_icloud_email,
+    )
+
+    async def acquire_registration_inventory_email(label: str) -> str:
+        # The remote inventory database cannot see account records saved on
+        # this workstation.  Drain and permanently consume any address that
+        # already has local registration history before returning a clean one
+        # to the browser workflow.
+        for _attempt in range(100):
+            email = await app["inventory_client"].acquire_email(label)
+            if not email:
+                return ""
+            record = await asyncio.to_thread(
+                load_account_record, app["db_file"], email
+            )
+            if not record:
+                return email
+            await app["inventory_client"].complete_email(
+                email,
+                True,
+                "本地已有 OpenAI 注册或尝试记录，已从远端库存永久去重",
+            )
+        raise RuntimeError("远端邮箱库存连续返回已有账号，已停止领取")
+
+    async def complete_registration_inventory_email(
+        email: str, success: bool, message: str
+    ) -> None:
+        await app["inventory_client"].complete_email(email, success, message)
 
     async def confirm_registration_email(email: str) -> None:
-        last_error = ""
-        for _ in range(20):
-            try:
-                identities = await active_icloud_identities()
-                if any(
-                    str(item.get("hme") or "").strip().lower() == email
-                    for item in identities
-                ):
-                    return
-            except RuntimeError as error:
-                last_error = str(error)
-            await asyncio.sleep(1.5)
-        if last_error:
-            raise RuntimeError(f"新邮箱列表同步失败：{last_error}")
-        raise RuntimeError("新邮箱在 30 秒内未出现在 iCloud 列表")
+        if not str(email or "").strip().lower().endswith("@icloud.com"):
+            raise RuntimeError("远端库存服务返回了无效的 iCloud 邮箱")
 
     async def save_registration_password(email: str, password: str) -> None:
         await asyncio.to_thread(
@@ -3419,7 +3535,7 @@ def create_app(
         acquire_email=acquire_registration_inventory_email,
         confirm_email=confirm_registration_email,
         save_password=save_registration_password,
-        release_email=release_registration_inventory_email,
+        complete_email=complete_registration_inventory_email,
     )
 
     async def generate_inventory_batch(label: str, count: int) -> dict:
@@ -3441,44 +3557,68 @@ def create_app(
                 db_file=str(app["db_file"]),
             )
 
-    app["scheduled_generation_manager"] = ScheduledGenerationManager(
-        db_file=app["db_file"],
-        generate_batch=generate_inventory_batch,
+    app["scheduled_generation_manager"] = (
+        ScheduledGenerationManager(
+            db_file=app["db_file"],
+            generate_batch=generate_inventory_batch,
+            batch_size=inventory_batch_size,
+            interval_seconds=inventory_interval_seconds,
+        )
+        if app["inventory_server_enabled"]
+        else None
     )
 
-    async def background_inbox_sync() -> None:
-        while True:
+    def reset_inbox_sync_backoff() -> None:
+        app["inbox_on_demand_next_attempt"] = 0.0
+        app["inbox_on_demand_failures"] = 0
+        app["inbox_on_demand_retry_after"] = 0
+        app["inbox_background_error"] = ""
+
+    async def sync_inbox_on_demand(limit: int, *, force: bool = False) -> list[dict]:
+        """Connect only for an active code request, with shared rate limiting."""
+
+        config_path: Path = app["inbox_config_file"]
+        if not config_path.exists():
+            raise FileNotFoundError("请先配置接收邮箱")
+
+        async with app["inbox_sync_lock"]:
+            now = time.monotonic()
+            if not force and now < app["inbox_on_demand_next_attempt"]:
+                if app["inbox_background_error"]:
+                    raise InboxSyncDeferredError(app["inbox_background_error"])
+                return []
+
+            config = load_config(str(config_path))
             try:
-                if app["browser_manager"].snapshot().get("running"):
-                    await asyncio.sleep(1)
-                    continue
-                config_path: Path = app["inbox_config_file"]
-                if config_path.exists():
-                    config = load_config(str(config_path))
-                    async with app["inbox_sync_lock"]:
-                        await asyncio.to_thread(
-                            sync_inbox, config, str(app["db_file"]), 100
-                        )
-                    app["inbox_background_last_sync"] = (
-                        datetime.now().astimezone().isoformat()
-                    )
-                    app["inbox_background_error"] = ""
-            except asyncio.CancelledError:
-                raise
+                inserted = await asyncio.to_thread(
+                    sync_inbox, config, str(app["db_file"]), limit
+                )
             except Exception as error:
-                app["inbox_background_error"] = _inbox_error_message(error)
-            await asyncio.sleep(app["inbox_sync_interval"])
+                public_message = _inbox_error_message(error)
+                failures = app["inbox_on_demand_failures"] + 1
+                base_delay = (
+                    ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS
+                    if "IMAP 登录失败" in public_message
+                    else ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS
+                )
+                delay = min(
+                    ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS,
+                    base_delay * (2 ** min(failures - 1, 6)),
+                )
+                app["inbox_on_demand_failures"] = failures
+                app["inbox_on_demand_retry_after"] = delay
+                app["inbox_on_demand_next_attempt"] = time.monotonic() + delay
+                app["inbox_background_error"] = public_message
+                raise
 
-    async def background_inbox_context(_: web.Application):
-        task = asyncio.create_task(background_inbox_sync())
-        try:
-            yield
-        finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-
-    app.cleanup_ctx.append(background_inbox_context)
+            reset_inbox_sync_backoff()
+            app["inbox_on_demand_next_attempt"] = (
+                time.monotonic() + ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS
+            )
+            app["inbox_background_last_sync"] = (
+                datetime.now().astimezone().isoformat()
+            )
+            return inserted
 
     async def browser_manager_context(_: web.Application):
         try:
@@ -3504,14 +3644,30 @@ def create_app(
 
     app.cleanup_ctx.append(registration_manager_context)
 
-    async def scheduled_generation_context(_: web.Application):
-        await app["scheduled_generation_manager"].start()
-        try:
-            yield
-        finally:
-            await app["scheduled_generation_manager"].close()
+    if app["inventory_server_enabled"]:
+        async def scheduled_generation_context(_: web.Application):
+            await app["scheduled_generation_manager"].start()
+            try:
+                yield
+            finally:
+                await app["scheduled_generation_manager"].close()
 
-    app.cleanup_ctx.append(scheduled_generation_context)
+        async def inventory_lease_cleanup_context(_: web.Application):
+            async def cleanup_loop() -> None:
+                while True:
+                    await asyncio.to_thread(expire_inventory_leases, app["db_file"])
+                    await asyncio.sleep(30)
+
+            task = asyncio.create_task(cleanup_loop())
+            try:
+                yield
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        app.cleanup_ctx.append(scheduled_generation_context)
+        app.cleanup_ctx.append(inventory_lease_cleanup_context)
 
     async def login_page(request: web.Request) -> web.Response:
         if not app["web_password"] or _session_valid(request):
@@ -3670,12 +3826,12 @@ def create_app(
         )
 
     async def gpt_emails(_: web.Request) -> web.Response:
+        identity_warning = ""
         try:
             identities = await active_icloud_identities()
         except RuntimeError as error:
-            return web.json_response(
-                {"ok": False, "error": str(error)}, status=502
-            )
+            identities = []
+            identity_warning = str(error)
         items = await asyncio.to_thread(
             _browser_email_items, app["db_file"], identities
         )
@@ -3683,6 +3839,7 @@ def create_app(
             {
                 "ok": True,
                 "items": items,
+                "identityWarning": identity_warning,
                 "updatedAt": datetime.now().astimezone().isoformat(),
             },
             headers={"Cache-Control": "no-store"},
@@ -3908,9 +4065,8 @@ def create_app(
             app["verification_manager"].snapshot(),
         )
 
-        # The background inbox task normally has the newest message already.
-        # Check the local database first so the workbench button responds without
-        # waiting for another IMAP round trip when possible.
+        # Read the database first.  IMAP is opened only when an active code
+        # request cannot be satisfied from messages already stored locally.
         item = await asyncio.to_thread(
             _latest_gpt_code,
             app["db_file"],
@@ -3923,11 +4079,7 @@ def create_app(
             return item, "", 200
 
         try:
-            config = load_config(str(config_path))
-            async with app["inbox_sync_lock"]:
-                await asyncio.to_thread(
-                    sync_inbox, config, str(app["db_file"]), 30
-                )
+            await sync_inbox_on_demand(30)
         except Exception as error:
             return None, _inbox_error_message(error), 502
         if (
@@ -4032,11 +4184,7 @@ def create_app(
                 {"ok": False, "error": "iCloud 收件箱尚未配置"}, status=503
             )
         try:
-            config = load_config(str(config_path))
-            async with app["inbox_sync_lock"]:
-                await asyncio.to_thread(
-                    sync_inbox, config, str(app["db_file"]), 100
-                )
+            await sync_inbox_on_demand(100)
         except Exception as error:
             return web.json_response(
                 {"ok": False, "error": _inbox_error_message(error)}, status=502
@@ -4277,27 +4425,73 @@ def create_app(
                 {"ok": False, "error": "邮箱标签长度必须是 1–100 个字符"},
                 status=400,
             )
-        concurrency = payload.get("concurrency", 3)
+        email = str(payload.get("email") or "").strip().lower()
         if (
-            isinstance(concurrency, bool)
-            or not isinstance(concurrency, int)
-            or not 1 <= concurrency <= 10
+            not email
+            or len(email) > 254
+            or email.count("@") != 1
+            or any(character.isspace() for character in email)
+            or "." not in email.rsplit("@", 1)[1]
         ):
             return web.json_response(
-                {"ok": False, "error": "并发数必须是 1–10 的整数"},
+                {"ok": False, "error": "请输入有效的注册邮箱地址"},
                 status=400,
             )
         try:
             task = app["registration_manager"].start(
                 label=label,
                 headless=bool(payload.get("headless", False)),
-                concurrency=concurrency,
+                concurrency=1,
+                email=email,
             )
         except RuntimeError as error:
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
             )
         return web.json_response({"ok": True, "started": True, "task": task})
+
+    async def registration_code_submit(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+            task = app["registration_manager"].submit_verification_code(
+                str(payload.get("email") or ""),
+                str(payload.get("code") or ""),
+            )
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        except RuntimeError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=409)
+        return web.json_response({"ok": True, "task": task})
+
+    async def registration_code_poll(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+            code = app["registration_manager"].poll_verification_code(
+                str(payload.get("email") or "")
+            )
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        except RuntimeError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=409)
+        if not code:
+            return web.json_response(
+                {"ok": False, "error": "等待手动输入验证码"}, status=404
+            )
+        return web.json_response({"ok": True, "code": code})
 
     async def registration_stop(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
@@ -4414,6 +4608,7 @@ def create_app(
             load_account_record, app["db_file"], email
         )
         reset_password = bool(payload.get("reset_password", False))
+        refresh_with_cookie = bool(payload.get("refresh_with_cookie", False))
         session = account_session(record)
         access_token = account_session_access_token(record)
         saved_two_factor = (
@@ -4421,6 +4616,32 @@ def create_app(
             if isinstance(record.get("two_factor"), dict)
             else {}
         )
+        if refresh_with_cookie and not reset_password:
+            if not account_saved_cookies(record):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "该账号尚未保存 Cookie，请先重新登录或注册获取 Cookie",
+                    },
+                    status=409,
+                )
+            try:
+                task = app["verification_manager"].start_with_browser(
+                    emails=[email], concurrency=1, force_refresh=True
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "started": True,
+                    "mode": "refresh_cookie",
+                    "message": "正在使用保存的 Cookie 重新获取 Session 与账号状态",
+                    "task": task,
+                }
+            )
         if (
             not reset_password
             and session
@@ -4453,12 +4674,32 @@ def create_app(
         identity_emails = {
             str(item.get("hme") or "").strip().lower() for item in identities
         }
-        identity_emails -= await asyncio.to_thread(
-            removed_account_emails, app["db_file"]
-        )
         if email not in identity_emails:
+            try:
+                deletion_message = await delete_invalid_icloud_email(
+                    email, "Apple 活动邮箱列表中未找到该地址"
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": f"该 iCloud 邮箱无效或已停用；自动删除失败：{error}",
+                    },
+                    status=502,
+                )
+            detail = f"Apple 活动邮箱列表中未找到该地址；{deletion_message}"
+            task = app["verification_manager"].record_invalid_email_deleted(
+                email, detail
+            )
             return web.json_response(
-                {"ok": False, "error": "该 iCloud 邮箱无效或已停用"}, status=400
+                {
+                    "ok": True,
+                    "started": False,
+                    "deleted": True,
+                    "mode": "deleted_invalid",
+                    "message": detail,
+                    "task": task,
+                }
             )
         if not reset_password:
             try:
@@ -4696,20 +4937,32 @@ def create_app(
         return web.json_response({"ok": True, "emails": list(emails)})
 
     async def scheduled_generation_status(_: web.Request) -> web.Response:
-        await app["scheduled_generation_manager"].initialize()
-        inventory_available = await asyncio.to_thread(
-            available_generated_inventory_count, app["db_file"]
+        manager = app.get("scheduled_generation_manager")
+        if manager is None:
+            return web.json_response(
+                {"ok": False, "error": "定时生成已迁移到远端库存服务"},
+                status=404,
+            )
+        await manager.initialize()
+        inventory = await asyncio.to_thread(
+            stored_registration_inventory_status, app["db_file"]
         )
         return web.json_response(
             {
                 "ok": True,
-                **app["scheduled_generation_manager"].snapshot(),
-                "inventoryAvailable": inventory_available,
+                **manager.snapshot(),
+                "inventoryAvailable": inventory["available"],
             },
             headers={"Cache-Control": "no-store"},
         )
 
     async def scheduled_generation_config(request: web.Request) -> web.Response:
+        manager = app.get("scheduled_generation_manager")
+        if manager is None:
+            return web.json_response(
+                {"ok": False, "error": "定时生成已迁移到远端库存服务"},
+                status=404,
+            )
         if not _local_token_valid(request, app):
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
@@ -4725,15 +4978,124 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "enabled 必须是布尔值"}, status=400
             )
-        state = await app["scheduled_generation_manager"].configure(
-            enabled=enabled
-        )
+        state = await manager.configure(enabled=enabled)
         inventory_available = await asyncio.to_thread(
             available_generated_inventory_count, app["db_file"]
         )
         return web.json_response(
             {"ok": True, **state, "inventoryAvailable": inventory_available}
         )
+
+    async def registration_inventory_client_status(_: web.Request) -> web.Response:
+        client = app["inventory_client"]
+        if not client.configured:
+            return web.json_response(
+                {
+                    "ok": True,
+                    "configured": False,
+                    "available": 0,
+                    "error": "远端邮箱库存服务未配置",
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            state = await client.status()
+        except RuntimeError as error:
+            return web.json_response(
+                {
+                    "ok": True,
+                    "configured": True,
+                    "available": 0,
+                    "error": str(error),
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+        return web.json_response(
+            {"configured": True, **state}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def integration_inventory_status(_: web.Request) -> web.Response:
+        if not app["inventory_server_enabled"]:
+            raise web.HTTPNotFound()
+        inventory = await asyncio.to_thread(
+            stored_registration_inventory_status, app["db_file"]
+        )
+        manager = app.get("scheduled_generation_manager")
+        if manager is not None:
+            await manager.initialize()
+        return web.json_response(
+            {
+                "ok": True,
+                **inventory,
+                "scheduledGeneration": manager.snapshot() if manager else None,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def integration_inventory_lease(request: web.Request) -> web.Response:
+        if not app["inventory_server_enabled"]:
+            raise web.HTTPNotFound()
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        client_id = str(payload.get("clientId") or "").strip()
+        label = str(payload.get("label") or "").strip()
+        if len(client_id) > 200 or len(label) > 200:
+            return web.json_response(
+                {"ok": False, "error": "clientId 或 label 过长"}, status=400
+            )
+        lease = await asyncio.to_thread(
+            lease_generated_inventory_email,
+            app["db_file"],
+            client_id=client_id,
+            label=label,
+            lease_seconds=app["inventory_lease_seconds"],
+        )
+        if not lease:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "inventory_empty",
+                    "error": "远端邮箱库存不足",
+                },
+                status=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        return web.json_response(
+            {"ok": True, "lease": lease}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def integration_inventory_result(request: web.Request) -> web.Response:
+        if not app["inventory_server_enabled"]:
+            raise web.HTTPNotFound()
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        if not isinstance(payload.get("success"), bool):
+            return web.json_response(
+                {"ok": False, "error": "success 必须是布尔值"}, status=400
+            )
+        try:
+            result = await asyncio.to_thread(
+                complete_generated_inventory_lease,
+                app["db_file"],
+                lease_id=str(payload.get("leaseId") or ""),
+                email=str(payload.get("email") or ""),
+                success=payload["success"],
+                message=str(payload.get("message") or ""),
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        if not result.get("ok"):
+            status = 404 if result.get("status") == "not_found" else 409
+            return web.json_response(result, status=status)
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
 
     async def registration_proxy_status(_: web.Request) -> web.Response:
         state = await asyncio.to_thread(
@@ -4816,9 +5178,11 @@ def create_app(
                 "folder": config.folder,
                 "useSsl": config.use_ssl,
                 "codeCount": code_count,
-                "backgroundInterval": app["inbox_sync_interval"],
+                "syncMode": "on-demand",
+                "backgroundInterval": 0,
                 "lastBackgroundSync": app["inbox_background_last_sync"],
                 "backgroundError": app["inbox_background_error"],
+                "retryAfterSeconds": app["inbox_on_demand_retry_after"],
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -4874,6 +5238,8 @@ def create_app(
                 {"ok": False, "error": _inbox_error_message(error)}, status=502
             )
         save_config(config, str(config_path))
+        reset_inbox_sync_backoff()
+        app["inbox_background_last_sync"] = datetime.now().astimezone().isoformat()
         return web.json_response({"ok": True, "message": "IMAP 登录成功，配置已保存在本机"})
 
     async def inbox_codes(request: web.Request) -> web.Response:
@@ -4902,11 +5268,7 @@ def create_app(
         if not config_path.exists():
             return web.json_response({"ok": False, "error": "请先配置接收邮箱"}, status=400)
         try:
-            config = load_config(str(config_path))
-            async with app["inbox_sync_lock"]:
-                inserted = await asyncio.to_thread(
-                    sync_inbox, config, str(app["db_file"]), limit
-                )
+            inserted = await sync_inbox_on_demand(limit, force=True)
         except Exception as error:
             return web.json_response(
                 {"ok": False, "error": _inbox_error_message(error)}, status=502
@@ -4939,7 +5301,15 @@ def create_app(
     app.router.add_post("/api/browser/stop", browser_stop)
     app.router.add_get("/api/registration/status", registration_status)
     app.router.add_post("/api/registration/start", registration_start)
+    app.router.add_post("/api/registration/code", registration_code_submit)
+    app.router.add_post("/api/registration/code/poll", registration_code_poll)
     app.router.add_post("/api/registration/stop", registration_stop)
+    app.router.add_get(
+        "/api/registration-inventory/status", registration_inventory_client_status
+    )
+    app.router.add_get(INVENTORY_STATUS_PATH, integration_inventory_status)
+    app.router.add_post(INVENTORY_LEASE_PATH, integration_inventory_lease)
+    app.router.add_post(INVENTORY_RESULT_PATH, integration_inventory_result)
     app.router.add_get(
         "/api/scheduled-generation/status", scheduled_generation_status
     )
@@ -4970,9 +5340,6 @@ async def run_server(args: argparse.Namespace) -> None:
         inbox_config_file=args.inbox_config_file,
         region=args.region,
         web_password=os.environ.get("HIDEMYEMAIL_WEB_PASSWORD", ""),
-        inbox_sync_interval=int(
-            os.environ.get("HIDEMYEMAIL_INBOX_SYNC_INTERVAL", "30")
-        ),
         target_project_dir=os.environ.get("OPENAI_REGISTER_PROJECT_DIR", ""),
         target_python=os.environ.get("OPENAI_REGISTER_PYTHON", ""),
         browser_service_url=os.environ.get(
@@ -4985,6 +5352,30 @@ async def run_server(args: argparse.Namespace) -> None:
         in {"1", "true", "yes", "on"},
         workbench_url=os.environ.get("ACCOUNT_WORKBENCH_URL", ""),
         workbench_import_token=_configured_workbench_import_token(),
+        inventory_server_enabled=os.environ.get(
+            "HIDEMYEMAIL_INVENTORY_SERVER", ""
+        ).strip().lower()
+        in {"1", "true", "yes", "on"},
+        inventory_service_url=os.environ.get("HIDEMYEMAIL_INVENTORY_URL", ""),
+        inventory_service_token=_configured_inventory_service_token(),
+        inventory_lease_seconds=int(
+            os.environ.get(
+                "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
+                str(DEFAULT_LEASE_SECONDS),
+            )
+        ),
+        inventory_batch_size=int(
+            os.environ.get(
+                "HIDEMYEMAIL_INVENTORY_BATCH_SIZE",
+                str(DEFAULT_INVENTORY_BATCH_SIZE),
+            )
+        ),
+        inventory_interval_seconds=int(
+            os.environ.get(
+                "HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS",
+                str(DEFAULT_INVENTORY_INTERVAL_SECONDS),
+            )
+        ),
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -5023,6 +5414,12 @@ def _load_local_env_file(path: Path) -> None:
         "ACCOUNT_WORKBENCH_URL",
         "ACCOUNT_WORKBENCH_IMPORT_TOKEN",
         "HIDEMYEMAIL_WEB_PASSWORD",
+        "HIDEMYEMAIL_INVENTORY_SERVER",
+        "HIDEMYEMAIL_INVENTORY_URL",
+        "HIDEMYEMAIL_INVENTORY_TOKEN",
+        "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
+        "HIDEMYEMAIL_INVENTORY_BATCH_SIZE",
+        "HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS",
     }
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -5043,12 +5440,19 @@ def _load_local_env_file(path: Path) -> None:
 
 
 def _configured_workbench_import_token() -> str:
-    """Use the token checked by the workbench when both aliases are present."""
-    return str(
-        os.environ.get("HME_IMPORT_TOKEN")
-        or os.environ.get("ACCOUNT_WORKBENCH_IMPORT_TOKEN")
-        or ""
-    ).strip()
+    """Return the dedicated local workbench token.
+
+    ``HME_IMPORT_TOKEN`` belongs to the workbench/remote-code-server side and
+    is intentionally ignored here.  Reading it from the Windows user
+    environment used to let a remote-service credential silently shadow the
+    local ``.env`` value and caused intermittent import authentication errors.
+    """
+    return str(os.environ.get("ACCOUNT_WORKBENCH_IMPORT_TOKEN") or "").strip()
+
+
+def _configured_inventory_service_token() -> str:
+    """Return only the credential dedicated to the remote inventory client."""
+    return str(os.environ.get("HIDEMYEMAIL_INVENTORY_TOKEN") or "").strip()
 
 
 def main() -> None:
