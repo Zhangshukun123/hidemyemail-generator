@@ -18,6 +18,7 @@ from hidemyemail_generator.webapp import (
     _match_relay_identity,
     _save_account_card_link,
     _workbench_import_payload,
+    _valid_supported_account_email,
 )
 
 
@@ -256,6 +257,12 @@ class GptEmailTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_workbench_import_accepts_supported_account_email_providers(self):
+        self.assertTrue(_valid_supported_account_email("one@icloud.com"))
+        self.assertTrue(_valid_supported_account_email("one@gmail.com"))
+        self.assertFalse(_valid_supported_account_email("not-an-email"))
+        self.assertFalse(_valid_supported_account_email("one@outlook.com"))
 
     def test_workbench_import_omits_unconfirmed_credentials(self):
         payload = _workbench_import_payload(

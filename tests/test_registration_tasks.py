@@ -169,7 +169,10 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, [("save", "manual.user@qq.com")])
         self.assertEqual(browser.start_options["concurrency"], 1)
+        self.assertFalse(browser.start_options["headless"])
         self.assertEqual(browser.started_accounts[0]["email"], "manual.user@qq.com")
+        self.assertTrue(browser.started_accounts[0]["manual_otp_entry"])
+        self.assertTrue(browser.started_accounts[0]["foreground_required"])
 
     async def test_manual_verification_code_wait_and_submit_lifecycle(self):
         manager = RegistrationTaskManager(
@@ -189,6 +192,79 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         manager.submit_verification_code("manual@qq.com", " 12 34 56 ")
         self.assertEqual(manager.poll_verification_code("manual@qq.com"), "123456")
         self.assertFalse(manager.snapshot()["awaitingCode"])
+
+    async def test_smsbower_provider_acquires_gmail_and_reports_completion(self):
+        browser = FakeBrowserManager()
+        events = []
+
+        async def acquire_provider(label):
+            events.append(("acquire_provider", label))
+            return "api.gmail@gmail.com"
+
+        async def poll_provider(email):
+            events.append(("poll_provider", email))
+            return "654321"
+
+        async def complete_provider(email, success, message):
+            events.append(("complete_provider", email, success, message))
+
+        async def acquire_inventory(_label):
+            raise AssertionError("SMSBower flow must not use iCloud inventory")
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=acquire_inventory,
+            confirm_email=lambda _email: None,
+            acquire_provider_email=acquire_provider,
+            poll_provider_code=poll_provider,
+            complete_provider_email=complete_provider,
+        )
+        state = manager.start(
+            label="SMSBower Gmail 注册",
+            provider="smsbower",
+            headless=True,
+            concurrency=8,
+        )
+        self.assertEqual(state["provider"], "smsbower")
+        self.assertEqual(state["requested"], 1)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["email"], "api.gmail@gmail.com")
+        self.assertEqual(events[0], ("acquire_provider", "SMSBower Gmail 注册"))
+        self.assertEqual(events[-1][0:3], ("complete_provider", "api.gmail@gmail.com", True))
+        self.assertEqual(browser.started_accounts[0]["email"], "api.gmail@gmail.com")
+        self.assertTrue(
+            browser.started_accounts[0]["password_first_required"]
+        )
+        self.assertTrue(browser.started_accounts[0]["foreground_required"])
+        self.assertFalse(browser.start_options["headless"])
+
+    async def test_smsbower_provider_poll_returns_code_without_manual_input(self):
+        async def poll_provider(email):
+            self.assertEqual(email, "auto.code@gmail.com")
+            return "246810"
+
+        manager = RegistrationTaskManager(
+            browser_manager=FakeBrowserManager(),
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            poll_provider_code=poll_provider,
+        )
+        manager._state.update(
+            running=True,
+            status="running",
+            provider="smsbower",
+            email="auto.code@gmail.com",
+            emails=["auto.code@gmail.com"],
+        )
+
+        code = await manager.poll_verification_code_async("auto.code@gmail.com")
+
+        self.assertEqual(code, "246810")
+        self.assertFalse(manager.snapshot()["awaitingCode"])
+        self.assertIn("SMSBower 已返回验证码", manager.snapshot()["message"])
 
     async def test_skips_two_factor_when_password_was_not_confirmed(self):
         browser = FakeBrowserManager(

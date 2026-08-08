@@ -23,6 +23,7 @@ from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.openai_browser_bridge import (
     ADD_PASSWORD_SELECTORS,
     PROFILE_MENU_STRICT_SELECTORS,
+    _activate_visible_registration_page,
     _click_add_password,
     _click_password_add_by_geometry,
     _click_profile_name_by_dom,
@@ -34,9 +35,12 @@ from hidemyemail_generator.openai_browser_bridge import (
     _mfa_token_was_invalidated,
     _open_settings_from_profile,
     configure_password_first_login,
+    configure_email_password_only_registration,
+    configure_manual_browser_verification,
     configure_resilient_about_you_input,
     configure_direct_registration_browser,
     configure_post_registration_password_setup,
+    configure_registration_otp_reader,
     configure_registration_profile_capture,
     configure_resilient_registration_navigation,
     configure_windowed_camoufox,
@@ -60,6 +64,328 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_gmail_registration_submits_email_without_google_oauth(self):
+        events = []
+
+        class Route:
+            def abort(self):
+                events.append("abort-google")
+
+        class Context:
+            def __init__(self):
+                self.routes = []
+
+            def route(self, pattern, handler):
+                self.routes.append((pattern, handler))
+
+        class EmailInput:
+            def fill(self, value):
+                events.append(("fill", value))
+
+            def press(self, key, **_kwargs):
+                events.append(("press", key))
+
+        class Page:
+            url = "https://auth.openai.com/log-in-or-create-account"
+
+            def bring_to_front(self):
+                return None
+
+            def evaluate(self, _script):
+                return None
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Worker:
+            headless = False
+
+            def __init__(self):
+                self.account = SimpleNamespace(email="password.only@gmail.com")
+                self.logs = []
+                self.original_register_calls = 0
+                self.original_fill_calls = 0
+
+            def _register(self, _page, _context):
+                self.original_register_calls += 1
+                return "registered"
+
+            def _fill_email_if_visible(self, _page):
+                self.original_fill_calls += 1
+                return False
+
+            def _visible_inputs(self, _page, _selectors):
+                return [EmailInput()]
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        page = Page()
+        context = Context()
+        self.assertTrue(
+            configure_email_password_only_registration(worker, enabled=True)
+        )
+        self.assertEqual(worker._register(page, context), "registered")
+        self.assertTrue(worker._fill_email_if_visible(page))
+
+        self.assertEqual(worker.original_register_calls, 1)
+        self.assertEqual(worker.original_fill_calls, 0)
+        self.assertEqual(
+            events,
+            [("fill", "password.only@gmail.com"), ("press", "Enter")],
+        )
+        self.assertEqual(len(context.routes), 2)
+        context.routes[0][1](Route())
+        self.assertEqual(events[-1], "abort-google")
+        self.assertIn("未点击 Google 登录按钮", worker.logs[-1])
+
+    def test_gmail_registration_returns_from_google_account_page(self):
+        events = []
+
+        class Page:
+            url = "https://accounts.google.com/v3/signin/identifier"
+
+            def go_back(self, **_kwargs):
+                events.append("back")
+                self.url = "https://auth.openai.com/log-in-or-create-account"
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="password.only@gmail.com")
+                self.logs = []
+
+            def _register(self, _page, _context):
+                return None
+
+            def _fill_email_if_visible(self, _page):
+                raise AssertionError("must not fill the Google account form")
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        self.assertTrue(
+            configure_email_password_only_registration(worker, enabled=True)
+        )
+        self.assertFalse(worker._fill_email_if_visible(Page()))
+        self.assertEqual(events, ["back"])
+        self.assertIn("已阻止 Google 账号登录页面", worker.logs[-1])
+
+    def test_visible_registration_input_uses_one_shot_window_focus(self):
+        events = []
+
+        class Page:
+            def bring_to_front(self):
+                events.append("page")
+
+            def evaluate(self, _script):
+                events.append("dom")
+
+        worker = SimpleNamespace(headless=False, log=lambda _message: None)
+        with patch(
+            "hidemyemail_generator.openai_browser_bridge._focus_camoufox_window_once",
+            return_value=True,
+        ) as focus_window:
+            self.assertTrue(_activate_visible_registration_page(worker, Page()))
+
+        self.assertEqual(events, ["page", "dom"])
+        focus_window.assert_called_once_with()
+
+    def test_smsbower_gmail_uses_local_registration_code_reader(self):
+        events = []
+
+        class Reader:
+            def __init__(self, account, log, proxy_url):
+                events.append(("reader", account.email, proxy_url))
+
+            def connect(self):
+                events.append(("connect",))
+
+            def wait_for_code(self, min_timestamp):
+                events.append(("wait", min_timestamp))
+                return "654321"
+
+        class Worker:
+            def __init__(self, email):
+                self.account = SimpleNamespace(email=email)
+                self.otp_reader = None
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                events.append(("original-preconnect", self.account.email))
+
+            def _wait_for_openai_email_code(self, min_timestamp):
+                events.append(("original-wait", min_timestamp))
+                return "original"
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "Bought@gmail.com")
+        )
+
+        gmail_worker = Worker("bought@gmail.com")
+        gmail_worker._preconnect_otp_reader()
+        self.assertEqual(
+            gmail_worker._wait_for_openai_email_code(123.0),
+            "654321",
+        )
+        self.assertEqual(
+            events,
+            [
+                ("reader", "bought@gmail.com", ""),
+                ("connect",),
+                ("wait", 123.0),
+            ],
+        )
+        self.assertIn("SMSBower API 自动取码", gmail_worker.logs[0])
+
+        icloud_worker = Worker("stock@icloud.com")
+        icloud_worker._preconnect_otp_reader()
+        self.assertEqual(
+            icloud_worker._wait_for_openai_email_code(456.0),
+            "original",
+        )
+        self.assertEqual(
+            events[-2:],
+            [
+                ("original-preconnect", "stock@icloud.com"),
+                ("original-wait", 456.0),
+            ],
+        )
+
+    def test_smsbower_backend_code_fills_japanese_code_field(self):
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                pass
+
+            def connect(self):
+                return None
+
+            def wait_for_code(self, _min_timestamp):
+                return "654321"
+
+        class Field:
+            def __init__(self):
+                self.value = ""
+
+            def fill(self, value):
+                self.value = value
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="bought@gmail.com")
+                self.otp_reader = None
+                self.field = Field()
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "original"
+
+            def _visible_inputs(self, _page, selectors):
+                if 'input[id="code"]' in selectors:
+                    return [self.field]
+                return []
+
+            def _submit_email_code(
+                self, page, min_timestamp, *, wait_for_session=True
+            ):
+                del wait_for_session
+                code = self._wait_for_openai_email_code(min_timestamp)
+                inputs = self._visible_inputs(
+                    page,
+                    [
+                        'input[autocomplete="one-time-code"]',
+                        'input[inputmode="numeric"]',
+                        'input[type="tel"]',
+                        'input[name="code"]',
+                    ],
+                )
+                if not inputs:
+                    raise RuntimeError("本地化 Code 输入框未识别")
+                inputs[0].fill(code)
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "bought@gmail.com")
+        )
+
+        worker = Worker()
+        worker._submit_email_code(object(), 0)
+
+        self.assertEqual(worker.field.value, "654321")
+        self.assertIn("已识别本地化 Code 输入框", worker.logs[-1])
+
+    def test_manual_email_waits_for_browser_submission_without_code_reader(self):
+        events = []
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def bring_to_front(self):
+                events.append("front")
+
+            def evaluate(self, _script):
+                events.append("focus")
+
+        class Worker:
+            headless = False
+            otp_reader = object()
+
+            def __init__(self):
+                self.logs = []
+                self.otp_states = [True, False]
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                events.append("original-preconnect")
+
+            def _submit_email_code(self, *_args, **_kwargs):
+                events.append("original-submit")
+
+            def _raise_if_page_closed(self, _page, _action):
+                return None
+
+            def _has_chatgpt_session(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                return self.otp_states.pop(0)
+
+        worker = Worker()
+        self.assertTrue(configure_manual_browser_verification(worker, enabled=True))
+
+        with patch(
+            "hidemyemail_generator.openai_browser_bridge.time.sleep",
+            return_value=None,
+        ):
+            worker._preconnect_otp_reader()
+            worker._submit_email_code(Page(), 0)
+
+        self.assertIsNone(worker.otp_reader)
+        self.assertNotIn("original-preconnect", events)
+        self.assertNotIn("original-submit", events)
+        self.assertIn("front", events)
+        self.assertTrue(any("不连接 IMAP" in item for item in worker.logs))
+        self.assertTrue(any("继续完成后续注册操作" in item for item in worker.logs))
+
     def test_registration_proxy_country_must_match_detected_exit(self):
         self.assertEqual(
             require_registration_proxy_country(SimpleNamespace(country="NL"), "NL"),
@@ -227,12 +553,14 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         worker = Worker()
         page = Page()
-        self.assertTrue(configure_password_first_login(worker, enabled=True))
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
         worker._continue_chatgpt_registration_complete(page)
         worker._fill_password_step(page)
 
         self.assertEqual(actions, ["password"])
-        self.assertEqual(worker.continue_calls, 1)
+        self.assertEqual(worker.continue_calls, 0)
         self.assertEqual(worker.original_calls, 1)
         self.assertTrue(worker._password_step_submitted)
         self.assertIn("唯一密码", worker.logs[-1])
@@ -241,6 +569,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
         worker._continue_chatgpt_registration_complete(page)
         self.assertTrue(worker._has_otp_input(page))
         self.assertEqual(actions, ["password"])
+        self.assertEqual(worker.continue_calls, 1)
 
     def test_email_code_page_without_password_option_uses_email_code(self):
         class Collection:
@@ -271,6 +600,93 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(configure_password_first_login(worker, enabled=True))
         self.assertTrue(worker._has_otp_input(Page()))
         self.assertIn("继续读取邮箱验证码", worker.logs[-1])
+
+    def test_required_password_first_never_falls_back_to_email_code(self):
+        class Collection:
+            def count(self):
+                return 0
+
+            def nth(self, _index):
+                raise IndexError
+
+        class Page:
+            def locator(self, _selector):
+                return Collection()
+
+        class Worker:
+            headless = False
+
+            def __init__(self):
+                self.continue_calls = 0
+                self.logs = []
+
+            def _continue_chatgpt_registration_complete(self, _page):
+                self.continue_calls += 1
+                return False
+
+            def _has_otp_input(self, _page):
+                return True
+
+            def _fill_password_step(self, _page):
+                raise AssertionError("password form was not reached")
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
+        with self.assertRaisesRegex(RuntimeError, "必须先选择使用密码继续"):
+            worker._continue_chatgpt_registration_complete(Page())
+        self.assertEqual(worker.continue_calls, 0)
+
+    def test_submitted_password_marker_allows_follow_up_email_code(self):
+        class Collection:
+            def count(self):
+                return 0
+
+            def nth(self, _index):
+                raise IndexError
+
+        class Page:
+            def locator(self, _selector):
+                return Collection()
+
+        class Worker:
+            headless = False
+
+            def __init__(self):
+                self.continue_calls = 0
+                self.logs = []
+
+            def _continue_chatgpt_registration_complete(self, _page):
+                self.continue_calls += 1
+                return True
+
+            def _has_otp_input(self, _page):
+                return True
+
+            def _fill_password_step(self, _page):
+                return None
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
+        # The upstream worker may rebuild its auth-page state after password
+        # submission.  The durable submission marker must still authorize the
+        # follow-up Gmail verification-code page.
+        worker._hme_password_entry_selected = False
+        worker._hme_password_entry_pending = False
+        worker._password_step_submitted = True
+
+        self.assertTrue(worker._continue_chatgpt_registration_complete(Page()))
+        self.assertTrue(worker._has_otp_input(Page()))
+        self.assertEqual(worker.continue_calls, 1)
 
     def test_registration_profile_name_is_captured_for_account_menu(self):
         backend = SimpleNamespace(
@@ -817,6 +1233,42 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertEqual(json.loads(record["cookies_json"]), cookies)
         self.assertEqual(account_saved_cookies(record), cookies)
 
+    def test_session_token_is_persisted_as_cookie_without_browser_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            _save_account_record(
+                db_file,
+                "gmail-cookie@gmail.com",
+                result={
+                    "access_token": "at-session-cookie",
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": "at-session-cookie",
+                            "sessionToken": "saved-session-cookie",
+                            "user": {"email": "gmail-cookie@gmail.com"},
+                        }
+                    ),
+                },
+            )
+
+            record = load_account_record(db_file, "gmail-cookie@gmail.com")
+            cookies = account_saved_cookies(record)
+            storage_state = load_saved_storage_state(
+                str(db_file), "gmail-cookie@gmail.com"
+            )
+
+        self.assertEqual(len(cookies), 1)
+        self.assertEqual(cookies[0]["name"], "__Secure-next-auth.session-token")
+        self.assertEqual(cookies[0]["value"], "saved-session-cookie")
+        self.assertTrue(cookies[0]["httpOnly"])
+        self.assertTrue(cookies[0]["secure"])
+        self.assertEqual(json.loads(record["cookies_json"]), cookies)
+        self.assertEqual(
+            json.loads(record["storage_state_json"])["cookies"],
+            cookies,
+        )
+        self.assertEqual(storage_state["cookies"], cookies)
+
     def test_saved_storage_state_falls_back_to_legacy_cookie_fields(self):
         cookies = [
             {
@@ -878,14 +1330,32 @@ class BrowserTaskHelperTests(unittest.TestCase):
             ]
         )
 
+        foreground_backend = SimpleNamespace(CamoufoxNewBrowser=original)
+        with (
+            patch.dict(
+                os.environ,
+                {"HME_BROWSER_FOREGROUND_REQUIRED": "1"},
+            ),
+            patch(
+                "hidemyemail_generator.openai_browser_bridge._move_camoufox_window"
+            ) as move_window,
+        ):
+            self.assertTrue(configure_windowed_camoufox(foreground_backend))
+            foreground_backend.CamoufoxNewBrowser("playwright", headless=False)
+            for _ in range(20):
+                if move_window.called:
+                    break
+                time.sleep(0.01)
+            move_window.assert_called_once()
+
         backend.CamoufoxNewBrowser(
             "playwright",
             window=(1024, 700),
             firefox_user_prefs={"browser.cache.disk.enable": False},
         )
-        self.assertEqual(calls[1][2]["window"], (1024, 700))
+        self.assertEqual(calls[-1][2]["window"], (1024, 700))
         self.assertFalse(
-            calls[1][2]["firefox_user_prefs"]["browser.cache.disk.enable"]
+            calls[-1][2]["firefox_user_prefs"]["browser.cache.disk.enable"]
         )
 
         proxy_calls = []
@@ -1857,6 +2327,121 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_otp_entry_forces_visible_browser_without_password_first(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json, os, sys\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "message = ';'.join([\n"
+                "    'manual=' + os.environ.get('HME_MANUAL_OTP_ENTRY', ''),\n"
+                "    'foreground=' + os.environ.get('HME_BROWSER_FOREGROUND_REQUIRED', ''),\n"
+                "    'password=' + os.environ.get('HME_PASSWORD_FIRST_REQUIRED', ''),\n"
+                "    'headless=' + str('--headless' in sys.argv),\n"
+                "])\n"
+                "print(prefix + json.dumps({'type':'log','message':message}), flush=True)\n"
+                "print(prefix + json.dumps({'type':'result','result':{'access_token':'at-test'}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                force_headless=True,
+            )
+
+            state = manager.start(
+                [
+                    {
+                        "email": "my.address@gmail.com",
+                        "password": "Generated!A7",
+                        "ensure_password": True,
+                        "manual_otp_entry": True,
+                    }
+                ],
+                headless=True,
+                concurrency=4,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=30)
+
+            messages = [entry["message"] for entry in manager.snapshot()["logs"]]
+            self.assertFalse(state["headless"])
+            self.assertTrue(state["foregroundRequired"])
+            self.assertTrue(state["accounts"][0]["manualOtpEntry"])
+            self.assertIn(
+                "manual=1;foreground=1;password=0;headless=False",
+                messages,
+            )
+
+    async def test_gmail_password_registration_forces_foreground_and_single_worker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json, os, sys\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "message = ';'.join([\n"
+                "    'foreground=' + os.environ.get('HME_BROWSER_FOREGROUND_REQUIRED', ''),\n"
+                "    'password=' + os.environ.get('HME_PASSWORD_FIRST_REQUIRED', ''),\n"
+                "    'headless=' + str('--headless' in sys.argv),\n"
+                "    'slots=' + os.environ.get('HME_BROWSER_WINDOW_SLOTS', ''),\n"
+                "])\n"
+                "print(prefix + json.dumps({'type':'log','message':message}), flush=True)\n"
+                "print(prefix + json.dumps({'type':'result','result':{'access_token':'at-test'}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                force_headless=True,
+            )
+
+            state = manager.start(
+                [
+                    {
+                        "email": "gmail.foreground@gmail.com",
+                        "password": "Generated!A7",
+                        "ensure_password": True,
+                    },
+                    {
+                        "email": "gmail.second@gmail.com",
+                        "password": "Generated!B8",
+                        "ensure_password": True,
+                    },
+                ],
+                headless=True,
+                concurrency=2,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=30)
+
+            messages = [entry["message"] for entry in manager.snapshot()["logs"]]
+            self.assertFalse(state["headless"])
+            self.assertTrue(state["foregroundRequired"])
+            self.assertEqual(state["concurrency"], 1)
+            self.assertEqual(
+                messages.count("foreground=1;password=1;headless=False;slots=1"),
+                2,
+            )
+            self.assertTrue(any("避免并发窗口抢焦点" in item for item in messages))
+
     async def test_concurrent_workers_receive_distinct_window_slots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

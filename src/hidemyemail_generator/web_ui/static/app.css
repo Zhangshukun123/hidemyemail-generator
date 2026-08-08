@@ -63,11 +63,15 @@ html[data-theme="light"] .sidebar { background: #ffffff; }
 .service-row { min-height: 53px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); color: var(--text-soft); font-size: 12px; }
 .service-row:last-child { border-bottom: 0; }.service-row span { display: flex; align-items: center; gap: 9px; }.service-row i { width: 21px; height: 21px; border-radius: 50%; display: grid; place-items: center; color: var(--green); background: var(--green-soft); font-style: normal; }
 .view-actions { display: block; margin-bottom: 16px; }
-.action-cluster { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; align-items: center; justify-content: flex-end; gap: 9px; background: var(--surface); }
+.action-cluster { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 9px; background: var(--surface); }
 .switch { display: flex; align-items: center; gap: 8px; color: var(--text-soft); font-size: 11px; white-space: nowrap; }
 .switch input { width: 17px; min-height: 17px; accent-color: var(--blue); }
 .mini-field { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }.mini-field input { width: 58px; }.mini-field select { width: 90px; min-height: 34px; padding: 6px 8px; }
 .mini-field.registration-email-field input { width: min(280px, 28vw); min-width: 190px; }
+.registration-source-group { min-height: 42px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-left: 9px; border-left: 1px solid var(--border); }
+.registration-source-group .registration-source-group { min-height: 34px; padding-left: 8px; }
+.mini-field.registration-provider-field select { width: 148px; }
+.mini-field.smsbower-price-field input { width: 72px; }
 .task-panel {
   --task-tone: var(--muted); --task-tone-soft: var(--surface-muted);
   margin-bottom: 16px; padding: 22px 24px 24px; border-radius: 14px;

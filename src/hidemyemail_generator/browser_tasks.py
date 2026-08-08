@@ -129,6 +129,29 @@ def account_session_access_token(record: dict[str, Any]) -> str:
     return token
 
 
+def account_session_token_cookie(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the reusable ChatGPT auth cookie exposed by Session JSON."""
+
+    session = account_session(record)
+    session_token = str(
+        session.get("sessionToken") or session.get("session_token") or ""
+    ).strip()
+    if not session_token:
+        return []
+    return [
+        {
+            "name": "__Secure-next-auth.session-token",
+            "value": session_token,
+            "domain": "chatgpt.com",
+            "path": "/",
+            "expires": -1,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        }
+    ]
+
+
 def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
     """Return reusable browser cookies from current and legacy account fields."""
 
@@ -156,7 +179,7 @@ def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
             normalized = [dict(item) for item in cookies if isinstance(item, dict)]
             if normalized:
                 return normalized
-    return []
+    return account_session_token_cookie(record)
 
 
 def session_email(session: Any) -> str:
@@ -250,6 +273,18 @@ def _save_account_record(
         result_two_factor = result.get("two_factor")
         if isinstance(result_two_factor, dict) and result_two_factor.get("secret"):
             current["two_factor"] = dict(result_two_factor)
+
+    saved_cookies = account_saved_cookies(current)
+    if saved_cookies:
+        if not current.get("cookies"):
+            current["cookies"] = saved_cookies
+        if not current.get("cookies_json"):
+            current["cookies_json"] = json.dumps(saved_cookies, ensure_ascii=False)
+        if not current.get("storage_state_json"):
+            current["storage_state_json"] = json.dumps(
+                {"cookies": saved_cookies, "origins": []},
+                ensure_ascii=False,
+            )
 
     conn = connect_db(str(db_file))
     try:
@@ -418,6 +453,12 @@ class BrowserTaskManager:
             if not email or email in seen:
                 continue
             seen.add(email)
+            manual_otp_entry = bool(account.get("manual_otp_entry", False))
+            gmail_registration = (
+                not manual_otp_entry
+                and email.endswith("@gmail.com")
+                and bool(account.get("ensure_password", False))
+            )
             deduplicated.append(
                 {
                     "email": email,
@@ -430,6 +471,16 @@ class BrowserTaskManager:
                     "cookie_refresh_only": bool(
                         account.get("cookie_refresh_only", False)
                     ),
+                    "manual_otp_entry": manual_otp_entry,
+                    "password_first_required": bool(
+                        account.get("password_first_required", False)
+                        or gmail_registration
+                    ),
+                    "foreground_required": bool(
+                        account.get("foreground_required", False)
+                        or manual_otp_entry
+                        or gmail_registration
+                    ),
                     "two_factor": account.get("two_factor")
                     if isinstance(account.get("two_factor"), dict)
                     else {},
@@ -439,7 +490,12 @@ class BrowserTaskManager:
             raise RuntimeError("没有需要获取 Session 的 iCloud 邮箱")
 
         concurrency = max(1, min(10, int(concurrency)))
-        headless = bool(headless or self.force_headless)
+        foreground_required = any(
+            item["foreground_required"] for item in deduplicated
+        )
+        if foreground_required:
+            concurrency = 1
+        headless = bool(headless or self.force_headless) and not foreground_required
         proxy_state = (
             self.registration_proxy_store.public_state()
             if self.registration_proxy_store is not None
@@ -455,6 +511,7 @@ class BrowserTaskManager:
             "status": "running",
             "running": True,
             "headless": headless,
+            "foregroundRequired": foreground_required,
             "concurrency": concurrency,
             "total": len(deduplicated),
             "completed": 0,
@@ -474,6 +531,10 @@ class BrowserTaskManager:
                     "passwordConfirmed": False,
                     "_enable_2fa": item["enable_2fa"],
                     "_cookie_refresh_only": item["cookie_refresh_only"],
+                    "_manual_otp_entry": item["manual_otp_entry"],
+                    "manualOtpEntry": item["manual_otp_entry"],
+                    "_password_first_required": item["password_first_required"],
+                    "_foreground_required": item["foreground_required"],
                     "_two_factor": item["two_factor"],
                     "phase": "queued",
                     "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
@@ -493,6 +554,17 @@ class BrowserTaskManager:
             f"跳过 {skipped}，并发 {concurrency}，"
             f"{'无头' if headless else '显示浏览器'}"
         )
+        if foreground_required:
+            if any(item["manual_otp_entry"] for item in deduplicated):
+                self._append_log(
+                    "自有邮箱手动验证码已锁定为单浏览器前台模式："
+                    "请在浏览器中输入验证码并点击继续"
+                )
+            else:
+                self._append_log(
+                    "Gmail 密码注册已锁定为单浏览器前台模式："
+                    "禁用无头并避免并发窗口抢焦点"
+                )
         if proxy_active:
             self._append_log(
                 "注册动态代理已启用："
@@ -619,6 +691,15 @@ class BrowserTaskManager:
                     else "0",
                     "HME_COOKIE_SESSION_REFRESH": "1"
                     if item.get("_cookie_refresh_only")
+                    else "0",
+                    "HME_MANUAL_OTP_ENTRY": "1"
+                    if item.get("_manual_otp_entry")
+                    else "0",
+                    "HME_PASSWORD_FIRST_REQUIRED": "1"
+                    if item.get("_password_first_required")
+                    else "0",
+                    "HME_BROWSER_FOREGROUND_REQUIRED": "1"
+                    if item.get("_foreground_required")
                     else "0",
                     "HME_OPENAI_2FA_STATE": json.dumps(
                         item.get("_two_factor") or {}, ensure_ascii=False

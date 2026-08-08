@@ -196,6 +196,49 @@ class WorkbenchOpenAICodeEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())["error"], "请先登录")
 
 
+class GptCredentialEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.app = create_app(base_dir=Path(self.temp_dir.name))
+        _save_account_record(
+            self.app["db_file"],
+            "saved@gmail.com",
+            result={
+                "access_token": "at-gmail-test",
+                "session_json": '{"accessToken":"at-gmail-test"}',
+            },
+        )
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp_dir.cleanup()
+
+    async def test_gmail_access_token_can_be_copied(self):
+        response = await self.client.post(
+            "/api/gpt-credential",
+            json={"email": "saved@gmail.com", "kind": "access_token"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            await response.json(),
+            {"ok": True, "value": "at-gmail-test"},
+        )
+
+    async def test_malformed_email_is_still_rejected(self):
+        response = await self.client.post(
+            "/api/gpt-credential",
+            json={"email": "not-an-email", "kind": "access_token"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"], "邮箱地址无效")
+
+
 class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -812,6 +855,7 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
             has_valid_session,
             marked_invalid=False,
             refresh_with_cookie=False,
+            email="protocol@icloud.com",
         ):
             with tempfile.TemporaryDirectory() as temp_dir:
                 base_dir = Path(temp_dir)
@@ -821,7 +865,7 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                 if has_valid_session:
                     _save_account_record(
                         app["db_file"],
-                        "protocol@icloud.com",
+                        email,
                         result={
                             "access_token": "valid-session-token",
                             "session_json": '{"accessToken":"valid-session-token"}',
@@ -840,7 +884,7 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                     if marked_invalid:
                         mark_account_session_invalid(
                             app["db_file"],
-                            "protocol@icloud.com",
+                            email,
                             "online endpoint returned 401",
                         )
                 verification_manager = ManagerStub(
@@ -866,7 +910,7 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                         response = await client.post(
                             "/api/account/verify-or-register",
                             json={
-                                "email": "protocol@icloud.com",
+                                "email": email,
                                 "headless": False,
                                 "reset_password": False,
                                 "refresh_with_cookie": refresh_with_cookie,
@@ -909,6 +953,24 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(verification_manager.verify_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
+
+        response, payload, verification_manager, browser_manager = await run_case(
+            has_valid_session=True,
+            refresh_with_cookie=True,
+            email="protocol@gmail.com",
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["mode"], "refresh_cookie")
+        self.assertEqual(
+            verification_manager.browser_refresh_starts,
+            [
+                {
+                    "emails": ["protocol@gmail.com"],
+                    "concurrency": 1,
+                    "force_refresh": True,
+                }
+            ],
+        )
 
         response, payload, verification_manager, browser_manager = await run_case(
             has_valid_session=True,

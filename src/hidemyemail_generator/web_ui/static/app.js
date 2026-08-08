@@ -317,6 +317,21 @@
       if (registrationProxy.country) {
         $("registrationProxyCountry").value = registrationProxy.country;
       }
+      const smsBower = state.smsBower || {};
+      const smsBowerStatus = $("smsbowerStatus");
+      smsBowerStatus.className = "badge " + (smsBower.configured ? "success" : "warning");
+      smsBowerStatus.textContent = smsBower.configured
+        ? "SMSBower Gmail · 已配置"
+        : "SMSBower 未配置";
+      if (smsBower.maxPrice) $("smsbowerMaxPrice").value = smsBower.maxPrice;
+      const registrationProvider = $("registrationEmailProvider").value || "icloud";
+      $("smsbowerControls").hidden = registrationProvider !== "gmail";
+      $("registerProviderButton").textContent = registrationProvider === "gmail"
+        ? "获取 Gmail 并注册"
+        : "使用 iCloud 注册";
+      $("registerProviderButton").disabled = Boolean(state.registrationTask.running) ||
+        (registrationProvider === "gmail" && !smsBower.configured);
+      $("registerEmailButton").disabled = Boolean(state.registrationTask.running);
       const task = state.browserTask;
       const registration = state.registrationTask;
       const hasRegistration = Boolean(registration.id && registration.status !== "idle");
@@ -334,6 +349,7 @@
       if (hasRegistration && registration.running && !task.total) {
         progress = {
           generating_email: 12,
+          purchasing_gmail: 12,
           preparing_email: 18,
           claiming_inventory: 12,
           confirming_email: 28,
@@ -368,7 +384,7 @@
       $("browserTaskProgressValue").textContent = progress + "%";
       const codePanel = $("registrationCodePanel");
       const awaitingEmail = (registration.awaitingCodeEmails || [])[0] || registration.email || "";
-      codePanel.hidden = !registration.awaitingCode;
+      codePanel.hidden = !registration.awaitingCode || registration.provider === "smsbower";
       $("registrationCodeEmail").textContent = registration.awaitingCode
         ? "验证码将用于 " + awaitingEmail
         : "等待注册页面请求验证码";
@@ -404,7 +420,7 @@
 
     registrationLabel(task) {
       const labels = {
-        idle: "空闲", generating_email: "正在创建邮箱", preparing_email: "正在准备邮箱", claiming_inventory: "正在领取库存", confirming_email: "正在确认邮箱",
+        idle: "空闲", generating_email: "正在创建邮箱", purchasing_gmail: "正在获取 Gmail", preparing_email: "正在准备邮箱", claiming_inventory: "正在领取库存", confirming_email: "正在确认邮箱",
         registering_openai: "正在注册 OpenAI", awaiting_verification_code: "等待输入验证码", completed: "注册成功",
         failed: "注册失败", cancelling: "正在停止", cancelled: "已停止",
       };
@@ -728,6 +744,7 @@
         browserTask: { status: "idle", runtime: {} },
         registrationTask: { status: "idle", phase: "idle" },
         registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
+        smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         verificationTask: { status: "idle", runtime: {} },
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
@@ -846,6 +863,11 @@
       this.store.patch({ registrationProxy: data });
     }
 
+    async loadSmsBower() {
+      const data = await this.api.get("/api/smsbower/status");
+      this.store.patch({ smsBower: data });
+    }
+
     browserOptions() {
       const concurrency = Number($("concurrency").value);
       if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
@@ -915,7 +937,7 @@
 
     bindCommands() {
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy()]);
+        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower()]);
         return "数据已刷新";
       });
       this.commands.register("toggle-theme", async () => {
@@ -936,11 +958,46 @@
           throw new Error("请输入有效的注册邮箱地址");
         }
         const data = await this.api.post("/api/registration/start", {
-          label: "手动邮箱注册", email, ...options, concurrency: 1,
+          label: "手动邮箱注册", provider: "manual", email, ...options, concurrency: 1,
         });
         this.store.patch({ registrationTask: data.task });
         this.schedule("registration", () => this.loadRegistrationTask(), 800);
         return "已添加邮箱并启动注册：" + email;
+      });
+      this.commands.register("register-provider", async () => {
+        const options = this.browserOptions();
+        const source = $("registrationEmailProvider").value || "icloud";
+        const smsBower = this.store.state.smsBower || {};
+        if (source === "gmail") {
+          if (!smsBower.configured) throw new Error("请先设置 SMSBower API Key");
+          const maxPrice = Number($("smsbowerMaxPrice").value);
+          if (!Number.isFinite(maxPrice) || maxPrice < 0.001 || maxPrice > 10) {
+            throw new Error("Gmail 最高价必须在 0.001–10 美元之间");
+          }
+          const config = await this.api.post("/api/smsbower/config", { maxPrice });
+          this.store.patch({ smsBower: { ...smsBower, ...config } });
+        }
+        const data = await this.api.post("/api/registration/start", {
+          label: source === "gmail" ? "SMSBower Gmail 注册" : "iCloud 邮箱注册",
+          provider: source === "gmail" ? "smsbower" : "inventory",
+          ...options,
+          concurrency: 1,
+        });
+        this.store.patch({ registrationTask: data.task });
+        this.schedule("registration", () => this.loadRegistrationTask(), 500);
+        return source === "gmail"
+          ? "已启动 SMSBower Gmail 获取与自动注册"
+          : "已启动 iCloud 库存邮箱注册";
+      });
+      this.commands.register("set-smsbower-key", async () => {
+        const apiKey = prompt("输入 SMSBower API Key。Key 只保存在本地数据库，接口和日志不会回传：", "");
+        if (apiKey === null) throw Object.assign(new Error(), { name: "AbortError" });
+        if (!apiKey.trim()) throw new Error("SMSBower API Key 不能为空");
+        const data = await this.api.post("/api/smsbower/config", {
+          apiKey: apiKey.trim(), maxPrice: Number($("smsbowerMaxPrice").value), service: "dr",
+        });
+        this.store.patch({ smsBower: data });
+        return "SMSBower API 已保存，可获取 Gmail 并自动注册";
       });
       this.commands.register("submit-registration-code", async () => {
         const task = this.store.state.registrationTask;
@@ -1151,6 +1208,9 @@
       $("verificationAccountSelect").addEventListener("change", (event) => {
         this.store.patch({ selectedVerificationEmail: event.target.value });
       });
+      $("registrationEmailProvider").addEventListener("change", () => {
+        this.renderer.renderAccounts(this.store.state);
+      });
       $("registrationProxyEnabled").addEventListener("change", async (event) => {
         try {
           const data = await this.api.post("/api/registration-proxy/config", {
@@ -1175,6 +1235,18 @@
           this.toast(error.message, "error");
         }
       });
+      $("smsbowerMaxPrice").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/smsbower/config", {
+            maxPrice: Number(event.target.value),
+          });
+          this.store.patch({ smsBower: data });
+          this.toast("SMSBower Gmail 最高价已更新为 $" + data.maxPrice);
+        } catch (error) {
+          await this.loadSmsBower();
+          this.toast(error.message, "error");
+        }
+      });
     }
 
     async start() {
@@ -1185,7 +1257,7 @@
       this.router.start();
       const results = await Promise.allSettled([
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(),
+        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(),
       ]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");

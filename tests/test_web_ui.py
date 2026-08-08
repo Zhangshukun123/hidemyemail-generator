@@ -94,6 +94,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="registrationEmail"', page)
         self.assertIn('id="registerEmailButton"', page)
         self.assertIn("添加邮箱并注册", page)
+        self.assertIn("验证码在浏览器中手动输入", page)
         self.assertIn('id="registrationCodePanel"', page)
         self.assertIn('id="registrationCode"', page)
         self.assertIn("submit-registration-code", page)
@@ -104,6 +105,24 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="registrationNetworkMode"', page)
         self.assertIn("本机 IP 直连 · 语言随出口", page)
         self.assertIn("关闭时使用本机公网 IP 直连", page)
+
+    def test_registration_can_buy_smsbower_gmail_and_poll_code_automatically(self):
+        page = build_app_page()
+
+        self.assertIn('id="smsbowerStatus"', page)
+        self.assertIn('id="smsbowerMaxPrice"', page)
+        self.assertIn('id="registrationEmailProvider"', page)
+        self.assertIn('<option value="icloud">iCloud 库存邮箱</option>', page)
+        self.assertIn('<option value="gmail">Gmail · SMSBower</option>', page)
+        self.assertIn('id="registerProviderButton"', page)
+        self.assertIn("获取 Gmail 并注册", page)
+        self.assertIn("使用 iCloud 注册", page)
+        self.assertIn('data-action="set-smsbower-key"', page)
+        self.assertIn('data-action="register-provider"', page)
+        self.assertIn("/api/smsbower/status", page)
+        self.assertIn("/api/smsbower/config", page)
+        self.assertIn('provider: source === "gmail" ? "smsbower" : "inventory"', page)
+        self.assertIn('registration.provider === "smsbower"', page)
 
     def test_verification_results_keep_every_account_visible(self):
         page = build_app_page()

@@ -67,6 +67,13 @@ from .scheduled_generation import (
     DEFAULT_INTERVAL_SECONDS as DEFAULT_INVENTORY_INTERVAL_SECONDS,
     ScheduledGenerationManager,
 )
+from .smsbower import (
+    DEFAULT_SMSBOWER_MAX_PRICE,
+    DEFAULT_SMSBOWER_SERVICE,
+    SMSBOWER_API_BASE_URL,
+    SMSBowerConfigStore,
+    SMSBowerMailClient,
+)
 from .web_ui import build_app_page, build_login_page
 
 
@@ -2783,9 +2790,20 @@ def _gpt_account_export(db_file: Path, email: str = "") -> list[str]:
     return lines
 
 
+def _valid_supported_account_email(email: str) -> bool:
+    target = str(email or "").strip().lower()
+    if len(target) > 320 or not re.fullmatch(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}"
+        r"@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+        target,
+    ):
+        return False
+    return target.rsplit("@", 1)[1] in {"icloud.com", "gmail.com"}
+
+
 def _workbench_import_payload(record: dict, email: str) -> dict:
     target = str(email or "").strip().lower()
-    if not target or "@" not in target:
+    if not _valid_supported_account_email(target):
         raise RuntimeError("邮箱地址无效")
     session = account_session(record)
     access_token = account_session_access_token(record)
@@ -3366,6 +3384,10 @@ def create_app(
     inventory_lease_seconds: int = DEFAULT_LEASE_SECONDS,
     inventory_batch_size: int = DEFAULT_INVENTORY_BATCH_SIZE,
     inventory_interval_seconds: int = DEFAULT_INVENTORY_INTERVAL_SECONDS,
+    smsbower_api_key: str = "",
+    smsbower_service: str = DEFAULT_SMSBOWER_SERVICE,
+    smsbower_max_price: float = DEFAULT_SMSBOWER_MAX_PRICE,
+    smsbower_api_base_url: str = SMSBOWER_API_BASE_URL,
 ) -> web.Application:
     app = web.Application(
         client_max_size=16 * 1024, middlewares=[auth_middleware]
@@ -3398,6 +3420,15 @@ def create_app(
         token=inventory_service_token,
     )
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
+    app["smsbower_config_store"] = SMSBowerConfigStore(
+        app["db_file"],
+        api_key=smsbower_api_key,
+        service=smsbower_service,
+        max_price=smsbower_max_price,
+    )
+    app["smsbower_client"] = SMSBowerMailClient(
+        app["smsbower_config_store"], base_url=smsbower_api_base_url
+    )
     browser_source = (
         Path(target_project_dir).resolve()
         if target_project_dir
@@ -3536,6 +3567,9 @@ def create_app(
         confirm_email=confirm_registration_email,
         save_password=save_registration_password,
         complete_email=complete_registration_inventory_email,
+        acquire_provider_email=app["smsbower_client"].acquire_email,
+        poll_provider_code=app["smsbower_client"].poll_code,
+        complete_provider_email=app["smsbower_client"].complete_email,
     )
 
     async def generate_inventory_batch(label: str, count: int) -> dict:
@@ -3887,7 +3921,11 @@ def create_app(
             )
         email = str(payload.get("email") or "").strip().lower()
         kind = str(payload.get("kind") or "").strip()
-        if not email.endswith("@icloud.com") or len(email) > 320:
+        if len(email) > 320 or not re.fullmatch(
+            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}"
+            r"@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+            email,
+        ):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -4052,6 +4090,19 @@ def create_app(
         email: str, since: str
     ) -> tuple[dict | None, str, int]:
         nonlocal gpt_code_identity_cache, gpt_code_identity_cache_at
+        if email.endswith("@gmail.com") and len(email) <= 320:
+            try:
+                code = await app["smsbower_client"].poll_next_code(email)
+            except RuntimeError as error:
+                message = str(error)
+                status = 409 if "未保存 SMSBower mailId" in message else 502
+                return None, message, status
+            if not code:
+                return None, "SMSBower Gmail 验证码尚未到达", 404
+            return {
+                "code": code,
+                "receivedAt": datetime.now(timezone.utc).isoformat(),
+            }, "", 200
         if not email.endswith("@icloud.com") or len(email) > 320:
             return None, "邮箱地址无效", 400
         config_path: Path = app["inbox_config_file"]
@@ -4213,7 +4264,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(body.get("email") or "").strip().lower()
-        if not email.endswith("@icloud.com") or len(email) > 320:
+        if not _valid_supported_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -4425,8 +4476,13 @@ def create_app(
                 {"ok": False, "error": "邮箱标签长度必须是 1–100 个字符"},
                 status=400,
             )
+        provider = str(payload.get("provider") or "manual").strip().lower()
+        if provider not in {"manual", "inventory", "smsbower"}:
+            return web.json_response(
+                {"ok": False, "error": "不支持的注册邮箱来源"}, status=400
+            )
         email = str(payload.get("email") or "").strip().lower()
-        if (
+        if provider == "manual" and (
             not email
             or len(email) > 254
             or email.count("@") != 1
@@ -4443,8 +4499,9 @@ def create_app(
                 headless=bool(payload.get("headless", False)),
                 concurrency=1,
                 email=email,
+                provider=provider,
             )
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
             )
@@ -4478,9 +4535,12 @@ def create_app(
             )
         try:
             payload = await request.json()
-            code = app["registration_manager"].poll_verification_code(
-                str(payload.get("email") or "")
-            )
+            manager = app["registration_manager"]
+            async_poller = getattr(manager, "poll_verification_code_async", None)
+            if callable(async_poller):
+                code = await async_poller(str(payload.get("email") or ""))
+            else:
+                code = manager.poll_verification_code(str(payload.get("email") or ""))
         except (json.JSONDecodeError, web.HTTPBadRequest):
             return web.json_response(
                 {"ok": False, "error": "请求格式无效"}, status=400
@@ -4488,8 +4548,17 @@ def create_app(
         except RuntimeError as error:
             return web.json_response({"ok": False, "error": str(error)}, status=409)
         if not code:
+            provider = app["registration_manager"].snapshot().get("provider")
             return web.json_response(
-                {"ok": False, "error": "等待手动输入验证码"}, status=404
+                {
+                    "ok": False,
+                    "error": (
+                        "SMSBower Gmail 验证码尚未到达"
+                        if provider == "smsbower"
+                        else "等待手动输入验证码"
+                    ),
+                },
+                status=404,
             )
         return web.json_response({"ok": True, "code": code})
 
@@ -4500,6 +4569,34 @@ def create_app(
             )
         task = await app["registration_manager"].stop()
         return web.json_response({"ok": True, "task": task})
+
+    async def smsbower_status(_: web.Request) -> web.Response:
+        return web.json_response(
+            {"ok": True, **app["smsbower_client"].public_state()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def smsbower_config(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+            state = app["smsbower_config_store"].configure(
+                api_key=payload.get("apiKey") if "apiKey" in payload else None,
+                service=payload.get("service") if "service" in payload else None,
+                max_price=(
+                    payload.get("maxPrice") if "maxPrice" in payload else None
+                ),
+            )
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        return web.json_response({"ok": True, **state})
 
     async def verification_status(_: web.Request) -> web.Response:
         return web.json_response(
@@ -4587,7 +4684,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
-        if not email.endswith("@icloud.com") or len(email) > 320:
+        if not _valid_supported_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -5304,6 +5401,8 @@ def create_app(
     app.router.add_post("/api/registration/code", registration_code_submit)
     app.router.add_post("/api/registration/code/poll", registration_code_poll)
     app.router.add_post("/api/registration/stop", registration_stop)
+    app.router.add_get("/api/smsbower/status", smsbower_status)
+    app.router.add_post("/api/smsbower/config", smsbower_config)
     app.router.add_get(
         "/api/registration-inventory/status", registration_inventory_client_status
     )
@@ -5376,6 +5475,16 @@ async def run_server(args: argparse.Namespace) -> None:
                 str(DEFAULT_INVENTORY_INTERVAL_SECONDS),
             )
         ),
+        smsbower_api_key=os.environ.get("SMSBOWER_API_KEY", ""),
+        smsbower_service=os.environ.get(
+            "SMSBOWER_MAIL_SERVICE", DEFAULT_SMSBOWER_SERVICE
+        ),
+        smsbower_max_price=float(
+            os.environ.get("SMSBOWER_MAX_PRICE", str(DEFAULT_SMSBOWER_MAX_PRICE))
+        ),
+        smsbower_api_base_url=os.environ.get(
+            "SMSBOWER_API_BASE_URL", SMSBOWER_API_BASE_URL
+        ),
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -5420,6 +5529,10 @@ def _load_local_env_file(path: Path) -> None:
         "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
         "HIDEMYEMAIL_INVENTORY_BATCH_SIZE",
         "HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS",
+        "SMSBOWER_API_KEY",
+        "SMSBOWER_MAIL_SERVICE",
+        "SMSBOWER_MAX_PRICE",
+        "SMSBOWER_API_BASE_URL",
     }
     try:
         lines = path.read_text(encoding="utf-8").splitlines()

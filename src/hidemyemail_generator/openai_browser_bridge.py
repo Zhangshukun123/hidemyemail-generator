@@ -11,6 +11,7 @@ import time
 import types
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     from .openai_mfa import MfaSetupError, enable_totp_mfa, generate_totp
@@ -37,6 +38,8 @@ CHATGPT_HOME_URL = "https://chatgpt.com/"
 CHATGPT_ACCOUNT_SETTINGS_URL = "https://chatgpt.com/#settings/Account"
 CHATGPT_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
 OTP_POLL_INTERVAL_SECONDS = 1.5
+CAMOUFOX_WINDOW_DISCOVERY_SECONDS = 5.0
+_CAMOUFOX_WINDOW_HANDLES: tuple[int, ...] = ()
 
 PROFILE_MENU_STRICT_SELECTORS = (
     '[data-testid="profile-button"]',
@@ -432,6 +435,22 @@ OTP_INPUT_SELECTORS = (
     'input[aria-label*="验证码" i]',
     'input[placeholder*="验证码" i]',
 )
+LOCALIZED_EMAIL_OTP_INPUT_SELECTORS = (
+    'input[id="code"]',
+    'input[id*="code" i]',
+    'input[name*="code" i]',
+    'input[id*="otp" i]',
+    'input[name*="otp" i]',
+    'input[data-testid="code-input"]',
+    'input[data-testid*="verification-code" i]',
+    'input[aria-labelledby*="code" i]',
+    'input[aria-label*="コード" i]',
+    'input[placeholder*="コード" i]',
+    'input[aria-label*="認証" i]',
+    'input[placeholder*="認証" i]',
+    'input[aria-label*="確認" i]',
+    'input[placeholder*="確認" i]',
+)
 OTP_SUBMIT_SELECTORS = (
     'button[type="submit"]:has-text("Continue")',
     'button[type="submit"]:has-text("Verify")',
@@ -522,7 +541,9 @@ def configure_registration_profile_capture(app_backend, worker) -> bool:
     return True
 
 
-def configure_password_first_login(worker, *, enabled: bool) -> bool:
+def configure_password_first_login(
+    worker, *, enabled: bool, required: bool = False
+) -> bool:
     """Choose password on the initial email-code page and submit the saved password."""
 
     original_has_otp = getattr(worker, "_has_otp_input", None)
@@ -540,8 +561,11 @@ def configure_password_first_login(worker, *, enabled: bool) -> bool:
         return True
 
     def choose_password_if_available(self, page) -> bool:
-        if getattr(self, "_hme_password_entry_selected", False):
+        if getattr(self, "_hme_password_entry_selected", False) or getattr(
+            self, "_password_step_submitted", False
+        ):
             return False
+        _activate_visible_registration_page(self, page)
         if not _click_first_visible(page, PASSWORD_CONTINUE_SELECTORS, timeout=500):
             return False
         self._hme_password_entry_selected = True
@@ -556,6 +580,19 @@ def configure_password_first_login(worker, *, enabled: bool) -> bool:
         raise RuntimeError("已点击使用密码继续，但 15 秒内没有进入密码页面")
 
     def continue_registration_and_choose_password(self, page):
+        password_path_started = bool(
+            getattr(self, "_hme_password_entry_selected", False)
+            or getattr(self, "_hme_password_entry_pending", False)
+            or getattr(self, "_password_step_submitted", False)
+        )
+        if required and not password_path_started:
+            if choose_password_if_available(self, page):
+                return True
+            if original_has_otp(page):
+                raise RuntimeError(
+                    "Gmail 注册必须先选择使用密码继续；"
+                    "已停止首次验证码入口，避免点击错误验证方式"
+                )
         result = original_continue_registration(page)
         if choose_password_if_available(self, page):
             return result
@@ -577,9 +614,15 @@ def configure_password_first_login(worker, *, enabled: bool) -> bool:
             if time.monotonic() - started_at <= 15:
                 return False
             raise RuntimeError("已点击使用密码继续，但 15 秒内没有进入密码页面")
-        if getattr(self, "_hme_password_entry_selected", False):
+        if getattr(self, "_hme_password_entry_selected", False) or getattr(
+            self, "_password_step_submitted", False
+        ):
             return has_otp
         if not choose_password_if_available(self, page):
+            if required:
+                raise RuntimeError(
+                    "Gmail 注册必须使用密码继续；当前页面未找到密码入口，已停止验证码回退"
+                )
             if not getattr(self, "_hme_password_entry_unavailable_logged", False):
                 self._hme_password_entry_unavailable_logged = True
                 self.log("[认证] 当前验证码页面没有使用密码入口，继续读取邮箱验证码")
@@ -808,6 +851,7 @@ def _activate_visible_registration_page(worker, page) -> bool:
             page.evaluate("() => window.focus()")
         except Exception:
             pass
+        _focus_camoufox_window_once()
         return True
     except Exception as error:
         if not getattr(worker, "_hme_about_you_focus_warning_logged", False):
@@ -938,6 +982,88 @@ def configure_resilient_about_you_input(worker) -> bool:
     return True
 
 
+def _is_google_account_url(url: str) -> bool:
+    try:
+        host = (urlparse(str(url or "")).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host == "accounts.google.com" or host.endswith(".accounts.google.com")
+
+
+def configure_email_password_only_registration(worker, *, enabled: bool) -> bool:
+    """Keep Gmail addresses on OpenAI's email/password path, never Google OAuth."""
+
+    original_register = getattr(worker, "_register", None)
+    original_fill_email = getattr(worker, "_fill_email_if_visible", None)
+    if not enabled or not callable(original_register) or not callable(original_fill_email):
+        return False
+    if getattr(worker, "_hme_email_password_only_configured", False):
+        return True
+
+    def register_without_google_oauth(self, page, context):
+        route_method = getattr(context, "route", None)
+        if callable(route_method):
+            for pattern in (
+                "https://accounts.google.com/**",
+                "https://*.accounts.google.com/**",
+            ):
+                try:
+                    route_method(pattern, lambda route, *_args: route.abort())
+                except Exception:
+                    pass
+        self.log("[认证] Gmail 地址仅使用 OpenAI 邮箱+密码注册；Google 账号入口已禁用")
+        return original_register(page, context)
+
+    def fill_openai_email_without_social_login(self, page) -> bool:
+        if _is_google_account_url(str(getattr(page, "url", "") or "")):
+            self.log("[认证] 已阻止 Google 账号登录页面，正在返回 OpenAI 邮箱注册")
+            go_back = getattr(page, "go_back", None)
+            if callable(go_back):
+                try:
+                    go_back(wait_until="domcontentloaded", timeout=15000)
+                except TypeError:
+                    go_back()
+                except Exception:
+                    pass
+            return False
+
+        visible_inputs = getattr(self, "_visible_inputs", None)
+        if not callable(visible_inputs):
+            return original_fill_email(page)
+        inputs = visible_inputs(
+            page,
+            [
+                'input[type="email"]',
+                'input[name="email"]',
+                'input[name="username"]',
+                'input[autocomplete="email"]',
+            ],
+        )
+        if not inputs:
+            return False
+
+        _activate_visible_registration_page(self, page)
+        email_input = inputs[0]
+        self.log("[认证] 填写 OpenAI 邮箱注册字段（不使用 Google 账号登录）")
+        email_input.fill(self.account.email)
+        try:
+            email_input.press("Enter", timeout=5000)
+        except TypeError:
+            email_input.press("Enter")
+        _page_wait(page, 700)
+        if _is_google_account_url(str(getattr(page, "url", "") or "")):
+            raise RuntimeError("已停止 Google 账号登录跳转；本次只允许邮箱+密码注册")
+        self.log("[认证] 已从邮箱输入框提交，未点击 Google 登录按钮")
+        return True
+
+    worker._register = types.MethodType(register_without_google_oauth, worker)
+    worker._fill_email_if_visible = types.MethodType(
+        fill_openai_email_without_social_login, worker
+    )
+    worker._hme_email_password_only_configured = True
+    return True
+
+
 def configure_windowed_camoufox(app_backend) -> bool:
     """Force Camoufox to use a centered, non-fullscreen outer window."""
 
@@ -958,7 +1084,10 @@ def configure_windowed_camoufox(app_backend) -> bool:
             firefox_user_prefs.update(CAMOUFOX_AUTH_RESOURCE_CACHE_PREFS)
         kwargs["firefox_user_prefs"] = firefox_user_prefs
         browser = original(playwright, *args, **kwargs)
-        if not kwargs.get("headless") and slot_count > 1:
+        foreground_required = str(
+            os.environ.get("HME_BROWSER_FOREGROUND_REQUIRED") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not kwargs.get("headless") and (slot_count > 1 or foreground_required):
             # Camoufox creates its visible top-level window only after the
             # caller opens a context/page.  Move it in the background so this
             # wrapper can return and let page creation proceed.
@@ -1110,8 +1239,11 @@ def _move_camoufox_window(browser, layout: dict[str, int]) -> bool:
         process = browser._impl_obj._connection._transport._proc
         root_pid = int(process.pid)
         user32 = ctypes.windll.user32
+        foreground_required = str(
+            os.environ.get("HME_BROWSER_FOREGROUND_REQUIRED") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         moved = False
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + CAMOUFOX_WINDOW_DISCOVERY_SECONDS
         while time.monotonic() < deadline:
             process_ids = _windows_descendant_process_ids(root_pid)
             handles: list[int] = []
@@ -1129,6 +1261,12 @@ def _move_camoufox_window(browser, layout: dict[str, int]) -> bool:
 
             user32.EnumWindows(collect_window, 0)
             for hwnd in handles:
+                _remember_camoufox_window(hwnd)
+                if foreground_required and user32.GetForegroundWindow() != hwnd:
+                    user32.ShowWindow(hwnd, 9)
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetFocus(hwnd)
                 moved = bool(
                     user32.MoveWindow(
                         hwnd,
@@ -1144,6 +1282,40 @@ def _move_camoufox_window(browser, layout: dict[str, int]) -> bool:
             # the slot briefly so the final browser window stays tiled.
             time.sleep(0.1)
         return moved
+    except Exception:
+        return False
+
+
+def _remember_camoufox_window(hwnd: int) -> None:
+    """Remember a visible Camoufox HWND for later one-shot input activation."""
+
+    global _CAMOUFOX_WINDOW_HANDLES
+    normalized = int(hwnd)
+    if normalized not in _CAMOUFOX_WINDOW_HANDLES:
+        _CAMOUFOX_WINDOW_HANDLES = (*_CAMOUFOX_WINDOW_HANDLES, normalized)
+
+
+def _focus_camoufox_window_once() -> bool:
+    """Bring Camoufox forward once without continuously stealing focus."""
+
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        focused = False
+        for hwnd in reversed(_CAMOUFOX_WINDOW_HANDLES):
+            if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+                continue
+            if user32.GetForegroundWindow() != hwnd:
+                user32.ShowWindow(hwnd, 9)
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+                user32.SetFocus(hwnd)
+            focused = True
+            break
+        return focused
     except Exception:
         return False
 
@@ -2214,6 +2386,132 @@ class ManualOtpReader:
         self.session.close()
 
 
+def configure_registration_otp_reader(app_backend, registration_email: str) -> bool:
+    """Route an SMSBower Gmail worker through the local registration-code API."""
+    target_email = str(registration_email or "").strip().lower()
+    if not target_email.endswith("@gmail.com"):
+        return False
+
+    worker_type = app_backend.OpenAIRegisterPayLinkWorker
+    original_preconnect = worker_type._preconnect_otp_reader
+    original_wait_for_code = worker_type._wait_for_openai_email_code
+    original_visible_inputs = getattr(worker_type, "_visible_inputs", None)
+    reader_type = app_backend.HotmailOtpReader
+
+    def is_smsbower_worker(worker) -> bool:
+        account = getattr(worker, "account", None)
+        email = str(getattr(account, "email", "") or "").strip().lower()
+        return email == target_email
+
+    def preconnect_otp_reader(worker) -> None:
+        if not is_smsbower_worker(worker):
+            return original_preconnect(worker)
+        if getattr(worker, "otp_reader", None):
+            return
+        worker.log("Gmail 账号使用 SMSBower API 自动取码，不连接 Outlook Graph/IMAP")
+        worker.otp_reader = reader_type(worker.account, worker.log, "")
+        worker.otp_reader.connect()
+
+    def wait_for_openai_email_code(worker, min_timestamp: float) -> str:
+        if not is_smsbower_worker(worker):
+            return original_wait_for_code(worker, min_timestamp)
+        if not getattr(worker, "otp_reader", None):
+            preconnect_otp_reader(worker)
+        worker.log("正在等待 SMSBower 返回 Gmail 验证码")
+        return worker.otp_reader.wait_for_code(min_timestamp)
+
+    def visible_inputs_with_localized_email_code(worker, page, selectors):
+        inputs = original_visible_inputs(worker, page, selectors)
+        if inputs or not is_smsbower_worker(worker):
+            return inputs
+        selector_text = " ".join(str(selector or "") for selector in selectors)
+        is_email_code_lookup = any(
+            marker in selector_text
+            for marker in (
+                "one-time-code",
+                'name="code"',
+                'inputmode="numeric"',
+                'type="tel"',
+            )
+        )
+        if not is_email_code_lookup:
+            return inputs
+        for selector in LOCALIZED_EMAIL_OTP_INPUT_SELECTORS:
+            localized_inputs = original_visible_inputs(worker, page, [selector])
+            if not localized_inputs:
+                continue
+            if not getattr(worker, "_hme_localized_otp_input_logged", False):
+                worker._hme_localized_otp_input_logged = True
+                worker.log("[验证码] 已识别本地化 Code 输入框，准备自动填写")
+            return localized_inputs
+        page_url = str(getattr(page, "url", "") or "").lower()
+        if "email-verification" in page_url:
+            text_inputs = original_visible_inputs(worker, page, ['input[type="text"]'])
+            if len(text_inputs) == 1:
+                worker.log("[验证码] 已按邮箱验证页面的唯一文本框定位 Code 输入框")
+                return text_inputs
+        return inputs
+
+    worker_type._preconnect_otp_reader = preconnect_otp_reader
+    worker_type._wait_for_openai_email_code = wait_for_openai_email_code
+    if callable(original_visible_inputs):
+        worker_type._visible_inputs = visible_inputs_with_localized_email_code
+    return True
+
+
+def configure_manual_browser_verification(worker, *, enabled: bool) -> bool:
+    """Wait for a user to submit the email code in the visible browser."""
+
+    if not enabled:
+        return False
+    if getattr(worker, "_hme_manual_browser_verification_configured", False):
+        return True
+
+    def skip_automatic_code_reader(self) -> None:
+        self.otp_reader = None
+        self.log(
+            "[验证码] 自有邮箱使用浏览器手动输入；"
+            "本次注册不连接 IMAP，也不调用自动取码服务"
+        )
+
+    def wait_for_manual_browser_submit(
+        self,
+        page,
+        _min_timestamp: float,
+        *,
+        wait_for_session: bool = True,
+    ) -> None:
+        del wait_for_session
+        self.log("[验证码] 请在浏览器中手动输入邮箱验证码并点击继续")
+        _activate_visible_registration_page(self, page)
+        deadline = time.time() + 600
+        code_input_seen = False
+        while time.time() < deadline:
+            self._raise_if_page_closed(page, "手动输入邮箱验证码")
+            if self._has_chatgpt_session(page):
+                self.log("[验证码] 已检测到登录会话，继续完成后续注册操作")
+                return
+            url = str(getattr(page, "url", "") or "")
+            if self._has_otp_input(page):
+                code_input_seen = True
+                time.sleep(0.5)
+                continue
+            if code_input_seen or "email-verification" not in url:
+                self.log("[验证码] 已检测到你提交验证码，继续完成后续注册操作")
+                return
+            time.sleep(0.5)
+        raise TimeoutError("在 600 秒内未检测到手动验证码提交")
+
+    worker._preconnect_otp_reader = types.MethodType(
+        skip_automatic_code_reader, worker
+    )
+    worker._submit_email_code = types.MethodType(
+        wait_for_manual_browser_submit, worker
+    )
+    worker._hme_manual_browser_verification_configured = True
+    return True
+
+
 # Keep the public name used by older integrations while routing it to manual entry.
 ICloudOtpReader = ManualOtpReader
 
@@ -2280,6 +2578,21 @@ def main() -> int:
     ensure_password = os.environ.get("HME_ENSURE_OPENAI_PASSWORD", "") == "1"
     enable_2fa = os.environ.get("HME_ENABLE_OPENAI_2FA", "") == "1"
     cookie_refresh_only = os.environ.get("HME_COOKIE_SESSION_REFRESH", "") == "1"
+    manual_otp_entry = os.environ.get("HME_MANUAL_OTP_ENTRY", "") == "1"
+    gmail_registration = (
+        not manual_otp_entry
+        and args.email.strip().lower().endswith("@gmail.com")
+        and bool(ensure_password)
+    )
+    password_first_required = (
+        os.environ.get("HME_PASSWORD_FIRST_REQUIRED", "") == "1"
+        or gmail_registration
+    )
+    foreground_required = (
+        os.environ.get("HME_BROWSER_FOREGROUND_REQUIRED", "") == "1"
+        or gmail_registration
+    )
+    browser_headless = bool(args.headless and not foreground_required)
     saved_storage_state = load_saved_storage_state(
         os.environ.get("HME_BROWSER_DB_FILE", ""),
         args.email,
@@ -2303,6 +2616,8 @@ def main() -> int:
         from account_models import MailAccount
 
         app_backend.HotmailOtpReader = ManualOtpReader
+        if not manual_otp_entry:
+            configure_registration_otp_reader(app_backend, args.email)
         configure_windowed_camoufox(app_backend)
         app_backend.OpenAIRegisterPayLinkWorker._force_fill_locator = (
             resilient_force_fill_locator
@@ -2333,7 +2648,7 @@ def main() -> int:
         worker = app_backend.OpenAIRegisterPayLinkWorker(
             account,
             "",
-            bool(args.headless),
+            browser_headless,
             proxy,
             proxy,
             log,
@@ -2372,7 +2687,31 @@ def main() -> int:
             direct_location = detect_direct_registration_location(
                 app_backend, log
             )
-        configure_password_first_login(worker, enabled=ensure_password)
+        configure_password_first_login(
+            worker,
+            enabled=ensure_password,
+            required=password_first_required,
+        )
+        configure_email_password_only_registration(
+            worker,
+            enabled=password_first_required,
+        )
+        if configure_manual_browser_verification(
+            worker,
+            enabled=manual_otp_entry,
+        ):
+            emit(
+                "log",
+                message=(
+                    "自有邮箱已启用浏览器手动验证码模式；"
+                    "输入验证码并点击继续后，程序会自动完成后续操作"
+                ),
+            )
+        if foreground_required:
+            emit(
+                "log",
+                message="Gmail 密码注册已强制使用前台浏览器；点击前会激活窗口",
+            )
         if configure_direct_registration_browser(
             worker,
             enabled=not bool(proxy_url),
@@ -2389,7 +2728,7 @@ def main() -> int:
                 ),
             )
         slot_index, slot_count = _browser_window_slot_from_environment()
-        if slot_count > 1 and not args.headless:
+        if slot_count > 1 and not browser_headless:
             emit(
                 "log",
                 message=(
