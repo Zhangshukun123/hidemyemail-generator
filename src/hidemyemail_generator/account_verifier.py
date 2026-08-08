@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import urllib.request
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from .inbox import connect_db
 EVENT_PREFIX = "HME_VERIFY_EVENT:"
 PROTOCOL_EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
 MAX_LOG_ITEMS = 300
+MAX_HISTORY_LOG_ITEMS = 1000
 
 
 def utc_now() -> str:
@@ -207,6 +209,7 @@ class AccountVerificationManager:
         code_service_url: str = "",
         code_service_token: str = "",
         browser_manager: BrowserTaskManager | None = None,
+        delete_invalid_email: Callable[[str, str], Awaitable[str]] | None = None,
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.db_file = db_file.resolve()
@@ -227,10 +230,12 @@ class AccountVerificationManager:
         self.code_service_url = str(code_service_url or "").strip().rstrip("/")
         self.code_service_token = str(code_service_token or "")
         self.browser_manager = browser_manager
+        self.delete_invalid_email = delete_invalid_email
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._browser_refresh_lock = asyncio.Lock()
         self._state: dict[str, Any] = self._idle_state()
+        self._history_logs: list[dict[str, Any]] = []
 
     @staticmethod
     def _idle_state() -> dict[str, Any]:
@@ -286,6 +291,7 @@ class AccountVerificationManager:
                 {key: value for key, value in item.items() if not key.startswith("_")}
                 for item in self._state.get("accounts", [])
             ],
+            "historyLogs": list(self._history_logs),
             "runtime": self.availability(),
         }
 
@@ -318,7 +324,7 @@ class AccountVerificationManager:
                 else "暂无已保存 Session 的账号"
             )
             raise RuntimeError(message)
-        concurrency = max(1, min(5, int(concurrency)))
+        concurrency = max(1, min(10, int(concurrency)))
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -415,8 +421,9 @@ class AccountVerificationManager:
         *,
         emails: list[str] | set[str],
         concurrency: int = 3,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
-        """Refresh missing Sessions in one headless browser batch, then verify."""
+        """Refresh Sessions in one headless browser batch, then verify."""
         if self._batch_task and not self._batch_task.done():
             raise RuntimeError("账号验证任务正在运行")
         runtime = self.availability()
@@ -442,7 +449,8 @@ class AccountVerificationManager:
             session = account_session(record)
             token = account_session_access_token(record)
             refresh_session = (
-                not session
+                bool(force_refresh)
+                or not session
                 or not token
                 or access_token_is_expired(token)
                 or bool(record.get("session_invalid_at"))
@@ -466,11 +474,14 @@ class AccountVerificationManager:
                     "email": email,
                     "status": "queued",
                     "message": (
-                        "等待无头浏览器重新获取 Session"
+                        "等待使用已保存 Cookie 重新获取 Session"
+                        if force_refresh
+                        else "等待无头浏览器重新获取 Session"
                         if refresh_session
                         else "等待验证"
                     ),
                     "_refresh_session": refresh_session,
+                    "_cookie_refresh_only": bool(force_refresh),
                     "_access_token": token,
                     "_account_type": account_type,
                     "_account_type_source": account_type_source,
@@ -489,6 +500,7 @@ class AccountVerificationManager:
             "status": "running",
             "running": True,
             "headless": True,
+            "refreshSource": "cookie" if force_refresh else "session_if_needed",
             "concurrency": concurrency,
             "total": len(accounts),
             "completed": 0,
@@ -503,7 +515,8 @@ class AccountVerificationManager:
             "finishedAt": "",
         }
         self._append_log(
-            f"无头浏览器验证已启动：{len(accounts)} 个账号，"
+            f"{'Cookie 刷新' if force_refresh else '无头浏览器验证'}已启动："
+            f"{len(accounts)} 个账号，"
             f"刷新 Session {refresh_count} 个，并发 {concurrency}"
         )
         self._batch_task = asyncio.create_task(
@@ -531,9 +544,18 @@ class AccountVerificationManager:
         try:
             if refresh_items:
                 for item in refresh_items:
-                    item.update(status="running", message="正在启动无头浏览器获取 Session")
+                    item.update(
+                        status="running",
+                        message=(
+                            "正在加载保存 Cookie 并重新获取 Session"
+                            if item.get("_cookie_refresh_only")
+                            else "正在启动无头浏览器获取 Session"
+                        ),
+                    )
                 self._append_log(
-                    f"正在启动 {len(refresh_items)} 个账号的无头浏览器进程，"
+                    f"正在启动 {len(refresh_items)} 个账号的"
+                    f"{'Cookie 刷新' if any(item.get('_cookie_refresh_only') for item in refresh_items) else '无头浏览器'}"
+                    "进程，"
                     f"并发 {concurrency}"
                 )
                 self.browser_manager.start(
@@ -544,6 +566,9 @@ class AccountVerificationManager:
                             "ensure_password": False,
                             "force_reset_password": False,
                             "enable_2fa": False,
+                            "cookie_refresh_only": bool(
+                                item.get("_cookie_refresh_only")
+                            ),
                             "two_factor": item.get("_two_factor") or {},
                         }
                         for item in refresh_items
@@ -596,7 +621,12 @@ class AccountVerificationManager:
                         _session_plan=session_plan,
                         _refresh_session=False,
                     )
-                    self._append_log("无头浏览器已获取 Session", email=email)
+                    self._append_log(
+                        "已使用保存 Cookie 获取最新 Session 与账号状态"
+                        if item.get("_cookie_refresh_only")
+                        else "无头浏览器已获取 Session",
+                        email=email,
+                    )
         except asyncio.CancelledError:
             if self.browser_manager.snapshot().get("running"):
                 await self.browser_manager.stop()
@@ -697,12 +727,64 @@ class AccountVerificationManager:
         self._append_log(item["message"], email=email)
         return True, ""
 
-    def _append_log(self, message: str, *, email: str = "") -> None:
-        entry = {"at": utc_now(), "email": email, "message": str(message)[:1000]}
+    def _append_log(
+        self, message: str, *, email: str = "", level: str = "info"
+    ) -> None:
+        entry = {
+            "at": utc_now(),
+            "taskId": str(self._state.get("id") or ""),
+            "email": email,
+            "level": level if level in {"info", "success", "warning", "error"} else "info",
+            "message": str(message)[:1000],
+        }
         logs = self._state.setdefault("logs", [])
         logs.append(entry)
         if len(logs) > MAX_LOG_ITEMS:
             del logs[:-MAX_LOG_ITEMS]
+        self._history_logs.append(dict(entry))
+        if len(self._history_logs) > MAX_HISTORY_LOG_ITEMS:
+            del self._history_logs[:-MAX_HISTORY_LOG_ITEMS]
+
+    def record_invalid_email_deleted(self, email: str, reason: str) -> dict[str, Any]:
+        """Expose a failed preflight check in the same UI used for verification logs."""
+        if self._batch_task and not self._batch_task.done():
+            raise RuntimeError("账号验证任务正在运行")
+        target = str(email or "").strip().lower()
+        detail = str(reason or "iCloud 邮箱无效或已停用")[:1000]
+        now = utc_now()
+        self._state = {
+            "id": uuid.uuid4().hex,
+            "status": "completed",
+            "running": False,
+            "concurrency": 1,
+            "total": 1,
+            "completed": 1,
+            "plus": 0,
+            "free": 0,
+            "expired": 1,
+            "deleted": 1,
+            "failed": 0,
+            "accounts": [
+                {
+                    "email": target,
+                    "status": "deleted",
+                    "sessionStatus": "expired",
+                    "message": detail,
+                }
+            ],
+            "logs": [],
+            "startedAt": now,
+            "finishedAt": now,
+        }
+        self._append_log(f"验证前检查失败：{detail}", email=target, level="error")
+        self._append_log("无效邮箱及本地账号凭据已自动删除", email=target, level="warning")
+        return self.snapshot()
+
+    async def _delete_confirmed_invalid_email(self, email: str, reason: str) -> str:
+        if self.delete_invalid_email is not None:
+            return str(await self.delete_invalid_email(email, reason) or "邮箱已删除")
+        await asyncio.to_thread(remove_invalid_account, self.db_file, email, reason)
+        return "本地邮箱记录及账号凭据已删除"
 
     async def _run_batch(self, concurrency: int) -> None:
         semaphore = asyncio.Semaphore(concurrency)
@@ -717,7 +799,9 @@ class AccountVerificationManager:
                 self._state["status"] = "completed"
                 self._append_log(
                     f"验证完成：Plus {self._state['plus']}，Free {self._state['free']}，"
-                    f"Token 失效 {self._state['expired']}，失败 {self._state['failed']}"
+                    f"Token 失效 {self._state['expired']}，"
+                    f"已删除 {self._state['deleted']}，失败 {self._state['failed']}",
+                    level=("warning" if self._state["expired"] else "success"),
                 )
         except asyncio.CancelledError:
             self._state["status"] = "cancelled"
@@ -982,6 +1066,22 @@ class AccountVerificationManager:
                 )
                 result = str(event.get("status") or "error")
                 detail = str(event.get("detail") or "").strip()
+                safe_detail = detail.replace(token, "[REDACTED]") if token else detail
+                response_log = (
+                    f"验证响应：status={result}，exitCode={return_code}"
+                    + (f"；{safe_detail}" if safe_detail else "；未返回详细说明")
+                )
+                self._append_log(
+                    response_log,
+                    email=email,
+                    level=(
+                        "success"
+                        if return_code == 0 and result in {"plus", "free"}
+                        else "warning"
+                        if return_code == 0 and result == "invalid"
+                        else "error"
+                    ),
+                )
                 session_owner = str(
                     item.get("_session_email") or ""
                 ).strip().lower()
@@ -1058,7 +1158,7 @@ class AccountVerificationManager:
                 else:
                     item.update(status=result, message=f"已归类为 {result.title()}")
                 self._state[effective_result] += 1
-                self._append_log(item["message"], email=email)
+                self._append_log(item["message"], email=email, level="success")
             elif return_code == 0 and result == "invalid":
                 if automatic_refresh_succeeded:
                     invalid_message = (
@@ -1073,32 +1173,45 @@ class AccountVerificationManager:
                     invalid_message += "；原 Session 已保留"
                 else:
                     invalid_message = "Token 已失效，原 Session 已保留"
-                await asyncio.to_thread(
-                    mark_account_session_invalid,
-                    self.db_file,
-                    email,
-                    invalid_message,
-                )
-                if item.get("_account_type") == "plus":
-                    item.update(
-                        status="plus",
-                        message=f"Plus 账号 {invalid_message}",
+                deletion_reason = f"{invalid_message}；验证详情：{detail or '两个账号接口均返回 401'}"
+                self._state["expired"] += 1
+                try:
+                    deletion_message = await self._delete_confirmed_invalid_email(
+                        email, deletion_reason
                     )
-                    self._state["plus"] += 1
-                else:
+                    item.update(
+                        status="deleted",
+                        sessionStatus="expired",
+                        message=f"Token 已确认失效；{deletion_message}",
+                    )
+                    self._state["deleted"] += 1
+                    self._append_log(item["message"], email=email, level="warning")
+                except Exception as error:
+                    delete_error = str(error or "删除邮箱失败")[:500]
+                    await asyncio.to_thread(
+                        mark_account_session_invalid,
+                        self.db_file,
+                        email,
+                        f"{deletion_reason}；自动删除失败：{delete_error}",
+                    )
                     item.update(
                         status="expired",
-                        message=invalid_message,
+                        sessionStatus="expired",
+                        message=f"{invalid_message}；自动删除失败：{delete_error}",
                     )
-                    self._state["expired"] += 1
-                self._append_log(item["message"], email=email)
+                    self._state["failed"] += 1
+                    self._append_log(item["message"], email=email, level="error")
             else:
                 error = detail or stderr.decode("utf-8", errors="replace").strip()
                 if token:
                     error = error.replace(token, "[REDACTED]")
                 item.update(status="failed", message=(error or "账号验证失败")[:500])
                 self._state["failed"] += 1
-                self._append_log(f"验证失败，账号已保留：{item['message']}", email=email)
+                self._append_log(
+                    f"验证失败，账号已保留：{item['message']}",
+                    email=email,
+                    level="error",
+                )
             self._state["completed"] += 1
             self._clear_private_item_fields(item)
 

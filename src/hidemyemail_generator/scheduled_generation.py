@@ -58,7 +58,7 @@ def _generation_error(result: dict[str, Any]) -> str:
 
 
 class ScheduledGenerationManager:
-    """Persist and run the fixed hourly Hide My Email inventory schedule."""
+    """Persist and run the periodic Hide My Email inventory schedule."""
 
     def __init__(
         self,
@@ -82,9 +82,31 @@ class ScheduledGenerationManager:
         self._wakeup = asyncio.Event()
         self._task: asyncio.Task | None = None
 
+    def _next_run_after(self, now: datetime) -> datetime:
+        now = _as_utc(now)
+        if int(self.interval_seconds) == 60 * 60:
+            return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return now + timedelta(seconds=self.interval_seconds)
+
+    def _schedule_enabled_message(self) -> str:
+        if int(self.interval_seconds) == 60 * 60:
+            return f"定时生成已启用；下个整点尝试生成 {self.batch_size} 个邮箱"
+        return (
+            f"定时生成已启用；{int(self.interval_seconds)} 秒后尝试生成 "
+            f"{self.batch_size} 个邮箱"
+        )
+
+    def _schedule_changed_message(self) -> str:
+        if int(self.interval_seconds) == 60 * 60:
+            return f"定时规则已更新为每个整点尝试生成 {self.batch_size} 个邮箱"
+        return (
+            f"定时规则已更新为每 {int(self.interval_seconds)} 秒尝试生成 "
+            f"{self.batch_size} 个邮箱"
+        )
+
     def _new_state(self, now: datetime) -> dict[str, Any]:
         enabled = self.default_enabled
-        next_run = now + timedelta(seconds=self.interval_seconds) if enabled else None
+        next_run = self._next_run_after(now) if enabled else None
         state: dict[str, Any] = {
             "enabled": enabled,
             "running": False,
@@ -105,7 +127,7 @@ class ScheduledGenerationManager:
             self._append_log(
                 state,
                 "info",
-                "定时生成已启用；从现在开始计时，第一批将在 1 小时后生成 5 个邮箱",
+                self._schedule_enabled_message(),
                 now,
             )
         return state
@@ -113,6 +135,16 @@ class ScheduledGenerationManager:
     def _normalize_state(self, value: Any, now: datetime) -> dict[str, Any]:
         if not isinstance(value, dict):
             return self._new_state(now)
+        try:
+            stored_batch_size = int(value.get("batchSize") or 0)
+            stored_interval_seconds = int(value.get("intervalSeconds") or 0)
+        except (TypeError, ValueError):
+            stored_batch_size = 0
+            stored_interval_seconds = 0
+        schedule_changed = (
+            stored_batch_size != self.batch_size
+            or stored_interval_seconds != int(self.interval_seconds)
+        )
         state = self._new_state(now)
         state.update(
             {
@@ -144,25 +176,30 @@ class ScheduledGenerationManager:
 
         if state.get("running"):
             # A prior process may have stopped after iCloud accepted some aliases.
-            # Wait a full interval before retrying instead of risking a duplicate burst.
+            # Resume at the next schedule boundary instead of risking a duplicate burst.
             state["running"] = False
             state["status"] = "waiting" if state["enabled"] else "paused"
             if state["enabled"]:
-                state["nextRunAt"] = _timestamp(
-                    now + timedelta(seconds=self.interval_seconds)
-                )
+                state["nextRunAt"] = _timestamp(self._next_run_after(now))
             self._append_log(
                 state,
                 "warning",
-                "检测到上次生成被服务重启中断；已重新等待完整 1 小时",
+                "检测到上次生成被服务重启中断；已改到下个计划时间重试",
                 now,
             )
         elif state["enabled"]:
             state["status"] = "waiting"
-            if _parse_timestamp(state.get("nextRunAt")) is None:
-                state["nextRunAt"] = _timestamp(
-                    now + timedelta(seconds=self.interval_seconds)
+            if schedule_changed:
+                state["startedAt"] = _timestamp(now)
+                state["nextRunAt"] = _timestamp(now)
+                self._append_log(
+                    state,
+                    "info",
+                    f"{self._schedule_changed_message()}；立即执行首轮",
+                    now,
                 )
+            elif _parse_timestamp(state.get("nextRunAt")) is None:
+                state["nextRunAt"] = _timestamp(self._next_run_after(now))
         else:
             state["status"] = "paused"
             state["nextRunAt"] = ""
@@ -249,15 +286,13 @@ class ScheduledGenerationManager:
                     enabled=True,
                     status="waiting",
                     startedAt=_timestamp(now),
-                    nextRunAt=_timestamp(
-                        now + timedelta(seconds=self.interval_seconds)
-                    ),
+                    nextRunAt=_timestamp(self._next_run_after(now)),
                     lastError="",
                 )
                 self._append_log(
                     self._state,
                     "info",
-                    "定时生成已启用；从现在开始计时，第一批将在 1 小时后生成 5 个邮箱",
+                    self._schedule_enabled_message(),
                     now,
                 )
             elif not enabled and was_enabled:
@@ -329,7 +364,7 @@ class ScheduledGenerationManager:
                     self._state.get("totalGenerated") or 0
                 ) + len(generated)
                 self._state["nextRunAt"] = (
-                    _timestamp(finished + timedelta(seconds=self.interval_seconds))
+                    _timestamp(self._next_run_after(finished))
                     if self._state.get("enabled")
                     else ""
                 )

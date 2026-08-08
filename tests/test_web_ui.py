@@ -30,8 +30,14 @@ class StructuredWebUiTests(unittest.TestCase):
             self.assertIn(f'data-route="{route}"', page)
         self.assertIn("gpt-link · PH / PHP hosted · 双代理严格 0", page)
         self.assertIn('id="verificationAccountSelect"', page)
+        self.assertIn('id="verificationConcurrency"', page)
+        self.assertIn('data-action="previous-verification"', page)
+        self.assertIn('data-action="next-verification"', page)
         self.assertIn('data-action="verify-selected"', page)
-        self.assertIn("验证选中账号", page)
+        self.assertIn("Cookie 刷新选中账号", page)
+        self.assertIn('id="verificationLog"', page)
+        self.assertIn("renderVerificationLogs", page)
+        self.assertIn("接口响应和删除原因", page)
 
     def test_app_page_uses_frontend_design_patterns(self):
         page = build_app_page()
@@ -43,6 +49,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("class WorkspaceRenderer", page)
         self.assertIn("class WorkspaceController", page)
         self.assertIn("window.__HME_LOCAL_TOKEN__ = __LOCAL_TOKEN__", page)
+        self.assertIn("按需同步（仅接码时连接）", page)
 
     def test_design_system_is_shared_and_scroll_friendly(self):
         page = build_app_page()
@@ -72,37 +79,50 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("task-log-row", page)
         self.assertIn("data-task-tone", page)
 
-    def test_hourly_inventory_panel_waits_before_generating_without_registration(self):
+    def test_hourly_inventory_generation_is_removed_from_local_workspace(self):
         page = build_app_page()
 
-        for element_id in (
-            "scheduledGenerationPanel",
-            "scheduledGenerationBadge",
-            "scheduledGenerationCountdown",
-            "scheduledGenerationLog",
-            "toggleScheduledGenerationButton",
-        ):
-            self.assertIn(f'id="{element_id}"', page)
-        self.assertIn("等待完整 1 小时", page)
-        self.assertIn("只入库，不注册", page)
-        self.assertIn('data-action="toggle-scheduled-generation"', page)
-        self.assertIn("/api/scheduled-generation/status", page)
-        self.assertIn("/api/scheduled-generation/config", page)
+        self.assertNotIn('id="scheduledGenerationPanel"', page)
+        self.assertNotIn('data-action="toggle-scheduled-generation"', page)
+        self.assertNotIn("/api/scheduled-generation/status", page)
+        self.assertNotIn("/api/scheduled-generation/config", page)
+        self.assertNotIn("/api/registration-inventory/status", page)
 
-    def test_one_click_registration_uses_generated_inventory(self):
+    def test_registration_accepts_manual_email_and_verification_code(self):
         page = build_app_page()
 
-        self.assertIn('id="registerFromInventoryButton"', page)
-        self.assertIn("从库存注册账号（--）", page)
-        self.assertIn('id="registrationInventoryAvailable"', page)
-        self.assertIn("可注册库存", page)
-        self.assertIn("claiming_inventory", page)
-        self.assertIn("正在领取库存", page)
-        self.assertIn("已按并发", page)
-        self.assertIn("inventoryAvailable", page)
+        self.assertIn('id="registrationEmail"', page)
+        self.assertIn('id="registerEmailButton"', page)
+        self.assertIn("添加邮箱并注册", page)
+        self.assertIn("验证码在浏览器中手动输入", page)
+        self.assertIn('id="registrationCodePanel"', page)
+        self.assertIn('id="registrationCode"', page)
+        self.assertIn("submit-registration-code", page)
+        self.assertIn("/api/registration/code", page)
+        self.assertIn("awaiting_verification_code", page)
+        self.assertNotIn("registerFromInventoryButton", page)
+        self.assertNotIn("registrationInventory", page)
         self.assertIn('id="registrationNetworkMode"', page)
         self.assertIn("本机 IP 直连 · 语言随出口", page)
         self.assertIn("关闭时使用本机公网 IP 直连", page)
+
+    def test_registration_can_buy_smsbower_gmail_and_poll_code_automatically(self):
+        page = build_app_page()
+
+        self.assertIn('id="smsbowerStatus"', page)
+        self.assertIn('id="smsbowerMaxPrice"', page)
+        self.assertIn('id="registrationEmailProvider"', page)
+        self.assertIn('<option value="icloud">iCloud 库存邮箱</option>', page)
+        self.assertIn('<option value="gmail">Gmail · SMSBower</option>', page)
+        self.assertIn('id="registerProviderButton"', page)
+        self.assertIn("获取 Gmail 并注册", page)
+        self.assertIn("使用 iCloud 注册", page)
+        self.assertIn('data-action="set-smsbower-key"', page)
+        self.assertIn('data-action="register-provider"', page)
+        self.assertIn("/api/smsbower/status", page)
+        self.assertIn("/api/smsbower/config", page)
+        self.assertIn('provider: source === "gmail" ? "smsbower" : "inventory"', page)
+        self.assertIn('registration.provider === "smsbower"', page)
 
     def test_verification_results_keep_every_account_visible(self):
         page = build_app_page()
@@ -110,6 +130,13 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("const taskAccountsByEmail = new Map", page)
         self.assertIn("return [...accountRows, ...taskOnlyRows]", page)
         self.assertIn("请选择一个账号（共 ", page)
+
+    def test_selected_account_refresh_uses_saved_cookie(self):
+        page = build_app_page()
+
+        self.assertIn("Cookie 刷新选中账号", page)
+        self.assertIn("refresh_with_cookie: true", page)
+        self.assertIn("使用保存的 Cookie 刷新 Session 与账号状态", page)
 
     def test_login_page_matches_the_workspace_identity(self):
         page = build_login_page()

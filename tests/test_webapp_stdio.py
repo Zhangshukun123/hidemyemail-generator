@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import sys
 import tempfile
@@ -15,9 +16,10 @@ from hidemyemail_generator.browser_tasks import (
     _save_account_record,
     load_account_record,
 )
-from hidemyemail_generator.inbox import connect_db
+from hidemyemail_generator.inbox import InboxConfig, connect_db, save_config
 from hidemyemail_generator.webapp import (
     WORKBENCH_OPENAI_CODE_PATH,
+    _configured_inventory_service_token,
     _configured_workbench_import_token,
     _configure_utf8_stdio,
     _generation_failure_message,
@@ -28,28 +30,45 @@ from hidemyemail_generator.webapp import (
 
 
 class WebAppStdioTests(unittest.TestCase):
-    def test_workbench_import_uses_the_token_checked_by_workbench(self):
+    def test_workbench_import_uses_dedicated_local_token(self):
         with mock.patch.dict(
             os.environ,
             {
-                "HME_IMPORT_TOKEN": "canonical-workbench-token",
-                "ACCOUNT_WORKBENCH_IMPORT_TOKEN": "stale-client-token",
+                "HME_IMPORT_TOKEN": "unrelated-remote-token",
+                "ACCOUNT_WORKBENCH_IMPORT_TOKEN": "local-workbench-token",
             },
             clear=False,
         ):
             self.assertEqual(
-                _configured_workbench_import_token(), "canonical-workbench-token"
+                _configured_workbench_import_token(), "local-workbench-token"
             )
 
-    def test_workbench_import_token_keeps_legacy_alias_fallback(self):
+    def test_workbench_import_does_not_fall_back_to_remote_token(self):
         with mock.patch.dict(
             os.environ,
-            {"ACCOUNT_WORKBENCH_IMPORT_TOKEN": "legacy-client-token"},
+            {"HME_IMPORT_TOKEN": "unrelated-remote-token"},
             clear=False,
         ):
-            os.environ.pop("HME_IMPORT_TOKEN", None)
+            os.environ.pop("ACCOUNT_WORKBENCH_IMPORT_TOKEN", None)
+            self.assertEqual(_configured_workbench_import_token(), "")
+
+    def test_inventory_does_not_fall_back_to_local_workbench_token(self):
+        with mock.patch.dict(
+            os.environ,
+            {"ACCOUNT_WORKBENCH_IMPORT_TOKEN": "unrelated-local-token"},
+            clear=False,
+        ):
+            os.environ.pop("HIDEMYEMAIL_INVENTORY_TOKEN", None)
+            self.assertEqual(_configured_inventory_service_token(), "")
+
+    def test_inventory_uses_its_dedicated_remote_token(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HIDEMYEMAIL_INVENTORY_TOKEN": "inventory-token"},
+            clear=False,
+        ):
             self.assertEqual(
-                _configured_workbench_import_token(), "legacy-client-token"
+                _configured_inventory_service_token(), "inventory-token"
             )
 
     def test_loads_local_workbench_settings_without_overriding_environment(self):
@@ -116,6 +135,7 @@ class WebAppStdioTests(unittest.TestCase):
             base_dir = Path(temp_dir) / "hidemyemail-generator"
             app = create_app(base_dir=base_dir)
 
+            self.assertNotIn("inbox_sync_interval", app)
             self.assertEqual(
                 app["browser_manager"].target_project_dir,
                 (base_dir.parent / "openai-register-paylink").resolve(),
@@ -174,6 +194,49 @@ class WorkbenchOpenAICodeEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 401)
         self.assertEqual((await response.json())["error"], "请先登录")
+
+
+class GptCredentialEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.app = create_app(base_dir=Path(self.temp_dir.name))
+        _save_account_record(
+            self.app["db_file"],
+            "saved@gmail.com",
+            result={
+                "access_token": "at-gmail-test",
+                "session_json": '{"accessToken":"at-gmail-test"}',
+            },
+        )
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp_dir.cleanup()
+
+    async def test_gmail_access_token_can_be_copied(self):
+        response = await self.client.post(
+            "/api/gpt-credential",
+            json={"email": "saved@gmail.com", "kind": "access_token"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            await response.json(),
+            {"ok": True, "value": "at-gmail-test"},
+        )
+
+    async def test_malformed_email_is_still_rejected(self):
+        response = await self.client.post(
+            "/api/gpt-credential",
+            json={"email": "not-an-email", "kind": "access_token"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"], "邮箱地址无效")
 
 
 class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -319,7 +382,86 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodePortalTests(unittest.IsolatedAsyncioTestCase):
-    async def test_private_link_opens_alias_only_portal(self):
+    @staticmethod
+    def fake_hide_my_email():
+        class FakeHideMyEmail:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def list_email(self):
+                return {
+                    "success": True,
+                    "result": {
+                        "hmeEmails": [
+                            {
+                                "hme": "one@icloud.com",
+                                "anonymousId": "one",
+                                "isActive": True,
+                            }
+                        ]
+                    },
+                }
+
+        return FakeHideMyEmail
+
+    async def test_account_list_uses_local_records_when_icloud_session_is_invalid(self):
+        class InvalidSessionHideMyEmail:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def list_email(self):
+                return {"success": False, "error": "Invalid global session"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            app["cookie_file"].write_text("fake-cookie", encoding="utf-8")
+            conn = connect_db(str(app["db_file"]))
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:352121354@qq.com",
+                        json.dumps(
+                            {
+                                "password": "Manual!Password123",
+                                "password_confirmed": True,
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                with mock.patch(
+                    "hidemyemail_generator.webapp.RichHideMyEmail",
+                    InvalidSessionHideMyEmail,
+                ):
+                    response = await client.get("/api/gpt-emails")
+                    payload = await response.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["items"][0]["email"], "352121354@qq.com")
+        self.assertEqual(payload["identityWarning"], "Invalid global session")
+
+    async def test_public_alias_only_portal_keeps_admin_private(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app = create_app(
                 base_dir=Path(temp_dir),
@@ -329,26 +471,29 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
             client = TestClient(TestServer(app))
             await client.start_server()
             try:
-                blocked = await client.get("/code", allow_redirects=False)
+                page = await client.get("/code", allow_redirects=False)
+                html = await page.text()
+                invalid_lookup = await client.post(
+                    "/api/code/latest", json={"email": "invalid"}
+                )
+                private_admin = await client.get(
+                    "/api/gpt-emails", allow_redirects=False
+                )
                 invalid = await client.get(
                     "/access?token=wrong", allow_redirects=False
                 )
                 granted = await client.get(
                     "/access?token=private-token", allow_redirects=False
                 )
-                session = granted.cookies["hme_session"].value
-                page = await client.get(
-                    "/code", headers={"Cookie": f"hme_session={session}"}
-                )
-                html = await page.text()
             finally:
                 await client.close()
 
-        self.assertEqual(blocked.status, 302)
+        self.assertEqual(page.status, 200)
+        self.assertEqual(invalid_lookup.status, 400)
+        self.assertEqual(private_admin.status, 401)
         self.assertEqual(invalid.status, 404)
         self.assertEqual(granted.status, 302)
         self.assertEqual(granted.headers["Location"], "/code")
-        self.assertEqual(page.status, 200)
         self.assertIn("输入“隐藏我的邮箱”子邮箱", html)
         self.assertIn("/api/code/latest", html)
         self.assertNotIn("password", html.lower())
@@ -398,6 +543,90 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first["code"], "333333")
         self.assertEqual(second["code"], "222222")
+
+    async def test_code_lookup_syncs_only_on_demand_and_shares_cooldown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "cookies.txt").write_text("cookie", encoding="utf-8")
+            save_config(
+                InboxConfig(
+                    host="imap.example.com",
+                    port=993,
+                    username="inbox@example.com",
+                    password="app-password",
+                ),
+                str(root / "inbox_config.json"),
+            )
+            app = create_app(base_dir=root)
+            client = TestClient(TestServer(app))
+            with (
+                mock.patch(
+                    "hidemyemail_generator.webapp.RichHideMyEmail",
+                    self.fake_hide_my_email(),
+                ),
+                mock.patch(
+                    "hidemyemail_generator.webapp.sync_inbox",
+                    return_value=[],
+                ) as sync,
+            ):
+                await client.start_server()
+                try:
+                    first = await client.post(
+                        "/api/code/latest", json={"email": "one@icloud.com"}
+                    )
+                    second = await client.post(
+                        "/api/code/latest", json={"email": "one@icloud.com"}
+                    )
+                finally:
+                    await client.close()
+
+        self.assertEqual(first.status, 404)
+        self.assertEqual(second.status, 404)
+        self.assertEqual(sync.call_count, 1)
+
+    async def test_authentication_failure_enters_backoff(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "cookies.txt").write_text("cookie", encoding="utf-8")
+            save_config(
+                InboxConfig(
+                    host="imap.example.com",
+                    port=993,
+                    username="inbox@example.com",
+                    password="app-password",
+                ),
+                str(root / "inbox_config.json"),
+            )
+            app = create_app(base_dir=root)
+            client = TestClient(TestServer(app))
+            with (
+                mock.patch(
+                    "hidemyemail_generator.webapp.RichHideMyEmail",
+                    self.fake_hide_my_email(),
+                ),
+                mock.patch(
+                    "hidemyemail_generator.webapp.sync_inbox",
+                    side_effect=RuntimeError("AUTHENTICATIONFAILED"),
+                ) as sync,
+            ):
+                await client.start_server()
+                try:
+                    first = await client.post(
+                        "/api/code/latest", json={"email": "one@icloud.com"}
+                    )
+                    second = await client.post(
+                        "/api/code/latest", json={"email": "one@icloud.com"}
+                    )
+                    first_payload = await first.json()
+                    second_payload = await second.json()
+                finally:
+                    await client.close()
+
+        self.assertEqual(first.status, 502)
+        self.assertEqual(second.status, 502)
+        self.assertIn("IMAP 登录失败", first_payload["error"])
+        self.assertEqual(second_payload["error"], first_payload["error"])
+        self.assertEqual(sync.call_count, 1)
 
 
 class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -509,7 +738,9 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
             def snapshot(self):
                 return {"running": False}
 
-            def start_with_browser(self, *, emails, concurrency):
+            def start_with_browser(
+                self, *, emails, concurrency, force_refresh=False
+            ):
                 self.starts.append({"emails": emails, "concurrency": concurrency})
                 return {
                     "running": True,
@@ -571,11 +802,17 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                 self.protocol_emails.append(email)
                 return {"running": True, "accounts": [{"email": email}]}
 
-            def start_with_browser(self, *, emails, concurrency):
+            def start_with_browser(
+                self, *, emails, concurrency, force_refresh=False
+            ):
                 if not self.allow_protocol:
                     raise AssertionError("browser refresh called on wrong manager")
                 self.browser_refresh_starts.append(
-                    {"emails": emails, "concurrency": concurrency}
+                    {
+                        "emails": emails,
+                        "concurrency": concurrency,
+                        "force_refresh": force_refresh,
+                    }
                 )
                 return {"running": True, "accounts": [{"email": emails[0]}]}
 
@@ -613,7 +850,13 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
 
-        async def run_case(*, has_valid_session, marked_invalid=False):
+        async def run_case(
+            *,
+            has_valid_session,
+            marked_invalid=False,
+            refresh_with_cookie=False,
+            email="protocol@icloud.com",
+        ):
             with tempfile.TemporaryDirectory() as temp_dir:
                 base_dir = Path(temp_dir)
                 (base_dir / "cookies.txt").write_text("cookie", encoding="utf-8")
@@ -622,16 +865,26 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                 if has_valid_session:
                     _save_account_record(
                         app["db_file"],
-                        "protocol@icloud.com",
+                        email,
                         result={
                             "access_token": "valid-session-token",
                             "session_json": '{"accessToken":"valid-session-token"}',
+                            "cookies_json": json.dumps(
+                                [
+                                    {
+                                        "name": "session",
+                                        "value": "saved-cookie",
+                                        "domain": "chatgpt.com",
+                                        "path": "/",
+                                    }
+                                ]
+                            ),
                         },
                     )
                     if marked_invalid:
                         mark_account_session_invalid(
                             app["db_file"],
-                            "protocol@icloud.com",
+                            email,
                             "online endpoint returned 401",
                         )
                 verification_manager = ManagerStub(
@@ -657,9 +910,10 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                         response = await client.post(
                             "/api/account/verify-or-register",
                             json={
-                                "email": "protocol@icloud.com",
+                                "email": email,
                                 "headless": False,
                                 "reset_password": False,
+                                "refresh_with_cookie": refresh_with_cookie,
                             },
                             headers={"X-Local-Token": app["local_token"]},
                         )
@@ -689,10 +943,34 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verification_manager.protocol_emails, [])
         self.assertEqual(
             verification_manager.browser_refresh_starts,
-            [{"emails": ["protocol@icloud.com"], "concurrency": 1}],
+            [
+                {
+                    "emails": ["protocol@icloud.com"],
+                    "concurrency": 1,
+                    "force_refresh": False,
+                }
+            ],
         )
         self.assertEqual(verification_manager.verify_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
+
+        response, payload, verification_manager, browser_manager = await run_case(
+            has_valid_session=True,
+            refresh_with_cookie=True,
+            email="protocol@gmail.com",
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["mode"], "refresh_cookie")
+        self.assertEqual(
+            verification_manager.browser_refresh_starts,
+            [
+                {
+                    "emails": ["protocol@gmail.com"],
+                    "concurrency": 1,
+                    "force_refresh": True,
+                }
+            ],
+        )
 
         response, payload, verification_manager, browser_manager = await run_case(
             has_valid_session=True,
@@ -702,7 +980,32 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["mode"], "refresh_session")
         self.assertEqual(
             verification_manager.browser_refresh_starts,
-            [{"emails": ["protocol@icloud.com"], "concurrency": 1}],
+            [
+                {
+                    "emails": ["protocol@icloud.com"],
+                    "concurrency": 1,
+                    "force_refresh": False,
+                }
+            ],
+        )
+        self.assertEqual(verification_manager.verify_starts, [])
+        self.assertEqual(browser_manager.browser_starts, 0)
+
+        response, payload, verification_manager, browser_manager = await run_case(
+            has_valid_session=True,
+            refresh_with_cookie=True,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["mode"], "refresh_cookie")
+        self.assertEqual(
+            verification_manager.browser_refresh_starts,
+            [
+                {
+                    "emails": ["protocol@icloud.com"],
+                    "concurrency": 1,
+                    "force_refresh": True,
+                }
+            ],
         )
         self.assertEqual(verification_manager.verify_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)

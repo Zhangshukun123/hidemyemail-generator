@@ -10,12 +10,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$token = [Environment]::GetEnvironmentVariable("HME_IMPORT_TOKEN", "Process")
+$token = [Environment]::GetEnvironmentVariable("HIDEMYEMAIL_REMOTE_TOKEN", "Process")
 if (-not $token) {
-    $token = [Environment]::GetEnvironmentVariable("HME_IMPORT_TOKEN", "User")
+    $token = [Environment]::GetEnvironmentVariable("HIDEMYEMAIL_REMOTE_TOKEN", "User")
 }
 if (-not $token -or $token.Length -lt 32) {
-    throw "HME_IMPORT_TOKEN is missing or too short."
+    throw "HIDEMYEMAIL_REMOTE_TOKEN is missing or too short."
 }
 
 if (-not $Since) {

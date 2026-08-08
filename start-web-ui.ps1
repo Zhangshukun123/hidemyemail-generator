@@ -43,6 +43,18 @@ $env:OPENAI_REGISTER_PYTHON = $registerPythonPath
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUNBUFFERED = "1"
+foreach ($name in @(
+    "HIDEMYEMAIL_INVENTORY_URL",
+    "HIDEMYEMAIL_INVENTORY_TOKEN",
+    "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS"
+)) {
+    if (-not [Environment]::GetEnvironmentVariable($name, "Process")) {
+        $userValue = [Environment]::GetEnvironmentVariable($name, "User")
+        if ($userValue) {
+            [Environment]::SetEnvironmentVariable($name, $userValue, "Process")
+        }
+    }
+}
 Set-Location -LiteralPath $projectDir
 
 Start-Process -FilePath $pythonWindowPath `

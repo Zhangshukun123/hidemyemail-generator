@@ -51,16 +51,6 @@
     return parts.join(":");
   }
 
-  function formatCountdown(value) {
-    const seconds = Math.max(0, Number(value || 0));
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const remaining = Math.floor(seconds % 60);
-    return [hours, minutes, remaining]
-      .map((part) => String(part).padStart(2, "0"))
-      .join(":");
-  }
-
   function abbreviateEmail(value) {
     const email = String(value || "");
     const at = email.indexOf("@");
@@ -308,7 +298,7 @@
       const sessions = state.accounts.filter((item) => item.sessionStatus === "ready").length;
       const twoFactor = state.accounts.filter((item) => item.hasTwoFactor).length;
       $("accountMetrics").innerHTML = [
-        metricCard("全部邮箱", total, "iCloud 隐藏邮箱", "", "✉"),
+        metricCard("全部邮箱", total, "已添加邮箱账号", "", "✉"),
         metricCard("已注册", registered, "OpenAI 账号", "green", "✓"),
         metricCard("Session 可用", sessions, "可直接验证与提链", "", "S"),
         metricCard("已开启 2FA", twoFactor, "双重验证", "amber", "2"),
@@ -327,13 +317,30 @@
       if (registrationProxy.country) {
         $("registrationProxyCountry").value = registrationProxy.country;
       }
+      const smsBower = state.smsBower || {};
+      const smsBowerStatus = $("smsbowerStatus");
+      smsBowerStatus.className = "badge " + (smsBower.configured ? "success" : "warning");
+      smsBowerStatus.textContent = smsBower.configured
+        ? "SMSBower Gmail · 已配置"
+        : "SMSBower 未配置";
+      if (smsBower.maxPrice) $("smsbowerMaxPrice").value = smsBower.maxPrice;
+      const registrationProvider = $("registrationEmailProvider").value || "icloud";
+      $("smsbowerControls").hidden = registrationProvider !== "gmail";
+      $("registerProviderButton").textContent = registrationProvider === "gmail"
+        ? "获取 Gmail 并注册"
+        : "使用 iCloud 注册";
+      $("registerProviderButton").disabled = Boolean(state.registrationTask.running) ||
+        (registrationProvider === "gmail" && !smsBower.configured);
+      $("registerEmailButton").disabled = Boolean(state.registrationTask.running);
       const task = state.browserTask;
       const registration = state.registrationTask;
       const hasRegistration = Boolean(registration.id && registration.status !== "idle");
       const primaryTask = hasRegistration ? registration : task;
       const status = primaryTask.status || "idle";
       const statusMeta = taskStatusMeta(status);
-      const taskTotal = Number(task.total || (hasRegistration ? registration.requested || 1 : 0));
+      const taskTotal = Number(task.total || (hasRegistration
+        ? registration.effectiveConcurrency || registration.claimed || registration.requested || 1
+        : 0));
       const taskCompleted = Number(task.total
         ? task.completed || 0
         : (hasRegistration && !registration.running ? 1 : 0));
@@ -342,9 +349,12 @@
       if (hasRegistration && registration.running && !task.total) {
         progress = {
           generating_email: 12,
+          purchasing_gmail: 12,
+          preparing_email: 18,
           claiming_inventory: 12,
           confirming_email: 28,
           registering_openai: 40,
+          awaiting_verification_code: 65,
           cancelling: 40,
         }[registration.phase] || progress;
       }
@@ -354,10 +364,10 @@
       $("taskStatusIcon").textContent = statusMeta[2];
       $("taskStateBadge").textContent = statusMeta[0];
       $("registrationSummary").textContent = hasRegistration
-        ? "一键注册 · " + this.registrationLabel(registration)
+        ? "邮箱注册 · " + this.registrationLabel(registration)
         : (task.status && task.status !== "idle"
           ? "浏览器任务 · " + statusMeta[0]
-          : "一键注册 · 等待开始");
+          : "邮箱注册 · 等待开始");
       const latestTaskLog = (task.logs || []).at(-1);
       $("taskMessage").textContent = hasRegistration
         ? (registration.message || "正在处理注册任务")
@@ -372,6 +382,12 @@
       $("browserTaskProgress").value = progress;
       $("browserTaskProgress").setAttribute("aria-valuenow", String(progress));
       $("browserTaskProgressValue").textContent = progress + "%";
+      const codePanel = $("registrationCodePanel");
+      const awaitingEmail = (registration.awaitingCodeEmails || [])[0] || registration.email || "";
+      codePanel.hidden = !registration.awaitingCode || registration.provider === "smsbower";
+      $("registrationCodeEmail").textContent = registration.awaitingCode
+        ? "验证码将用于 " + awaitingEmail
+        : "等待注册页面请求验证码";
 
       const seenLogs = new Set();
       const logs = [
@@ -402,49 +418,10 @@
       ).join("") : '<tr><td colspan="6"><div class="empty-state compact">没有匹配的账号</div></td></tr>';
     }
 
-    renderScheduledGeneration(state) {
-      const schedule = state.scheduledGeneration || {};
-      const enabled = Boolean(schedule.enabled);
-      const running = Boolean(schedule.running);
-      const hasError = Boolean(schedule.lastError);
-      const panel = $("scheduledGenerationPanel");
-      panel.dataset.taskTone = running || enabled ? (hasError ? "failed" : "running") : "cancelled";
-      $("scheduledGenerationIcon").textContent = running ? "↻" : enabled ? "◷" : "×";
-      $("scheduledGenerationBadge").textContent = running ? "生成中" : enabled ? "计时中" : "已暂停";
-      $("scheduledGenerationMessage").textContent = running
-        ? "正在生成 5 个邮箱并存入库存；不会启动 OpenAI 注册。"
-        : enabled
-          ? "下次执行：" + formatDate(schedule.nextRunAt) + "；每轮只生成邮箱，不注册。"
-          : "定时生成已暂停；重新启用后会从完整 1 小时重新计时。";
-      $("scheduledGenerationBatch").textContent = Number(schedule.batchSize || 5) + " 个";
-      $("scheduledGenerationInterval").textContent = "1 小时";
-      const inventoryAvailable = Math.max(0, Number(schedule.inventoryAvailable || 0));
-      $("registrationInventoryAvailable").textContent = inventoryAvailable + " 个";
-      $("registerFromInventoryButton").textContent = "从库存注册账号（" + inventoryAvailable + "）";
-      $("registerFromInventoryButton").title = "当前可领取 " + inventoryAvailable + " 个生成邮箱";
-      $("scheduledGenerationCountdown").textContent = enabled
-        ? formatCountdown(schedule.secondsUntilNext)
-        : "已暂停";
-      const toggle = $("toggleScheduledGenerationButton");
-      toggle.textContent = enabled ? "暂停定时生成" : "启用并开始 1 小时计时";
-      toggle.className = "button " + (enabled ? "danger" : "primary") + " small";
-
-      const logs = Array.isArray(schedule.logs) ? schedule.logs.slice(-8) : [];
-      $("scheduledGenerationLog").innerHTML = logs.length ? logs.map((item) => {
-        const level = item.level === "error" ? "error" : item.level === "warning" ? "warning" : "success";
-        const glyph = level === "error" ? "!" : level === "warning" ? "×" : "✓";
-        return '<div class="task-log-row"><span class="task-log-icon ' + level + '">' + glyph +
-          '</span><time datetime="' + escapeHtml(item.at || "") + '">' + formatClock(item.at) +
-          '</time><span class="task-log-email">定时检查</span><span class="task-log-message">' +
-          escapeHtml(item.message || "") + "</span></div>";
-      }).join("") : '<div class="task-log-empty">暂无定时生成检查日志</div>';
-      $("scheduledGenerationLog").scrollTop = $("scheduledGenerationLog").scrollHeight;
-    }
-
     registrationLabel(task) {
       const labels = {
-        idle: "空闲", generating_email: "正在创建邮箱", claiming_inventory: "正在领取库存", confirming_email: "正在确认邮箱",
-        registering_openai: "正在注册 OpenAI", completed: "注册成功",
+        idle: "空闲", generating_email: "正在创建邮箱", purchasing_gmail: "正在获取 Gmail", preparing_email: "正在准备邮箱", claiming_inventory: "正在领取库存", confirming_email: "正在确认邮箱",
+        registering_openai: "正在注册 OpenAI", awaiting_verification_code: "等待输入验证码", completed: "注册成功",
         failed: "注册失败", cancelling: "正在停止", cancelled: "已停止",
       };
       return labels[task.phase] || labels[task.status] || "空闲";
@@ -475,7 +452,7 @@
         this.credentialButton("复制 AT", "copy-credential", item, "access_token", !item.hasSession) +
         this.credentialButton("复制 Session", "copy-credential", item, "session", !item.hasSession) +
         this.credentialButton("获取验证码", "get-code", item) +
-        this.credentialButton("验证账号", "verify-account", item) +
+        this.credentialButton(item.hasCookies ? "Cookie 刷新状态" : "尚未保存 Cookie", "verify-account", item, "", !item.hasCookies) +
         this.credentialButton("一键导入工作台", "import-workbench", item, "", !item.hasImportableSession) +
         this.credentialButton("复制账号", "copy-account", item, "", !item.hasPassword) +
         this.credentialButton("删除邮箱", "delete-email", item, "", false, "danger") +
@@ -573,29 +550,33 @@
       const rows = this.verificationRows(state);
       const plus = state.accounts.filter((item) => item.accountType === "plus").length;
       const free = state.accounts.filter((item) => item.accountType === "free").length;
-      const errors = rows.filter((item) => ["failed", "expired", "error"].includes(item.status) || item.sessionStatus === "expired").length;
+      const errors = rows.filter((item) => ["failed", "expired", "error", "deleted"].includes(item.status) || item.sessionStatus === "expired").length;
       $("verificationMetrics").innerHTML = [
         metricCard("本次验证", task.total || rows.length, "账号数量", "", "✓"),
         metricCard("Plus 账号", task.plus || plus, "已识别 Plus", "purple", "P"),
         metricCard("Free 账号", task.free || free, "已识别 Free", "green", "F"),
-        metricCard("异常账号", task.failed || task.expired || errors, "需要处理", "amber", "!"),
+        metricCard("异常账号", task.failed || task.expired || errors, "已删除 " + (task.deleted || 0), "amber", "!"),
       ].join("");
       $("verificationTaskTitle").textContent = task.id ? "验证任务 #" + task.id.slice(0, 10) : "验证任务";
       $("verificationSummary").textContent = task.status && task.status !== "idle"
-        ? (task.completed || 0) + " / " + (task.total || 0) + " 已完成"
+        ? (task.completed || 0) + " / " + (task.total || 0) + " 已完成 · 并发 " + (task.concurrency || 1) + " · 删除 " + (task.deleted || 0)
         : "尚未开始批量验证";
       $("verificationProgress").value = task.total ? Math.round((task.completed || 0) / task.total * 100) : 0;
       $("verificationProgress").hidden = !task.running;
       const selectedEmail = state.accounts.some((item) => item.email === state.selectedVerificationEmail)
         ? state.selectedVerificationEmail : "";
+      const selectedAccount = state.accounts.find((item) => item.email === selectedEmail);
       $("verificationAccountSelect").innerHTML = '<option value="">请选择一个账号（共 ' +
         state.accounts.length + ' 个）</option>' +
         state.accounts.map((item) => '<option value="' + escapeHtml(item.email) + '">' +
           escapeHtml(item.email + " · " + planName(item.accountType) + " · Session " + sessionName(item.sessionStatus)) +
           "</option>").join("");
       $("verificationAccountSelect").value = selectedEmail;
-      $("verificationAccountSelect").disabled = Boolean(task.running) || !state.accounts.length;
-      $("verifySelectedButton").disabled = Boolean(task.running) || !selectedEmail || !task.runtime?.available;
+      $("verificationAccountSelect").disabled = !state.accounts.length;
+      $("verificationPreviousButton").disabled = !state.accounts.length;
+      $("verificationNextButton").disabled = !state.accounts.length;
+      $("verificationConcurrency").disabled = Boolean(task.running);
+      $("verifySelectedButton").disabled = Boolean(task.running) || !selectedAccount?.hasCookies || !task.runtime?.available;
       $("verifyAllButton").disabled = Boolean(task.running) || !state.verificationTask.runtime?.available;
       $("stopVerificationButton").disabled = !task.running;
       const filter = state.verificationFilter;
@@ -603,13 +584,14 @@
         filter === "all" ||
         (filter === "plus" && item.accountType === "plus") ||
         (filter === "free" && item.accountType === "free") ||
-        (filter === "error" && (["failed", "expired", "error"].includes(item.status) || item.sessionStatus === "expired"))
+        (filter === "error" && (["failed", "expired", "error", "deleted"].includes(item.status) || item.sessionStatus === "expired"))
       );
       $("verificationTableBody").innerHTML = filtered.length ? filtered.map((item) => {
         const selected = state.selectedVerificationEmail === item.email;
         const status = item.status || "pending";
-        const isError = ["failed", "expired", "error"].includes(status) || item.sessionStatus === "expired";
-        const statusLabel = isError ? "异常" : status === "queued" ? "等待中" :
+        const isDeleted = status === "deleted";
+        const isError = ["failed", "expired", "error", "deleted"].includes(status) || item.sessionStatus === "expired";
+        const statusLabel = isDeleted ? "已删除" : isError ? "异常" : status === "queued" ? "等待中" :
           status === "running" ? "验证中" : status === "pending" ? "待验证" : "有效";
         const statusKind = isError ? "error" : ["queued", "running", "pending"].includes(status) ? "warning" : "success";
         return '<tr data-selectable data-action="select-verification" data-email="' + escapeHtml(item.email) +
@@ -621,6 +603,7 @@
           '</td><td>' + formatDate(item.verifiedAt || task.finishedAt || task.startedAt) + "</td></tr>";
       }).join("") : '<tr><td colspan="5"><div class="empty-state compact">暂无验证记录</div></td></tr>';
       this.renderVerificationDetail(state, rows);
+      this.renderVerificationLogs(state);
     }
 
     renderVerificationDetail(state, rows) {
@@ -633,7 +616,8 @@
       }
       $("verificationDetailEmail").textContent = item.email;
       const status = item.status || "pending";
-      const isError = ["failed", "expired", "error"].includes(status) || item.sessionStatus === "expired";
+      const isDeleted = status === "deleted";
+      const isError = ["failed", "expired", "error", "deleted"].includes(status) || item.sessionStatus === "expired";
       const isPending = ["pending", "queued", "running"].includes(status);
       const sessionReady = item.sessionStatus === "ready";
       const planKnown = ["plus", "free"].includes(item.accountType);
@@ -651,9 +635,25 @@
         step("读取 Plus / Free 套餐", isError ? "pending" : isPending || !planKnown ? "pending" : "success") +
         step("保存验证结果", isError ? "pending" : isPending || !planKnown ? "pending" : "success") + '</div>' +
         (isError ? '<div class="detail-error">' + escapeHtml(item.message || "Access Token 已过期，请重新获取 Session") +
-        '</div>' : "") + '<div class="verification-detail-actions"><button class="button primary" data-action="verify-account" data-email="' +
-        escapeHtml(item.email) + '"' + (state.verificationTask.running ? " disabled" : "") + '>' +
-        (sessionReady ? "验证此账号" : "获取 Session 并验证") + "</button></div>";
+        '</div>' : "") + (isDeleted ? "" : '<div class="verification-detail-actions"><button class="button primary" data-action="verify-account" data-email="' +
+        escapeHtml(item.email) + '"' + (state.verificationTask.running || !item.hasCookies ? " disabled" : "") + '>' +
+        (item.hasCookies ? "使用 Cookie 刷新状态" : "尚未保存 Cookie") + "</button></div>");
+    }
+
+    renderVerificationLogs(state) {
+      const selected = String(state.selectedVerificationEmail || "").toLowerCase();
+      const logs = (state.verificationTask.historyLogs || state.verificationTask.logs || []).slice(-300).reverse();
+      $("verificationLogCount").textContent = logs.length + " 条";
+      $("verificationLog").innerHTML = logs.length ? logs.map((entry) => {
+        const message = String(entry.message || "");
+        const level = entry.level || (/失败|无效|失效|错误/.test(message) ? "error" : /等待|重试|删除/.test(message) ? "warning" : "info");
+        const icon = level === "error" ? "!" : level === "warning" ? "·" : "✓";
+        const email = String(entry.email || "");
+        return '<div class="task-log-row ' + (selected && email.toLowerCase() === selected ? "selected" : "") + '">' +
+          '<span class="task-log-icon ' + escapeHtml(level) + '">' + icon + '</span><time>' +
+          escapeHtml(formatClock(entry.at)) + '</time><span class="task-log-email" title="' + escapeHtml(email) + '">' +
+          escapeHtml(email || "任务") + '</span><span class="task-log-message">' + escapeHtml(message) + "</span></div>";
+      }).join("") : '<div class="task-log-empty">尚无验证日志</div>';
     }
 
     renderSettings(state) {
@@ -679,8 +679,12 @@
 
     renderImapSettings(state) {
       const inbox = state.inbox;
+      const lastSync = inbox.lastBackgroundSync
+        ? " · 上次：" + formatDate(inbox.lastBackgroundSync)
+        : "";
+      const syncStatus = "按需同步（仅接码时连接）" + lastSync;
       $("settingsStatus").className = "badge " + (inbox.configured ? "success" : "warning");
-      $("settingsStatus").textContent = inbox.configured ? "IMAP 已配置" : "等待配置";
+      $("settingsStatus").textContent = inbox.configured ? "IMAP 已保存" : "等待配置";
       $("settingsPanel").innerHTML =
         '<form id="imapForm" class="settings-form"><section class="form-section"><h3>邮箱连接</h3><div class="form-grid two">' +
         '<label class="field-label">IMAP 主机<input id="imapHost" value="' + escapeHtml(inbox.host || "") +
@@ -689,8 +693,8 @@
         escapeHtml(inbox.username || "") + '" placeholder="name@icloud.com"></label><label class="field-label">应用专用密码<input id="imapPassword" type="password" placeholder="' +
         (inbox.configured ? "留空则保持现有密码" : "请输入应用专用密码") + '"></label></div></section>' +
         '<section class="form-section"><h3>连接状态</h3><div class="connection-card"><strong>' +
-        (inbox.configured ? "✓ IMAP 配置可用" : "尚未配置 IMAP") + '</strong><span>验证码数量：' +
-        (inbox.codeCount || 0) + '</span><span>后台同步：' + escapeHtml(inbox.lastBackgroundSync || "尚未同步") +
+        (inbox.configured ? "✓ IMAP 配置已保存" : "尚未配置 IMAP") + '</strong><span>验证码数量：' +
+        (inbox.codeCount || 0) + '</span><span>收件模式：' + escapeHtml(syncStatus) +
         '</span></div></section><div class="settings-actions"><button class="button" type="button" data-action="sync-inbox">立即同步</button><button class="button primary" type="button" data-action="save-imap">保存并测试</button></div></form>';
     }
 
@@ -739,8 +743,8 @@
         accounts: [],
         browserTask: { status: "idle", runtime: {} },
         registrationTask: { status: "idle", phase: "idle" },
-        scheduledGeneration: { enabled: true, running: false, batchSize: 5, intervalSeconds: 3600, logs: [] },
         registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
+        smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         verificationTask: { status: "idle", runtime: {} },
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
@@ -766,7 +770,6 @@
       this.renderer.renderShell(state);
       this.renderer.renderOverview(state);
       this.renderer.renderAccounts(state);
-      this.renderer.renderScheduledGeneration(state);
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
       if (this.router.current === "settings") this.renderer.renderSettings(state);
@@ -829,7 +832,7 @@
         this.store.patch({ registrationTask: data });
         if (data.running) this.schedule("registration", () => this.loadRegistrationTask(), 1200);
         else if (wasRunning) await Promise.all([
-          this.loadAccounts(), this.loadBrowserTask(), this.loadScheduledGeneration(),
+          this.loadAccounts(), this.loadBrowserTask(),
         ]);
       } catch (error) {
         this.toast(error.message, "error");
@@ -855,22 +858,14 @@
       this.store.patch({ inbox: data });
     }
 
-    async loadScheduledGeneration() {
-      try {
-        const previousTotal = Number(this.store.state.scheduledGeneration.totalGenerated || 0);
-        const data = await this.api.get("/api/scheduled-generation/status");
-        this.store.patch({ scheduledGeneration: data });
-        if (Number(data.totalGenerated || 0) > previousTotal) await this.loadAccounts();
-        this.schedule("scheduled-generation", () => this.loadScheduledGeneration(), 10000);
-      } catch (error) {
-        this.toast(error.message, "error");
-        this.schedule("scheduled-generation", () => this.loadScheduledGeneration(), 15000);
-      }
-    }
-
     async loadRegistrationProxy() {
       const data = await this.api.get("/api/registration-proxy/status");
       this.store.patch({ registrationProxy: data });
+    }
+
+    async loadSmsBower() {
+      const data = await this.api.get("/api/smsbower/status");
+      this.store.patch({ smsBower: data });
     }
 
     browserOptions() {
@@ -881,6 +876,26 @@
       return { headless: $("headless").checked, concurrency };
     }
 
+    verificationConcurrency() {
+      const concurrency = Number($("verificationConcurrency").value);
+      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
+        throw new Error("验证并发必须是 1–10 的整数");
+      }
+      return concurrency;
+    }
+
+    moveVerificationSelection(offset) {
+      const accounts = this.store.state.accounts;
+      if (!accounts.length) throw new Error("暂无可验证账号");
+      const current = accounts.findIndex(
+        (item) => item.email === this.store.state.selectedVerificationEmail
+      );
+      const base = current < 0 ? (offset > 0 ? -1 : 0) : current;
+      const next = (base + offset + accounts.length) % accounts.length;
+      this.store.patch({ selectedVerificationEmail: accounts[next].email });
+      return "已选择 " + accounts[next].email;
+    }
+
     selectedAccount(email) {
       return this.store.state.accounts.find((item) => item.email === email);
     }
@@ -888,13 +903,20 @@
     async startAccountVerification(email) {
       const item = this.selectedAccount(email);
       if (!item) throw new Error("请先选择一个账号");
+      if (!item.hasCookies) throw new Error("该账号尚未保存 Cookie，请先重新登录或注册获取 Cookie");
       this.store.patch({ selectedVerificationEmail: item.email });
       const data = await this.api.post("/api/account/verify-or-register", {
         email: item.email, headless: $("headless").checked, reset_password: false,
+        refresh_with_cookie: true,
       });
-      await Promise.all([this.loadBrowserTask(), this.loadVerificationTask()]);
+      await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadVerificationTask()]);
+      if (data.mode === "deleted_invalid") {
+        return data.message || "无效邮箱已自动删除；请选择下一个账号继续验证";
+      }
       this.schedule("verification", () => this.loadVerificationTask(), 800);
-      return data.mode === "verify" ? "正在验证 Plus 与 Session 状态" : "正在获取 Session 并验证套餐";
+      return data.mode === "refresh_cookie"
+        ? "正在使用保存的 Cookie 刷新 Session 与账号状态"
+        : "正在获取 Session 并验证套餐";
     }
 
     async copyText(value) {
@@ -915,7 +937,7 @@
 
     bindCommands() {
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadScheduledGeneration(), this.loadRegistrationProxy()]);
+        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower()]);
         return "数据已刷新";
       });
       this.commands.register("toggle-theme", async () => {
@@ -931,22 +953,63 @@
       });
       this.commands.register("register", async () => {
         const options = this.browserOptions();
+        const email = $("registrationEmail").value.trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          throw new Error("请输入有效的注册邮箱地址");
+        }
         const data = await this.api.post("/api/registration/start", {
-          label: "OpenAI 一键注册", ...options,
+          label: "手动邮箱注册", provider: "manual", email, ...options, concurrency: 1,
         });
         this.store.patch({ registrationTask: data.task });
         this.schedule("registration", () => this.loadRegistrationTask(), 800);
-        return "已按并发 " + options.concurrency + " 从生成邮箱库存启动注册";
+        return "已添加邮箱并启动注册：" + email;
       });
-      this.commands.register("toggle-scheduled-generation", async () => {
-        const enabled = Boolean(this.store.state.scheduledGeneration.enabled);
-        if (enabled && !confirm("暂停每小时生成 5 个邮箱？已生成的邮箱会保留，且不会启动注册。")) {
-          throw Object.assign(new Error(), { name: "AbortError" });
+      this.commands.register("register-provider", async () => {
+        const options = this.browserOptions();
+        const source = $("registrationEmailProvider").value || "icloud";
+        const smsBower = this.store.state.smsBower || {};
+        if (source === "gmail") {
+          if (!smsBower.configured) throw new Error("请先设置 SMSBower API Key");
+          const maxPrice = Number($("smsbowerMaxPrice").value);
+          if (!Number.isFinite(maxPrice) || maxPrice < 0.001 || maxPrice > 10) {
+            throw new Error("Gmail 最高价必须在 0.001–10 美元之间");
+          }
+          const config = await this.api.post("/api/smsbower/config", { maxPrice });
+          this.store.patch({ smsBower: { ...smsBower, ...config } });
         }
-        const data = await this.api.post("/api/scheduled-generation/config", { enabled: !enabled });
-        this.store.patch({ scheduledGeneration: data });
-        this.schedule("scheduled-generation", () => this.loadScheduledGeneration(), 1000);
-        return enabled ? "定时生成已暂停" : "已开始计时，1 小时后生成第一批 5 个邮箱";
+        const data = await this.api.post("/api/registration/start", {
+          label: source === "gmail" ? "SMSBower Gmail 注册" : "iCloud 邮箱注册",
+          provider: source === "gmail" ? "smsbower" : "inventory",
+          ...options,
+          concurrency: 1,
+        });
+        this.store.patch({ registrationTask: data.task });
+        this.schedule("registration", () => this.loadRegistrationTask(), 500);
+        return source === "gmail"
+          ? "已启动 SMSBower Gmail 获取与自动注册"
+          : "已启动 iCloud 库存邮箱注册";
+      });
+      this.commands.register("set-smsbower-key", async () => {
+        const apiKey = prompt("输入 SMSBower API Key。Key 只保存在本地数据库，接口和日志不会回传：", "");
+        if (apiKey === null) throw Object.assign(new Error(), { name: "AbortError" });
+        if (!apiKey.trim()) throw new Error("SMSBower API Key 不能为空");
+        const data = await this.api.post("/api/smsbower/config", {
+          apiKey: apiKey.trim(), maxPrice: Number($("smsbowerMaxPrice").value), service: "dr",
+        });
+        this.store.patch({ smsBower: data });
+        return "SMSBower API 已保存，可获取 Gmail 并自动注册";
+      });
+      this.commands.register("submit-registration-code", async () => {
+        const task = this.store.state.registrationTask;
+        const email = (task.awaitingCodeEmails || [])[0] || task.email || "";
+        const code = $("registrationCode").value.replace(/\s+/g, "");
+        if (!email) throw new Error("当前没有等待验证码的注册邮箱");
+        if (!/^[A-Za-z0-9]{4,10}$/.test(code)) throw new Error("请输入 4–10 位验证码");
+        const data = await this.api.post("/api/registration/code", { email, code });
+        $("registrationCode").value = "";
+        this.store.patch({ registrationTask: data.task });
+        this.schedule("registration", () => this.loadRegistrationTask(), 400);
+        return "验证码已提交，注册继续运行";
       });
       this.commands.register("set-registration-proxy-credential", async () => {
         const proxyLine = prompt("输入动态代理连接（host:port:username:password）。凭据只保存在本地，不会显示在日志中：", "");
@@ -1064,7 +1127,7 @@
       this.commands.register("verify-all", async () => {
         const emails = this.store.state.accounts.map((item) => item.email);
         if (!emails.length) throw new Error("暂无可验证账号");
-        const concurrency = this.browserOptions().concurrency;
+        const concurrency = this.verificationConcurrency();
         if (!confirm("验证 " + emails.length + " 个账号，并发 " + concurrency + "，是否继续？")) {
           throw Object.assign(new Error(), { name: "AbortError" });
         }
@@ -1075,6 +1138,12 @@
       });
       this.commands.register("verify-selected", async () => {
         return this.startAccountVerification(this.store.state.selectedVerificationEmail);
+      });
+      this.commands.register("previous-verification", async () => {
+        return this.moveVerificationSelection(-1);
+      });
+      this.commands.register("next-verification", async () => {
+        return this.moveVerificationSelection(1);
       });
       this.commands.register("stop-verification", async () => {
         await this.api.post("/api/account-verification/stop");
@@ -1139,6 +1208,9 @@
       $("verificationAccountSelect").addEventListener("change", (event) => {
         this.store.patch({ selectedVerificationEmail: event.target.value });
       });
+      $("registrationEmailProvider").addEventListener("change", () => {
+        this.renderer.renderAccounts(this.store.state);
+      });
       $("registrationProxyEnabled").addEventListener("change", async (event) => {
         try {
           const data = await this.api.post("/api/registration-proxy/config", {
@@ -1163,6 +1235,18 @@
           this.toast(error.message, "error");
         }
       });
+      $("smsbowerMaxPrice").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/smsbower/config", {
+            maxPrice: Number(event.target.value),
+          });
+          this.store.patch({ smsBower: data });
+          this.toast("SMSBower Gmail 最高价已更新为 $" + data.maxPrice);
+        } catch (error) {
+          await this.loadSmsBower();
+          this.toast(error.message, "error");
+        }
+      });
     }
 
     async start() {
@@ -1173,7 +1257,7 @@
       this.router.start();
       const results = await Promise.allSettled([
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(), this.loadScheduledGeneration(), this.loadRegistrationProxy(),
+        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(),
       ]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");
