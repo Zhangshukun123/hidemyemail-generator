@@ -71,12 +71,30 @@ class StructuredWebUiTests(unittest.TestCase):
             "browserTaskSuccess",
             "taskElapsed",
             "browserTaskProgressValue",
+            "taskCurrentLocation",
+            "taskCurrentStage",
+            "taskCurrentAction",
+            "taskCurrentAccount",
+            "taskAssistance",
+            "taskAssistanceBadge",
+            "taskAssistanceTitle",
+            "taskAssistanceText",
+            "taskLogCount",
             "taskLog",
         ):
             self.assertIn(f'id="{element_id}"', page)
         self.assertIn("formatElapsed", page)
         self.assertIn("abbreviateEmail", page)
         self.assertIn("task-log-row", page)
+        self.assertIn("task-live-context", page)
+        self.assertIn("registration-command-deck", page)
+        self.assertIn("task-console-grid", page)
+        self.assertIn("task-flow-strip", page)
+        self.assertIn("taskStageGroup", page)
+        self.assertIn("task-timeline", page)
+        self.assertIn("taskStageLabel", page)
+        self.assertIn("inferLogContext", page)
+        self.assertIn("浏览器执行轨迹", page)
         self.assertIn("data-task-tone", page)
 
     def test_hourly_inventory_generation_is_removed_from_local_workspace(self):
@@ -115,8 +133,12 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('<option value="icloud">iCloud 库存邮箱</option>', page)
         self.assertIn('<option value="gmail">Gmail · SMSBower</option>', page)
         self.assertIn('id="registerProviderButton"', page)
-        self.assertIn("获取 Gmail 并注册", page)
-        self.assertIn("使用 iCloud 注册", page)
+        self.assertIn("开始 Gmail 注册", page)
+        self.assertIn("开始 iCloud 注册", page)
+        self.assertIn("无头浏览器（关闭＝前台窗口）", page)
+        self.assertNotIn("options.headless = true", page)
+        self.assertIn("本机取码保留 ", page)
+        self.assertIn("smsBower.retentionHours || 24", page)
         self.assertIn('data-action="set-smsbower-key"', page)
         self.assertIn('data-action="register-provider"', page)
         self.assertIn("/api/smsbower/status", page)
@@ -137,6 +159,20 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("Cookie 刷新选中账号", page)
         self.assertIn("refresh_with_cookie: true", page)
         self.assertIn("使用保存的 Cookie 刷新 Session 与账号状态", page)
+
+    def test_account_without_two_factor_exposes_add_action(self):
+        page = build_app_page()
+
+        self.assertIn('this.credentialButton("添加 2FA", "enable-2fa"', page)
+        self.assertIn('this.commands.register("enable-2fa"', page)
+        self.assertIn('this.api.post("/api/account/enable-2fa"', page)
+
+    def test_gmail_delete_warning_describes_local_cleanup(self):
+        page = build_app_page()
+
+        self.assertIn('email.toLowerCase().endsWith("@gmail.com")', page)
+        self.assertIn("不会删除 Gmail 服务商侧的邮箱", page)
+        self.assertIn('return data.message || "邮箱已删除"', page)
 
     def test_login_page_matches_the_workspace_identity(self):
         page = build_login_page()

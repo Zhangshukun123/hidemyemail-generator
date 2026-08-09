@@ -11,16 +11,142 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .browser_diagnostics import browser_diagnostic_context
 from .inbox import connect_db, mark_address
 from .registration_proxy import RegistrationProxyStore
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
 MAX_LOG_ITEMS = 300
+MAX_GOOGLE_FINGERPRINT_RETRIES = 1
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def browser_log_context(message: str) -> dict[str, str]:
+    """Turn a worker message into a concise, UI-friendly execution context."""
+
+    text = str(message or "").strip()
+    structured = browser_diagnostic_context(text)
+    if structured is not None:
+        return structured
+    normalized = text.casefold()
+    detail = text
+    if text.startswith("[") and "]" in text:
+        detail = text.split("]", 1)[1].strip()
+    detail = (detail.split("；", 1)[0] or text)[:120]
+
+    status = "active"
+    if any(marker in normalized for marker in ("失败", "错误", "异常", "http 401", "超时")):
+        status = "error"
+    elif any(marker in normalized for marker in ("停止", "取消", "仍是", "未完成", "跳过")):
+        status = "warning"
+    elif any(marker in normalized for marker in ("等待", "请在", "手动", "继续监测")):
+        status = "waiting"
+    elif any(marker in normalized for marker in ("成功", "已保存", "已开启", "校验通过", "已确认")):
+        status = "success"
+
+    stage = "running"
+    location = "注册任务"
+    action = detail or "处理浏览器任务"
+
+    google_page_markers = (
+        "Google 账号登录页面",
+        "Google 登录页",
+        "Google 登录要求",
+        "Google 页面返回",
+        "从 Google 返回",
+    )
+    if "2fa" in normalized or "totp" in normalized:
+        stage = "two_factor"
+        location = "OpenAI 两步验证"
+        action = "配置并保存 TOTP 2FA"
+    elif any(marker in text for marker in ("注册完成", "浏览器取全部完成")) or (
+        "注册成功" in text and "Session 已保存" in text
+    ):
+        stage = "completed"
+        location = "注册完成"
+        action = "保存账号结果并完成任务"
+    elif any(marker in normalized for marker in ("smsbower", "购买 openai gmail", "购买 gmail")):
+        stage = "provider"
+        location = "SMSBower 服务"
+        action = "获取 Gmail 与邮箱验证码" if "验证码" in text else "获取 Gmail 注册邮箱"
+    elif any(marker in text for marker in google_page_markers):
+        stage = "google_oauth"
+        location = "Google 登录页"
+        if "全新指纹" in text or "更换指纹" in text:
+            action = "关闭当前浏览器并更换指纹"
+        elif any(marker in text for marker in ("已从 Google 返回", "已重新打开", "重新输入邮箱")):
+            action = "返回 OpenAI 并重新输入邮箱"
+        elif "仍是" in text or "返回失败" in text:
+            action = "保持浏览器并继续监测返回"
+        else:
+            action = "识别误入页面并返回 OpenAI"
+    elif any(marker in text for marker in ("安全验证", "security-check", "challenge")):
+        stage = "security"
+        location = "安全验证页"
+        action = "等待手动完成安全验证，完成后自动继续"
+    elif "密码" in text or "password" in normalized:
+        stage = "password"
+        location = "OpenAI 密码页"
+        if "等待" in text or "使用密码继续" in text:
+            action = "等待密码输入页并持续监测"
+        elif any(marker in text for marker in ("已提交", "已设置", "保存唯一密码")):
+            action = "填写并提交账号密码"
+        else:
+            action = "检查并处理密码登录"
+    elif "验证码" in text or "verification" in normalized or "otp" in normalized:
+        stage = "email_verification"
+        location = "邮箱验证码页"
+        if any(marker in text for marker in ("等待", "请在", "轮询")):
+            action = "等待并监测邮箱验证码"
+        elif any(marker in text for marker in ("已提交", "已收到", "自动取得", "交给")):
+            action = "提交邮箱验证码并继续"
+        else:
+            action = "识别并处理邮箱验证码"
+    elif any(
+        marker in text
+        for marker in (
+            "邮箱登录页",
+            "邮箱注册字段",
+            "邮箱输入框",
+            "Google 账号入口已禁用",
+            "未点击 Google 登录按钮",
+        )
+    ):
+        stage = "openai_auth"
+        location = "OpenAI 邮箱登录页"
+        action = "输入邮箱并进入密码流程"
+    elif any(marker in text for marker in ("基础资料", "姓名", "出生", "年龄")):
+        stage = "profile"
+        location = "OpenAI 基础资料页"
+        action = "填写并校验姓名与出生信息"
+    elif "session" in normalized or "cookie" in normalized:
+        stage = "session"
+        location = "OpenAI Session 接口"
+        action = "获取并保存 Session / Cookie"
+    elif any(marker in text for marker in ("代理", "直连", "出口国家", "公网 IP")):
+        stage = "network"
+        location = "网络与代理检查"
+        action = "确认注册出口与浏览器语言"
+    elif any(marker in normalized for marker in ("camoufox", "浏览器", "fontconfig", "窗口")):
+        stage = "browser"
+        location = "浏览器运行环境"
+        action = "启动并监测 Camoufox 浏览器"
+    elif any(marker in text for marker in ("库存", "领取邮箱", "邮箱已添加", "准备注册邮箱")):
+        stage = "prepare"
+        location = "注册准备"
+        action = "准备邮箱与账号凭据"
+    if status == "error":
+        action = detail or "检查失败原因"
+    return {
+        "stage": stage,
+        "location": location,
+        "action": action,
+        "status": status,
+    }
 
 
 def decode_jwt_payload(token: str) -> dict[str, Any]:
@@ -385,6 +511,10 @@ class BrowserTaskManager:
             "skipped": 0,
             "accounts": [],
             "logs": [],
+            "currentStage": "idle",
+            "currentLocation": "等待任务",
+            "currentAction": "尚未开始",
+            "currentStatus": "idle",
             "startedAt": "",
             "finishedAt": "",
         }
@@ -463,6 +593,9 @@ class BrowserTaskManager:
                 {
                     "email": email,
                     "password": str(account.get("password") or ""),
+                    "password_confirmed": bool(
+                        account.get("password_confirmed", False)
+                    ),
                     "ensure_password": bool(account.get("ensure_password", False)),
                     "force_reset_password": bool(
                         account.get("force_reset_password", False)
@@ -479,7 +612,6 @@ class BrowserTaskManager:
                     "foreground_required": bool(
                         account.get("foreground_required", False)
                         or manual_otp_entry
-                        or gmail_registration
                     ),
                     "two_factor": account.get("two_factor")
                     if isinstance(account.get("two_factor"), dict)
@@ -527,8 +659,8 @@ class BrowserTaskManager:
                     "_password": item["password"],
                     "_ensure_password": item["ensure_password"],
                     "_force_reset_password": item["force_reset_password"],
-                    "_password_confirmed": False,
-                    "passwordConfirmed": False,
+                    "_password_confirmed": item["password_confirmed"],
+                    "passwordConfirmed": item["password_confirmed"],
                     "_enable_2fa": item["enable_2fa"],
                     "_cookie_refresh_only": item["cookie_refresh_only"],
                     "_manual_otp_entry": item["manual_otp_entry"],
@@ -536,6 +668,8 @@ class BrowserTaskManager:
                     "_password_first_required": item["password_first_required"],
                     "_foreground_required": item["foreground_required"],
                     "_two_factor": item["two_factor"],
+                    "_fingerprint_retry_count": 0,
+                    "fingerprintRetries": 0,
                     "phase": "queued",
                     "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
                     "_window_slot": slot_index % min(concurrency, len(deduplicated)),
@@ -544,6 +678,10 @@ class BrowserTaskManager:
                 for slot_index, item in enumerate(deduplicated)
             ],
             "logs": [],
+            "currentStage": "prepare",
+            "currentLocation": "任务队列",
+            "currentAction": "准备启动浏览器任务",
+            "currentStatus": "active",
             "startedAt": utc_now(),
             "finishedAt": "",
             "useRegistrationProxy": proxy_active,
@@ -562,9 +700,13 @@ class BrowserTaskManager:
                 )
             else:
                 self._append_log(
-                    "Gmail 密码注册已锁定为单浏览器前台模式："
+                    "该浏览器任务已显式要求前台模式："
                     "禁用无头并避免并发窗口抢焦点"
                 )
+        else:
+            self._append_log(
+                "Camoufox 后台交互已启用：窗口被其他应用遮挡时仍继续加载和执行"
+            )
         if proxy_active:
             self._append_log(
                 "注册动态代理已启用："
@@ -580,15 +722,33 @@ class BrowserTaskManager:
         text = str(message or "").strip()
         if not text:
             return
-        entry = {"at": utc_now(), "email": email, "message": text[:1000]}
+        context = browser_log_context(text)
+        entry = {
+            "at": utc_now(),
+            "email": email,
+            "message": text[:1000],
+            **context,
+        }
         logs = self._state.setdefault("logs", [])
         logs.append(entry)
         if len(logs) > MAX_LOG_ITEMS:
             del logs[:-MAX_LOG_ITEMS]
+        self._state.update(
+            currentStage=context["stage"],
+            currentLocation=context["location"],
+            currentAction=context["action"],
+            currentStatus=context["status"],
+        )
         if email:
             item = self._account_item(email)
             if item is not None:
                 item["latestLog"] = text[:500]
+                item.update(
+                    stage=context["stage"],
+                    location=context["location"],
+                    action=context["action"],
+                    logStatus=context["status"],
+                )
 
     def _account_item(self, email: str) -> dict[str, Any] | None:
         target = email.strip().lower()
@@ -679,12 +839,18 @@ class BrowserTaskManager:
                     "HME_BROWSER_SERVICE_URL": self.service_url,
                     "HME_BROWSER_WORKER_TOKEN": self.worker_token,
                     "HME_BROWSER_DB_FILE": str(self.db_file),
+                    "HME_BROWSER_DIAGNOSTICS_DIR": str(
+                        self.db_file.parent / "output" / "browser-diagnostics"
+                    ),
                     "HME_OPENAI_PASSWORD": str(item.get("_password") or ""),
                     "HME_ENSURE_OPENAI_PASSWORD": "1"
                     if item.get("_ensure_password")
                     else "0",
                     "HME_FORCE_RESET_OPENAI_PASSWORD": "1"
                     if item.get("_force_reset_password")
+                    else "0",
+                    "HME_OPENAI_PASSWORD_CONFIRMED": "1"
+                    if item.get("_password_confirmed")
                     else "0",
                     "HME_ENABLE_OPENAI_2FA": "1"
                     if item.get("_enable_2fa")
@@ -700,7 +866,7 @@ class BrowserTaskManager:
                     else "0",
                     "HME_BROWSER_FOREGROUND_REQUIRED": "1"
                     if item.get("_foreground_required")
-                    else "0",
+                    else "",
                     "HME_OPENAI_2FA_STATE": json.dumps(
                         item.get("_two_factor") or {}, ensure_ascii=False
                     ),
@@ -731,42 +897,98 @@ class BrowserTaskManager:
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NO_WINDOW
 
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    cwd=str(self.target_project_dir),
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    creationflags=creationflags,
-                    limit=4 * 1024 * 1024,
+            return_code = -1
+            for fingerprint_attempt in range(
+                MAX_GOOGLE_FINGERPRINT_RETRIES + 1
+            ):
+                env["HME_BROWSER_FINGERPRINT_ATTEMPT"] = str(
+                    fingerprint_attempt
                 )
-                self._processes[email] = process
-                stdout_task = asyncio.create_task(
-                    self._read_stdout(process.stdout, item)
+                item.pop("_fresh_fingerprint_required", None)
+                item.pop("_fresh_fingerprint_reason", None)
+                item.pop("_error", None)
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *command,
+                        cwd=str(self.target_project_dir),
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        creationflags=creationflags,
+                        limit=4 * 1024 * 1024,
+                    )
+                    self._processes[email] = process
+                    stdout_task = asyncio.create_task(
+                        self._read_stdout(process.stdout, item)
+                    )
+                    stderr_task = asyncio.create_task(
+                        self._read_stderr(process.stderr, item)
+                    )
+                    return_code = await process.wait()
+                    await asyncio.gather(stdout_task, stderr_task)
+                except asyncio.CancelledError:
+                    item["status"] = "cancelled"
+                    item["message"] = "任务已停止"
+                    raise
+                except Exception as error:
+                    return_code = -1
+                    item["_error"] = str(error)
+                finally:
+                    self._processes.pop(email, None)
+
+                if not item.pop("_fresh_fingerprint_required", False):
+                    break
+                reason = str(
+                    item.pop("_fresh_fingerprint_reason", "") or ""
+                ).strip()
+                item.pop("_result", None)
+                if fingerprint_attempt >= MAX_GOOGLE_FINGERPRINT_RETRIES:
+                    item["_error"] = (
+                        "第二个独立指纹仍被要求 Google 登录；"
+                        "已放弃该 Gmail，不再继续注册"
+                    )
+                    self._append_log(
+                        "第二次启动仍要求 Google 登录；当前浏览器已关闭，"
+                        "已放弃该 Gmail，不再生成新指纹",
+                        email=email,
+                    )
+                    break
+
+                retry_number = fingerprint_attempt + 1
+                item["_fingerprint_retry_count"] = retry_number
+                item["fingerprintRetries"] = retry_number
+                item["message"] = "正在关闭当前浏览器并生成全新指纹"
+                self._append_log(
+                    "检测到 Google 登录要求，本轮注册已判定失败；"
+                    "当前浏览器已关闭，正在新建 Camoufox 进程、生成全新指纹并"
+                    f"重新打开注册（{retry_number}/"
+                    f"{MAX_GOOGLE_FINGERPRINT_RETRIES}）"
+                    + (f"：{reason}" if reason else ""),
+                    email=email,
                 )
-                stderr_task = asyncio.create_task(
-                    self._read_stderr(process.stderr, item)
-                )
-                return_code = await process.wait()
-                await asyncio.gather(stdout_task, stderr_task)
-            except asyncio.CancelledError:
-                item["status"] = "cancelled"
-                item["message"] = "任务已停止"
-                raise
-            except Exception as error:
-                return_code = -1
-                item["_error"] = str(error)
-            finally:
-                self._processes.pop(email, None)
 
             password = str(item.get("_password") or "")
             result = item.get("_result")
             password_confirmed = bool(item.get("_password_confirmed"))
+            strict_gmail_credentials = bool(
+                email.endswith("@gmail.com")
+                and item.get("_ensure_password")
+            )
             session_saved = bool(
                 isinstance(result, dict)
                 and str(result.get("access_token") or "").strip()
             )
+            if session_saved and strict_gmail_credentials:
+                if not password_confirmed:
+                    item["_error"] = (
+                        "Gmail 注册未确认密码；已拒绝保存免密码账号"
+                    )
+                    session_saved = False
+                elif not item.get("twoFactorEnabled"):
+                    item["_error"] = (
+                        "Gmail 注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
+                    )
+                    session_saved = False
             if session_saved:
                 await asyncio.to_thread(
                     _save_account_record,
@@ -784,11 +1006,11 @@ class BrowserTaskManager:
                 item["phase"] = "completed"
                 saved_parts = ["Session / AT / Cookie 已保存"]
                 if item.get("_ensure_password") and not password_confirmed:
-                    saved_parts.append("密码待设置")
+                    saved_parts.append("OpenAI 免密码注册")
                 if item.get("twoFactorEnabled"):
                     saved_parts.append("2FA 已开启")
                 elif item.get("_enable_2fa") and not password_confirmed:
-                    saved_parts.append("2FA 已跳过（需先设置密码）")
+                    saved_parts.append("2FA 已跳过（免密码账号）")
                 elif item.get("_enable_2fa"):
                     saved_parts.append("2FA 待开启")
                 item["message"] = "；".join(saved_parts)
@@ -853,10 +1075,11 @@ class BrowserTaskManager:
                 password = str(event.get("password") or "")
                 if password:
                     item["_password"] = password
-                item["_password_confirmed"] = bool(
-                    event.get("password_confirmed")
-                )
-                item["passwordConfirmed"] = item["_password_confirmed"]
+                if event.get("password_confirmed") is not None:
+                    item["_password_confirmed"] = bool(
+                        event.get("password_confirmed")
+                    )
+                    item["passwordConfirmed"] = item["_password_confirmed"]
                 two_factor = (
                     result.get("two_factor") if isinstance(result, dict) else None
                 )
@@ -873,7 +1096,20 @@ class BrowserTaskManager:
                 password_confirmed = bool(event.get("password_confirmed"))
                 item["_password_confirmed"] = password_confirmed
                 item["passwordConfirmed"] = password_confirmed
-                if isinstance(result, dict):
+                two_factor = (
+                    result.get("two_factor") if isinstance(result, dict) else None
+                )
+                two_factor_enabled = bool(
+                    isinstance(two_factor, dict) and two_factor.get("enabled")
+                )
+                strict_gmail_credentials = bool(
+                    email.endswith("@gmail.com")
+                    and item.get("_ensure_password")
+                )
+                if isinstance(result, dict) and (
+                    not strict_gmail_credentials
+                    or (password_confirmed and two_factor_enabled)
+                ):
                     await asyncio.to_thread(
                         _save_account_record,
                         self.db_file,
@@ -887,9 +1123,12 @@ class BrowserTaskManager:
                         ),
                     )
                 item["message"] = (
+                    "Gmail 密码已确认，正在开启 2FA"
+                    if strict_gmail_credentials and password_confirmed
+                    else
                     "OpenAI 注册成功，正在开启 2FA"
                     if item.get("_enable_2fa") and password_confirmed
-                    else "OpenAI 注册成功，密码待设置，已跳过 2FA"
+                    else "OpenAI 免密码注册成功，已跳过依赖密码的 2FA"
                     if item.get("_enable_2fa")
                     else "OpenAI 注册成功，Session 已保存"
                 )
@@ -901,13 +1140,17 @@ class BrowserTaskManager:
                 two_factor = event.get("two_factor")
                 if isinstance(two_factor, dict):
                     item["_two_factor"] = two_factor
-                    await asyncio.to_thread(
-                        _save_account_record,
-                        self.db_file,
-                        email,
-                        password=str(item.get("_password") or ""),
-                        two_factor=two_factor,
-                    )
+                    if not (
+                        email.endswith("@gmail.com")
+                        and item.get("_ensure_password")
+                    ):
+                        await asyncio.to_thread(
+                            _save_account_record,
+                            self.db_file,
+                            email,
+                            password=str(item.get("_password") or ""),
+                            two_factor=two_factor,
+                        )
                 item["message"] = "2FA 密钥已保存，正在激活"
             elif kind == "two_factor_enabled":
                 item["twoFactorEnabled"] = True
@@ -923,6 +1166,21 @@ class BrowserTaskManager:
                         event.get("password_confirmed")
                     )
                     item["passwordConfirmed"] = item["_password_confirmed"]
+            elif kind == "fresh_fingerprint_required":
+                item["_fresh_fingerprint_required"] = True
+                item["_fresh_fingerprint_reason"] = str(
+                    event.get("reason") or "OpenAI 注册要求 Google 登录"
+                )[:500]
+                password = str(event.get("password") or "")
+                if password:
+                    item["_password"] = password
+                if event.get("password_confirmed") is not None:
+                    item["_password_confirmed"] = bool(
+                        event.get("password_confirmed")
+                    )
+                    item["passwordConfirmed"] = item[
+                        "_password_confirmed"
+                    ]
 
     async def _read_stderr(
         self, stream: asyncio.StreamReader | None, item: dict[str, Any]

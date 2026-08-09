@@ -1,0 +1,15 @@
+[    2478ms] [WARNING] [GSI_LOGGER]: Your client application uses one of the Google One Tap prompt UI status methods that may stop functioning when FedCM becomes mandatory. Refer to the migration guide to update your code accordingly and opt-in to FedCM to test your changes. Learn more: https://developers.google.com/identity/gsi/web/guides/fedcm-migration?s=dc#display_moment and https://developers.google.com/identity/gsi/web/guides/fedcm-migration?s=dc#skipped_moment @ https://accounts.google.com/gsi/client:86
+[    3179ms] [ERROR] Provider's accounts list is empty. @ https://chatgpt.com/:0
+[    7005ms] [ERROR] [GSI_LOGGER]: FedCM get() rejects with NetworkError: Error retrieving a token. @ https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:27
+[   24562ms] [ERROR] Qt: [@formatjs/intl Error MISSING_TRANSLATION] Missing message: "dynamicUsernameInput.email" for locale "zh-CN", using default message (Email address) as fallback.
+
+    at new Qt (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:20:79)
+    at nn (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:24:287)
+    at Vn (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:24:5318)
+    at Mt (https://chatgpt.com/cdn/assets/35711af7-oi9yrrozfcoz951a.js:2:2705)
+    at Jo (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:36:48769)
+    at Vc (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:36:71461)
+    at ol (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:36:82112)
+    at Gd (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:36:126901)
+    at Wd (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:36:126874)
+    at Ud (https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:36:126733) @ https://chatgpt.com/cdn/assets/2340486e-eagvzznw7lk1t4r3.js:27

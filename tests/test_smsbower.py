@@ -1,10 +1,15 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from hidemyemail_generator.browser_tasks import (
+    _save_account_record,
+    load_account_record,
+)
 from hidemyemail_generator.smsbower import SMSBowerConfigStore, SMSBowerMailClient
 from hidemyemail_generator.webapp import create_app
 
@@ -14,6 +19,8 @@ class SMSBowerMailClientTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.requests = []
         self.code_attempts = 0
+        self.code_error = ""
+        self.status_error = ""
 
         async def get_activation(request):
             self.requests.append(("activation", dict(request.query)))
@@ -23,6 +30,8 @@ class SMSBowerMailClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def get_code(request):
             self.requests.append(("code", dict(request.query)))
+            if self.code_error:
+                return web.json_response({"status": 0, "error": self.code_error})
             self.code_attempts += 1
             if self.code_attempts in {1, 3}:
                 return web.json_response(
@@ -36,6 +45,8 @@ class SMSBowerMailClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def set_status(request):
             self.requests.append(("status", dict(request.query)))
+            if self.status_error:
+                return web.json_response({"status": 0, "error": self.status_error})
             return web.json_response({"status": 1, "message": "Success"})
 
         api = web.Application()
@@ -71,9 +82,15 @@ class SMSBowerMailClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activation_query["service"], "dr")
         self.assertEqual(activation_query["domain"], "gmail.com")
         self.assertEqual(activation_query["alias"], "0")
+        self.assertNotIn("duration", activation_query)
+        self.assertNotIn("hours", activation_query)
         self.assertEqual(self.requests[-1][1]["id"], "41")
         self.assertEqual(self.requests[-1][1]["status"], "5")
-        self.assertEqual(self.client.public_state()["active"], 1)
+        state = self.client.public_state()
+        self.assertEqual(state["active"], 1)
+        self.assertEqual(state["expired"], 0)
+        self.assertEqual(state["retentionHours"], 24)
+        self.assertFalse(state["providerGuaranteesRetention"])
 
         restarted = SMSBowerMailClient(
             self.store, base_url=str(self.server.make_url("/")).rstrip("/")
@@ -84,6 +101,62 @@ class SMSBowerMailClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await restarted.poll_next_code(email), "")
         status_requests = [query for kind, query in self.requests if kind == "status"]
         self.assertEqual([item["status"] for item in status_requests], ["5", "5"])
+
+    async def test_activation_is_retained_locally_for_at_most_24_hours(self):
+        now = [datetime(2026, 8, 9, 1, 2, 3, tzinfo=timezone.utc)]
+        client = SMSBowerMailClient(
+            self.store,
+            base_url=str(self.server.make_url("/")).rstrip("/"),
+            clock=lambda: now[0],
+        )
+        email = await client.acquire_email("OpenAI")
+
+        self.assertEqual(client.public_state()["active"], 1)
+        now[0] += timedelta(hours=23, minutes=59)
+        self.assertEqual(await client.poll_code(email), "")
+
+        requests_before_expiry = len(self.requests)
+        now[0] += timedelta(minutes=2)
+        with self.assertRaisesRegex(RuntimeError, "24 小时保留期限"):
+            await client.poll_next_code(email)
+        self.assertEqual(len(self.requests), requests_before_expiry)
+
+    async def test_explicit_cancellation_always_sends_status_two(self):
+        email = await self.client.acquire_email("OpenAI")
+        self.assertEqual(await self.client.poll_code(email), "")
+        self.assertEqual(await self.client.poll_code(email), "123456")
+
+        await self.client.cancel_email(email, "code timeout")
+
+        status_requests = [query for kind, query in self.requests if kind == "status"]
+        self.assertEqual(status_requests[-1]["status"], "2")
+        state = self.client.public_state()
+        self.assertEqual(state["active"], 0)
+        self.assertEqual(state["expired"], 0)
+
+        restarted = SMSBowerMailClient(
+            self.store,
+            base_url=str(self.server.make_url("/")).rstrip("/"),
+        )
+        requests_after_cancellation = len(self.requests)
+        with self.assertRaisesRegex(RuntimeError, "未保存 SMSBower mailId"):
+            await restarted.poll_next_code(email)
+        self.assertEqual(restarted.public_state()["active"], 0)
+        self.assertEqual(len(self.requests), requests_after_cancellation)
+
+    async def test_provider_cancellation_marks_activation_expired_immediately(self):
+        email = await self.client.acquire_email("OpenAI")
+        self.code_error = "Activation is already canceled"
+
+        with self.assertRaisesRegex(RuntimeError, "激活已失效"):
+            await self.client.poll_code(email)
+        self.assertEqual(self.client.public_state()["active"], 0)
+        self.assertEqual(self.client.public_state()["expired"], 1)
+
+        requests_after_cancellation = len(self.requests)
+        with self.assertRaisesRegex(RuntimeError, "Activation is already canceled"):
+            await self.client.poll_next_code(email)
+        self.assertEqual(len(self.requests), requests_after_cancellation)
 
     async def test_old_gmail_without_persisted_mail_id_is_explicit(self):
         with self.assertRaisesRegex(RuntimeError, "未保存 SMSBower mailId"):
@@ -96,8 +169,63 @@ class SMSBowerMailClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("apiKey", state)
         self.assertNotIn("test-api-key-123", str(state))
 
+    async def test_forget_email_removes_persisted_activation(self):
+        email = await self.client.acquire_email("OpenAI")
+
+        self.assertTrue(await self.client.forget_email(email.upper()))
+        self.assertEqual(self.client.public_state()["active"], 0)
+        self.assertFalse(await self.client.forget_email(email))
+
+        restarted = SMSBowerMailClient(
+            self.store, base_url=str(self.server.make_url("/")).rstrip("/")
+        )
+        self.assertEqual(restarted.public_state()["active"], 0)
+
 
 class SMSBowerWebRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gmail_delete_removes_local_account_without_icloud_lookup(self):
+        class SMSBowerClientStub:
+            def __init__(self):
+                self.forgotten = []
+
+            async def forget_email(self, email):
+                self.forgotten.append(email)
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            smsbower = SMSBowerClientStub()
+            app["smsbower_client"] = smsbower
+            email = "saved.account@gmail.com"
+            _save_account_record(
+                app["db_file"],
+                email,
+                result={
+                    "access_token": "gmail-access-token",
+                    "session_json": '{"accessToken":"gmail-access-token"}',
+                },
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/gpt-email/delete",
+                    json={"email": email},
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+
+            self.assertEqual(load_account_record(app["db_file"], email), {})
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(smsbower.forgotten, [email])
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["deleted"])
+        self.assertFalse(payload["deactivated"])
+        self.assertIn("Gmail", payload["message"])
+
     async def test_gmail_code_route_uses_smsbower_activation(self):
         class SMSBowerClientStub:
             def __init__(self):
@@ -127,6 +255,30 @@ class SMSBowerWebRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["code"], "654321")
         self.assertEqual(smsbower.emails, ["fresh.account@gmail.com"])
+
+    async def test_gmail_code_route_reports_expired_activation_as_gone(self):
+        class SMSBowerClientStub:
+            async def poll_next_code(self, _email):
+                raise RuntimeError("SMSBower Gmail 激活已超过本机 24 小时保留期限")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            app["smsbower_client"] = SMSBowerClientStub()
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/gpt-code",
+                    json={"email": "expired.account@gmail.com"},
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 410)
+        self.assertFalse(payload["ok"])
+        self.assertIn("24 小时", payload["error"])
 
     async def test_config_and_provider_registration_routes(self):
         class RegistrationManagerStub:
@@ -173,7 +325,7 @@ class SMSBowerWebRouteTests(unittest.IsolatedAsyncioTestCase):
                 status_payload = await status.json()
                 started = await client.post(
                     "/api/registration/start",
-                    json={"provider": "smsbower", "headless": True},
+                    json={"provider": "smsbower", "headless": False},
                     headers=headers,
                 )
                 inventory_started = await client.post(
@@ -193,6 +345,7 @@ class SMSBowerWebRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.starts[0]["provider"], "smsbower")
         self.assertEqual(manager.starts[0]["email"], "")
         self.assertEqual(manager.starts[0]["concurrency"], 1)
+        self.assertFalse(manager.starts[0]["headless"])
         self.assertEqual(inventory_started.status, 200)
         self.assertEqual(manager.starts[1]["provider"], "inventory")
         self.assertEqual(manager.starts[1]["email"], "")

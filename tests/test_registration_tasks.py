@@ -6,12 +6,25 @@ from hidemyemail_generator.registration_tasks import generate_openai_password
 
 
 class FakeBrowserManager:
-    def __init__(self, *, password_confirmed=True, two_factor_enabled=True):
+    def __init__(
+        self,
+        *,
+        password_confirmed=True,
+        two_factor_enabled=True,
+        password_confirmed_sequence=None,
+        two_factor_enabled_sequence=None,
+    ):
         self.started_accounts = []
         self.start_options = {}
+        self.started_batches = []
+        self.start_options_history = []
         self.reset_count = 0
         self.password_confirmed = password_confirmed
         self.two_factor_enabled = two_factor_enabled
+        self.password_confirmed_sequence = list(
+            password_confirmed_sequence or []
+        )
+        self.two_factor_enabled_sequence = list(two_factor_enabled_sequence or [])
         self.state = {
             "status": "idle",
             "running": False,
@@ -44,6 +57,8 @@ class FakeBrowserManager:
             "concurrency": concurrency,
             "use_registration_proxy": use_registration_proxy,
         }
+        self.started_batches.append([dict(item) for item in accounts])
+        self.start_options_history.append(dict(self.start_options))
         self.state.update(
             status="running",
             running=True,
@@ -54,6 +69,21 @@ class FakeBrowserManager:
 
     async def wait(self):
         await asyncio.sleep(0)
+        attempt = max(0, len(self.started_batches) - 1)
+        password_confirmed = (
+            self.password_confirmed_sequence[
+                min(attempt, len(self.password_confirmed_sequence) - 1)
+            ]
+            if self.password_confirmed_sequence
+            else self.password_confirmed
+        )
+        two_factor_enabled = (
+            self.two_factor_enabled_sequence[
+                min(attempt, len(self.two_factor_enabled_sequence) - 1)
+            ]
+            if self.two_factor_enabled_sequence
+            else self.two_factor_enabled
+        )
         self.state.update(
             status="completed",
             running=False,
@@ -62,8 +92,8 @@ class FakeBrowserManager:
                 {
                     "email": account["email"],
                     "status": "success",
-                    "passwordConfirmed": self.password_confirmed,
-                    "twoFactorEnabled": self.two_factor_enabled,
+                    "passwordConfirmed": password_confirmed,
+                    "twoFactorEnabled": two_factor_enabled,
                 }
                 for account in self.started_accounts
             ],
@@ -83,6 +113,65 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(password, r"[a-z]")
         self.assertRegex(password, r"\d")
         self.assertRegex(password, r"[!@#$%^&*_+=-]")
+
+    async def test_stop_during_provider_finalization_clears_running_state(self):
+        browser = FakeBrowserManager()
+        finalization_started = asyncio.Event()
+        finalization_cancelled = asyncio.Event()
+
+        async def acquire_provider(_label):
+            return "cancel.finalization@gmail.com"
+
+        async def complete_provider(_email, _success, _message):
+            finalization_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalization_cancelled.set()
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            acquire_provider_email=acquire_provider,
+            complete_provider_email=complete_provider,
+        )
+        manager.start(
+            label="SMSBower Gmail 注册",
+            provider="smsbower",
+            headless=False,
+        )
+        await asyncio.wait_for(finalization_started.wait(), timeout=2)
+
+        snapshot = await asyncio.wait_for(manager.stop(), timeout=2)
+
+        self.assertTrue(finalization_cancelled.is_set())
+        self.assertTrue(manager._task.done())
+        self.assertEqual(snapshot["status"], "cancelled")
+        self.assertEqual(snapshot["phase"], "cancelled")
+        self.assertFalse(snapshot["running"])
+        self.assertTrue(snapshot["finishedAt"])
+
+    async def test_stop_repairs_stale_completed_task_state(self):
+        manager = RegistrationTaskManager(
+            browser_manager=FakeBrowserManager(),
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+        )
+        manager._task = asyncio.create_task(asyncio.sleep(0))
+        await manager._task
+        manager._state.update(
+            status="cancelling",
+            phase="cancelling",
+            running=True,
+            finishedAt="",
+        )
+
+        snapshot = await manager.stop()
+
+        self.assertEqual(snapshot["status"], "cancelled")
+        self.assertFalse(snapshot["running"])
+        self.assertTrue(snapshot["finishedAt"])
 
     async def test_claims_inventory_email_then_runs_browser_registration(self):
         browser = FakeBrowserManager()
@@ -126,7 +215,7 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(browser.started_accounts[0]["force_reset_password"])
         self.assertEqual(browser.started_accounts[0]["password"], events[2][2])
         self.assertIn("成功 1/1", snapshot["message"])
-        self.assertIn("密码已设置 1/1", snapshot["message"])
+        self.assertIn("密码已确认 1/1", snapshot["message"])
         self.assertIn("2FA 已开启 1/1", snapshot["message"])
         self.assertTrue(browser.state["headless"])
         self.assertTrue(browser.state["useRegistrationProxy"])
@@ -222,7 +311,7 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         state = manager.start(
             label="SMSBower Gmail 注册",
             provider="smsbower",
-            headless=True,
+            headless=False,
             concurrency=8,
         )
         self.assertEqual(state["provider"], "smsbower")
@@ -266,6 +355,160 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.snapshot()["awaitingCode"])
         self.assertIn("SMSBower 已返回验证码", manager.snapshot()["message"])
 
+    async def test_smsbower_code_timeout_cancels_activation_and_marks_failure(self):
+        now = [100.0]
+        completions = []
+
+        async def poll_provider(_email):
+            return ""
+
+        async def cancel_provider(email, message):
+            completions.append((email, message))
+
+        manager = RegistrationTaskManager(
+            browser_manager=FakeBrowserManager(),
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            poll_provider_code=poll_provider,
+            cancel_provider_email=cancel_provider,
+            provider_code_timeout_seconds=30,
+            monotonic=lambda: now[0],
+        )
+        manager._state.update(
+            running=True,
+            status="running",
+            provider="smsbower",
+            email="timeout@gmail.com",
+            emails=["timeout@gmail.com"],
+        )
+
+        self.assertEqual(
+            await manager.poll_verification_code_async(
+                "timeout@gmail.com", request_id="request-one"
+            ),
+            "",
+        )
+        now[0] += 30.1
+        with self.assertRaisesRegex(RuntimeError, "已取消邮箱激活"):
+            await manager.poll_verification_code_async(
+                "timeout@gmail.com", request_id="request-one"
+            )
+        with self.assertRaisesRegex(RuntimeError, "已取消邮箱激活"):
+            await manager.poll_verification_code_async(
+                "timeout@gmail.com", request_id="request-one"
+            )
+
+        self.assertEqual(len(completions), 1)
+        self.assertEqual(completions[0][0], "timeout@gmail.com")
+        self.assertIn("30 秒", completions[0][1])
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["phase"], "failed")
+        self.assertIn("已取消邮箱激活", snapshot["message"])
+
+    async def test_smsbower_distinct_browser_requests_wait_for_distinct_codes(self):
+        initial_calls = []
+        next_calls = []
+
+        async def poll_initial(email):
+            initial_calls.append(email)
+            return "123456"
+
+        async def poll_next(email):
+            next_calls.append(email)
+            return "654321"
+
+        manager = RegistrationTaskManager(
+            browser_manager=FakeBrowserManager(),
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            poll_provider_code=poll_initial,
+            poll_provider_next_code=poll_next,
+        )
+        manager._state.update(
+            running=True,
+            status="running",
+            provider="smsbower",
+            email="auto.code@gmail.com",
+            emails=["auto.code@gmail.com"],
+        )
+
+        first = await manager.poll_verification_code_async(
+            "auto.code@gmail.com", request_id="request-one"
+        )
+        first_retry = await manager.poll_verification_code_async(
+            "auto.code@gmail.com", request_id="request-one"
+        )
+        second = await manager.poll_verification_code_async(
+            "auto.code@gmail.com", request_id="request-two"
+        )
+        second_retry = await manager.poll_verification_code_async(
+            "auto.code@gmail.com", request_id="request-two"
+        )
+
+        self.assertEqual((first, first_retry), ("123456", "123456"))
+        self.assertEqual((second, second_retry), ("654321", "654321"))
+        self.assertEqual(initial_calls, ["auto.code@gmail.com"])
+        self.assertEqual(next_calls, ["auto.code@gmail.com"])
+
+    async def test_missing_two_factor_stays_visible_before_provider_completion(self):
+        browser = FakeBrowserManager(two_factor_enabled_sequence=[False, True])
+        events = []
+        partial_two_factor = {
+            "enabled": False,
+            "status": "enrolled",
+            "secret": "JBSWY3DPEHPK3PXP",
+            "factor_id": "factor-1",
+            "session_id": "session-1",
+        }
+
+        async def acquire_provider(label):
+            events.append(("acquire", label))
+            return "retry.2fa@gmail.com"
+
+        async def save_password(email, password):
+            events.append(("save", email, password))
+
+        async def load_account(email):
+            events.append(("load", email))
+            return {
+                "password": browser.started_batches[0][0]["password"],
+                "password_confirmed": True,
+                "two_factor": partial_two_factor,
+            }
+
+        async def complete_provider(email, success, message):
+            events.append(("complete", email, success, message))
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            save_password=save_password,
+            acquire_provider_email=acquire_provider,
+            complete_provider_email=complete_provider,
+            load_account=load_account,
+        )
+        manager.start(
+            label="SMSBower Gmail 注册",
+            provider="smsbower",
+            headless=False,
+        )
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(len(browser.started_batches), 2)
+        self.assertFalse(browser.start_options_history[1]["headless"])
+        self.assertTrue(browser.start_options_history[1]["use_registration_proxy"])
+        retry_account = browser.started_batches[1][0]
+        self.assertTrue(retry_account["foreground_required"])
+        self.assertTrue(retry_account["password_confirmed"])
+        self.assertTrue(retry_account["enable_2fa"])
+        self.assertEqual(retry_account["two_factor"], partial_two_factor)
+        self.assertEqual(events[-1][0:3], ("complete", "retry.2fa@gmail.com", True))
+        self.assertTrue(any("2FA 补做完成" in item["message"] for item in snapshot["logs"]))
+
     async def test_skips_two_factor_when_password_was_not_confirmed(self):
         browser = FakeBrowserManager(
             password_confirmed=False,
@@ -288,8 +531,44 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = manager.snapshot()
         self.assertEqual(snapshot["status"], "completed")
-        self.assertIn("密码已设置 0/1", snapshot["message"])
-        self.assertIn("2FA 已开启 0/1", snapshot["message"])
+        self.assertIn("密码已确认 0/1", snapshot["message"])
+        self.assertTrue(
+            any("免密码注册" in item["message"] for item in snapshot["logs"])
+        )
+        self.assertEqual(len(browser.started_batches), 1)
+
+    async def test_smsbower_gmail_rejects_passwordless_result(self):
+        browser = FakeBrowserManager(
+            password_confirmed=False,
+            two_factor_enabled=False,
+        )
+        completions = []
+
+        async def acquire_provider(_label):
+            return "strict-result@gmail.com"
+
+        async def complete_provider(email, success, message):
+            completions.append((email, success, message))
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            acquire_provider_email=acquire_provider,
+            complete_provider_email=complete_provider,
+        )
+        manager.start(
+            label="SMSBower Gmail 严格注册",
+            provider="smsbower",
+            headless=True,
+        )
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertIn("拒绝免密码账号", snapshot["message"])
+        self.assertEqual(completions[-1][0:2], ("strict-result@gmail.com", False))
+        self.assertEqual(len(browser.started_batches), 1)
 
     async def test_empty_inventory_fails_without_starting_browser(self):
         browser = FakeBrowserManager()

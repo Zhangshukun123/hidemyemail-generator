@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import secrets
 import string
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from .browser_tasks import BrowserTaskManager
+from .browser_tasks import BrowserTaskManager, browser_log_context
 
 
 AcquireInventoryEmail = Callable[[str], Awaitable[str]]
@@ -17,7 +18,10 @@ ReleaseInventoryEmail = Callable[[str], Awaitable[None]]
 CompleteInventoryEmail = Callable[[str, bool, str], Awaitable[None]]
 AcquireProviderEmail = Callable[[str], Awaitable[str]]
 PollProviderCode = Callable[[str], Awaitable[str]]
+PollProviderNextCode = Callable[[str], Awaitable[str]]
 CompleteProviderEmail = Callable[[str, bool, str], Awaitable[None]]
+CancelProviderEmail = Callable[[str, str], Awaitable[None]]
+LoadAccount = Callable[[str], Awaitable[dict[str, Any]]]
 
 
 def utc_now() -> str:
@@ -52,7 +56,12 @@ class RegistrationTaskManager:
         complete_email: CompleteInventoryEmail | None = None,
         acquire_provider_email: AcquireProviderEmail | None = None,
         poll_provider_code: PollProviderCode | None = None,
+        poll_provider_next_code: PollProviderNextCode | None = None,
         complete_provider_email: CompleteProviderEmail | None = None,
+        cancel_provider_email: CancelProviderEmail | None = None,
+        load_account: LoadAccount | None = None,
+        provider_code_timeout_seconds: float = 30.0,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.browser_manager = browser_manager
         self.acquire_email = acquire_email
@@ -62,11 +71,22 @@ class RegistrationTaskManager:
         self.complete_email = complete_email
         self.acquire_provider_email = acquire_provider_email
         self.poll_provider_code = poll_provider_code
+        self.poll_provider_next_code = poll_provider_next_code
         self.complete_provider_email = complete_provider_email
+        self.cancel_provider_email = cancel_provider_email
+        self.load_account = load_account
+        self.provider_code_timeout_seconds = max(
+            1.0, float(provider_code_timeout_seconds)
+        )
+        self._monotonic = monotonic or time.monotonic
         self._task: asyncio.Task | None = None
         self._state: dict[str, Any] = self._idle_state()
         self._manual_codes: dict[str, str] = {}
         self._awaiting_code_emails: set[str] = set()
+        self._provider_code_request_ids: dict[str, list[str]] = {}
+        self._provider_code_cache: dict[tuple[str, str], str] = {}
+        self._provider_code_started_at: dict[tuple[str, str], float] = {}
+        self._provider_cancelled_emails: set[str] = set()
 
     @staticmethod
     def _idle_state() -> dict[str, Any]:
@@ -82,6 +102,10 @@ class RegistrationTaskManager:
             "awaitingCodeEmails": [],
             "message": "尚未启动一键注册",
             "logs": [],
+            "currentStage": "idle",
+            "currentLocation": "等待任务",
+            "currentAction": "尚未开始",
+            "currentStatus": "idle",
             "startedAt": "",
             "finishedAt": "",
         }
@@ -123,6 +147,10 @@ class RegistrationTaskManager:
             reset_browser_state()
         self._manual_codes.clear()
         self._awaiting_code_emails.clear()
+        self._provider_code_request_ids.clear()
+        self._provider_code_cache.clear()
+        self._provider_code_started_at.clear()
+        self._provider_cancelled_emails.clear()
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -150,6 +178,10 @@ class RegistrationTaskManager:
                 else f"正在从已生成邮箱库存领取 {concurrency} 个账号"
             ),
             "logs": [],
+            "currentStage": "prepare",
+            "currentLocation": "注册准备",
+            "currentAction": "准备注册邮箱",
+            "currentStatus": "active",
             "startedAt": utc_now(),
             "finishedAt": "",
         }
@@ -171,10 +203,20 @@ class RegistrationTaskManager:
         return self.snapshot()
 
     def _append_log(self, message: str) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        context = browser_log_context(text)
         self._state.setdefault("logs", []).append(
-            {"at": utc_now(), "message": str(message or "")[:1000]}
+            {"at": utc_now(), "message": text[:1000], **context}
         )
         del self._state["logs"][:-100]
+        self._state.update(
+            currentStage=context["stage"],
+            currentLocation=context["location"],
+            currentAction=context["action"],
+            currentStatus=context["status"],
+        )
 
     def _validate_poll_target(self, email: str) -> str:
         target = str(email or "").strip().lower()
@@ -208,8 +250,25 @@ class RegistrationTaskManager:
             self._append_log(f"注册浏览器正在等待手动输入验证码：{target}")
         return ""
 
-    async def poll_verification_code_async(self, email: str) -> str:
+    @staticmethod
+    def _normalize_provider_request_id(request_id: str) -> str:
+        value = str(request_id or "").strip()
+        if not value:
+            return ""
+        if len(value) > 128 or any(
+            not (character.isalnum() or character in "-_") for character in value
+        ):
+            raise ValueError("验证码请求标识无效")
+        return value
+
+    async def poll_verification_code_async(
+        self,
+        email: str,
+        *,
+        request_id: str = "",
+    ) -> str:
         target = self._validate_poll_target(email)
+        provider_request_id = self._normalize_provider_request_id(request_id)
         manual_code = self._manual_codes.pop(target, "")
         if manual_code:
             self._awaiting_code_emails.discard(target)
@@ -224,8 +283,89 @@ class RegistrationTaskManager:
             return self.poll_verification_code(target)
         if self.poll_provider_code is None:
             raise RuntimeError("SMSBower Gmail 验证码服务未配置")
-        code = await self.poll_provider_code(target)
+        timeout_seconds = self.provider_code_timeout_seconds
+        timeout_label = f"{timeout_seconds:g}"
+        timeout_message = (
+            f"SMSBower Gmail 验证码等待超过 {timeout_label} 秒，"
+            "已取消邮箱激活并判定注册失败"
+        )
+        if target in self._provider_cancelled_emails:
+            raise RuntimeError(timeout_message)
+        timeout_key = (target, provider_request_id or "__default__")
+        started_at = self._provider_code_started_at.setdefault(
+            timeout_key,
+            self._monotonic(),
+        )
+
+        async def cancel_timed_out_activation() -> None:
+            if target in self._provider_cancelled_emails:
+                return
+            cancel_provider = self.cancel_provider_email
+            if cancel_provider is None and self.complete_provider_email is not None:
+
+                async def cancel_provider(email: str, message: str) -> None:
+                    await self.complete_provider_email(email, False, message)
+
+            if cancel_provider is None:
+                raise RuntimeError(
+                    timeout_message + "；SMSBower 取消接口未配置"
+                )
+            try:
+                await cancel_provider(target, timeout_message)
+            except Exception as error:
+                failure_message = (
+                    f"SMSBower Gmail 验证码等待超过 {timeout_label} 秒，"
+                    f"取消邮箱激活失败：{str(error)[:240]}"
+                )
+                self._state.update(
+                    status="failed",
+                    phase="failed",
+                    message=failure_message,
+                )
+                self._append_log(f"失败：{failure_message}")
+                raise RuntimeError(failure_message) from error
+            self._provider_cancelled_emails.add(target)
+            self._provider_code_started_at = {
+                key: value
+                for key, value in self._provider_code_started_at.items()
+                if key[0] != target
+            }
+            self._state.update(
+                status="failed",
+                phase="failed",
+                message=timeout_message,
+            )
+            self._append_log(f"失败：{timeout_message}")
+
+        if self._monotonic() - started_at >= timeout_seconds:
+            await cancel_timed_out_activation()
+            raise RuntimeError(timeout_message)
+        provider_poller = self.poll_provider_code
+        if provider_request_id:
+            cache_key = (target, provider_request_id)
+            cached_code = self._provider_code_cache.get(cache_key, "")
+            if cached_code:
+                return cached_code
+            request_ids = self._provider_code_request_ids.setdefault(target, [])
+            if provider_request_id not in request_ids:
+                request_ids.append(provider_request_id)
+                del request_ids[:-8]
+            request_index = request_ids.index(provider_request_id)
+            if request_index > 0 and self.poll_provider_next_code is not None:
+                provider_poller = self.poll_provider_next_code
+        code = await provider_poller(target)
         if code:
+            self._provider_code_started_at.pop(timeout_key, None)
+            if provider_request_id:
+                self._provider_code_cache[(target, provider_request_id)] = code
+                active_request_ids = set(
+                    self._provider_code_request_ids.get(target, [])
+                )
+                self._provider_code_cache = {
+                    key: value
+                    for key, value in self._provider_code_cache.items()
+                    if key[0] != target or key[1] in active_request_ids
+                }
             self._awaiting_code_emails.discard(target)
             self._sync_code_state()
             self._state.update(
@@ -234,6 +374,9 @@ class RegistrationTaskManager:
             )
             self._append_log(f"已从 SMSBower 自动取得 Gmail 验证码：{target}")
             return code
+        if self._monotonic() - started_at >= timeout_seconds:
+            await cancel_timed_out_activation()
+            raise RuntimeError(timeout_message)
         if target not in self._awaiting_code_emails:
             self._awaiting_code_emails.add(target)
             self._sync_code_state()
@@ -269,6 +412,29 @@ class RegistrationTaskManager:
         waiting = sorted(self._awaiting_code_emails)
         self._state["awaitingCode"] = bool(waiting)
         self._state["awaitingCodeEmails"] = waiting
+
+    def _finalize_cancelled_state(self) -> None:
+        already_cancelled = (
+            self._state.get("status") == "cancelled"
+            and not self._state.get("running")
+        )
+        self._state.update(
+            status="cancelled",
+            running=False,
+            phase="cancelled",
+            message="一键注册已停止",
+        )
+        if not already_cancelled:
+            self._append_log("一键注册已停止")
+        self._manual_codes.clear()
+        self._awaiting_code_emails.clear()
+        self._provider_code_request_ids.clear()
+        self._provider_code_cache.clear()
+        self._provider_code_started_at.clear()
+        self._provider_cancelled_emails.clear()
+        self._sync_code_state()
+        if not self._state.get("finishedAt"):
+            self._state["finishedAt"] = utc_now()
 
     async def _run(
         self,
@@ -370,7 +536,10 @@ class RegistrationTaskManager:
                         "enable_2fa": True,
                         "manual_otp_entry": provider == "manual",
                         "password_first_required": provider == "smsbower",
-                        "foreground_required": provider in {"manual", "smsbower"},
+                        "foreground_required": (
+                            provider == "manual"
+                            or (provider == "smsbower" and not headless)
+                        ),
                     }
                 )
                 self._append_log(
@@ -403,7 +572,7 @@ class RegistrationTaskManager:
             )
             self.browser_manager.start(
                 accounts,
-                headless=False if provider in {"manual", "smsbower"} else headless,
+                headless=False if provider == "manual" else headless,
                 concurrency=effective_concurrency,
                 use_registration_proxy=True,
             )
@@ -413,17 +582,155 @@ class RegistrationTaskManager:
             browser_result = await browser_wait
             succeeded = max(0, int(browser_result.get("succeeded") or 0))
             result_accounts = browser_result.get("accounts") or []
-            successful_emails = {
+            registered_emails = {
                 str(item.get("email") or "").strip().lower()
                 for item in result_accounts
                 if item.get("status") == "success" and item.get("email")
             }
             if (
                 succeeded == effective_concurrency
-                and len(successful_emails) != effective_concurrency
+                and len(registered_emails) != effective_concurrency
             ):
-                successful_emails = set(claimed_emails)
+                registered_emails = set(claimed_emails)
             if succeeded == effective_concurrency:
+                result_by_email = {
+                    str(item.get("email") or "").strip().lower(): item
+                    for item in result_accounts
+                    if isinstance(item, dict) and item.get("email")
+                }
+                account_by_email = {
+                    str(item.get("email") or "").strip().lower(): item
+                    for item in accounts
+                }
+                retry_accounts: list[dict[str, Any]] = []
+                passwordless_accounts: list[str] = []
+                already_enabled: set[str] = set()
+                for email in claimed_emails:
+                    if email not in registered_emails:
+                        continue
+                    result_item = result_by_email.get(email, {})
+                    if result_item.get("twoFactorEnabled"):
+                        already_enabled.add(email)
+                        continue
+                    record: dict[str, Any] = {}
+                    if self.load_account is not None:
+                        loaded = await self.load_account(email)
+                        if isinstance(loaded, dict):
+                            record = loaded
+                    saved_two_factor = (
+                        record.get("two_factor")
+                        if isinstance(record.get("two_factor"), dict)
+                        else {}
+                    )
+                    if saved_two_factor.get("enabled"):
+                        already_enabled.add(email)
+                        result_by_email[email] = {
+                            **result_item,
+                            "email": email,
+                            "twoFactorEnabled": True,
+                        }
+                        continue
+                    source_account = account_by_email.get(email, {})
+                    password = str(
+                        record.get("password") or source_account.get("password") or ""
+                    )
+                    password_confirmed = bool(
+                        record.get("password_confirmed")
+                        if "password_confirmed" in record
+                        else result_item.get("passwordConfirmed")
+                    )
+                    if not password or not password_confirmed:
+                        passwordless_accounts.append(email)
+                        continue
+                    retry_accounts.append(
+                        {
+                            "email": email,
+                            "password": password,
+                            "password_confirmed": True,
+                            "enable_2fa": True,
+                            "foreground_required": (
+                                provider == "smsbower" and not headless
+                            ),
+                            "two_factor": saved_two_factor,
+                        }
+                    )
+
+                if passwordless_accounts:
+                    strict_gmail_failures = [
+                        email
+                        for email in passwordless_accounts
+                        if email.endswith("@gmail.com")
+                    ]
+                    if strict_gmail_failures:
+                        raise RuntimeError(
+                            "Gmail 注册必须确认密码并开启 2FA；"
+                            "已拒绝免密码账号："
+                            + "、".join(strict_gmail_failures)
+                        )
+                    self._append_log(
+                        "OpenAI 当前使用免密码注册，已跳过密码设置和依赖密码的 2FA；"
+                        "账号注册、Session、AT 与 Cookie 仍判定成功："
+                        + "、".join(passwordless_accounts)
+                    )
+
+                if retry_accounts:
+                    self._state.update(
+                        phase="repairing_2fa",
+                        message=(
+                            f"检测到 {len(retry_accounts)} 个账号尚未完成 2FA；"
+                            f"正在使用 Cookie 启动一次"
+                            f"{'前台' if provider == 'smsbower' and not headless else '无头'}补做"
+                        ),
+                    )
+                    self._append_log(self._state["message"])
+                    self.browser_manager.start(
+                        retry_accounts,
+                        headless=headless,
+                        concurrency=len(retry_accounts),
+                        use_registration_proxy=True,
+                    )
+                    retry_result = await self.browser_manager.wait()
+                    retry_items = {
+                        str(item.get("email") or "").strip().lower(): item
+                        for item in retry_result.get("accounts") or []
+                        if isinstance(item, dict) and item.get("email")
+                    }
+                    retry_failures = []
+                    for retry_account in retry_accounts:
+                        email = str(retry_account["email"])
+                        item = retry_items.get(email, {})
+                        if item.get("status") == "success" and item.get(
+                            "twoFactorEnabled"
+                        ):
+                            already_enabled.add(email)
+                            result_by_email[email] = item
+                            continue
+                        retry_failures.append(
+                            f"{email}（{str(item.get('message') or '2FA 未开启')[:160]}）"
+                        )
+                    if retry_failures:
+                        raise RuntimeError(
+                            "注册后的 2FA 补做仍未完成：" + "；".join(retry_failures)
+                        )
+                    self._append_log(
+                        f"注册后 2FA 补做完成：{len(retry_accounts)}/{len(retry_accounts)}"
+                    )
+
+                missing_two_factor = [
+                    email
+                    for email in claimed_emails
+                    if email not in already_enabled
+                    and email not in passwordless_accounts
+                ]
+                if missing_two_factor:
+                    raise RuntimeError(
+                        "以下账号仍未完成 2FA：" + "、".join(missing_two_factor)
+                    )
+
+                successful_emails = set(claimed_emails)
+                result_accounts = [
+                    result_by_email.get(email, {}) for email in claimed_emails
+                ]
                 password_confirmed = sum(
                     1 for item in result_accounts if item.get("passwordConfirmed")
                 )
@@ -432,7 +739,7 @@ class RegistrationTaskManager:
                 )
                 detail = (
                     f"并发注册完成：成功 {succeeded}/{effective_concurrency}；"
-                    f"密码已设置 {password_confirmed}/{effective_concurrency}；"
+                    f"密码已确认 {password_confirmed}/{effective_concurrency}；"
                     f"2FA 已开启 {two_factor_enabled}/{effective_concurrency}；"
                     f"Session / Cookie 已保存"
                 )
@@ -459,10 +766,7 @@ class RegistrationTaskManager:
                     + (f"；{detail}" if detail else "")
                 )
         except asyncio.CancelledError:
-            self._state.update(
-                status="cancelled", phase="cancelled", message="一键注册已停止"
-            )
-            self._append_log("一键注册已停止")
+            self._finalize_cancelled_state()
             raise
         except Exception as error:
             self._state.update(
@@ -472,63 +776,89 @@ class RegistrationTaskManager:
             )
             self._append_log(f"失败：{self._state['message']}")
         finally:
-            finalization_emails = (
-                claimed_emails if provider in {"inventory", "smsbower"} else []
-            )
-            for email in finalization_emails:
-                try:
-                    if provider == "smsbower" and self.complete_provider_email is not None:
-                        success = email in successful_emails
-                        await self.complete_provider_email(
-                            email,
-                            success,
-                            str(self._state.get("message") or "OpenAI 注册失败"),
-                        )
+            try:
+                finalization_emails = (
+                    claimed_emails if provider in {"inventory", "smsbower"} else []
+                )
+                for email in finalization_emails:
+                    try:
+                        if (
+                            provider == "smsbower"
+                            and self.complete_provider_email is not None
+                        ):
+                            if email in self._provider_cancelled_emails:
+                                self._append_log(
+                                    f"SMSBower Gmail 验证码超时，激活已取消：{email}"
+                                )
+                                continue
+                            success = email in successful_emails
+                            await self.complete_provider_email(
+                                email,
+                                success,
+                                str(self._state.get("message") or "OpenAI 注册失败"),
+                            )
+                            self._append_log(
+                                f"已向 SMSBower 回执 Gmail 激活状态（{email}）："
+                                f"{'注册成功' if success else '注册未完成'}"
+                            )
+                        elif provider == "inventory" and self.complete_email is not None:
+                            success = email in successful_emails
+                            await self.complete_email(
+                                email,
+                                success,
+                                (
+                                    "OpenAI 注册成功"
+                                    if success
+                                    else str(
+                                        self._state.get("message") or "OpenAI 注册失败"
+                                    )
+                                ),
+                            )
+                            self._append_log(
+                                f"已向远端库存回执（{email}）："
+                                f"{'注册成功，标记已使用' if success else '注册失败，已永久隔离'}"
+                            )
+                        elif provider == "inventory" and self.release_email is not None:
+                            await self.release_email(email)
+                    except Exception as error:
                         self._append_log(
-                            f"已向 SMSBower 回执 Gmail 激活状态（{email}）："
-                            f"{'注册成功' if success else '注册未完成'}"
+                            f"提交{' SMSBower 激活' if provider == 'smsbower' else '库存'}回执失败"
+                            f"（{email}）：{str(error)[:300]}"
                         )
-                    elif provider == "inventory" and self.complete_email is not None:
-                        success = email in successful_emails
-                        await self.complete_email(
-                            email,
-                            success,
-                            (
-                                "OpenAI 注册成功"
-                                if success
-                                else str(self._state.get("message") or "OpenAI 注册失败")
-                            ),
-                        )
-                        self._append_log(
-                            f"已向远端库存回执（{email}）："
-                            f"{'注册成功，标记已使用' if success else '注册失败，已永久隔离'}"
-                        )
-                    elif provider == "inventory" and self.release_email is not None:
-                        await self.release_email(email)
-                except Exception as error:
-                    self._append_log(
-                        f"提交{' SMSBower 激活' if provider == 'smsbower' else '库存'}回执失败"
-                        f"（{email}）：{str(error)[:300]}"
-                    )
-            self._state["running"] = False
-            self._manual_codes.clear()
-            self._awaiting_code_emails.clear()
-            self._sync_code_state()
-            self._state["finishedAt"] = utc_now()
+            finally:
+                if self._state.get("status") == "cancelling":
+                    self._finalize_cancelled_state()
+                else:
+                    self._state["running"] = False
+                    self._manual_codes.clear()
+                    self._awaiting_code_emails.clear()
+                    self._provider_code_request_ids.clear()
+                    self._provider_code_cache.clear()
+                    self._provider_code_started_at.clear()
+                    self._provider_cancelled_emails.clear()
+                    self._sync_code_state()
+                    self._state["finishedAt"] = utc_now()
 
     async def stop(self) -> dict[str, Any]:
-        if not self._task or self._task.done():
+        if not self._task:
+            return self.snapshot()
+        if self._task.done():
+            if self._state.get("running") or self._state.get("status") == "cancelling":
+                self._finalize_cancelled_state()
             return self.snapshot()
         self._state.update(
             status="cancelling", phase="cancelling", message="正在停止一键注册"
         )
         if self.browser_manager.snapshot().get("running"):
             await self.browser_manager.stop()
-        self._task.cancel()
+        if not self._task.done():
+            self._task.cancel()
         try:
             await self._task
         except asyncio.CancelledError:
             pass
+        if self._state.get("running") or self._state.get("status") == "cancelling":
+            self._finalize_cancelled_state()
         return self.snapshot()
 
     async def close(self) -> None:
@@ -536,7 +866,9 @@ class RegistrationTaskManager:
 
 
 __all__ = [
+    "CancelProviderEmail",
     "CompleteInventoryEmail",
+    "LoadAccount",
     "RegistrationTaskManager",
     "generate_openai_password",
 ]

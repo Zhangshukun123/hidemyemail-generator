@@ -1661,7 +1661,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
     }
 
     async function deleteEmail(email) {
-      const warning = `确定永久删除邮箱 ${email} 吗？\n\n该操作会停用并删除 iCloud 隐藏邮箱，同时清除本地保存的 OpenAI 密码、Session、AT 和 2FA，无法撤销。`;
+      const isGmail = email.toLowerCase().endsWith("@gmail.com");
+      const warning = isGmail
+        ? `确定从本机账号列表删除 ${email} 吗？\n\n该操作会清除本地保存的 OpenAI 密码、Session、AT、2FA 和 SMSBower 激活记录，但不会删除 Gmail 服务商侧的邮箱，无法撤销。`
+        : `确定永久删除邮箱 ${email} 吗？\n\n该操作会停用并删除 iCloud 隐藏邮箱，同时清除本地保存的 OpenAI 密码、Session、AT 和 2FA，无法撤销。`;
       if (!confirm(warning)) {
         const error = new Error("已取消删除");
         error.name = "AbortError";
@@ -3561,6 +3564,9 @@ def create_app(
             password_confirmed=False,
         )
 
+    async def load_registration_account(email: str) -> dict:
+        return await asyncio.to_thread(load_account_record, app["db_file"], email)
+
     app["registration_manager"] = RegistrationTaskManager(
         browser_manager=app["browser_manager"],
         acquire_email=acquire_registration_inventory_email,
@@ -3569,7 +3575,10 @@ def create_app(
         complete_email=complete_registration_inventory_email,
         acquire_provider_email=app["smsbower_client"].acquire_email,
         poll_provider_code=app["smsbower_client"].poll_code,
+        poll_provider_next_code=app["smsbower_client"].poll_next_code,
         complete_provider_email=app["smsbower_client"].complete_email,
+        cancel_provider_email=app["smsbower_client"].cancel_email,
+        load_account=load_registration_account,
     )
 
     async def generate_inventory_batch(label: str, count: int) -> dict:
@@ -4005,7 +4014,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
-        if not email.endswith("@icloud.com") or len(email) > 320:
+        if not _valid_supported_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -4023,6 +4032,20 @@ def create_app(
             )
 
         async with app["delete_lock"]:
+            if email.endswith("@gmail.com"):
+                await app["smsbower_client"].forget_email(email)
+                await asyncio.to_thread(
+                    _remove_deleted_email_records, app["db_file"], email
+                )
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "deleted": True,
+                        "deactivated": False,
+                        "message": "Gmail 本地账号凭据及 SMSBower 激活记录已删除",
+                    }
+                )
+
             try:
                 identities = await active_icloud_identities()
             except RuntimeError as error:
@@ -4095,7 +4118,12 @@ def create_app(
                 code = await app["smsbower_client"].poll_next_code(email)
             except RuntimeError as error:
                 message = str(error)
-                status = 409 if "未保存 SMSBower mailId" in message else 502
+                if "激活已" in message:
+                    status = 410
+                elif "未保存 SMSBower mailId" in message:
+                    status = 409
+                else:
+                    status = 502
                 return None, message, status
             if not code:
                 return None, "SMSBower Gmail 验证码尚未到达", 404
@@ -4536,15 +4564,19 @@ def create_app(
         try:
             payload = await request.json()
             manager = app["registration_manager"]
+            email = str(payload.get("email") or "")
+            request_id = str(payload.get("requestId") or "")
             async_poller = getattr(manager, "poll_verification_code_async", None)
             if callable(async_poller):
-                code = await async_poller(str(payload.get("email") or ""))
+                code = await async_poller(email, request_id=request_id)
             else:
-                code = manager.poll_verification_code(str(payload.get("email") or ""))
+                code = manager.poll_verification_code(email)
         except (json.JSONDecodeError, web.HTTPBadRequest):
             return web.json_response(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
         except RuntimeError as error:
             return web.json_response({"ok": False, "error": str(error)}, status=409)
         if not code:
@@ -4858,6 +4890,85 @@ def create_app(
                 "mode": (
                     "set_password" if reset_password or access_token else "register"
                 ),
+                "task": task,
+            }
+        )
+
+    async def enable_account_two_factor(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(payload.get("email") or "").strip().lower()
+        if not _valid_supported_account_email(email):
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        if app["registration_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "一键注册正在运行，请等待完成"}, status=409
+            )
+        if app["browser_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "浏览器任务正在运行，请等待完成"}, status=409
+            )
+        if app["verification_manager"].snapshot().get("running"):
+            return web.json_response(
+                {"ok": False, "error": "账号验证任务正在运行，请等待完成"},
+                status=409,
+            )
+
+        record = await asyncio.to_thread(
+            load_account_record, app["db_file"], email
+        )
+        two_factor = (
+            record.get("two_factor")
+            if isinstance(record.get("two_factor"), dict)
+            else {}
+        )
+        if two_factor.get("enabled"):
+            return web.json_response(
+                {"ok": False, "error": "该账号已经开启 2FA"}, status=409
+            )
+        password = str(record.get("password") or "")
+        if not password or record.get("password_confirmed") is False:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "请先设置并确认账号密码，再添加 2FA",
+                },
+                status=409,
+            )
+        try:
+            task = app["browser_manager"].start(
+                [
+                    {
+                        "email": email,
+                        "password": password,
+                        "password_confirmed": True,
+                        "enable_2fa": True,
+                        "two_factor": two_factor,
+                    }
+                ],
+                headless=True,
+                concurrency=1,
+            )
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=409
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "started": True,
+                "mode": "enable_2fa",
+                "message": "正在使用无头浏览器登录账号并添加 2FA",
                 "task": task,
             }
         )
@@ -5423,6 +5534,7 @@ def create_app(
     app.router.add_post(
         "/api/account/verify-or-register", verify_or_register_account
     )
+    app.router.add_post("/api/account/enable-2fa", enable_account_two_factor)
     app.router.add_get("/api/inbox/status", inbox_status)
     app.router.add_post("/api/inbox/config", inbox_config)
     app.router.add_get("/api/inbox/codes", inbox_codes)

@@ -491,6 +491,56 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received.status, 200)
         self.assertEqual(payload["code"], "123456")
 
+    async def test_registration_code_poll_forwards_browser_request_id(self):
+        class RegistrationManagerStub:
+            def __init__(self):
+                self.polls = []
+
+            def snapshot(self):
+                return {
+                    "status": "running",
+                    "running": True,
+                    "provider": "smsbower",
+                }
+
+            async def poll_verification_code_async(
+                self, email, *, request_id=""
+            ):
+                self.polls.append((email, request_id))
+                return "654321"
+
+            async def stop(self):
+                return self.snapshot()
+
+            async def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            manager = RegistrationManagerStub()
+            app["registration_manager"] = manager
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/registration/code/poll",
+                    json={
+                        "email": "fresh.account@gmail.com",
+                        "requestId": "browser-request-1",
+                    },
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["code"], "654321")
+        self.assertEqual(
+            manager.polls,
+            [("fresh.account@gmail.com", "browser-request-1")],
+        )
+
     async def test_integration_status_reports_available_inventory_count(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             token = "test-token-at-least-32-characters-long"

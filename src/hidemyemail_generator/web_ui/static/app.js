@@ -71,6 +71,54 @@
     return states[status] || states.idle;
   }
 
+  function taskStageLabel(stage) {
+    const labels = {
+      idle: "准备", running: "执行", prepare: "准备", provider: "邮箱服务",
+      network: "网络", browser: "浏览器", openai_auth: "OpenAI 登录",
+      google_oauth: "页面纠正", security: "安全验证", password: "密码",
+      email_verification: "邮箱验证", profile: "基础资料", session: "Session",
+      two_factor: "2FA", completed: "完成",
+    };
+    return labels[stage] || "执行";
+  }
+
+  function taskStageGroup(stage) {
+    if (["idle", "running", "prepare", "provider", "network", "browser"].includes(stage)) return "prepare";
+    if (["openai_auth", "google_oauth", "password"].includes(stage)) return "auth";
+    if (["security", "email_verification"].includes(stage)) return "verify";
+    if (stage === "profile") return "profile";
+    if (["session", "two_factor", "completed"].includes(stage)) return "session";
+    return "prepare";
+  }
+
+  function inferLogContext(item) {
+    const message = String(item.message || "");
+    const lower = message.toLowerCase();
+    let stage = item.stage || "running";
+    let location = item.location || "注册任务";
+    let action = item.action || message || "处理浏览器任务";
+    let status = item.status || (/失败|错误|异常|超时/.test(message)
+      ? "error" : /停止|取消|仍是|未完成|跳过/.test(message)
+        ? "warning" : /等待|请在|手动|继续监测/.test(message)
+          ? "waiting" : /成功|已保存|已开启|校验通过/.test(message) ? "success" : "active");
+    if (!item.stage && /google 账号登录页面|google 登录页|google 登录要求|google 页面返回|从 google 返回/i.test(message)) {
+      stage = "google_oauth"; location = "Google 登录页";
+      action = /全新指纹|更换指纹/.test(message)
+        ? "关闭当前浏览器并更换指纹" : "返回 OpenAI 并重新输入邮箱";
+    } else if (!item.stage && /安全验证|security-check|challenge/.test(lower)) {
+      stage = "security"; location = "安全验证页"; action = "等待手动完成安全验证，完成后自动继续";
+    } else if (!item.stage && /密码|password/.test(lower)) {
+      stage = "password"; location = "OpenAI 密码页"; action = "检查并处理密码登录";
+    } else if (!item.stage && /验证码|verification|otp/.test(lower)) {
+      stage = "email_verification"; location = "邮箱验证码页"; action = "识别并处理邮箱验证码";
+    } else if (!item.stage && /邮箱登录页|邮箱注册字段|邮箱输入框|google 账号入口已禁用|未点击 google 登录按钮/i.test(message)) {
+      stage = "openai_auth"; location = "OpenAI 邮箱登录页"; action = "输入邮箱并进入密码流程";
+    } else if (!item.stage && /session|cookie/.test(lower)) {
+      stage = "session"; location = "OpenAI Session 接口"; action = "获取并保存 Session / Cookie";
+    }
+    return { ...item, stage, location, action, status };
+  }
+
   function initials(email) {
     return String(email || "?").split("@")[0].split(/[._-]/).slice(0, 2)
       .map((part) => part.slice(0, 1).toUpperCase()).join("") || "?";
@@ -321,14 +369,14 @@
       const smsBowerStatus = $("smsbowerStatus");
       smsBowerStatus.className = "badge " + (smsBower.configured ? "success" : "warning");
       smsBowerStatus.textContent = smsBower.configured
-        ? "SMSBower Gmail · 已配置"
+        ? "SMSBower Gmail · 本机取码保留 " + (smsBower.retentionHours || 24) + " 小时"
         : "SMSBower 未配置";
       if (smsBower.maxPrice) $("smsbowerMaxPrice").value = smsBower.maxPrice;
       const registrationProvider = $("registrationEmailProvider").value || "icloud";
       $("smsbowerControls").hidden = registrationProvider !== "gmail";
       $("registerProviderButton").textContent = registrationProvider === "gmail"
-        ? "获取 Gmail 并注册"
-        : "使用 iCloud 注册";
+        ? "开始 Gmail 注册"
+        : "开始 iCloud 注册";
       $("registerProviderButton").disabled = Boolean(state.registrationTask.running) ||
         (registrationProvider === "gmail" && !smsBower.configured);
       $("registerEmailButton").disabled = Boolean(state.registrationTask.running);
@@ -398,16 +446,73 @@
         if (seenLogs.has(key)) return false;
         seenLogs.add(key);
         return true;
-      }).sort((left, right) => new Date(left.at || 0) - new Date(right.at || 0)).slice(-8);
+      }).sort((left, right) => new Date(left.at || 0) - new Date(right.at || 0))
+        .slice(-16).map(inferLogContext);
+      const latestContext = logs.at(-1) || inferLogContext({
+        stage: primaryTask.currentStage || "idle",
+        location: primaryTask.currentLocation || "等待任务",
+        action: primaryTask.currentAction || "尚未开始",
+        status: primaryTask.currentStatus || "idle",
+        email: registration.email || "",
+      });
+      const stageGroup = taskStageGroup(latestContext.stage);
+      $("taskPanel").dataset.currentStage = latestContext.stage;
+      $("taskPanel").dataset.stageGroup = stageGroup;
+      document.querySelectorAll("#taskPanel .task-flow-step").forEach((step) => {
+        const active = step.dataset.flow === stageGroup;
+        step.classList.toggle("active", active);
+        if (active) step.setAttribute("aria-current", "step");
+        else step.removeAttribute("aria-current");
+      });
+      $("taskCurrentLocation").textContent = latestContext.location;
+      $("taskCurrentStage").textContent = taskStageLabel(latestContext.stage);
+      $("taskCurrentAction").textContent = latestContext.action;
+      $("taskCurrentAccount").textContent = latestContext.email
+        ? abbreviateEmail(latestContext.email) : "未选择账号";
+      let assistance = {
+        mode: "automatic", badge: "自动化执行", title: "页面状态持续监测",
+        text: "遇到页面跳转时会自动识别并继续",
+      };
+      if (latestContext.stage === "security") {
+        assistance = {
+          mode: "manual", badge: "需要人工操作", title: "请完成当前安全验证",
+          text: "浏览器会保持登录状态，验证完成后程序自动继续",
+        };
+      } else if (latestContext.stage === "google_oauth") {
+        assistance = {
+          mode: "recovering", badge: "正在自动恢复", title: "检测到 Google 登录页",
+          text: "本轮已判定失败；正在关闭当前浏览器、生成全新指纹并重新打开注册",
+        };
+      } else if (latestContext.stage === "email_verification" && registration.provider === "manual") {
+        assistance = {
+          mode: "manual", badge: "等待人工输入", title: "请在浏览器输入邮箱验证码",
+          text: "提交后程序会继续完成资料、Session 与 2FA",
+        };
+      } else if (latestContext.status === "error") {
+        assistance = {
+          mode: "error", badge: "需要检查", title: "当前步骤出现异常",
+          text: "请查看右侧最后一条执行记录中的失败原因",
+        };
+      } else if (latestContext.stage === "completed") {
+        assistance = {
+          mode: "completed", badge: "任务已完成", title: "账号结果已保存",
+          text: "Session、Cookie 与 2FA 状态已写入账号记录",
+        };
+      }
+      $("taskAssistance").dataset.mode = assistance.mode;
+      $("taskAssistanceBadge").textContent = assistance.badge;
+      $("taskAssistanceTitle").textContent = assistance.title;
+      $("taskAssistanceText").textContent = assistance.text;
+      $("taskLogCount").textContent = logs.length + " 条";
       $("taskLog").innerHTML = logs.length ? logs.map((item) => {
-        const message = String(item.message || "");
-        const kind = /失败|错误|异常/.test(message) ? "error" : /停止|取消/.test(message) ? "warning" : "success";
-        const glyph = kind === "error" ? "!" : kind === "warning" ? "×" : "✓";
-        return '<div class="task-log-row"><span class="task-log-icon ' + kind + '">' + glyph +
-          '</span><time datetime="' + escapeHtml(item.at || "") + '">' + formatClock(item.at) +
-          '</time><span class="task-log-email" title="' + escapeHtml(item.email || "") + '">' +
-          escapeHtml(abbreviateEmail(item.email)) + '</span><span class="task-log-message">' +
-          escapeHtml(message) + "</span></div>";
+        const glyph = item.status === "error" ? "!" : item.status === "warning" ? "×" :
+          item.status === "waiting" ? "…" : item.status === "success" ? "✓" : "•";
+        return '<div class="task-log-row ' + escapeHtml(item.status) + '"><span class="task-log-rail"><i class="task-log-icon ' +
+          escapeHtml(item.status) + '">' + glyph + '</i></span><time datetime="' + escapeHtml(item.at || "") + '">' +
+          formatClock(item.at) + '</time><div class="task-log-context"><div><span class="task-log-stage">' +
+          escapeHtml(taskStageLabel(item.stage)) + '</span><strong>' + escapeHtml(item.location) + '</strong></div><span class="task-log-email" title="' +
+          escapeHtml(item.email || "") + '">' + escapeHtml(abbreviateEmail(item.email)) + '</span></div><div class="task-log-copy"><strong>' +
+          escapeHtml(item.action) + '</strong><span>' + escapeHtml(item.message || "") + "</span></div></div>";
       }).join("") : '<div class="task-log-empty">暂无任务日志</div>';
       $("taskLog").scrollTop = $("taskLog").scrollHeight;
 
@@ -442,12 +547,15 @@
         escapeHtml(item.email) + '">复制邮箱</button><button class="row-action" data-action="select-account" data-email="' +
         escapeHtml(item.email) + '">' + (selected ? "收起" : "更多") + "</button></div></td></tr>";
       if (!selected) return main;
+      const twoFactorPrimaryAction = item.hasTwoFactor
+        ? this.credentialButton("复制 2FA 密钥", "copy-credential", item, "totp_secret")
+        : this.credentialButton("添加 2FA", "enable-2fa", item, "", !item.hasPassword, "primary");
       return main + '<tr class="account-detail-row"><td colspan="6"><div class="account-detail"><div class="credential-summary">' +
         '<span><b>账号</b><code>' + escapeHtml(item.email) + '</code></span><span><b>密码</b><code>' +
         (item.hasPassword ? "••••••••••••" : "尚未保存") + '</code></span><span><b>2FA</b><code>' +
         (item.hasTwoFactor ? "已开启" : "未开启") + '</code></span></div><div class="credential-actions">' +
         this.credentialButton("复制密码", "copy-credential", item, "password", !item.hasPassword) +
-        this.credentialButton("复制 2FA 密钥", "copy-credential", item, "totp_secret", !item.hasTwoFactor) +
+        twoFactorPrimaryAction +
         this.credentialButton("复制 2FA 码", "copy-credential", item, "totp_code", !item.hasTwoFactor) +
         this.credentialButton("复制 AT", "copy-credential", item, "access_token", !item.hasSession) +
         this.credentialButton("复制 Session", "copy-credential", item, "session", !item.hasSession) +
@@ -986,7 +1094,7 @@
         this.store.patch({ registrationTask: data.task });
         this.schedule("registration", () => this.loadRegistrationTask(), 500);
         return source === "gmail"
-          ? "已启动 SMSBower Gmail 获取与自动注册"
+          ? "已启动 SMSBower Gmail 获取与自动注册（" + (options.headless ? "无头" : "前台窗口") + "）"
           : "已启动 iCloud 库存邮箱注册";
       });
       this.commands.register("set-smsbower-key", async () => {
@@ -1031,13 +1139,16 @@
       this.commands.register("stop-task", async () => {
         if (!confirm("停止当前注册或浏览器任务？")) throw Object.assign(new Error(), { name: "AbortError" });
         if (this.store.state.registrationTask.running) {
-          await this.api.post("/api/registration/stop");
+          const data = await this.api.post("/api/registration/stop");
+          this.store.patch({ registrationTask: data.task });
           await this.loadRegistrationTask();
+          return data.task.running ? "正在停止一键注册" : (data.task.message || "一键注册已停止");
         } else {
-          await this.api.post("/api/browser/stop");
+          const data = await this.api.post("/api/browser/stop");
+          this.store.patch({ browserTask: data.task });
           await this.loadBrowserTask();
+          return data.task.running ? "正在停止浏览器任务" : (data.task.message || "浏览器任务已停止");
         }
-        return "停止请求已发送";
       });
       this.commands.register("select-account", async ({ element }) => {
         const email = element.dataset.email;
@@ -1053,6 +1164,18 @@
         });
         await this.copyText(data.value);
         return "凭据已复制";
+      });
+      this.commands.register("enable-2fa", async ({ element }) => {
+        const item = this.selectedAccount(element.dataset.email);
+        if (!item) throw new Error("账号不存在，请刷新后重试");
+        if (item.hasTwoFactor) throw new Error("该账号已经开启 2FA");
+        if (!item.hasPassword) throw new Error("请先设置并确认账号密码，再添加 2FA");
+        const data = await this.api.post("/api/account/enable-2fa", {
+          email: item.email, headless: true,
+        });
+        this.store.patch({ browserTask: data.task });
+        this.schedule("browser", () => this.loadBrowserTask(), 800);
+        return "正在使用无头浏览器为 " + item.email + " 添加 2FA";
       });
       this.commands.register("get-code", async ({ element }) => {
         const email = element.dataset.email;
@@ -1092,10 +1215,14 @@
       });
       this.commands.register("delete-email", async ({ element }) => {
         const email = element.dataset.email;
-        if (!confirm("永久删除邮箱 " + email + "？该操作无法撤销。")) throw Object.assign(new Error(), { name: "AbortError" });
-        await this.api.post("/api/gpt-email/delete", { email });
+        const isGmail = email.toLowerCase().endsWith("@gmail.com");
+        const warning = isGmail
+          ? "从本机账号列表删除 " + email + "？这会清除本地账号凭据和 SMSBower 激活记录，但不会删除 Gmail 服务商侧的邮箱。"
+          : "永久删除邮箱 " + email + "？该操作无法撤销。";
+        if (!confirm(warning)) throw Object.assign(new Error(), { name: "AbortError" });
+        const data = await this.api.post("/api/gpt-email/delete", { email });
         await this.loadAccounts();
-        return "邮箱已删除";
+        return data.message || "邮箱已删除";
       });
       this.commands.register("select-card-account", async ({ element }) => {
         this.store.patch({ selectedCardEmail: element.dataset.email });

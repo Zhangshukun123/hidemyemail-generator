@@ -630,6 +630,84 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_account_can_start_dedicated_two_factor_task(self):
+        class BrowserManagerStub:
+            def __init__(self):
+                self.starts = []
+
+            def snapshot(self):
+                return {"running": False}
+
+            def start(self, accounts, **options):
+                self.starts.append({"accounts": accounts, **options})
+                return {"running": True, "accounts": [{"email": accounts[0]["email"]}]}
+
+            async def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            _save_account_record(
+                app["db_file"],
+                "secure@icloud.com",
+                password="Existing!Password123",
+                password_confirmed=True,
+                two_factor={
+                    "enabled": False,
+                    "status": "enrolled",
+                    "secret": "JBSWY3DPEHPK3PXP",
+                    "factor_id": "factor-1",
+                    "session_id": "session-1",
+                },
+            )
+            browser_manager = BrowserManagerStub()
+            app["browser_manager"] = browser_manager
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/account/enable-2fa",
+                    json={"email": "secure@icloud.com", "headless": False},
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["mode"], "enable_2fa")
+        started = browser_manager.starts[0]
+        self.assertTrue(started["headless"])
+        self.assertEqual(started["concurrency"], 1)
+        account = started["accounts"][0]
+        self.assertTrue(account["password_confirmed"])
+        self.assertTrue(account["enable_2fa"])
+        self.assertEqual(account["two_factor"]["status"], "enrolled")
+
+    async def test_unconfirmed_account_cannot_start_two_factor_task(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            _save_account_record(
+                app["db_file"],
+                "pending@icloud.com",
+                password="LocalOnly!Password123",
+                password_confirmed=False,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/account/enable-2fa",
+                    json={"email": "pending@icloud.com"},
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 409)
+        self.assertEqual(payload["error"], "请先设置并确认账号密码，再添加 2FA")
+
     async def test_password_reset_never_enables_two_factor(self):
         class BrowserManagerStub:
             def __init__(self):
