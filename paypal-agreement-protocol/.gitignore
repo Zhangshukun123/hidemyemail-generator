@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Runtime state / secrets
+.env
+
+# Local captures often contain URLs/tokens and page data
+captures/
+
+# Ad-hoc archives / generated artifacts
+*.zip
