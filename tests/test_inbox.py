@@ -171,6 +171,47 @@ class InboxSyncTests(unittest.TestCase):
             [("INBOX", "4"), ("Junk", "4")],
         )
 
+    def test_latency_sensitive_sync_can_scan_junk_before_inbox(self):
+        mailbox = JunkAwareFakeMailbox()
+        config = InboxConfig(
+            host="imap.example.com",
+            port=993,
+            username="user@example.com",
+            password="password",
+        )
+
+        def record_for_folder(_conn, folder_config, uid, _raw_message):
+            return {"folder": folder_config.folder, "uid": uid}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "inbox.db"
+            with (
+                patch(
+                    "hidemyemail_generator.inbox.imaplib.IMAP4_SSL",
+                    return_value=mailbox,
+                ),
+                patch(
+                    "hidemyemail_generator.inbox.message_to_record",
+                    side_effect=record_for_folder,
+                ),
+                patch(
+                    "hidemyemail_generator.inbox.insert_message",
+                    return_value=True,
+                ),
+            ):
+                inserted = sync_inbox(
+                    config,
+                    str(db_file),
+                    limit=1,
+                    junk_first=True,
+                )
+
+        self.assertEqual(mailbox.selected_folders, ["Junk", "INBOX"])
+        self.assertEqual(
+            [(item["folder"], item["uid"]) for item in inserted],
+            [("Junk", "4"), ("INBOX", "4")],
+        )
+
 
 
 class VerificationCodeExtractionTests(unittest.TestCase):

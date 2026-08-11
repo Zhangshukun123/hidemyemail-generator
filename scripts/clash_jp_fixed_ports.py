@@ -25,6 +25,12 @@ BEGIN_MARKER = "# HME_JP_FIXED_PORTS_BEGIN"
 END_MARKER = "# HME_JP_FIXED_PORTS_END"
 
 
+def _json_output(payload: dict) -> str:
+    """Return JSON that is safe to print on legacy Windows consoles."""
+
+    return json.dumps(payload, ensure_ascii=True)
+
+
 def _clash_verge_dir() -> Path:
     appdata = str(os.environ.get("APPDATA") or "").strip()
     if not appdata:
@@ -214,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             ClashController(discover_clash_connection()).reload_config(
                 args.reload_only
             )
-            print(json.dumps({"ok": True, "reloaded": str(args.reload_only)}))
+            print(_json_output({"ok": True, "reloaded": str(args.reload_only)}))
             return 0
         payload = apply_fixed_ports(
             base_port=args.base_port,
@@ -222,9 +228,9 @@ def main(argv: list[str] | None = None) -> int:
             map_file=args.map_file,
         )
     except (ClashControllerError, OSError, RuntimeError, ValueError) as error:
-        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        print(_json_output({"ok": False, "error": str(error)}))
         return 1
-    print(json.dumps({"ok": True, **payload}, ensure_ascii=False))
+    print(_json_output({"ok": True, **payload}))
     return 0
 
 

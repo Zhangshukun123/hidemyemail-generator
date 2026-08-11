@@ -36,7 +36,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-action="previous-verification"', page)
         self.assertIn('data-action="next-verification"', page)
         self.assertIn('data-action="verify-selected"', page)
-        self.assertIn("Cookie 刷新选中账号", page)
+        self.assertIn("验证选中账号", page)
         self.assertIn('id="verificationLog"', page)
         self.assertIn("renderVerificationLogs", page)
         self.assertIn("接口响应和删除原因", page)
@@ -113,7 +113,13 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("registration.runningCount || 0", page)
         self.assertIn("启动下一个注册进程（运行中", page)
         self.assertIn("registration.failureRecords || []", page)
-        self.assertIn("失败邮箱已记录，可重新点击注册", page)
+        self.assertIn('id="registrationFailurePanel"', page)
+        self.assertIn('id="registrationFailureList"', page)
+        self.assertIn('data-action="retry-registration"', page)
+        self.assertIn('this.commands.register("retry-registration"', page)
+        self.assertIn("失败邮箱已记录，可在失败邮箱列表重新注册", page)
+        self.assertIn('label: "失败邮箱重新注册", provider: "manual", email', page)
+        self.assertIn("item.hasSession && item.hasTwoFactor", page)
         self.assertNotIn(
             '$("registerEmailButton").disabled = Boolean(state.registrationTask.running)',
             page,
@@ -176,12 +182,12 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("return [...accountRows, ...taskOnlyRows]", page)
         self.assertIn("请选择一个账号（共 ", page)
 
-    def test_selected_account_refresh_uses_saved_cookie(self):
+    def test_selected_account_refreshes_cookie_only_after_token_invalid(self):
         page = build_app_page()
 
-        self.assertIn("Cookie 刷新选中账号", page)
+        self.assertIn("验证选中账号", page)
         self.assertIn("refresh_with_cookie: true", page)
-        self.assertIn("使用保存的 Cookie 刷新 Session 与账号状态", page)
+        self.assertIn("仅在 401/token_invalid 时刷新并复验", page)
 
     def test_account_without_two_factor_exposes_add_action(self):
         page = build_app_page()

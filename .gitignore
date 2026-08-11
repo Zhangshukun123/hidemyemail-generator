@@ -12,6 +12,7 @@ hidemyemail.db
 hidemyemail.db-*
 inbox_config.json
 exports/
+output/clash-jp-fixed-ports.json
 cookie.txt
 cookies.txt
 cookies.txt.bak

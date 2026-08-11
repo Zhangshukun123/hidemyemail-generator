@@ -604,7 +604,9 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
             )
             app = create_app(base_dir=root)
 
-            def sync_junk(_config, db_file, _limit):
+            def sync_junk(_config, db_file, _limit, **_kwargs):
+                if not _kwargs.get("junk_first"):
+                    return []
                 conn = connect_db(str(db_file))
                 try:
                     record = {
@@ -630,13 +632,17 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch(
                     "hidemyemail_generator.webapp.sync_inbox",
                     side_effect=sync_junk,
-                ),
+                ) as sync,
                 mock.patch(
                     "hidemyemail_generator.webapp.RichHideMyEmail"
                 ) as icloud_client,
             ):
                 await client.start_server()
                 try:
+                    await asyncio.sleep(0.05)
+                    async with app["inbox_sync_lock"]:
+                        pass
+                    app["inbox_on_demand_next_attempt"] = 0.0
                     response = await client.post(
                         "/api/gpt-code",
                         json={"email": "relay@icloud.com"},
@@ -648,6 +654,9 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["code"], "938388")
+        self.assertTrue(
+            any(call.kwargs.get("junk_first") for call in sync.call_args_list)
+        )
         icloud_client.assert_not_called()
 
     async def test_authentication_failure_enters_backoff(self):
@@ -1104,17 +1113,18 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
             email="protocol@gmail.com",
         )
         self.assertEqual(response.status, 200)
-        self.assertEqual(payload["mode"], "refresh_cookie")
+        self.assertEqual(payload["mode"], "verify")
         self.assertEqual(
-            verification_manager.browser_refresh_starts,
+            verification_manager.verify_starts,
             [
                 {
-                    "emails": ["protocol@gmail.com"],
                     "concurrency": 1,
-                    "force_refresh": True,
+                    "emails": ["protocol@gmail.com"],
+                    "force_online": True,
                 }
             ],
         )
+        self.assertEqual(verification_manager.browser_refresh_starts, [])
 
         response, payload, verification_manager, browser_manager = await run_case(
             has_valid_session=True,
@@ -1140,18 +1150,18 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
             refresh_with_cookie=True,
         )
         self.assertEqual(response.status, 200)
-        self.assertEqual(payload["mode"], "refresh_cookie")
+        self.assertEqual(payload["mode"], "verify")
         self.assertEqual(
-            verification_manager.browser_refresh_starts,
+            verification_manager.verify_starts,
             [
                 {
-                    "emails": ["protocol@icloud.com"],
                     "concurrency": 1,
-                    "force_refresh": True,
+                    "emails": ["protocol@icloud.com"],
+                    "force_online": True,
                 }
             ],
         )
-        self.assertEqual(verification_manager.verify_starts, [])
+        self.assertEqual(verification_manager.browser_refresh_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
 
 

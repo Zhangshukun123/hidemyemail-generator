@@ -151,6 +151,7 @@ OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS = (
 # Compatibility export for existing-account login callers. Registration callers
 # must explicitly use OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS.
 OPENAI_EMAIL_SUBMIT_SELECTORS = OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS
+_HOME_EMAIL_ENTRY_ALREADY_OPEN = object()
 
 
 def is_chatgpt_homepage(url: str) -> bool:
@@ -280,9 +281,15 @@ def _wait_for_candidate(
     first_visible: Callable,
     wait: Callable,
     semantic_candidate: Callable | None = None,
+    email_entry_already_open: Callable | None = None,
 ):
     deadline = time.monotonic() + max(1.0, float(timeout_seconds))
     while time.monotonic() < deadline:
+        if (
+            email_entry_already_open is not None
+            and email_entry_already_open(page)
+        ):
+            return _HOME_EMAIL_ENTRY_ALREADY_OPEN
         candidate = first_visible(page, selectors, timeout=700)
         if candidate is None and semantic_candidate is not None:
             candidate = semantic_candidate(page)
@@ -393,6 +400,25 @@ def click_chatgpt_home_login(
             semantic_match_logged = True
         return candidate
 
+    def email_entry_already_open(target_page) -> bool:
+        return (
+            first_visible(
+                target_page,
+                OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
+                timeout=300,
+            )
+            is not None
+        )
+
+    def use_open_email_entry(candidate) -> bool:
+        if candidate is not _HOME_EMAIL_ENTRY_ALREADY_OPEN:
+            return False
+        log(
+            "[认证] 已识别 ChatGPT 首页右侧登录或注册抽屉；"
+            f"邮箱框已经可用，跳过被抽屉覆盖的{entry_label}按钮"
+        )
+        return True
+
     candidate = _wait_for_candidate(
         page,
         entry_selectors,
@@ -400,7 +426,10 @@ def click_chatgpt_home_login(
         first_visible=first_visible,
         wait=wait,
         semantic_candidate=semantic_candidate,
+        email_entry_already_open=email_entry_already_open,
     )
+    if use_open_email_entry(candidate):
+        return True
     if candidate is None:
         log(
             f"[认证] ChatGPT 首页加载完成后暂未出现{entry_label}按钮；"
@@ -425,7 +454,10 @@ def click_chatgpt_home_login(
                 first_visible=first_visible,
                 wait=wait,
                 semantic_candidate=semantic_candidate,
+                email_entry_already_open=email_entry_already_open,
             )
+        if use_open_email_entry(candidate):
+            return True
         if candidate is None:
             raise RuntimeError(
                 f"ChatGPT 首页重新加载后仍未找到可用的{entry_label}按钮"
@@ -482,7 +514,10 @@ def click_chatgpt_home_login(
         first_visible=first_visible,
         wait=wait,
         semantic_candidate=semantic_candidate,
+        email_entry_already_open=email_entry_already_open,
     )
+    if use_open_email_entry(retry_candidate):
+        return True
     if retry_candidate is None or not is_chatgpt_homepage(
         str(getattr(page, "url", "") or "")
     ):

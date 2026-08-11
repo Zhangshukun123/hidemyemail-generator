@@ -934,6 +934,95 @@ class RegistrationAuthTests(unittest.TestCase):
         self.assertTrue(any("预先打开登录或新注册抽屉" in line for line in worker.logs))
         self.assertTrue(any("跳过首页注册按钮" in line for line in worker.logs))
 
+    def test_delayed_home_drawer_wins_over_covered_signup_button(self):
+        events = []
+
+        class CoveredSignup:
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def click(**_kwargs):
+                raise AssertionError("covered homepage signup must not be clicked")
+
+        class Page:
+            def __init__(self):
+                self.url = "about:blank"
+                self.email_checks = 0
+
+            def goto(self, url, **_kwargs):
+                events.append(("goto", url))
+                self.url = url
+                return "response"
+
+            @staticmethod
+            def wait_for_load_state(_state, **_kwargs):
+                return None
+
+        class Worker:
+            existing_login_only = False
+
+            def __init__(self):
+                self.logs = []
+                self.fill_calls = 0
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _register(self, page, context, **_kwargs):
+                page.goto("https://chatgpt.com/")
+                signin_url = self._create_openai_signin_url(context)
+                self._goto_auth_page(page, signin_url)
+                return "registered"
+
+            @staticmethod
+            def _create_openai_signin_url(_context):
+                return "https://auth.openai.com/create-account"
+
+            @staticmethod
+            def _create_login_url(_context):
+                return "https://auth.openai.com/log-in"
+
+            @staticmethod
+            def _goto_auth_page(page, url):
+                return page.goto(url)
+
+            def _fill_email_if_visible(self, page):
+                self.fill_calls += 1
+                page.url = "https://auth.openai.com/email-verification"
+                return True
+
+        worker = Worker()
+        page = Page()
+
+        def first_visible(target_page, selectors, **_kwargs):
+            if selectors == OPENAI_EMAIL_LOGIN_INPUT_SELECTORS:
+                target_page.email_checks += 1
+                # The drawer mounts just after the wrapper's first quick check.
+                return object() if target_page.email_checks >= 2 else None
+            if selectors == openai_registration_navigation.CHATGPT_HOME_SIGNUP_SELECTORS:
+                return CoveredSignup()
+            return None
+
+        with patch.object(
+            openai_registration_navigation,
+            "_first_visible",
+            side_effect=first_visible,
+        ):
+            self.assertTrue(
+                openai_registration_navigation.configure_chatgpt_home_login_entry(
+                    worker,
+                    activate_page=lambda _worker, _page: True,
+                )
+            )
+            self.assertEqual(worker._register(page, object()), "registered")
+
+        self.assertEqual(worker.fill_calls, 1)
+        self.assertEqual(events, [("goto", "https://chatgpt.com/")])
+        self.assertTrue(any("右侧登录或注册抽屉" in line for line in worker.logs))
+        self.assertTrue(any("跳过被抽屉覆盖的免费注册按钮" in line for line in worker.logs))
+
     def test_home_entry_only_blocks_the_initial_generated_auth_navigation(self):
         events = []
 

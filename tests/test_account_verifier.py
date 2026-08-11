@@ -6,13 +6,16 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hidemyemail_generator.account_verifier import (
     AccountVerificationManager,
     load_verifiable_accounts,
     remove_invalid_account,
     removed_account_emails,
+    refresh_session_with_saved_cookies,
     save_account_classification,
+    validate_refreshed_session,
 )
 from hidemyemail_generator.browser_tasks import (
     _save_account_record,
@@ -63,7 +66,249 @@ def token_with_plan(plan: str, *, expires_in: int = 3600) -> str:
     return f"header.{payload}.signature"
 
 
+def token_with_identity(
+    email: str, account_id: str, *, plan: str = "free", expires_in: int = 3600
+) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "exp": int(time.time()) + expires_in,
+                "https://api.openai.com/profile": {"email": email},
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_plan_type": plan,
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cookie_refresher_calls_both_session_endpoints_through_proxy(self):
+        email = "proxy-refresh@icloud.com"
+        old_token = token_with_identity(email, "acct-proxy")
+        new_token = token_with_identity(email, "acct-proxy") + "-new"
+        calls = []
+
+        class Headers:
+            def __init__(self, values):
+                self.values = values
+
+            def getall(self, name, default):
+                return self.values if name == "Set-Cookie" else default
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload, set_cookie):
+                self.payload = payload
+                self.headers = Headers([set_cookie])
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self, **_kwargs):
+                return self.payload
+
+        class ClientSession:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def get(self, url, **kwargs):
+                calls.append((url, kwargs))
+                if len(calls) == 1:
+                    return Response(
+                        {
+                            "accessToken": old_token,
+                            "user": {"email": email},
+                            "account": {"id": "acct-proxy"},
+                        },
+                        "session=intermediate; Path=/; Secure; HttpOnly",
+                    )
+                return Response(
+                    {
+                        "accessToken": new_token,
+                        "user": {"email": email},
+                        "account": {"id": "acct-proxy"},
+                    },
+                    "session=final; Path=/; Secure; HttpOnly",
+                )
+
+        with patch(
+            "hidemyemail_generator.account_verifier.aiohttp.ClientSession",
+            ClientSession,
+        ):
+            result = await refresh_session_with_saved_cookies(
+                email=email,
+                previous_token=old_token,
+                cookies=[
+                    {
+                        "name": "session",
+                        "value": "saved",
+                        "domain": "chatgpt.com",
+                        "path": "/",
+                    }
+                ],
+                proxy_url="http://127.0.0.1:19002",
+                storage_state={"origins": [{"origin": "https://chatgpt.com"}]},
+            )
+
+        self.assertEqual(
+            [call[0] for call in calls],
+            [
+                "https://chatgpt.com/api/auth/session",
+                "https://chatgpt.com/api/auth/session?refresh=true",
+            ],
+        )
+        self.assertTrue(
+            all(call[1]["proxy"] == "http://127.0.0.1:19002" for call in calls)
+        )
+        self.assertIn("session=intermediate", calls[1][1]["headers"]["Cookie"])
+        self.assertEqual(result["access_token"], new_token)
+        self.assertEqual(json.loads(result["cookies_json"])[0]["value"], "final")
+
+    async def test_token_invalid_cookie_refresh_is_staged_until_online_recheck(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "unused.py"
+            bridge.write_text("# overridden by test\n", encoding="utf-8")
+            db_file = root / "hme.db"
+            email = "staged@icloud.com"
+            old_token = token_with_identity(email, "acct-1")
+            new_token = token_with_identity(email, "acct-1") + "-new"
+            old_cookies = [
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": "old-cookie",
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                }
+            ]
+            _save_account_record(
+                db_file,
+                email,
+                result={
+                    "access_token": old_token,
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": old_token,
+                            "user": {"email": email},
+                            "account": {"id": "acct-1"},
+                        }
+                    ),
+                    "cookies_json": json.dumps(old_cookies),
+                    "storage_state_json": json.dumps(
+                        {"cookies": old_cookies, "origins": []}
+                    ),
+                    "registration_proxy_url": "http://127.0.0.1:19001",
+                },
+            )
+            refresh_calls = []
+
+            async def refresh_candidate(**kwargs):
+                refresh_calls.append(kwargs)
+                return {
+                    "access_token": new_token,
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": new_token,
+                            "user": {"email": email},
+                            "account": {"id": "acct-1"},
+                        }
+                    ),
+                    "cookies_json": json.dumps(
+                        [
+                            {
+                                "name": "__Secure-next-auth.session-token",
+                                "value": "new-cookie",
+                                "domain": "chatgpt.com",
+                                "path": "/",
+                            }
+                        ]
+                    ),
+                    "storage_state_json": json.dumps(
+                        {
+                            "cookies": [
+                                {
+                                    "name": "__Secure-next-auth.session-token",
+                                    "value": "new-cookie",
+                                    "domain": "chatgpt.com",
+                                    "path": "/",
+                                }
+                            ],
+                            "origins": [],
+                        }
+                    ),
+                    "session_acquisition_method": "cookie_session_refresh",
+                }
+
+            class StagedManager(AccountVerificationManager):
+                async def _check_access_token(
+                    self, item, target_email, token, *, force_online=False
+                ):
+                    if token == old_token:
+                        return 0, {"status": "invalid", "detail": "401/token_invalid"}, b""
+                    self.assert_candidate_is_not_saved(token)
+                    if not force_online:
+                        raise AssertionError("refreshed token was not forced through online check")
+                    return 0, {"status": "free", "detail": "online verified"}, b""
+
+                def assert_candidate_is_not_saved(self, token):
+                    record = load_account_record(self.db_file, email)
+                    if record["access_token"] != old_token or token != new_token:
+                        raise AssertionError("candidate Session was saved before recheck")
+
+            manager = StagedManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                cookie_session_refresher=refresh_candidate,
+            )
+            manager.start(concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            record = load_account_record(db_file, email)
+            self.assertEqual(snapshot["free"], 1)
+            self.assertEqual(record["access_token"], new_token)
+            self.assertEqual(record["cookies"][0]["value"], "new-cookie")
+            self.assertEqual(record["session_acquisition_method"], "cookie_session_refresh")
+            self.assertEqual(len(refresh_calls), 1)
+            self.assertEqual(refresh_calls[0]["proxy_url"], "http://127.0.0.1:19001")
+            messages = "\n".join(item["message"] for item in snapshot["logs"])
+            self.assertIn("401/token_invalid", messages)
+            self.assertIn("复验成功", messages)
+
+    def test_refreshed_token_rejects_mismatched_workspace(self):
+        email = "owner@icloud.com"
+        old_token = token_with_identity(email, "acct-original")
+        new_token = token_with_identity(email, "acct-other")
+
+        with self.assertRaisesRegex(RuntimeError, "account_id/workspace 与原账号不匹配"):
+            validate_refreshed_session(
+                expected_email=email,
+                previous_token=old_token,
+                session={
+                    "accessToken": new_token,
+                    "user": {"email": email},
+                    "account": {"id": "acct-other"},
+                },
+            )
+
     async def test_valid_jwt_plus_is_classified_without_running_online_bridge(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

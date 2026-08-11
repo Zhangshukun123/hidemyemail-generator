@@ -308,6 +308,18 @@ def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
     return account_session_token_cookie(record)
 
 
+def account_registration_proxy_url(record: dict[str, Any]) -> str:
+    """Return the exact proxy URL retained when this account was registered."""
+
+    direct = str(record.get("registration_proxy_url") or "").strip()
+    if direct:
+        return direct
+    metadata = record.get("registration_proxy")
+    if isinstance(metadata, dict):
+        return str(metadata.get("url") or "").strip()
+    return ""
+
+
 def session_email(session: Any) -> str:
     if not isinstance(session, dict):
         return ""
@@ -365,6 +377,10 @@ def _save_account_record(
         acquisition_method = str(
             result.get("session_acquisition_method") or ""
         ).strip()
+        registration_proxy_url = str(
+            result.get("registration_proxy_url") or ""
+        ).strip()
+        registration_proxy = result.get("registration_proxy")
         if access_token or session_json:
             current.pop("session_invalid_at", None)
         if access_token:
@@ -396,6 +412,10 @@ def _save_account_record(
                 current["cookies"] = parsed_cookies
         if acquisition_method:
             current["session_acquisition_method"] = acquisition_method
+        if registration_proxy_url:
+            current["registration_proxy_url"] = registration_proxy_url
+        if isinstance(registration_proxy, dict) and registration_proxy:
+            current["registration_proxy"] = dict(registration_proxy)
         result_two_factor = result.get("two_factor")
         if isinstance(result_two_factor, dict) and result_two_factor.get("secret"):
             current["two_factor"] = dict(result_two_factor)
@@ -1025,11 +1045,21 @@ class BrowserTaskManager:
                     item["_error"] = "注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
                     session_saved = False
             if session_saved:
+                result_to_save = dict(result)
+                if proxy_url:
+                    result_to_save["registration_proxy_url"] = proxy_url
+                    result_to_save["registration_proxy"] = {
+                        "mode": str(proxy_state.get("mode") or ""),
+                        "country": str(proxy_state.get("country") or ""),
+                        "endpoint": str(proxy_state.get("endpoint") or ""),
+                        "node": str(proxy_state.get("currentNode") or ""),
+                        "saved_at": utc_now(),
+                    }
                 await asyncio.to_thread(
                     _save_account_record,
                     self.db_file,
                     email,
-                    result=result,
+                    result=result_to_save,
                     password=password,
                     password_confirmed=(
                         password_confirmed
@@ -1275,6 +1305,7 @@ class BrowserTaskManager:
 
 __all__ = [
     "BrowserTaskManager",
+    "account_registration_proxy_url",
     "access_token_is_expired",
     "decode_jwt_payload",
     "jwt_account_type",
