@@ -53,6 +53,7 @@ HOME_EMAIL_MODAL_PROGRESS_SELECTORS = (
     'input[name="code"]',
     'input[inputmode="numeric"]',
 )
+CHATGPT_HOME_URL = "https://chatgpt.com/"
 
 
 def _wait_for_home_email_modal_transition(
@@ -401,6 +402,9 @@ def configure_chatgpt_home_login_entry(
     )
     original_create_login_url = getattr(worker, "_create_login_url", None)
     original_goto_auth_page = getattr(worker, "_goto_auth_page", None)
+    original_restart_stalled_session = getattr(
+        worker, "_restart_login_after_stalled_session", None
+    )
     if not enabled or not all(
         callable(item)
         for item in (
@@ -560,11 +564,47 @@ def configure_chatgpt_home_login_entry(
                 return None
             return original_goto_auth_page(target_page, url)
 
+        def restart_stalled_session_from_visible_page(
+            target_page,
+            target_context,
+        ):
+            """Re-enter auth without closing the visible OTP page/context."""
+
+            is_closed = getattr(target_page, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                raise RuntimeError(
+                    "邮箱验证码页已关闭，保留浏览器上下文后仍没有可操作页面"
+                )
+            self.log(
+                "[验证码] 验证页面会话已失效；保留当前浏览器页和固定代理，"
+                "不关闭可见验证码窗口，正在从 ChatGPT 首页重新进入当前邮箱"
+            )
+            self._hme_force_home_auth_reentry = True
+            target_context.clear_cookies()
+            self._last_chatgpt_session_email = ""
+            self._last_chatgpt_session_mismatch = False
+            self._session_mismatch_log_key = ""
+            target_page.goto(
+                CHATGPT_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            signin_url = self._create_login_url(target_context)
+            self._goto_auth_page(target_page, signin_url)
+            self.log(
+                "[验证码] 已根据当前页面重新建立同一邮箱登录流程；"
+                "正在等待并识别新的邮箱验证码界面"
+            )
+
         try:
             page.goto = goto_and_choose_login
             self._create_openai_signin_url = registration_url_from_clicked_page
             self._create_login_url = login_url_from_clicked_page
             self._goto_auth_page = keep_clicked_auth_page
+            if callable(original_restart_stalled_session):
+                self._restart_login_after_stalled_session = (
+                    restart_stalled_session_from_visible_page
+                )
         except Exception as error:
             raise RuntimeError("无法保护 ChatGPT 主页登录入口") from error
         try:
@@ -577,6 +617,10 @@ def configure_chatgpt_home_login_entry(
             self._create_openai_signin_url = original_create_registration_url
             self._create_login_url = original_create_login_url
             self._goto_auth_page = original_goto_auth_page
+            if callable(original_restart_stalled_session):
+                self._restart_login_after_stalled_session = (
+                    original_restart_stalled_session
+                )
 
     worker._register = types.MethodType(register_from_home_login, worker)
     worker._hme_home_login_entry_configured = True

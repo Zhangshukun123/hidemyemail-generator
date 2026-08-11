@@ -9,6 +9,9 @@ dependencies = [
     "rich>=13.7.1",
     "click>=8.1.7",
     "certifi>=2024.2.2",
+    "httpx[http2,socks]>=0.27,<1",
+    "loguru>=0.7,<1",
+    "pproxy>=2.7,<3",
 ]
 
 authors = [

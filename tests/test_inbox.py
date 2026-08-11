@@ -58,6 +58,23 @@ class FakeMailbox:
         return "BYE", []
 
 
+class JunkAwareFakeMailbox(FakeMailbox):
+    def __init__(self):
+        super().__init__()
+        self.selected_folders = []
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\Junk) "/" "Junk"',
+            b'(\\HasNoChildren \\Trash) "/" "Deleted Messages"',
+        ]
+
+    def select(self, folder):
+        self.selected_folders.append(folder)
+        return "OK", []
+
+
 class InboxSyncTests(unittest.TestCase):
     def test_inbox_message_does_not_remove_generated_inventory_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -117,6 +134,42 @@ class InboxSyncTests(unittest.TestCase):
                 sync_inbox(config, str(db_file), limit=3)
 
         self.assertEqual(mailbox.fetched_uids, [b"4", b"3", b"2"])
+
+    def test_sync_also_scans_server_junk_folder(self):
+        mailbox = JunkAwareFakeMailbox()
+        config = InboxConfig(
+            host="imap.example.com",
+            port=993,
+            username="user@example.com",
+            password="password",
+        )
+
+        def record_for_folder(_conn, folder_config, uid, _raw_message):
+            return {"folder": folder_config.folder, "uid": uid}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "inbox.db"
+            with (
+                patch(
+                    "hidemyemail_generator.inbox.imaplib.IMAP4_SSL",
+                    return_value=mailbox,
+                ),
+                patch(
+                    "hidemyemail_generator.inbox.message_to_record",
+                    side_effect=record_for_folder,
+                ),
+                patch(
+                    "hidemyemail_generator.inbox.insert_message",
+                    return_value=True,
+                ),
+            ):
+                inserted = sync_inbox(config, str(db_file), limit=1)
+
+        self.assertEqual(mailbox.selected_folders, ["INBOX", "Junk"])
+        self.assertEqual(
+            [(item["folder"], item["uid"]) for item in inserted],
+            [("INBOX", "4"), ("Junk", "4")],
+        )
 
 
 

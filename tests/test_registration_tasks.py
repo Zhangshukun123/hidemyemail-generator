@@ -1,7 +1,10 @@
 import asyncio
 import unittest
 
-from hidemyemail_generator.registration_tasks import RegistrationTaskManager
+from hidemyemail_generator.registration_tasks import (
+    ConcurrentRegistrationTaskManager,
+    RegistrationTaskManager,
+)
 from hidemyemail_generator.registration_tasks import generate_openai_password
 
 
@@ -105,7 +108,215 @@ class FakeBrowserManager:
         return self.snapshot()
 
 
+class FakeRegistrationProcess:
+    def __init__(self, process_number):
+        self.process_number = process_number
+        self.codes = {}
+        self.state = {
+            "id": "",
+            "status": "idle",
+            "running": False,
+            "phase": "idle",
+            "provider": "manual",
+            "email": "",
+            "emails": [],
+            "awaitingCode": False,
+            "awaitingCodeEmails": [],
+            "requested": 0,
+            "effectiveConcurrency": 0,
+            "claimed": 0,
+            "message": "idle",
+            "logs": [],
+            "startedAt": "",
+            "finishedAt": "",
+        }
+
+    def start(self, *, label, headless, concurrency, email, provider):
+        del label, headless
+        process_id = f"process-{self.process_number}"
+        self.state.update(
+            id=process_id,
+            status="running",
+            running=True,
+            phase="registering_openai",
+            provider=provider,
+            email=email,
+            emails=[email],
+            requested=concurrency,
+            effectiveConcurrency=1,
+            claimed=1,
+            message=f"正在注册 {email}",
+            logs=[
+                {
+                    "at": f"2026-08-11T00:00:0{self.process_number}+00:00",
+                    "message": f"开始 {email}",
+                }
+            ],
+            startedAt=f"2026-08-11T00:00:0{self.process_number}+00:00",
+        )
+        return self.snapshot()
+
+    def snapshot(self):
+        return {**self.state, "logs": list(self.state["logs"])}
+
+    def submit_verification_code(self, email, code):
+        self.codes[email] = code
+        return self.snapshot()
+
+    def poll_verification_code(self, email):
+        return self.codes.pop(email, "")
+
+    async def poll_verification_code_async(self, email, *, request_id=""):
+        del request_id
+        return self.poll_verification_code(email)
+
+    async def stop(self):
+        self.state.update(status="cancelled", running=False, phase="cancelled")
+        return self.snapshot()
+
+    def fail(self, message="registration failed"):
+        self.state.update(
+            status="failed",
+            running=False,
+            phase="failed",
+            message=message,
+            finishedAt="2026-08-11T00:01:00+00:00",
+        )
+
+
 class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_manager_starts_next_process_while_previous_runs(self):
+        processes = []
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            shared_browser_manager=FakeBrowserManager(),
+            max_processes=3,
+        )
+
+        coordinator.start(
+            label="first",
+            headless=False,
+            concurrency=1,
+            email="first@icloud.com",
+            provider="manual",
+        )
+        state = coordinator.start(
+            label="second",
+            headless=False,
+            concurrency=1,
+            email="second@icloud.com",
+            provider="manual",
+        )
+
+        self.assertEqual(state["runningCount"], 2)
+        self.assertEqual(state["processCount"], 2)
+        self.assertTrue(state["canStartNext"])
+        self.assertEqual(
+            [task["email"] for task in state["tasks"]],
+            ["first@icloud.com", "second@icloud.com"],
+        )
+        self.assertIn("[进程 1 · first@icloud.com]", state["logs"][0]["message"])
+        coordinator.submit_verification_code("first@icloud.com", "123456")
+        self.assertEqual(processes[0].codes["first@icloud.com"], "123456")
+
+        state = coordinator.start(
+            label="third",
+            headless=False,
+            concurrency=1,
+            email="third@icloud.com",
+            provider="manual",
+        )
+        self.assertEqual(state["runningCount"], 3)
+        self.assertFalse(state["canStartNext"])
+        with self.assertRaisesRegex(RuntimeError, "达到上限 3"):
+            coordinator.start(
+                label="fourth",
+                headless=False,
+                concurrency=1,
+                email="fourth@icloud.com",
+                provider="manual",
+            )
+
+        stopped = await coordinator.stop()
+        self.assertEqual(stopped["runningCount"], 0)
+        self.assertFalse(stopped["running"])
+
+    async def test_concurrent_manager_rejects_duplicate_active_email(self):
+        processes = []
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            max_processes=2,
+        )
+        coordinator.start(
+            label="first",
+            headless=False,
+            concurrency=1,
+            email="same@icloud.com",
+            provider="manual",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "已有正在运行"):
+            coordinator.start(
+                label="duplicate",
+                headless=False,
+                concurrency=1,
+                email="same@icloud.com",
+                provider="manual",
+            )
+
+    async def test_failed_email_is_recorded_and_can_be_registered_again(self):
+        processes = []
+        recorded = []
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            record_failure=lambda failure: recorded.append(failure),
+            max_processes=2,
+        )
+        coordinator.start(
+            label="first attempt",
+            headless=False,
+            concurrency=1,
+            email="retry@icloud.com",
+            provider="manual",
+        )
+        processes[0].fail("验证码失败")
+        await asyncio.sleep(0.3)
+
+        state = coordinator.snapshot()
+        self.assertEqual(state["recordedFailureCount"], 1)
+        self.assertTrue(state["tasks"][0]["failureRecorded"])
+        self.assertEqual(recorded[0]["email"], "retry@icloud.com")
+        self.assertEqual(recorded[0]["message"], "验证码失败")
+
+        restarted = coordinator.start(
+            label="retry",
+            headless=False,
+            concurrency=1,
+            email="retry@icloud.com",
+            provider="manual",
+        )
+        self.assertEqual(restarted["runningCount"], 1)
+        self.assertEqual(restarted["tasks"][-1]["email"], "retry@icloud.com")
+        await coordinator.stop()
+
     async def test_generated_password_contains_required_character_groups(self):
         password = generate_openai_password()
         self.assertGreaterEqual(len(password), 16)
@@ -263,6 +474,133 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(browser.started_accounts[0]["manual_otp_entry"])
         self.assertTrue(browser.started_accounts[0]["foreground_required"])
 
+    async def test_manual_icloud_email_uses_automatic_inbox_code_reader(self):
+        browser = FakeBrowserManager()
+
+        async def save_password(_email, _password):
+            return None
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            save_password=save_password,
+        )
+        manager.start(
+            label="iCloud 自有邮箱注册",
+            email="relay.address@icloud.com",
+            headless=False,
+        )
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        account = browser.started_accounts[0]
+        self.assertFalse(account["manual_otp_entry"])
+        self.assertFalse(account["foreground_required"])
+        self.assertTrue(account["password_first_required"])
+        self.assertTrue(
+            any("垃圾邮件" in item["message"] for item in manager.snapshot()["logs"])
+        )
+
+    async def test_retry_reuses_first_saved_password_without_overwriting_it(self):
+        browser = FakeBrowserManager()
+        saved_password = "FirstAttempt!A7Password"
+        events = []
+
+        async def load_account(email):
+            events.append(("load", email))
+            return {
+                "email": email,
+                "password": saved_password,
+                "password_confirmed": False,
+            }
+
+        async def save_password(email, password):
+            events.append(("save", email, password))
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+            save_password=save_password,
+            load_account=load_account,
+        )
+        manager.start(
+            label="iCloud 自有邮箱重试",
+            email="Retry.Alias@icloud.com",
+            headless=False,
+        )
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        account = browser.started_batches[0][0]
+        self.assertEqual(account["email"], "retry.alias@icloud.com")
+        self.assertEqual(account["password"], saved_password)
+        self.assertFalse(account["password_confirmed"])
+        self.assertEqual(events, [("load", "retry.alias@icloud.com")])
+        self.assertTrue(
+            any(
+                "本次继续使用原密码，不生成或覆盖新密码" in item["message"]
+                for item in manager.snapshot()["logs"]
+            )
+        )
+
+    async def test_browser_page_recognition_is_relayed_to_registration_logs(self):
+        class LoggingBrowserManager(FakeBrowserManager):
+            def __init__(self):
+                super().__init__()
+                self.log_ready = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def wait(self):
+                self.state.update(
+                    id="browser-recognition-task",
+                    logs=[
+                        {
+                            "message": (
+                                "[界面识别] 当前=邮箱验证码页；语言=日文；"
+                                "目标邮箱=匹配；验证码输入框=可见；"
+                                "使用密码继续=可见；决策=点击“使用密码继续”并进入密码设置"
+                            )
+                        }
+                    ],
+                )
+                self.log_ready.set()
+                await self.release.wait()
+                return await super().wait()
+
+        browser = LoggingBrowserManager()
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+        )
+        manager.start(
+            label="iCloud 自有邮箱注册",
+            email="relay.address@icloud.com",
+            headless=False,
+        )
+        await asyncio.wait_for(browser.log_ready.wait(), timeout=2)
+        await asyncio.sleep(0.5)
+
+        running = manager.snapshot()
+        recognition_logs = [
+            item["message"]
+            for item in running["logs"]
+            if item["message"].startswith("[界面识别]")
+        ]
+        self.assertEqual(len(recognition_logs), 1)
+        self.assertEqual(running["currentStage"], "password")
+        self.assertEqual(running["currentLocation"], "OpenAI 密码页")
+        self.assertIn("点击", running["message"])
+
+        browser.release.set()
+        await asyncio.wait_for(manager._task, timeout=5)
+        self.assertTrue(
+            any(
+                item["message"].startswith("[界面识别]")
+                for item in manager.snapshot()["logs"]
+            )
+        )
+
     async def test_manual_verification_code_wait_and_submit_lifecycle(self):
         manager = RegistrationTaskManager(
             browser_manager=FakeBrowserManager(),
@@ -327,7 +665,7 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             browser.started_accounts[0]["password_first_required"]
         )
-        self.assertTrue(browser.started_accounts[0]["foreground_required"])
+        self.assertFalse(browser.started_accounts[0]["foreground_required"])
         self.assertFalse(browser.start_options["headless"])
 
     async def test_smsbower_provider_poll_returns_code_without_manual_input(self):
@@ -471,6 +809,8 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
 
         async def load_account(email):
             events.append(("load", email))
+            if not browser.started_batches:
+                return {}
             return {
                 "password": browser.started_batches[0][0]["password"],
                 "password_confirmed": True,
@@ -502,14 +842,14 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(browser.start_options_history[1]["headless"])
         self.assertTrue(browser.start_options_history[1]["use_registration_proxy"])
         retry_account = browser.started_batches[1][0]
-        self.assertTrue(retry_account["foreground_required"])
+        self.assertFalse(retry_account["foreground_required"])
         self.assertTrue(retry_account["password_confirmed"])
         self.assertTrue(retry_account["enable_2fa"])
         self.assertEqual(retry_account["two_factor"], partial_two_factor)
         self.assertEqual(events[-1][0:3], ("complete", "retry.2fa@gmail.com", True))
         self.assertTrue(any("2FA 补做完成" in item["message"] for item in snapshot["logs"]))
 
-    async def test_skips_two_factor_when_password_was_not_confirmed(self):
+    async def test_rejects_passwordless_icloud_result(self):
         browser = FakeBrowserManager(
             password_confirmed=False,
             two_factor_enabled=False,
@@ -530,11 +870,8 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(manager._task, timeout=5)
 
         snapshot = manager.snapshot()
-        self.assertEqual(snapshot["status"], "completed")
-        self.assertIn("密码已确认 0/1", snapshot["message"])
-        self.assertTrue(
-            any("免密码注册" in item["message"] for item in snapshot["logs"])
-        )
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertIn("拒绝免密码账号", snapshot["message"])
         self.assertEqual(len(browser.started_batches), 1)
 
     async def test_smsbower_gmail_rejects_passwordless_result(self):

@@ -94,12 +94,29 @@ OPENAI_EMAIL_LOGIN_INPUT_SELECTORS = (
     'input[name="email"]',
     'input[name="username"]',
     'input[autocomplete="email"]',
+    'input[data-testid*="email" i]',
+    'input[placeholder="Email address" i]',
+    'input[placeholder*="email" i]',
+    'input[aria-label*="email" i]',
+    'input[placeholder*="メールアドレス"]',
+    'input[aria-label*="メールアドレス"]',
+    'input[placeholder*="邮箱"]',
+    'input[aria-label*="邮箱"]',
 )
-_EMAIL_CONTROL_SCOPE = (
-    ':is(form, [role="dialog"]):has('
+_EMAIL_INPUT_SCOPE_SELECTOR = (
     'input:is([type="email"], [name="email"], [name="username"], '
-    '[autocomplete="email"])'
-    ')'
+    '[autocomplete="email"], [data-testid*="email" i], '
+    '[placeholder*="email" i], [aria-label*="email" i], '
+    '[placeholder*="メールアドレス"], [aria-label*="メールアドレス"], '
+    '[placeholder*="邮箱"], [aria-label*="邮箱"])'
+)
+_EMAIL_CONTROL_SCOPES = (
+    ':is(form, [role="dialog"]):has('
+    f'{_EMAIL_INPUT_SCOPE_SELECTOR})',
+    ':is(aside, [data-testid*="auth" i], [data-testid*="modal" i], '
+    '[data-testid*="drawer" i], [class*="auth" i], [class*="modal" i], '
+    '[class*="drawer" i]):has('
+    f'{_EMAIL_INPUT_SCOPE_SELECTOR})',
 )
 _EMAIL_REGISTRATION_ACTION_LABELS = (
     "Continue",
@@ -115,7 +132,8 @@ _EMAIL_REGISTRATION_ACTION_LABELS = (
 )
 OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS = (
     *tuple(
-        f'{_EMAIL_CONTROL_SCOPE} {control}:text-is("{label}")'
+        f'{scope} {control}:text-is("{label}")'
+        for scope in _EMAIL_CONTROL_SCOPES
         for label in _EMAIL_REGISTRATION_ACTION_LABELS
         for control in ("button", '[role="button"]')
     ),
@@ -123,11 +141,12 @@ OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS = (
 OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS = (
     *OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS,
     *tuple(
-        f'{_EMAIL_CONTROL_SCOPE} {control}:text-is("{label}")'
+        f'{scope} {control}:text-is("{label}")'
+        for scope in _EMAIL_CONTROL_SCOPES
         for label in ("Log in", "登录", "登入", "ログイン")
         for control in ("button", '[role="button"]')
     ),
-    f'{_EMAIL_CONTROL_SCOPE} button[type="submit"]',
+    *tuple(f'{scope} button[type="submit"]' for scope in _EMAIL_CONTROL_SCOPES),
 )
 # Compatibility export for existing-account login callers. Registration callers
 # must explicitly use OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS.

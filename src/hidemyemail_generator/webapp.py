@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import hmac
+import html
 import json
 import os
 import re
@@ -17,6 +18,10 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
+from .account_deactivation import (
+    mark_deactivation_notice_processed,
+    pending_deactivation_notices,
+)
 from .account_verifier import AccountVerificationManager, removed_account_emails
 from .browser_tasks import (
     BrowserTaskManager,
@@ -45,6 +50,7 @@ from .inbox import (
 from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
+from .paypal_protocol_service import PayPalProtocolService
 from .registration_inventory import (
     DEFAULT_LEASE_SECONDS,
     available_generated_inventory_count,
@@ -60,7 +66,11 @@ from .registration_inventory_client import (
     INVENTORY_STATUS_PATH,
     RemoteRegistrationInventoryClient,
 )
-from .registration_tasks import RegistrationTaskManager, generate_openai_password
+from .registration_tasks import (
+    ConcurrentRegistrationTaskManager,
+    RegistrationTaskManager,
+    generate_openai_password,
+)
 from .registration_proxy import RegistrationProxyStore
 from .scheduled_generation import (
     DEFAULT_BATCH_SIZE as DEFAULT_INVENTORY_BATCH_SIZE,
@@ -94,6 +104,8 @@ ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 15
 ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS = 60
 ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS = 15 * 60
 ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS = 60 * 60
+DEACTIVATION_SCAN_INTERVAL_SECONDS = 5 * 60
+REGISTRATION_PROCESS_FAILURE_PREFIX = "registration_process_failure:"
 CARD_LINK_REGIONS = {
     "US": {"label": "美国", "currency": "USD", "locale": "en-US"},
     "JP": {"label": "日本", "currency": "JPY", "locale": "ja-JP"},
@@ -117,7 +129,7 @@ PAGE_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'none'; style-src 'unsafe-inline' https://cdn.jsdelivr.net; "
         "script-src 'unsafe-inline'; "
-        "connect-src 'self'; img-src 'self' data:; form-action 'self'; "
+        "connect-src 'self'; img-src 'self' data:; frame-src 'self'; form-action 'self'; "
         "frame-ancestors 'none'; base-uri 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
@@ -128,6 +140,14 @@ OPENAI_RUNTIME_SIBLING_NAMES = (
     "openai-register-paylink",
     "openai-register-paylink-ui-dist-20260706-README-deploy",
 )
+PAYPAL_PROTOCOL_PREFIX = "/paypal-pay"
+
+
+def _default_paypal_runtime_dir() -> Path:
+    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "HideMyEmailGenerator" / "paypal-protocol"
+    return Path.home() / ".local" / "share" / "HideMyEmailGenerator" / "paypal-protocol"
 
 
 def _default_openai_runtime_dir(base_dir: Path) -> Path:
@@ -3391,9 +3411,13 @@ def create_app(
     smsbower_service: str = DEFAULT_SMSBOWER_SERVICE,
     smsbower_max_price: float = DEFAULT_SMSBOWER_MAX_PRICE,
     smsbower_api_base_url: str = SMSBOWER_API_BASE_URL,
+    paypal_project_dir: str = "",
+    paypal_python: str = "",
+    paypal_port: int = 18097,
+    deactivation_scan_interval_seconds: float = DEACTIVATION_SCAN_INTERVAL_SECONDS,
 ) -> web.Application:
     app = web.Application(
-        client_max_size=16 * 1024, middlewares=[auth_middleware]
+        client_max_size=1024 * 1024, middlewares=[auth_middleware]
     )
     app["local_token"] = secrets.token_urlsafe(32)
     app["web_password"] = web_password
@@ -3409,6 +3433,15 @@ def create_app(
     app["inbox_on_demand_next_attempt"] = 0.0
     app["inbox_on_demand_failures"] = 0
     app["inbox_on_demand_retry_after"] = 0
+    app["deactivation_scan_state"] = {
+        "intervalSeconds": max(0.05, float(deactivation_scan_interval_seconds)),
+        "status": "waiting",
+        "lastScan": "",
+        "nextScan": "",
+        "error": "",
+        "deletedCount": 0,
+        "lastResult": {},
+    }
     app["generate_lock"] = asyncio.Lock()
     app["delete_lock"] = asyncio.Lock()
     app["inbox_sync_lock"] = asyncio.Lock()
@@ -3431,6 +3464,17 @@ def create_app(
     )
     app["smsbower_client"] = SMSBowerMailClient(
         app["smsbower_config_store"], base_url=smsbower_api_base_url
+    )
+    paypal_source = (
+        Path(paypal_project_dir).resolve()
+        if paypal_project_dir
+        else (base_dir / "paypal-agreement-protocol").resolve()
+    )
+    app["paypal_service"] = PayPalProtocolService(
+        project_dir=paypal_source,
+        runtime_dir=_default_paypal_runtime_dir(),
+        port=max(1, min(int(paypal_port), 65535)),
+        python_executable=Path(paypal_python) if paypal_python else None,
     )
     browser_source = (
         Path(target_project_dir).resolve()
@@ -3515,6 +3559,8 @@ def create_app(
                 )
             return "iCloud 邮箱及本地账号凭据已删除"
 
+    app["deactivation_delete_account"] = delete_invalid_icloud_email
+
     app["verification_manager"] = AccountVerificationManager(
         target_project_dir=browser_source,
         db_file=app["db_file"],
@@ -3567,18 +3613,121 @@ def create_app(
     async def load_registration_account(email: str) -> dict:
         return await asyncio.to_thread(load_account_record, app["db_file"], email)
 
-    app["registration_manager"] = RegistrationTaskManager(
-        browser_manager=app["browser_manager"],
+    async def record_registration_failure(task: dict) -> None:
+        process_id = str(task.get("processId") or task.get("id") or "").strip()
+        if not process_id:
+            return
+        record = {
+            "processId": process_id,
+            "status": "failed",
+            "provider": str(task.get("provider") or ""),
+            "email": str(task.get("email") or "").strip().lower(),
+            "emails": [
+                str(item or "").strip().lower()
+                for item in task.get("emails", [])
+                if str(item or "").strip()
+            ],
+            "message": str(task.get("message") or "注册失败")[:1000],
+            "currentStage": str(task.get("currentStage") or "failed"),
+            "currentLocation": str(task.get("currentLocation") or "注册流程"),
+            "currentAction": str(task.get("currentAction") or "注册失败")[:500],
+            "startedAt": str(task.get("startedAt") or ""),
+            "finishedAt": str(task.get("finishedAt") or ""),
+            "recordedAt": str(task.get("recordedAt") or ""),
+            "logs": [
+                {
+                    key: str(log.get(key) or "")[:1000]
+                    for key in (
+                        "at",
+                        "message",
+                        "stage",
+                        "location",
+                        "action",
+                        "status",
+                    )
+                }
+                for log in task.get("logs", [])[-30:]
+                if isinstance(log, dict)
+            ],
+        }
+
+        def save_failure() -> None:
+            conn = connect_db(str(app["db_file"]))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO settings(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        f"{REGISTRATION_PROCESS_FAILURE_PREFIX}{process_id}",
+                        json.dumps(record, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(save_failure)
+
+    def load_registration_failures(limit: int = 20) -> list[dict]:
+        conn = connect_db(str(app["db_file"]))
+        try:
+            rows = conn.execute(
+                """
+                SELECT value
+                FROM settings
+                WHERE key LIKE ?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (f"{REGISTRATION_PROCESS_FAILURE_PREFIX}%", max(1, int(limit))),
+            ).fetchall()
+        finally:
+            conn.close()
+        records: list[dict] = []
+        for row in rows:
+            try:
+                item = json.loads(str(row["value"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+        return records
+
+    def create_registration_process() -> RegistrationTaskManager:
+        primary_browser = app["browser_manager"]
+        process_browser = BrowserTaskManager(
+            target_project_dir=primary_browser.target_project_dir,
+            service_url=primary_browser.service_url,
+            worker_token=primary_browser.worker_token,
+            db_file=primary_browser.db_file,
+            python_executable=primary_browser.python_executable,
+            bridge_file=primary_browser.bridge_file,
+            force_headless=primary_browser.force_headless,
+            registration_proxy_store=primary_browser.registration_proxy_store,
+        )
+        return RegistrationTaskManager(
+            browser_manager=process_browser,
+            acquire_email=acquire_registration_inventory_email,
+            confirm_email=confirm_registration_email,
+            save_password=save_registration_password,
+            complete_email=complete_registration_inventory_email,
+            acquire_provider_email=app["smsbower_client"].acquire_email,
+            poll_provider_code=app["smsbower_client"].poll_code,
+            poll_provider_next_code=app["smsbower_client"].poll_next_code,
+            complete_provider_email=app["smsbower_client"].complete_email,
+            cancel_provider_email=app["smsbower_client"].cancel_email,
+            load_account=load_registration_account,
+        )
+
+    app["registration_manager"] = ConcurrentRegistrationTaskManager(
+        process_factory=create_registration_process,
+        shared_browser_manager=app["browser_manager"],
         acquire_email=acquire_registration_inventory_email,
-        confirm_email=confirm_registration_email,
-        save_password=save_registration_password,
         complete_email=complete_registration_inventory_email,
-        acquire_provider_email=app["smsbower_client"].acquire_email,
-        poll_provider_code=app["smsbower_client"].poll_code,
-        poll_provider_next_code=app["smsbower_client"].poll_next_code,
-        complete_provider_email=app["smsbower_client"].complete_email,
-        cancel_provider_email=app["smsbower_client"].cancel_email,
-        load_account=load_registration_account,
+        record_failure=record_registration_failure,
+        max_processes=10,
     )
 
     async def generate_inventory_batch(label: str, count: int) -> dict:
@@ -3663,6 +3812,148 @@ def create_app(
             )
             return inserted
 
+    def account_task_running() -> bool:
+        for manager_name in (
+            "registration_manager",
+            "browser_manager",
+            "verification_manager",
+        ):
+            try:
+                if app[manager_name].snapshot().get("running"):
+                    return True
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+        return False
+
+    async def scan_deactivation_notices_once(
+        *, force_sync: bool = True
+    ) -> dict[str, object]:
+        state: dict = app["deactivation_scan_state"]
+        scanned_at = datetime.now().astimezone().isoformat()
+        state.update(status="running", lastScan=scanned_at, error="")
+
+        if account_task_running():
+            result: dict[str, object] = {
+                "status": "deferred",
+                "message": "账号任务正在运行，停用通知删除已延期到下一轮",
+                "notices": 0,
+                "deleted": 0,
+                "missing": 0,
+                "failed": 0,
+            }
+            state.update(status="deferred", lastResult=result)
+            return result
+
+        try:
+            await sync_inbox_on_demand(100, force=force_sync)
+        except FileNotFoundError:
+            result = {
+                "status": "unconfigured",
+                "message": "收件箱尚未配置",
+                "notices": 0,
+                "deleted": 0,
+                "missing": 0,
+                "failed": 0,
+            }
+            state.update(status="unconfigured", lastResult=result)
+            return result
+        except Exception as error:
+            message = _inbox_error_message(error)
+            result = {
+                "status": "error",
+                "message": message,
+                "notices": 0,
+                "deleted": 0,
+                "missing": 0,
+                "failed": 1,
+            }
+            state.update(status="error", error=message, lastResult=result)
+            return result
+
+        notices = await asyncio.to_thread(
+            pending_deactivation_notices, app["db_file"]
+        )
+        deleted = 0
+        missing = 0
+        failed = 0
+        errors: list[str] = []
+        deferred = False
+        for notice in notices:
+            if account_task_running():
+                deferred = True
+                break
+            email = str(notice["email"])
+            account_record = await asyncio.to_thread(
+                load_account_record, app["db_file"], email
+            )
+            if not account_record:
+                await asyncio.to_thread(
+                    mark_deactivation_notice_processed,
+                    app["db_file"],
+                    notice,
+                    email=email,
+                    status="account_missing",
+                    detail="停用通知对应的本地账号已不存在",
+                )
+                missing += 1
+                continue
+
+            reason = "OpenAI 停用邮件确认该账号已无法使用"
+            try:
+                deletion_message = await app["deactivation_delete_account"](
+                    email, reason
+                )
+                detail = f"{reason}；{deletion_message}"
+                await asyncio.to_thread(
+                    mark_deactivation_notice_processed,
+                    app["db_file"],
+                    notice,
+                    email=email,
+                    status="deleted",
+                    detail=detail,
+                    account_record=account_record,
+                )
+            except Exception as error:
+                failed += 1
+                errors.append(f"{email}: {error}")
+                continue
+            deleted += 1
+
+        status = "deferred" if deferred else "error" if failed else "ok"
+        message = (
+            "账号任务开始运行，剩余停用通知已延期到下一轮"
+            if deferred
+            else "；".join(errors)[:1000]
+            if errors
+            else f"已检查 {len(notices)} 封停用通知，删除 {deleted} 个账号"
+        )
+        result = {
+            "status": status,
+            "message": message,
+            "notices": len(notices),
+            "deleted": deleted,
+            "missing": missing,
+            "failed": failed,
+        }
+        state["deletedCount"] += deleted
+        state.update(
+            status=status,
+            error="；".join(errors)[:1000],
+            lastResult=result,
+        )
+        return result
+
+    app["deactivation_scan_once"] = scan_deactivation_notices_once
+
+    async def paypal_service_context(_: web.Application):
+        await app["paypal_service"].ensure_running()
+        try:
+            yield
+        finally:
+            await app["paypal_service"].close()
+
+    app.cleanup_ctx.append(paypal_service_context)
+
     async def browser_manager_context(_: web.Application):
         try:
             yield
@@ -3686,6 +3977,43 @@ def create_app(
             await app["registration_manager"].close()
 
     app.cleanup_ctx.append(registration_manager_context)
+
+    async def deactivation_scan_context(_: web.Application):
+        state: dict = app["deactivation_scan_state"]
+
+        async def scan_loop() -> None:
+            first_scan = True
+            while True:
+                scan_task = asyncio.create_task(
+                    scan_deactivation_notices_once(force_sync=not first_scan)
+                )
+                try:
+                    await asyncio.shield(scan_task)
+                except asyncio.CancelledError:
+                    # asyncio.to_thread keeps running after its awaiting task is
+                    # cancelled.  Wait for the in-flight scan so its SQLite
+                    # connection is closed before application cleanup returns.
+                    await scan_task
+                    raise
+                except Exception as error:
+                    message = str(error)[:1000]
+                    state.update(status="error", error=message)
+                first_scan = False
+                interval = float(state["intervalSeconds"])
+                state["nextScan"] = datetime.fromtimestamp(
+                    time.time() + interval
+                ).astimezone().isoformat()
+                await asyncio.sleep(interval)
+
+        task = asyncio.create_task(scan_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    app.cleanup_ctx.append(deactivation_scan_context)
 
     if app["inventory_server_enabled"]:
         async def scheduled_generation_context(_: web.Application):
@@ -4161,6 +4489,21 @@ def create_app(
             await sync_inbox_on_demand(30)
         except Exception as error:
             return None, _inbox_error_message(error), 502
+
+        # Most forwarded messages expose the Hide My Email recipient directly.
+        # Check those immediately after IMAP sync so an expired iCloud cookie
+        # cannot hide a code that has already reached INBOX or Junk.
+        item = await asyncio.to_thread(
+            _latest_gpt_code,
+            app["db_file"],
+            email,
+            gpt_code_identity_cache,
+            since,
+            consume=True,
+        )
+        if item:
+            return item, "", 200
+
         if (
             not gpt_code_identity_cache
             or time.monotonic() - gpt_code_identity_cache_at > 120
@@ -4482,8 +4825,12 @@ def create_app(
         )
 
     async def registration_status(_: web.Request) -> web.Response:
+        task = app["registration_manager"].snapshot()
+        task["failureRecords"] = await asyncio.to_thread(
+            load_registration_failures
+        )
         return web.json_response(
-            {"ok": True, **app["registration_manager"].snapshot()},
+            {"ok": True, **task},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -5325,8 +5672,22 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         enabled = payload.get("enabled") if "enabled" in payload else None
+        mode = payload.get("mode") if "mode" in payload else None
         country = payload.get("country") if "country" in payload else None
         proxy_line = payload.get("proxyLine") if "proxyLine" in payload else None
+        clash_controller = (
+            payload.get("clashController") if "clashController" in payload else None
+        )
+        clash_secret = payload.get("clashSecret") if "clashSecret" in payload else None
+        clash_selector = (
+            payload.get("clashSelector") if "clashSelector" in payload else None
+        )
+        clash_proxy_url = (
+            payload.get("clashProxyUrl") if "clashProxyUrl" in payload else None
+        )
+        max_latency_ms = (
+            payload.get("maxLatencyMs") if "maxLatencyMs" in payload else None
+        )
         if enabled is not None and not isinstance(enabled, bool):
             return web.json_response(
                 {"ok": False, "error": "enabled 必须是布尔值"}, status=400
@@ -5335,18 +5696,48 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "country 必须是国家代码"}, status=400
             )
+        if mode is not None and not isinstance(mode, str):
+            return web.json_response(
+                {"ok": False, "error": "mode 必须是代理模式"}, status=400
+            )
         if proxy_line is not None and (
             not isinstance(proxy_line, str) or len(proxy_line) > 1000
         ):
             return web.json_response(
                 {"ok": False, "error": "代理连接信息无效"}, status=400
             )
+        clash_strings = {
+            "clashController": clash_controller,
+            "clashSecret": clash_secret,
+            "clashSelector": clash_selector,
+            "clashProxyUrl": clash_proxy_url,
+        }
+        if any(
+            value is not None
+            and (not isinstance(value, str) or len(value) > 1000)
+            for value in clash_strings.values()
+        ):
+            return web.json_response(
+                {"ok": False, "error": "Clash 配置字段无效"}, status=400
+            )
+        if max_latency_ms is not None and (
+            isinstance(max_latency_ms, bool) or not isinstance(max_latency_ms, int)
+        ):
+            return web.json_response(
+                {"ok": False, "error": "maxLatencyMs 必须是整数"}, status=400
+            )
         try:
             state = await asyncio.to_thread(
                 app["registration_proxy_store"].configure,
                 enabled=enabled,
+                mode=mode,
                 country=country,
                 proxy_line=proxy_line,
+                clash_controller=clash_controller,
+                clash_secret=clash_secret,
+                clash_selector=clash_selector,
+                clash_proxy_url=clash_proxy_url,
+                max_latency_ms=max_latency_ms,
             )
         except ValueError as error:
             return web.json_response(
@@ -5354,18 +5745,56 @@ def create_app(
             )
         return web.json_response({"ok": True, **state})
 
+    async def registration_proxy_rotate(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            proxy_url, state = await asyncio.to_thread(
+                app["registration_proxy_store"].next_proxy,
+                force=True,
+            )
+        except (RuntimeError, ValueError) as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=502
+            )
+        if not proxy_url:
+            return web.json_response(
+                {"ok": False, "error": "注册代理尚未配置"}, status=400
+            )
+        return web.json_response(
+            {"ok": True, **state}, headers={"Cache-Control": "no-store"}
+        )
+
     async def inbox_status(_: web.Request) -> web.Response:
         config_path: Path = app["inbox_config_file"]
+        cleanup_status = dict(app["deactivation_scan_state"])
         if not config_path.exists():
             return web.json_response(
-                {"ok": True, "configured": False, "codeCount": 0},
+                {
+                    "ok": True,
+                    "configured": False,
+                    "codeCount": 0,
+                    "syncMode": "scheduled-and-on-demand",
+                    "backgroundInterval": cleanup_status["intervalSeconds"],
+                    "deactivationCleanup": cleanup_status,
+                },
                 headers={"Cache-Control": "no-store"},
             )
         try:
             config = load_config(str(config_path))
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return web.json_response(
-                {"ok": True, "configured": False, "codeCount": 0, "error": "收件箱配置文件无效"},
+                {
+                    "ok": True,
+                    "configured": False,
+                    "codeCount": 0,
+                    "error": "收件箱配置文件无效",
+                    "syncMode": "scheduled-and-on-demand",
+                    "backgroundInterval": cleanup_status["intervalSeconds"],
+                    "deactivationCleanup": cleanup_status,
+                },
                 headers={"Cache-Control": "no-store"},
             )
         conn = connect_db(str(app["db_file"]))
@@ -5386,11 +5815,12 @@ def create_app(
                 "folder": config.folder,
                 "useSsl": config.use_ssl,
                 "codeCount": code_count,
-                "syncMode": "on-demand",
-                "backgroundInterval": 0,
+                "syncMode": "scheduled-and-on-demand",
+                "backgroundInterval": cleanup_status["intervalSeconds"],
                 "lastBackgroundSync": app["inbox_background_last_sync"],
                 "backgroundError": app["inbox_background_error"],
                 "retryAfterSeconds": app["inbox_on_demand_retry_after"],
+                "deactivationCleanup": cleanup_status,
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -5484,6 +5914,104 @@ def create_app(
         items = await asyncio.to_thread(_code_items, app["db_file"], 30)
         return web.json_response({"ok": True, "inserted": len(inserted), "items": items})
 
+    async def paypal_status(_: web.Request) -> web.Response:
+        state = await app["paypal_service"].snapshot(ensure=True)
+        return web.json_response(
+            {"ok": True, **state}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def paypal_proxy(request: web.Request) -> web.Response:
+        service: PayPalProtocolService = app["paypal_service"]
+        if not await service.ensure_running():
+            state = await service.snapshot()
+            message = str(state.get("error") or "PayPal 协议服务暂不可用")
+            return web.Response(
+                text=(
+                    "<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+                    "<title>PP 支付服务不可用</title>"
+                    "<style>body{margin:0;padding:48px;background:#08111f;color:#e7eefb;"
+                    "font:15px system-ui}main{max-width:720px;margin:auto;padding:28px;"
+                    "border:1px solid #22324a;border-radius:14px;background:#0d192b}"
+                    "h1{font-size:22px}p{color:#91a2bb;line-height:1.7}</style>"
+                    f"<main><h1>PP 支付服务不可用</h1><p>{html.escape(message)}</p>"
+                    "<p>请刷新工作台后重试。</p></main></html>"
+                ),
+                status=503,
+                content_type="text/html",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        tail = str(request.match_info.get("tail") or "")
+        upstream_url = f"{service.upstream_url}/" + tail
+        if request.query_string:
+            upstream_url += "?" + request.query_string
+        forwarded_headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.lower()
+            not in {
+                "connection",
+                "content-length",
+                "host",
+                "transfer-encoding",
+            }
+        }
+        forwarded_headers["Host"] = request.host
+        if request.remote:
+            forwarded_headers["X-Forwarded-For"] = request.remote
+        body = await request.read()
+        timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_read=None)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    request.method,
+                    upstream_url,
+                    headers=forwarded_headers,
+                    data=body or None,
+                    allow_redirects=False,
+                ) as upstream:
+                    response_body = await upstream.read()
+                    response_headers = {}
+                    for name in (
+                        "Content-Type",
+                        "Cache-Control",
+                        "Content-Disposition",
+                        "Last-Modified",
+                        "ETag",
+                        "Referrer-Policy",
+                        "Permissions-Policy",
+                        "X-Content-Type-Options",
+                    ):
+                        value = upstream.headers.get(name)
+                        if value:
+                            response_headers[name] = value
+                    content_type = str(upstream.headers.get("Content-Type") or "")
+                    if "text/html" in content_type:
+                        content_security_policy = str(
+                            upstream.headers.get("Content-Security-Policy") or ""
+                        ).replace("frame-ancestors 'none'", "frame-ancestors 'self'")
+                        if content_security_policy:
+                            response_headers["Content-Security-Policy"] = (
+                                content_security_policy
+                            )
+                        response_headers["X-Frame-Options"] = "SAMEORIGIN"
+                    set_cookie = upstream.headers.get("Set-Cookie")
+                    if set_cookie:
+                        response_headers["Set-Cookie"] = set_cookie.replace(
+                            "Path=/", f"Path={PAYPAL_PROTOCOL_PREFIX}/"
+                        )
+                    return web.Response(
+                        body=response_body,
+                        status=upstream.status,
+                        headers=response_headers,
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            service.ready = False
+            service.error = f"PayPal 协议服务连接失败：{error}"
+            return web.json_response(
+                {"ok": False, "error": service.error}, status=502
+            )
+
     app.router.add_get("/login", login_page)
     app.router.add_post("/api/login", login_api)
     app.router.add_get("/access", access_page)
@@ -5492,6 +6020,9 @@ def create_app(
     app.router.add_post("/api/logout", logout_api)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/", index)
+    app.router.add_get("/api/paypal/status", paypal_status)
+    app.router.add_route("*", PAYPAL_PROTOCOL_PREFIX, paypal_proxy)
+    app.router.add_route("*", f"{PAYPAL_PROTOCOL_PREFIX}/{{tail:.*}}", paypal_proxy)
     app.router.add_get("/api/gpt-emails", gpt_emails)
     app.router.add_post("/api/account/type", account_type_update)
     app.router.add_post("/api/gpt-credential", gpt_credential)
@@ -5528,6 +6059,7 @@ def create_app(
     )
     app.router.add_get("/api/registration-proxy/status", registration_proxy_status)
     app.router.add_post("/api/registration-proxy/config", registration_proxy_config)
+    app.router.add_post("/api/registration-proxy/rotate", registration_proxy_rotate)
     app.router.add_get("/api/account-verification/status", verification_status)
     app.router.add_post("/api/account-verification/start", verification_start)
     app.router.add_post("/api/account-verification/stop", verification_stop)
@@ -5597,6 +6129,9 @@ async def run_server(args: argparse.Namespace) -> None:
         smsbower_api_base_url=os.environ.get(
             "SMSBOWER_API_BASE_URL", SMSBOWER_API_BASE_URL
         ),
+        paypal_project_dir=os.environ.get("PAYPAL_PROTOCOL_PROJECT_DIR", ""),
+        paypal_python=os.environ.get("PAYPAL_PROTOCOL_PYTHON", ""),
+        paypal_port=int(os.environ.get("PAYPAL_PROTOCOL_PORT", "18097")),
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -5645,6 +6180,9 @@ def _load_local_env_file(path: Path) -> None:
         "SMSBOWER_MAIL_SERVICE",
         "SMSBOWER_MAX_PRICE",
         "SMSBOWER_API_BASE_URL",
+        "PAYPAL_PROTOCOL_PROJECT_DIR",
+        "PAYPAL_PROTOCOL_PYTHON",
+        "PAYPAL_PROTOCOL_PORT",
     }
     try:
         lines = path.read_text(encoding="utf-8").splitlines()

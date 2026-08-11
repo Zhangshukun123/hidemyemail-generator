@@ -638,6 +638,11 @@ class BrowserTaskManager:
             and proxy_state.get("enabled")
             and proxy_state.get("configured")
         )
+        clash_proxy_active = bool(
+            proxy_active and proxy_state.get("mode") == "clash"
+        )
+        if clash_proxy_active:
+            concurrency = 1
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -708,11 +713,24 @@ class BrowserTaskManager:
                 "Camoufox 后台交互已启用：窗口被其他应用遮挡时仍继续加载和执行"
             )
         if proxy_active:
-            self._append_log(
-                "注册动态代理已启用："
-                f"{proxy_state.get('countryLabel') or proxy_state.get('country')} "
-                "出口；每个账号使用独立 SID"
-            )
+            if clash_proxy_active:
+                if proxy_state.get("fixedPortsEnabled"):
+                    self._append_log(
+                        "Clash 日本固定端口已启用：当前进程内保持单账号；"
+                        "可同时启动其他注册进程，每个进程使用独立固定端口；"
+                        f"高于 {proxy_state.get('maxLatencyMs') or 900} ms 的出口会被跳过"
+                    )
+                else:
+                    self._append_log(
+                        "Clash 日本节点轮询已启用：注册任务强制串行；"
+                        f"每个账号开始前切换节点并跳过高于 {proxy_state.get('maxLatencyMs') or 900} ms 的出口"
+                    )
+            else:
+                self._append_log(
+                    "注册动态代理已启用："
+                    f"{proxy_state.get('countryLabel') or proxy_state.get('country')} "
+                    "出口；每个账号使用独立 SID"
+                )
         self._batch_task = asyncio.create_task(
             self._run_batch(headless=headless, concurrency=concurrency)
         )
@@ -812,9 +830,17 @@ class BrowserTaskManager:
                     self._state["completed"] += 1
                     self._append_log(item["message"], email=email)
                     return
-                proxy_url, proxy_state = await asyncio.to_thread(
-                    self.registration_proxy_store.next_proxy
-                )
+                try:
+                    proxy_url, proxy_state = await asyncio.to_thread(
+                        self.registration_proxy_store.next_proxy
+                    )
+                except Exception as error:
+                    item["status"] = "failed"
+                    item["message"] = f"注册代理切换失败：{error}"
+                    self._state["failed"] += 1
+                    self._state["completed"] += 1
+                    self._append_log(item["message"], email=email)
+                    return
                 if not proxy_url:
                     item["status"] = "failed"
                     item["message"] = "注册动态代理已启用但未配置"
@@ -824,12 +850,25 @@ class BrowserTaskManager:
                     return
                 item["proxyCountry"] = str(proxy_state.get("country") or "")
                 item["proxyEndpoint"] = str(proxy_state.get("endpoint") or "")
-                self._append_log(
-                    "已分配新的粘性代理会话："
-                    f"{proxy_state.get('countryLabel') or proxy_state.get('country')}；"
-                    "注册、2FA 与 Session 获取全程保持同一出口",
-                    email=email,
-                )
+                if proxy_state.get("mode") == "clash":
+                    item["proxyNode"] = str(proxy_state.get("currentNode") or "")
+                    item["proxyLatencyMs"] = int(
+                        proxy_state.get("lastLatencyMs") or 0
+                    )
+                    self._append_log(
+                        "已固定 Clash 日本出口："
+                        f"{proxy_state.get('currentNode') or '日本节点'}，"
+                        f"延迟 {proxy_state.get('lastLatencyMs') or 0} ms；"
+                        "本账号注册、2FA 与 Session 获取结束前不再切换",
+                        email=email,
+                    )
+                else:
+                    self._append_log(
+                        "已分配新的粘性代理会话："
+                        f"{proxy_state.get('countryLabel') or proxy_state.get('country')}；"
+                        "注册、2FA 与 Session 获取全程保持同一出口",
+                        email=email,
+                    )
 
             env = os.environ.copy()
             env.update(
@@ -970,24 +1009,20 @@ class BrowserTaskManager:
             password = str(item.get("_password") or "")
             result = item.get("_result")
             password_confirmed = bool(item.get("_password_confirmed"))
-            strict_gmail_credentials = bool(
-                email.endswith("@gmail.com")
-                and item.get("_ensure_password")
+            strict_password_credentials = bool(
+                item.get("_ensure_password")
+                and item.get("_password_first_required")
             )
             session_saved = bool(
                 isinstance(result, dict)
                 and str(result.get("access_token") or "").strip()
             )
-            if session_saved and strict_gmail_credentials:
+            if session_saved and strict_password_credentials:
                 if not password_confirmed:
-                    item["_error"] = (
-                        "Gmail 注册未确认密码；已拒绝保存免密码账号"
-                    )
+                    item["_error"] = "注册未确认密码；已拒绝保存免密码账号"
                     session_saved = False
                 elif not item.get("twoFactorEnabled"):
-                    item["_error"] = (
-                        "Gmail 注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
-                    )
+                    item["_error"] = "注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
                     session_saved = False
             if session_saved:
                 await asyncio.to_thread(
@@ -1102,12 +1137,12 @@ class BrowserTaskManager:
                 two_factor_enabled = bool(
                     isinstance(two_factor, dict) and two_factor.get("enabled")
                 )
-                strict_gmail_credentials = bool(
-                    email.endswith("@gmail.com")
-                    and item.get("_ensure_password")
+                strict_password_credentials = bool(
+                    item.get("_ensure_password")
+                    and item.get("_password_first_required")
                 )
                 if isinstance(result, dict) and (
-                    not strict_gmail_credentials
+                    not strict_password_credentials
                     or (password_confirmed and two_factor_enabled)
                 ):
                     await asyncio.to_thread(
@@ -1123,8 +1158,8 @@ class BrowserTaskManager:
                         ),
                     )
                 item["message"] = (
-                    "Gmail 密码已确认，正在开启 2FA"
-                    if strict_gmail_credentials and password_confirmed
+                    "密码已确认，正在开启 2FA"
+                    if strict_password_credentials and password_confirmed
                     else
                     "OpenAI 注册成功，正在开启 2FA"
                     if item.get("_enable_2fa") and password_confirmed

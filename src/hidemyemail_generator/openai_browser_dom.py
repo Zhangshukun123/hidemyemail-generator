@@ -49,21 +49,25 @@ def _activate_visible_registration_page(
     *,
     focus_window=focus_camoufox_window_once,
 ) -> bool:
-    """Activate the tab without stealing OS focus unless manual input needs it."""
+    """Focus a manual browser once; automatic DOM work stays in the background."""
 
     if bool(getattr(worker, "headless", False)):
         return False
+    foreground_required = str(
+        os.environ.get("HME_BROWSER_FOREGROUND_REQUIRED") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not foreground_required:
+        return False
+    if bool(getattr(worker, "_hme_foreground_activation_attempted", False)):
+        return False
+    worker._hme_foreground_activation_attempted = True
     try:
         page.bring_to_front()
         try:
             page.evaluate("() => window.focus()")
         except Exception:
             pass
-        foreground_required = str(
-            os.environ.get("HME_BROWSER_FOREGROUND_REQUIRED") or ""
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if foreground_required:
-            focus_window()
+        focus_window()
         return True
     except Exception as error:
         if not getattr(worker, "_hme_about_you_focus_warning_logged", False):

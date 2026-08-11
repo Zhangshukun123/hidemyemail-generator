@@ -55,6 +55,9 @@ except ImportError:
 _auth_click_email_submit = _registration_auth.click_email_submit
 _auth_input_value = _registration_auth.input_value
 _auth_paste_email_and_submit = _registration_auth.paste_email_and_submit
+OPENAI_EMAIL_LOGIN_INPUT_SELECTORS = (
+    _registration_auth.OPENAI_EMAIL_LOGIN_INPUT_SELECTORS
+)
 OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS = (
     _registration_auth.OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS
 )
@@ -360,6 +363,48 @@ def configure_password_first_login(
     if getattr(worker, "_hme_password_first_login_configured", False):
         return True
 
+    def verification_page_recognition(
+        self,
+        page,
+        *,
+        has_otp: bool,
+        password_choice: str,
+        decision: str,
+        body_text: str = "",
+    ) -> str:
+        if not body_text:
+            try:
+                body_text = str(page.locator("body").inner_text(timeout=800) or "")
+            except Exception:
+                body_text = ""
+        normalized = re.sub(r"\s+", " ", body_text).strip()
+        folded = normalized.casefold()
+        if any(marker in normalized for marker in ("受信箱", "パスワードで続行", "コード")):
+            language = "日文"
+        elif any(marker in normalized for marker in ("收件箱", "使用密码继续", "验证码")):
+            language = "中文"
+        elif any(
+            marker in folded
+            for marker in ("check your inbox", "continue with password", "code")
+        ):
+            language = "英文"
+        else:
+            language = "未确认"
+        account = getattr(self, "account", None)
+        target_email = str(getattr(account, "email", "") or "").strip().casefold()
+        if not target_email:
+            email_match = "未提供"
+        elif target_email in folded:
+            email_match = "匹配"
+        else:
+            email_match = "未在页面文案中确认"
+        return (
+            "[界面识别] 当前=邮箱验证码页；"
+            f"语言={language}；目标邮箱={email_match}；"
+            f"验证码输入框={'可见' if has_otp else '未确认'}；"
+            f"使用密码继续={password_choice}；决策={decision}"
+        )
+
     def password_entry_page_state(page, *, has_otp: bool) -> tuple[str, str]:
         url = str(getattr(page, "url", "") or "")
         lowered_url = url.casefold()
@@ -372,6 +417,11 @@ def configure_password_first_login(
             return "security", "安全验证页面"
         if has_otp or "email-verification" in lowered_url:
             return "email_verification", "邮箱验证页面"
+        if any(
+            marker in lowered_url
+            for marker in ("/create-account/password", "/sign-up/password")
+        ):
+            return "password_loading", "密码设置页面正在加载"
         if any(
             marker in lowered_url
             for marker in ("/log-in", "/login", "/sign-in", "/signup")
@@ -464,10 +514,24 @@ def configure_password_first_login(
             self, "_password_step_submitted", False
         ):
             return False
-        before_url = str(getattr(page, "url", "") or "")
+        has_otp = bool(original_has_otp(page))
+        try:
+            body_text = str(page.locator("body").inner_text(timeout=800) or "")
+        except Exception:
+            body_text = ""
         _activate_visible_registration_page(self, page)
         if not _click_first_visible(page, PASSWORD_CONTINUE_SELECTORS, timeout=500):
             return False
+        self.log(
+            verification_page_recognition(
+                self,
+                page,
+                has_otp=has_otp,
+                password_choice="可见",
+                decision="点击“使用密码继续”并进入密码设置",
+                body_text=body_text,
+            )
+        )
         self._hme_password_entry_selected = True
         self._hme_password_entry_pending = True
         self._hme_password_entry_started_at = time.monotonic()
@@ -477,41 +541,63 @@ def configure_password_first_login(
             "[认证] 已选择使用密码继续；等待密码输入页面，"
             "如出现安全验证可手动完成，程序会持续监测"
         )
-        if before_url:
-            deadline = time.monotonic() + 60.0
-            while time.monotonic() < deadline:
-                current_url = str(getattr(page, "url", "") or "")
-                password_visible = bool(
-                    callable(original_has_password)
-                    and original_has_password(page)
-                )
-                if password_visible or (
-                    current_url
-                    and current_url != before_url
-                    and "email-verification" not in current_url.casefold()
-                ):
-                    try:
-                        route = urlparse(current_url).path or "/"
-                    except (TypeError, ValueError):
-                        route = "/"
-                    emit_browser_diagnostic(
-                        self.log,
-                        BrowserDiagnosticCode.AUTH_PASSWORD_ROUTE_TRANSITION,
-                        f"使用密码入口已完成页面切换：{route}；"
-                        "未启动邮箱验证码读取",
-                    )
-                    return True
-                monitor_password_entry_wait(
-                    self,
-                    page,
-                    has_otp=bool(original_has_otp(page)),
-                )
-                _page_wait(page, 250)
-            raise RuntimeError(
-                "点击使用密码继续后 60 秒内仍未进入密码页；"
-                "已停止邮箱验证码读取，避免重新登录到错误分支"
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            current_url = str(getattr(page, "url", "") or "")
+            password_visible = bool(
+                callable(original_has_password) and original_has_password(page)
             )
-        return True
+            if password_visible:
+                self.log(
+                    "[界面识别] 当前=密码设置页；密码输入框=可见；"
+                    "密码提交=未完成；Session 判定=暂缓；"
+                    "决策=填写并提交创建邮箱时保存的唯一密码"
+                )
+                self._fill_password_step(page)
+                submitted_url = current_url
+                self.log(
+                    "[认证] 密码已提交，正在等待页面离开密码设置页；"
+                    "期间不读取 Session"
+                )
+                while time.monotonic() < deadline:
+                    current_url = str(getattr(page, "url", "") or "")
+                    password_still_visible = bool(
+                        callable(original_has_password)
+                        and original_has_password(page)
+                    )
+                    if not password_still_visible or (
+                        current_url
+                        and submitted_url
+                        and current_url != submitted_url
+                    ):
+                        try:
+                            route = urlparse(current_url).path or "/"
+                        except (TypeError, ValueError):
+                            route = "/"
+                        emit_browser_diagnostic(
+                            self.log,
+                            BrowserDiagnosticCode.AUTH_PASSWORD_ROUTE_TRANSITION,
+                            f"密码已提交并完成页面切换：{route}；"
+                            "现在允许继续验证码或 Session 判断",
+                        )
+                        return True
+                    monitor_password_entry_wait(
+                        self,
+                        page,
+                        has_otp=bool(original_has_otp(page)),
+                    )
+                    _page_wait(page, 250)
+                break
+            monitor_password_entry_wait(
+                self,
+                page,
+                has_otp=bool(original_has_otp(page)),
+            )
+            _page_wait(page, 250)
+        raise RuntimeError(
+            "点击使用密码继续后 60 秒内仍未完成密码填写、提交和页面切换；"
+            "已停止 Session 读取，避免把未完成注册误判为成功"
+        )
 
     def wait_for_required_password_choice(self, page) -> bool:
         url = str(getattr(page, "url", "") or "").casefold()
@@ -541,14 +627,21 @@ def configure_password_first_login(
             if has_otp and not otp_seen:
                 otp_seen = True
                 self.log(
-                    "[认证] 邮箱验证码框已先出现，但使用密码继续入口可能仍在异步加载；"
-                    f"继续等待最多 {timeout_label} 秒，期间不读取 SMSBower 验证码"
+                    verification_page_recognition(
+                        self,
+                        page,
+                        has_otp=True,
+                        password_choice="暂未出现",
+                        decision=(
+                            f"继续监测最多 {timeout_label} 秒，期间不读取邮箱验证码"
+                        ),
+                    )
                 )
             if "email-verification" not in current_url:
                 return False
             _page_wait(page, 250)
         raise RuntimeError(
-            f"Gmail 注册在邮箱验证页完整等待 {timeout_label} 秒仍未出现使用密码继续入口；"
+            f"注册流程在邮箱验证页完整等待 {timeout_label} 秒仍未出现使用密码继续入口；"
             "已拒绝创建免密码账号"
         )
 
@@ -565,7 +658,7 @@ def configure_password_first_login(
                 return True
             if original_has_otp(page):
                 raise RuntimeError(
-                    "Gmail 注册必须先选择使用密码继续；"
+                    "注册必须先选择使用密码继续；"
                     "已停止首次验证码入口，避免点击错误验证方式"
                 )
         result = original_continue_registration(page)
@@ -577,7 +670,7 @@ def configure_password_first_login(
             and original_has_otp(page)
         ):
             raise RuntimeError(
-                "Gmail 注册未经过密码输入就进入邮箱验证码；"
+                "注册未经过密码输入就进入邮箱验证码；"
                 "已停止并拒绝保存免密码账号"
             )
         if (
@@ -587,7 +680,15 @@ def configure_password_first_login(
             and not getattr(self, "_hme_password_entry_unavailable_logged", False)
         ):
             self._hme_password_entry_unavailable_logged = True
-            self.log("[认证] 当前验证码页面没有使用密码入口，继续读取邮箱验证码")
+            self.log(
+                verification_page_recognition(
+                    self,
+                    page,
+                    has_otp=True,
+                    password_choice="未出现",
+                    decision="继续读取邮箱验证码",
+                )
+            )
         return result
 
     def has_otp_or_choose_password(self, page):
@@ -605,12 +706,22 @@ def configure_password_first_login(
             return has_otp
         if not choose_password_if_available(self, page):
             if required:
+                if wait_for_required_password_choice(self, page):
+                    return False
                 raise RuntimeError(
-                    "Gmail 注册必须使用密码继续；当前页面未找到密码入口，已停止验证码回退"
+                    "注册必须使用密码继续；当前页面未找到密码入口，已停止验证码回退"
                 )
             if not getattr(self, "_hme_password_entry_unavailable_logged", False):
                 self._hme_password_entry_unavailable_logged = True
-                self.log("[认证] 当前验证码页面没有使用密码入口，继续读取邮箱验证码")
+                self.log(
+                    verification_page_recognition(
+                        self,
+                        page,
+                        has_otp=True,
+                        password_choice="未出现",
+                        decision="继续读取邮箱验证码",
+                    )
+                )
             return has_otp
         return False
 
@@ -1025,12 +1136,7 @@ def configure_email_password_only_registration(
             return original_fill_email(page)
         inputs = visible_inputs(
             page,
-            [
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[name="username"]',
-                'input[autocomplete="email"]',
-            ],
+            list(OPENAI_EMAIL_LOGIN_INPUT_SELECTORS),
         )
         if not inputs:
             return False

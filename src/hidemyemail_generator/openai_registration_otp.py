@@ -27,11 +27,90 @@ def iso_timestamp(value: float) -> str:
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
+EMAIL_VERIFICATION_CONTEXT_INPUT_SELECTORS = (
+    'input:not([type])',
+    'input[type="text"]',
+    'input[type="number"]',
+    'input[type="tel"]',
+    'input[role="textbox"]',
+)
+EMAIL_VERIFICATION_UI_MARKERS = {
+    "日文": (
+        "受信箱を確認",
+        "検証コード",
+        "確認コード",
+        "メールを再送信",
+        "続行",
+    ),
+    "中文": (
+        "检查收件箱",
+        "查看收件箱",
+        "验证码",
+        "重新发送邮件",
+        "继续",
+    ),
+    "英文": (
+        "check your inbox",
+        "verification code",
+        "enter the code",
+        "resend email",
+        "continue",
+    ),
+}
+
+
+def _email_verification_ui_state(
+    page,
+    expected_email: str,
+    visible_inputs,
+) -> dict[str, object]:
+    """Combine task context with URL and visible text before touching OTP UI."""
+
+    url = str(getattr(page, "url", "") or "")
+    try:
+        body_text = str(page.locator("body").inner_text(timeout=800) or "")
+    except Exception:
+        body_text = ""
+    normalized = re.sub(r"\s+", " ", body_text).strip()
+    folded = normalized.casefold()
+    target = str(expected_email or "").strip().casefold()
+    locale_label = ""
+    marker_count = 0
+    for label, markers in EMAIL_VERIFICATION_UI_MARKERS.items():
+        count = sum(marker.casefold() in folded for marker in markers)
+        if count > marker_count:
+            locale_label = label
+            marker_count = count
+    try:
+        inputs = visible_inputs(
+            page,
+            list(EMAIL_VERIFICATION_CONTEXT_INPUT_SELECTORS),
+        )
+    except Exception:
+        inputs = []
+    route_match = "email-verification" in url.casefold()
+    email_match = bool(target and target in folded)
+    has_input = bool(inputs)
+    content_match = marker_count >= 2
+    signal_count = sum((route_match, email_match, content_match))
+    return {
+        "recognized": has_input and signal_count >= 2,
+        "url": url,
+        "routeMatch": route_match,
+        "emailMatch": email_match,
+        "contentMatch": content_match,
+        "locale": locale_label or "本地化",
+        "markerCount": marker_count,
+        "inputs": inputs,
+    }
+
+
 class ManualOtpReader:
     def __init__(self, account, log, _proxy_url: str = "") -> None:
         import requests
 
         self.email = str(account.email or "").strip().lower()
+        self.icloud_inbox = self.email.endswith("@icloud.com")
         self.log = log
         self.service_url = os.environ.get(
             "HME_BROWSER_SERVICE_URL", "http://127.0.0.1:8765"
@@ -48,29 +127,51 @@ class ManualOtpReader:
             response.raise_for_status()
         except Exception as error:
             raise RuntimeError(f"无法连接手动验证码服务：{error}") from error
-        self.log("手动验证码通道已连接；需要验证码时请在工作台输入")
+        icloud_inbox = getattr(
+            self, "icloud_inbox", self.email.endswith("@icloud.com")
+        )
+        self.log(
+            "iCloud 验证码通道已连接；将自动扫描收件箱与垃圾邮件"
+            if icloud_inbox
+            else "手动验证码通道已连接；需要验证码时请在工作台输入"
+        )
 
     def wait_for_code(self, _min_timestamp: float) -> str:
         deadline = time.time() + 600
         last_error = ""
         request_id = secrets.token_urlsafe(12)
         standalone_code_route_logged = False
+        icloud_inbox = getattr(
+            self, "icloud_inbox", self.email.endswith("@icloud.com")
+        )
         while time.time() < deadline:
             try:
-                response = self.session.post(
-                    self.service_url + "/api/registration/code/poll",
-                    headers={"X-Local-Token": self.token},
-                    json={
-                        "email": self.email,
-                        "requestId": request_id,
-                        "minTimestamp": float(_min_timestamp or 0),
-                    },
-                    timeout=10,
-                )
+                if icloud_inbox:
+                    response = self.session.post(
+                        self.service_url + "/api/gpt-code",
+                        headers={"X-Local-Token": self.token},
+                        json={
+                            "email": self.email,
+                            "since": iso_timestamp(float(_min_timestamp or 0)),
+                        },
+                        timeout=10,
+                    )
+                else:
+                    response = self.session.post(
+                        self.service_url + "/api/registration/code/poll",
+                        headers={"X-Local-Token": self.token},
+                        json={
+                            "email": self.email,
+                            "requestId": request_id,
+                            "minTimestamp": float(_min_timestamp or 0),
+                        },
+                        timeout=10,
+                    )
                 payload = response.json()
                 registration_error = str(payload.get("error") or "")
                 if (
-                    response.status_code == 409
+                    not icloud_inbox
+                    and response.status_code == 409
                     and "没有正在运行的注册任务" in registration_error
                 ):
                     if not standalone_code_route_logged:
@@ -105,17 +206,18 @@ class ManualOtpReader:
                 last_error = str(error)
             time.sleep(OTP_POLL_INTERVAL_SECONDS)
         detail = f"：{last_error}" if last_error else ""
-        raise TimeoutError(f"在 600 秒内未收到手动输入的验证码{detail}")
+        raise TimeoutError(f"在 600 秒内未收到邮箱验证码{detail}")
 
     def close(self) -> None:
         self.session.close()
 
 
 def configure_registration_otp_reader(app_backend, registration_email: str) -> bool:
-    """Route an SMSBower Gmail worker through the local registration-code API."""
+    """Route supported registration mail through the local code APIs."""
     target_email = str(registration_email or "").strip().lower()
-    if not target_email.endswith("@gmail.com"):
+    if not target_email.endswith(("@gmail.com", "@icloud.com")):
         return False
+    icloud_inbox = target_email.endswith("@icloud.com")
 
     worker_type = app_backend.OpenAIRegisterPayLinkWorker
     original_preconnect = worker_type._preconnect_otp_reader
@@ -124,31 +226,39 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
     original_visible_inputs = getattr(worker_type, "_visible_inputs", None)
     reader_type = app_backend.HotmailOtpReader
 
-    def is_smsbower_worker(worker) -> bool:
+    def is_supported_worker(worker) -> bool:
         account = getattr(worker, "account", None)
         email = str(getattr(account, "email", "") or "").strip().lower()
         return email == target_email
 
     def preconnect_otp_reader(worker) -> None:
-        if not is_smsbower_worker(worker):
+        if not is_supported_worker(worker):
             return original_preconnect(worker)
         if getattr(worker, "otp_reader", None):
             return
-        worker.log("Gmail 账号使用 SMSBower API 自动取码，不连接 Outlook Graph/IMAP")
+        worker.log(
+            "iCloud 邮箱自动扫描 INBOX 与垃圾邮件取码"
+            if icloud_inbox
+            else "Gmail 账号使用 SMSBower API 自动取码，不连接 Outlook Graph/IMAP"
+        )
         worker.otp_reader = reader_type(worker.account, worker.log, "")
         worker.otp_reader.connect()
 
     def wait_for_openai_email_code(worker, min_timestamp: float) -> str:
-        if not is_smsbower_worker(worker):
+        if not is_supported_worker(worker):
             return original_wait_for_code(worker, min_timestamp)
         if not getattr(worker, "otp_reader", None):
             preconnect_otp_reader(worker)
-        worker.log("正在等待 SMSBower 返回 Gmail 验证码")
+        worker.log(
+            "正在从 iCloud 转发收件箱与垃圾邮件等待验证码"
+            if icloud_inbox
+            else "正在等待 SMSBower 返回 Gmail 验证码"
+        )
         return worker.otp_reader.wait_for_code(min_timestamp)
 
     def visible_inputs_with_localized_email_code(worker, page, selectors):
         inputs = original_visible_inputs(worker, page, selectors)
-        if inputs or not is_smsbower_worker(worker):
+        if not is_supported_worker(worker):
             return inputs
         selector_text = " ".join(str(selector or "") for selector in selectors)
         is_email_code_lookup = any(
@@ -162,11 +272,29 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
         )
         if not is_email_code_lookup:
             return inputs
+        ui_state = _email_verification_ui_state(
+            page,
+            target_email,
+            original_visible_inputs.__get__(worker, type(worker)),
+        )
+        if inputs:
+            if ui_state["recognized"] and not getattr(
+                worker, "_hme_otp_fill_context_logged", False
+            ):
+                worker._hme_otp_fill_context_logged = True
+                worker.log(
+                    f"[验证码] 新验证码已到达；已再次确认目标邮箱、页面 URL、"
+                    f"{ui_state['locale']}验证文案和 Code 输入框，正在自动填写并提交"
+                )
+            return inputs
         page_url = str(getattr(page, "url", "") or "").lower()
         retry_count = (
-            9
+            20
             if getattr(worker, "_hme_waiting_to_fill_otp_input", False)
-            and "email-verification" in page_url
+            and (
+                "email-verification" in page_url
+                or bool(ui_state["recognized"])
+            )
             else 1
         )
         for attempt in range(retry_count):
@@ -188,9 +316,27 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                     worker._hme_localized_otp_input_logged = True
                     worker.log("[验证码] 已识别本地化 Code 输入框，准备自动填写")
                 return localized_inputs
+            ui_state = _email_verification_ui_state(
+                page,
+                target_email,
+                original_visible_inputs.__get__(worker, type(worker)),
+            )
+            if ui_state["recognized"]:
+                context_inputs = list(ui_state["inputs"])
+                if len(context_inputs) == 1:
+                    if not getattr(worker, "_hme_otp_fill_context_logged", False):
+                        worker._hme_otp_fill_context_logged = True
+                        worker.log(
+                            f"[验证码] 新验证码已到达；已结合目标邮箱、页面 URL、"
+                            f"{ui_state['locale']}界面文案识别唯一 Code 输入框，"
+                            "正在自动填写并提交"
+                        )
+                    return context_inputs
             if "email-verification" in current_page_url:
                 text_inputs = original_visible_inputs(
-                    worker, page, ['input[type="text"]']
+                    worker,
+                    page,
+                    list(EMAIL_VERIFICATION_CONTEXT_INPUT_SELECTORS),
                 )
                 if len(text_inputs) == 1:
                     worker.log("[验证码] 已按邮箱验证页面的唯一文本框定位 Code 输入框")
@@ -204,12 +350,28 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
         *,
         wait_for_session=True,
     ):
-        if not is_smsbower_worker(worker):
+        if not is_supported_worker(worker):
             return original_submit_email_code(
                 worker,
                 page,
                 min_timestamp,
                 wait_for_session=wait_for_session,
+            )
+        ui_state = _email_verification_ui_state(
+            page,
+            target_email,
+            original_visible_inputs.__get__(worker, type(worker)),
+        )
+        if ui_state["recognized"]:
+            worker.log(
+                f"[验证码] 已结合当前注册上下文、页面 URL、目标邮箱、"
+                f"{ui_state['locale']}界面文案和 Code 输入框识别邮箱验证页；"
+                "下一步自动扫描 INBOX 与垃圾邮件"
+            )
+        else:
+            worker.log(
+                "[验证码] 当前注册流程已进入邮箱验证码分支；"
+                "正在继续核对页面 URL、目标邮箱、可见文案和 Code 输入框"
             )
         worker._hme_waiting_to_fill_otp_input = True
         try:

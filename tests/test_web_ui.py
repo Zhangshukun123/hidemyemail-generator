@@ -16,6 +16,7 @@ class StructuredWebUiTests(unittest.TestCase):
             "overviewView",
             "accountsView",
             "cardLinksView",
+            "ppPaymentView",
             "verificationView",
             "settingsView",
         ):
@@ -24,6 +25,7 @@ class StructuredWebUiTests(unittest.TestCase):
             "overview",
             "accounts",
             "card-links",
+            "pp-payment",
             "verification",
             "settings",
         ):
@@ -38,6 +40,13 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="verificationLog"', page)
         self.assertIn("renderVerificationLogs", page)
         self.assertIn("接口响应和删除原因", page)
+        self.assertIn("PP 支付", page)
+        self.assertIn('data-src="/paypal-pay/"', page)
+        self.assertIn("/api/paypal/status", page)
+        self.assertIn("renderPayPal", page)
+        self.assertIn('id="registrationProxyMode"', page)
+        self.assertIn("Clash 日本轮询", page)
+        self.assertIn("/api/registration-proxy/rotate", page)
 
     def test_app_page_uses_frontend_design_patterns(self):
         page = build_app_page()
@@ -97,6 +106,19 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("浏览器执行轨迹", page)
         self.assertIn("data-task-tone", page)
 
+    def test_running_registration_keeps_start_next_process_available(self):
+        page = build_app_page()
+
+        self.assertIn("registration.canStartNext !== false", page)
+        self.assertIn("registration.runningCount || 0", page)
+        self.assertIn("启动下一个注册进程（运行中", page)
+        self.assertIn("registration.failureRecords || []", page)
+        self.assertIn("失败邮箱已记录，可重新点击注册", page)
+        self.assertNotIn(
+            '$("registerEmailButton").disabled = Boolean(state.registrationTask.running)',
+            page,
+        )
+
     def test_hourly_inventory_generation_is_removed_from_local_workspace(self):
         page = build_app_page()
 
@@ -112,7 +134,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="registrationEmail"', page)
         self.assertIn('id="registerEmailButton"', page)
         self.assertIn("添加邮箱并注册", page)
-        self.assertIn("验证码在浏览器中手动输入", page)
+        self.assertIn("iCloud 自动扫描收件箱与垃圾邮件", page)
+        self.assertIn("其他邮箱在浏览器中手动输入", page)
         self.assertIn('id="registrationCodePanel"', page)
         self.assertIn('id="registrationCode"', page)
         self.assertIn("submit-registration-code", page)
@@ -217,6 +240,60 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("统一管理邮箱与账号", page)
         self.assertIn("登录工作台", page)
+
+    async def test_paypal_status_reports_missing_vendored_service(self):
+        response = await self.client.get("/api/paypal/status")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["available"])
+        self.assertFalse(payload["running"])
+        self.assertEqual(payload["url"], "/paypal-pay/")
+
+    async def test_registration_failure_record_is_persisted_in_status(self):
+        manager = self.app["registration_manager"]
+        await manager.record_failure(
+            {
+                "processId": "failed-process-1",
+                "status": "failed",
+                "provider": "manual",
+                "email": "retry@icloud.com",
+                "emails": ["retry@icloud.com"],
+                "message": "验证码失败",
+                "currentStage": "email_verification",
+                "currentLocation": "OpenAI 验证码页",
+                "currentAction": "等待邮箱验证码",
+                "startedAt": "2026-08-11T00:00:00+00:00",
+                "finishedAt": "2026-08-11T00:01:00+00:00",
+                "recordedAt": "2026-08-11T00:01:01+00:00",
+                "logs": [
+                    {
+                        "at": "2026-08-11T00:01:00+00:00",
+                        "message": "失败：验证码失败",
+                        "stage": "email_verification",
+                        "location": "OpenAI 验证码页",
+                        "action": "等待邮箱验证码",
+                        "status": "error",
+                        "password": "must-not-be-saved",
+                    }
+                ],
+                "password": "must-not-be-saved",
+                "token": "must-not-be-saved",
+            }
+        )
+
+        response = await self.client.get("/api/registration/status")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["failureRecords"][0]["processId"], "failed-process-1")
+        self.assertEqual(payload["failureRecords"][0]["email"], "retry@icloud.com")
+        self.assertEqual(payload["failureRecords"][0]["message"], "验证码失败")
+        self.assertNotIn("password", payload["failureRecords"][0])
+        self.assertNotIn("token", payload["failureRecords"][0])
+        self.assertNotIn("password", payload["failureRecords"][0]["logs"][0])
 
 
 if __name__ == "__main__":

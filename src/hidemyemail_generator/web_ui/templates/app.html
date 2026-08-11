@@ -13,6 +13,7 @@
     <symbol id="i-dashboard" viewBox="0 0 24 24"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></symbol>
     <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m4 7 8 6 8-6"/></symbol>
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
+    <symbol id="i-paypal" viewBox="0 0 24 24"><path d="M7 20 9.3 4h6.2a4.8 4.8 0 0 1 0 9.6h-4.7"/><path d="m10.1 20 1.4-9.5h4.4a3.6 3.6 0 0 1 0 7.2h-3.4"/></symbol>
     <symbol id="i-checklist" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="m8 9 1.5 1.5L12 8M13 10h3M8 15h8"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
@@ -29,6 +30,7 @@
         <button class="nav-item" type="button" data-route="overview"><svg><use href="#i-dashboard"/></svg><span>概览</span></button>
         <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>邮箱账号</span><b id="accountNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>直卡提链接</span><b id="cardLinkNavCount">—</b></button>
+        <button class="nav-item" type="button" data-route="pp-payment"><svg><use href="#i-paypal"/></svg><span>PP 支付</span><b id="paypalNavState">—</b></button>
         <button class="nav-item" type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span>验证记录</span></button>
         <button class="nav-item" type="button" data-route="settings"><svg><use href="#i-settings"/></svg><span>系统设置</span></button>
       </nav>
@@ -67,10 +69,11 @@
             </div>
             <div class="command-block command-network">
               <div class="command-heading"><span>NETWORK</span><strong>浏览器出口</strong></div>
-              <label class="switch command-switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册动态代理</label>
+              <label class="switch command-switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册代理</label>
               <span id="registrationNetworkMode" class="badge blue">本机 IP 直连 · 语言随出口</span>
+              <label class="command-field command-country" for="registrationProxyMode"><span>模式</span><select id="registrationProxyMode"><option value="dynamic">动态 SID</option><option value="clash">Clash 日本轮询</option></select></label>
               <label class="command-field command-country" for="registrationProxyCountry"><span>出口</span><select id="registrationProxyCountry"><option value="NL">荷兰 NL</option><option value="US">美国 US</option><option value="JP">日本 JP</option><option value="DE">德国 DE</option><option value="GB">英国 GB</option><option value="FR">法国 FR</option><option value="CA">加拿大 CA</option><option value="AU">澳大利亚 AU</option><option value="SG">新加坡 SG</option><option value="HK">中国香港 HK</option><option value="TW">中国台湾 TW</option><option value="KR">韩国 KR</option><option value="BR">巴西 BR</option><option value="IN">印度 IN</option><option value="TR">土耳其 TR</option></select></label>
-              <button class="button" data-action="set-registration-proxy-credential">代理连接</button>
+              <button id="registrationProxySetupButton" class="button" data-action="set-registration-proxy-credential">代理连接</button>
             </div>
             <div class="command-block command-utilities">
               <div class="command-heading"><span>TOOLS</span><strong>运行选项</strong></div>
@@ -79,8 +82,8 @@
               <button class="button" data-action="fetch-all">获取全部 Session</button>
             </div>
             <div class="command-manual">
-              <div><span>自有邮箱</span><small>验证码在浏览器中手动输入，程序保持页面并继续监测</small></div>
-              <label class="command-field registration-email-field" for="registrationEmail"><span>自有邮箱（验证码在浏览器中手动输入）</span><input id="registrationEmail" type="email" placeholder="name@example.com" autocomplete="email"></label>
+              <div><span>自有邮箱</span><small>iCloud 自动扫描收件箱与垃圾邮件；其他邮箱在浏览器中手动输入</small></div>
+              <label class="command-field registration-email-field" for="registrationEmail"><span>自有邮箱（iCloud 支持自动取码）</span><input id="registrationEmail" type="email" placeholder="name@example.com" autocomplete="email"></label>
               <button id="registerEmailButton" class="button" data-action="register">添加邮箱并注册</button>
             </div>
           </div>
@@ -169,6 +172,17 @@
         <div class="split-workspace">
           <article class="panel account-picker"><div id="cardMetrics" class="metric-grid compact three"></div><div class="panel-head"><div><h2>选择账号</h2><p id="cardLinkSummary">正在加载…</p></div></div><div class="filter-bar padded"><input id="cardSearch" type="search" placeholder="搜索邮箱账号"><select id="cardStatusFilter"><option value="all">链接：全部</option><option value="generated">已生成</option><option value="available">可提取</option><option value="unavailable">Session 不可用</option></select></div><div id="cardAccountList" class="select-list"></div></article>
           <aside class="panel extraction-panel"><div class="panel-head"><div><h2>提取设置</h2><p>选择账号后生成严格 0 hosted 链接</p></div></div><div class="mode-label">gpt-link · PH / PHP hosted · 双代理严格 0</div><label class="field-label">建单代理<input id="cardLinkCreateProxy" type="password" placeholder="代理 1（留空则直连）" autocomplete="off"></label><label class="field-label">优惠代理<input id="cardLinkPromotionProxy" type="password" placeholder="代理 2（留空复用代理 1）" autocomplete="off"></label><div class="check-grid"><span>✓ Session 可用</span><span>✓ 地区 PH</span><span>✓ 币种 PHP</span><span>✓ 金额必须为 0</span></div><div class="button-row"><button id="generateCardLinkButton" class="button primary" data-action="generate-card-link">提取严格 0</button><button id="copyCardLinkButton" class="button" data-action="copy-card-link" disabled>复制链接</button><button id="openCardLinkButton" class="button" data-action="open-card-link" disabled>打开支付页</button></div><div class="operation-log"><h3>当前结果</h3><div id="cardOperationState" class="empty-state compact">请选择一个账号</div></div></aside>
+        </div>
+      </section>
+
+      <section class="view pp-payment-view" id="ppPaymentView" data-view="pp-payment" hidden>
+        <article class="panel pp-payment-toolbar">
+          <div class="pp-payment-heading"><span class="pp-mark">P</span><div><h2>PayPal 协议支付</h2><p>提交 BA 链接、手机号与代理，完成协议授权流程</p></div></div>
+          <div class="pp-payment-actions"><span id="paypalServiceStatus" class="badge">正在连接</span><button class="button" type="button" data-action="reload-paypal">刷新支付台</button><a class="button primary" href="/paypal-pay/" target="_blank" rel="noopener">新窗口打开</a></div>
+        </article>
+        <div class="panel pp-payment-frame-shell">
+          <iframe id="paypalPaymentFrame" title="PayPal 协议支付工作台" data-src="/paypal-pay/" loading="lazy" referrerpolicy="no-referrer"></iframe>
+          <div id="paypalPaymentEmpty" class="pp-payment-empty"><span class="pp-mark large">P</span><strong>正在启动 PP 支付服务</strong><p>服务就绪后会自动载入协议支付工作台。</p></div>
         </div>
       </section>
 

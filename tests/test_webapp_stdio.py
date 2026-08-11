@@ -16,7 +16,12 @@ from hidemyemail_generator.browser_tasks import (
     _save_account_record,
     load_account_record,
 )
-from hidemyemail_generator.inbox import InboxConfig, connect_db, save_config
+from hidemyemail_generator.inbox import (
+    InboxConfig,
+    connect_db,
+    insert_message,
+    save_config,
+)
 from hidemyemail_generator.webapp import (
     WORKBENCH_OPENAI_CODE_PATH,
     _configured_inventory_service_token,
@@ -583,6 +588,67 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.status, 404)
         self.assertEqual(second.status, 404)
         self.assertEqual(sync.call_count, 1)
+
+    async def test_gpt_code_returns_direct_junk_match_with_expired_icloud_cookie(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "cookies.txt").write_text("expired-cookie", encoding="utf-8")
+            save_config(
+                InboxConfig(
+                    host="imap.example.com",
+                    port=993,
+                    username="inbox@example.com",
+                    password="app-password",
+                ),
+                str(root / "inbox_config.json"),
+            )
+            app = create_app(base_dir=root)
+
+            def sync_junk(_config, db_file, _limit):
+                conn = connect_db(str(db_file))
+                try:
+                    record = {
+                        "account_key": "inbox@example.com@imap.example.com/Junk",
+                        "folder": "Junk",
+                        "uid": "junk-1",
+                        "sender": "noreply@openai.com",
+                        "recipients": "relay@icloud.com",
+                        "hme_address": "relay@icloud.com",
+                        "subject": "Your ChatGPT verification code",
+                        "code": "938388",
+                        "body_preview": "Your verification code is 938388",
+                        "received_at": "2026-08-11T02:53:50+00:00",
+                        "created_at": "2026-08-11T02:53:51+00:00",
+                    }
+                    insert_message(conn, record)
+                    return [record]
+                finally:
+                    conn.close()
+
+            client = TestClient(TestServer(app))
+            with (
+                mock.patch(
+                    "hidemyemail_generator.webapp.sync_inbox",
+                    side_effect=sync_junk,
+                ),
+                mock.patch(
+                    "hidemyemail_generator.webapp.RichHideMyEmail"
+                ) as icloud_client,
+            ):
+                await client.start_server()
+                try:
+                    response = await client.post(
+                        "/api/gpt-code",
+                        json={"email": "relay@icloud.com"},
+                        headers={"X-Local-Token": app["local_token"]},
+                    )
+                    payload = await response.json()
+                finally:
+                    await client.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["code"], "938388")
+        icloud_client.assert_not_called()
 
     async def test_authentication_failure_enters_backoff(self):
         with tempfile.TemporaryDirectory() as temp_dir:

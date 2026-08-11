@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import secrets
 import string
 import time
@@ -22,6 +23,7 @@ PollProviderNextCode = Callable[[str], Awaitable[str]]
 CompleteProviderEmail = Callable[[str, bool, str], Awaitable[None]]
 CancelProviderEmail = Callable[[str, str], Awaitable[None]]
 LoadAccount = Callable[[str], Awaitable[dict[str, Any]]]
+RecordProcessFailure = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 def utc_now() -> str:
@@ -217,6 +219,51 @@ class RegistrationTaskManager:
             currentAction=context["action"],
             currentStatus=context["status"],
         )
+
+    def _relay_browser_logs(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        task_id: str,
+        cursor: int,
+    ) -> tuple[str, int]:
+        current_task_id = str(snapshot.get("id") or "")
+        if current_task_id and current_task_id != task_id:
+            task_id = current_task_id
+            cursor = 0
+        logs = snapshot.get("logs")
+        if not isinstance(logs, list):
+            return task_id, cursor
+        if cursor > len(logs):
+            cursor = 0
+        for entry in logs[cursor:]:
+            if not isinstance(entry, dict):
+                continue
+            message = str(entry.get("message") or "").strip()
+            if not message:
+                continue
+            context = browser_log_context(message)
+            self._append_log(message)
+            self._state.update(
+                phase=context["stage"],
+                message=message[:500],
+            )
+        return task_id, len(logs)
+
+    async def _wait_for_browser_with_logs(self) -> dict[str, Any]:
+        browser_wait = asyncio.create_task(self.browser_manager.wait())
+        task_id = ""
+        cursor = 0
+        while not browser_wait.done():
+            task_id, cursor = self._relay_browser_logs(
+                self.browser_manager.snapshot(),
+                task_id=task_id,
+                cursor=cursor,
+            )
+            await asyncio.sleep(0.4)
+        result = await browser_wait
+        self._relay_browser_logs(result, task_id=task_id, cursor=cursor)
+        return result
 
     def _validate_poll_target(self, email: str) -> str:
         target = str(email or "").strip().lower()
@@ -508,7 +555,11 @@ class RegistrationTaskManager:
                         if provider == "smsbower"
                         else (
                             f"自有邮箱已就绪，正在准备 OpenAI 注册：{claimed_emails[0]}；"
-                            "验证码将在浏览器中手动输入"
+                            + (
+                                "验证码将自动扫描收件箱与垃圾邮件"
+                                if claimed_emails[0].endswith("@icloud.com")
+                                else "验证码将在浏览器中手动输入"
+                            )
                             if provider == "manual"
                             else f"已领取 {effective_concurrency} 个库存邮箱，正在准备注册"
                         )
@@ -524,33 +575,56 @@ class RegistrationTaskManager:
             for index, email in enumerate(claimed_emails, start=1):
                 if provider == "inventory":
                     await self.confirm_email(email)
-                password = generate_openai_password()
-                if self.save_password is not None:
-                    await self.save_password(email, password)
+                automatic_inbox_code = (
+                    provider == "manual" and email.endswith("@icloud.com")
+                )
+                manual_browser_code = provider == "manual" and not automatic_inbox_code
+                saved_account: dict[str, Any] = {}
+                if self.load_account is not None:
+                    loaded_account = await self.load_account(email)
+                    if isinstance(loaded_account, dict):
+                        saved_account = loaded_account
+                password = str(saved_account.get("password") or "")
+                reused_password = bool(password)
+                if not reused_password:
+                    password = generate_openai_password()
+                    if self.save_password is not None:
+                        await self.save_password(email, password)
                 accounts.append(
                     {
                         "email": email,
                         "password": password,
+                        "password_confirmed": bool(
+                            saved_account.get("password_confirmed", False)
+                        ),
                         "ensure_password": True,
                         "force_reset_password": False,
                         "enable_2fa": True,
-                        "manual_otp_entry": provider == "manual",
-                        "password_first_required": provider == "smsbower",
-                        "foreground_required": (
-                            provider == "manual"
-                            or (provider == "smsbower" and not headless)
-                        ),
+                        "manual_otp_entry": manual_browser_code,
+                        "password_first_required": True,
+                        "foreground_required": manual_browser_code,
                     }
                 )
-                self._append_log(
-                    f"邮箱已添加并保存唯一密码（{index}/{effective_concurrency}）：{email}"
-                )
+                if reused_password:
+                    self._append_log(
+                        "检测到该邮箱已有首次注册保存的密码"
+                        f"（{index}/{effective_concurrency}）：{email}；"
+                        "本次继续使用原密码，不生成或覆盖新密码"
+                    )
+                else:
+                    self._append_log(
+                        f"邮箱已添加并保存唯一密码（{index}/{effective_concurrency}）：{email}"
+                    )
             self._state.update(
                 phase="registering_openai",
                 message=(
                     f"正在启动 {effective_concurrency} 个 Camoufox 注册浏览器"
                     + (
-                        "；验证码请直接在浏览器中手动输入并点击继续"
+                        (
+                            "；验证码将自动扫描收件箱与垃圾邮件"
+                            if claimed_emails[0].endswith("@icloud.com")
+                            else "；验证码请直接在浏览器中手动输入并点击继续"
+                        )
                         if provider == "manual"
                         else ""
                     )
@@ -565,7 +639,11 @@ class RegistrationTaskManager:
                 f"{effective_concurrency} 个邮箱已准备，按并发 "
                 f"{effective_concurrency} 启动 Camoufox"
                 + (
-                    "；自有邮箱不连接 IMAP，验证码由你在浏览器中手动输入"
+                    (
+                        "；iCloud 自有邮箱自动扫描 INBOX 与垃圾邮件取码"
+                        if claimed_emails[0].endswith("@icloud.com")
+                        else "；自有邮箱不连接 IMAP，验证码由你在浏览器中手动输入"
+                    )
                     if provider == "manual"
                     else ""
                 )
@@ -576,10 +654,7 @@ class RegistrationTaskManager:
                 concurrency=effective_concurrency,
                 use_registration_proxy=True,
             )
-            browser_wait = asyncio.create_task(self.browser_manager.wait())
-            while not browser_wait.done():
-                await asyncio.sleep(0.4)
-            browser_result = await browser_wait
+            browser_result = await self._wait_for_browser_with_logs()
             succeeded = max(0, int(browser_result.get("succeeded") or 0))
             result_accounts = browser_result.get("accounts") or []
             registered_emails = {
@@ -648,24 +723,24 @@ class RegistrationTaskManager:
                             "password": password,
                             "password_confirmed": True,
                             "enable_2fa": True,
-                            "foreground_required": (
-                                provider == "smsbower" and not headless
-                            ),
+                            "foreground_required": False,
                             "two_factor": saved_two_factor,
                         }
                     )
 
                 if passwordless_accounts:
-                    strict_gmail_failures = [
+                    strict_password_failures = [
                         email
                         for email in passwordless_accounts
-                        if email.endswith("@gmail.com")
+                        if account_by_email.get(email, {}).get(
+                            "password_first_required"
+                        )
                     ]
-                    if strict_gmail_failures:
+                    if strict_password_failures:
                         raise RuntimeError(
-                            "Gmail 注册必须确认密码并开启 2FA；"
+                            "注册必须确认密码并开启 2FA；"
                             "已拒绝免密码账号："
-                            + "、".join(strict_gmail_failures)
+                            + "、".join(strict_password_failures)
                         )
                     self._append_log(
                         "OpenAI 当前使用免密码注册，已跳过密码设置和依赖密码的 2FA；"
@@ -679,7 +754,7 @@ class RegistrationTaskManager:
                         message=(
                             f"检测到 {len(retry_accounts)} 个账号尚未完成 2FA；"
                             f"正在使用 Cookie 启动一次"
-                            f"{'前台' if provider == 'smsbower' and not headless else '无头'}补做"
+                            f"{'显示浏览器后台' if not headless else '无头'}补做"
                         ),
                     )
                     self._append_log(self._state["message"])
@@ -689,7 +764,7 @@ class RegistrationTaskManager:
                         concurrency=len(retry_accounts),
                         use_registration_proxy=True,
                     )
-                    retry_result = await self.browser_manager.wait()
+                    retry_result = await self._wait_for_browser_with_logs()
                     retry_items = {
                         str(item.get("email") or "").strip().lower(): item
                         for item in retry_result.get("accounts") or []
@@ -865,10 +940,268 @@ class RegistrationTaskManager:
         await self.stop()
 
 
+class ConcurrentRegistrationTaskManager:
+    """Coordinate independent registration processes behind one web API."""
+
+    def __init__(
+        self,
+        *,
+        process_factory: Callable[[], RegistrationTaskManager],
+        shared_browser_manager: BrowserTaskManager | None = None,
+        acquire_email: AcquireInventoryEmail | None = None,
+        complete_email: CompleteInventoryEmail | None = None,
+        record_failure: RecordProcessFailure | None = None,
+        max_processes: int = 10,
+        history_limit: int = 20,
+    ) -> None:
+        self.process_factory = process_factory
+        self.shared_browser_manager = shared_browser_manager
+        self.acquire_email = acquire_email
+        self.complete_email = complete_email
+        self.record_failure = record_failure
+        self.max_processes = max(2, min(20, int(max_processes)))
+        self.history_limit = max(self.max_processes, int(history_limit))
+        self._processes: dict[str, RegistrationTaskManager] = {}
+        self._monitor_tasks: dict[str, asyncio.Task] = {}
+        self._recorded_failures: set[str] = set()
+        self._latest_process_id = ""
+
+    def _process_snapshots(self) -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (process_id, manager.snapshot())
+            for process_id, manager in self._processes.items()
+        ]
+
+    def _trim_history(self) -> None:
+        completed = [
+            process_id
+            for process_id, snapshot in self._process_snapshots()
+            if not snapshot.get("running")
+        ]
+        while len(self._processes) > self.history_limit and completed:
+            self._processes.pop(completed.pop(0), None)
+
+    def snapshot(self) -> dict[str, Any]:
+        snapshots = self._process_snapshots()
+        if not snapshots:
+            return {
+                **RegistrationTaskManager._idle_state(),
+                "runningCount": 0,
+                "processCount": 0,
+                "maxProcesses": self.max_processes,
+                "canStartNext": True,
+                "recordedFailureCount": len(self._recorded_failures),
+                "tasks": [],
+            }
+
+        active = [item for item in snapshots if item[1].get("running")]
+        latest = next(
+            (
+                item
+                for item in reversed(snapshots)
+                if item[0] == self._latest_process_id
+            ),
+            snapshots[-1],
+        )
+        display = active[-1] if active else latest
+        display_state = dict(display[1])
+        active_count = len(active)
+        awaiting_emails: list[str] = []
+        combined_logs: list[dict[str, Any]] = []
+        public_tasks: list[dict[str, Any]] = []
+        for process_index, (process_id, state) in enumerate(snapshots, start=1):
+            emails = [
+                str(email or "").strip().lower()
+                for email in state.get("emails", [])
+                if str(email or "").strip()
+            ]
+            for email in state.get("awaitingCodeEmails", []):
+                target = str(email or "").strip().lower()
+                if target and target not in awaiting_emails:
+                    awaiting_emails.append(target)
+            process_label = f"进程 {process_index}"
+            if emails:
+                process_label += f" · {emails[0]}"
+            public_tasks.append(
+                {
+                    **state,
+                    "processId": process_id,
+                    "processIndex": process_index,
+                    "processLabel": process_label,
+                    "failureRecorded": process_id in self._recorded_failures,
+                }
+            )
+            for log in state.get("logs", []):
+                entry = dict(log)
+                entry["processId"] = process_id
+                entry["processIndex"] = process_index
+                entry["message"] = f"[{process_label}] {entry.get('message', '')}"
+                combined_logs.append(entry)
+        combined_logs.sort(key=lambda item: str(item.get("at") or ""))
+        summary_snapshots = active or [display]
+        summary_states = [state for _, state in summary_snapshots]
+        summary_emails: list[str] = []
+        for state in summary_states:
+            for email in state.get("emails", []):
+                target = str(email or "").strip().lower()
+                if target and target not in summary_emails:
+                    summary_emails.append(target)
+
+        display_state.update(
+            id=display[0],
+            running=bool(active),
+            status="running" if active else display_state.get("status", "idle"),
+            message=(
+                f"{active_count} 个注册进程正在运行；最新进程："
+                f"{display_state.get('message', '')}"
+                if active_count
+                else display_state.get("message", "")
+            ),
+            emails=summary_emails,
+            awaitingCode=bool(awaiting_emails),
+            awaitingCodeEmails=awaiting_emails,
+            requested=sum(int(state.get("requested") or 0) for state in summary_states),
+            effectiveConcurrency=sum(
+                int(state.get("effectiveConcurrency") or 0) for state in summary_states
+            ),
+            claimed=sum(int(state.get("claimed") or 0) for state in summary_states),
+            logs=combined_logs[-100:],
+            runningCount=active_count,
+            processCount=len(snapshots),
+            maxProcesses=self.max_processes,
+            canStartNext=active_count < self.max_processes,
+            recordedFailureCount=len(self._recorded_failures),
+            tasks=public_tasks,
+        )
+        return display_state
+
+    def _active_manager_for_email(self, email: str) -> RegistrationTaskManager:
+        target = str(email or "").strip().lower()
+        for _, manager in reversed(list(self._processes.items())):
+            state = manager.snapshot()
+            emails = {
+                str(item or "").strip().lower()
+                for item in state.get("emails", [])
+            }
+            if state.get("running") and target in emails:
+                return manager
+        raise RuntimeError("该邮箱当前没有正在运行的注册任务")
+
+    def start(
+        self,
+        *,
+        label: str,
+        headless: bool,
+        concurrency: int = 1,
+        email: str = "",
+        provider: str = "",
+    ) -> dict[str, Any]:
+        active = [
+            state
+            for _, state in self._process_snapshots()
+            if state.get("running")
+        ]
+        if len(active) >= self.max_processes:
+            raise RuntimeError(f"注册进程已达到上限 {self.max_processes}")
+        target = str(email or "").strip().lower()
+        if target and any(
+            target
+            in {
+                str(item or "").strip().lower()
+                for item in state.get("emails", [])
+            }
+            for state in active
+        ):
+            raise RuntimeError("该邮箱已有正在运行的注册进程")
+        if (
+            self.shared_browser_manager is not None
+            and self.shared_browser_manager.snapshot().get("running")
+        ):
+            raise RuntimeError("浏览器任务正在运行，请等待完成后再注册")
+
+        manager = self.process_factory()
+        task = manager.start(
+            label=label,
+            headless=headless,
+            concurrency=concurrency,
+            email=target,
+            provider=provider,
+        )
+        process_id = str(task.get("id") or uuid.uuid4().hex)
+        self._processes[process_id] = manager
+        self._latest_process_id = process_id
+        self._monitor_tasks[process_id] = asyncio.create_task(
+            self._monitor_process(process_id, manager)
+        )
+        self._trim_history()
+        return self.snapshot()
+
+    async def _monitor_process(
+        self,
+        process_id: str,
+        manager: RegistrationTaskManager,
+    ) -> None:
+        while manager.snapshot().get("running"):
+            await asyncio.sleep(0.25)
+        state = manager.snapshot()
+        if (
+            state.get("status") != "failed"
+            or process_id in self._recorded_failures
+            or self.record_failure is None
+        ):
+            return
+        failure = {
+            **state,
+            "processId": process_id,
+            "recordedAt": utc_now(),
+        }
+        result = self.record_failure(failure)
+        if inspect.isawaitable(result):
+            await result
+        self._recorded_failures.add(process_id)
+
+    def poll_verification_code(self, email: str) -> str:
+        return self._active_manager_for_email(email).poll_verification_code(email)
+
+    async def poll_verification_code_async(
+        self,
+        email: str,
+        *,
+        request_id: str = "",
+    ) -> str:
+        manager = self._active_manager_for_email(email)
+        return await manager.poll_verification_code_async(
+            email,
+            request_id=request_id,
+        )
+
+    def submit_verification_code(self, email: str, code: str) -> dict[str, Any]:
+        self._active_manager_for_email(email).submit_verification_code(email, code)
+        return self.snapshot()
+
+    async def stop(self) -> dict[str, Any]:
+        active_managers = [
+            manager
+            for manager in self._processes.values()
+            if manager.snapshot().get("running")
+        ]
+        if active_managers:
+            await asyncio.gather(*(manager.stop() for manager in active_managers))
+        return self.snapshot()
+
+    async def close(self) -> None:
+        await self.stop()
+        monitors = [task for task in self._monitor_tasks.values() if not task.done()]
+        if monitors:
+            await asyncio.gather(*monitors, return_exceptions=True)
+
+
 __all__ = [
     "CancelProviderEmail",
     "CompleteInventoryEmail",
+    "ConcurrentRegistrationTaskManager",
     "LoadAccount",
+    "RecordProcessFailure",
     "RegistrationTaskManager",
     "generate_openai_password",
 ]

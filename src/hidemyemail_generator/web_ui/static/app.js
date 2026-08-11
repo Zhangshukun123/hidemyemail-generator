@@ -7,6 +7,7 @@
     overview: ["DASHBOARD", "概览", "集中查看账号、任务与服务状态"],
     accounts: ["ACCOUNT WORKSPACE", "邮箱账号", "管理 iCloud 邮箱、OpenAI Session 与账号凭据"],
     "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "使用 PH / PHP hosted 双代理流程提取严格 0 链接"],
+    "pp-payment": ["PAYPAL WORKSPACE", "PP 支付", "PayPal BA 协议授权与支付任务"],
     verification: ["VERIFICATION WORKSPACE", "验证记录", "批量验证账号、套餐与 Session 状态"],
     settings: ["SYSTEM SETTINGS", "系统设置", "管理邮箱、浏览器、集成与安全配置"],
   };
@@ -260,6 +261,7 @@
       $("accountNavCount").textContent = state.accounts.length || "—";
       const links = state.accounts.filter((item) => item.cardLink).length;
       $("cardLinkNavCount").textContent = links || "—";
+      $("paypalNavState").textContent = state.paypal?.running ? "在线" : "—";
       const runtime = state.browserTask.runtime || {};
       const available = Boolean(runtime.available);
       $("runtimeDot").className = available ? "ok" : "bad";
@@ -352,16 +354,26 @@
         metricCard("已开启 2FA", twoFactor, "双重验证", "amber", "2"),
       ].join("");
       const registrationProxy = state.registrationProxy || {};
+      const clashProxyMode = registrationProxy.mode === "clash";
       $("registrationProxyEnabled").checked = Boolean(registrationProxy.enabled);
       $("registrationProxyEnabled").disabled = !registrationProxy.configured;
       $("registrationProxyEnabled").title = registrationProxy.configured
-        ? "开启时使用所选国家的粘性动态代理；关闭时使用本机公网 IP 直连"
+        ? (clashProxyMode
+          ? "每个账号开始前轮询新的日本节点，任务期间固定出口"
+          : "开启时使用所选国家的粘性动态代理；关闭时使用本机公网 IP 直连")
         : "请先设置代理连接";
       const networkMode = $("registrationNetworkMode");
       networkMode.className = "badge " + (registrationProxy.enabled ? "success" : "blue");
-      networkMode.textContent = registrationProxy.enabled
-        ? "动态代理 · " + (registrationProxy.countryLabel || registrationProxy.country || "")
-        : "本机 IP 直连 · 语言随出口";
+      networkMode.textContent = registrationProxy.enabled && clashProxyMode
+        ? "Clash 日本轮询" + (registrationProxy.currentNode
+          ? " · " + registrationProxy.currentNode + " · " + (registrationProxy.lastLatencyMs || 0) + "ms"
+          : " · ≤" + (registrationProxy.maxLatencyMs || 900) + "ms")
+        : (registrationProxy.enabled
+          ? "动态代理 · " + (registrationProxy.countryLabel || registrationProxy.country || "")
+          : "本机 IP 直连 · 语言随出口");
+      $("registrationProxyMode").value = registrationProxy.mode || "dynamic";
+      $("registrationProxyCountry").disabled = clashProxyMode;
+      $("registrationProxySetupButton").textContent = clashProxyMode ? "检测并切换日本 IP" : "代理连接";
       if (registrationProxy.country) {
         $("registrationProxyCountry").value = registrationProxy.country;
       }
@@ -372,16 +384,21 @@
         ? "SMSBower Gmail · 本机取码保留 " + (smsBower.retentionHours || 24) + " 小时"
         : "SMSBower 未配置";
       if (smsBower.maxPrice) $("smsbowerMaxPrice").value = smsBower.maxPrice;
+      const registration = state.registrationTask || {};
+      const canStartNextRegistration = registration.canStartNext !== false;
+      const activeRegistrationProcesses = Number(registration.runningCount || 0);
       const registrationProvider = $("registrationEmailProvider").value || "icloud";
       $("smsbowerControls").hidden = registrationProvider !== "gmail";
       $("registerProviderButton").textContent = registrationProvider === "gmail"
-        ? "开始 Gmail 注册"
-        : "开始 iCloud 注册";
-      $("registerProviderButton").disabled = Boolean(state.registrationTask.running) ||
+        ? (activeRegistrationProcesses ? "启动下一个 Gmail 注册进程" : "开始 Gmail 注册")
+        : (activeRegistrationProcesses ? "启动下一个 iCloud 注册进程" : "开始 iCloud 注册");
+      $("registerProviderButton").disabled = !canStartNextRegistration ||
         (registrationProvider === "gmail" && !smsBower.configured);
-      $("registerEmailButton").disabled = Boolean(state.registrationTask.running);
+      $("registerEmailButton").disabled = !canStartNextRegistration;
+      $("registerEmailButton").textContent = activeRegistrationProcesses
+        ? `启动下一个注册进程（运行中 ${activeRegistrationProcesses}）`
+        : "添加邮箱并注册";
       const task = state.browserTask;
-      const registration = state.registrationTask;
       const hasRegistration = Boolean(registration.id && registration.status !== "idle");
       const primaryTask = hasRegistration ? registration : task;
       const status = primaryTask.status || "idle";
@@ -438,8 +455,18 @@
         : "等待注册页面请求验证码";
 
       const seenLogs = new Set();
+      const recordedFailureLogs = (registration.failureRecords || []).map((record) => ({
+        at: record.recordedAt || record.finishedAt || record.startedAt || "",
+        email: record.email || (record.emails || [])[0] || "",
+        message: "失败邮箱已记录，可重新点击注册：" + (record.message || "注册失败"),
+        stage: record.currentStage || "failed",
+        location: record.currentLocation || "注册失败记录",
+        action: "失败邮箱已记录，可重新注册",
+        status: "error",
+      }));
       const logs = [
         ...(registration.logs || []).map((item) => ({ ...item, email: item.email || registration.email || "" })),
+        ...recordedFailureLogs,
         ...(task.logs || []),
       ].filter((item) => {
         const key = [item.at, item.email, item.message].join("|");
@@ -627,6 +654,33 @@
         (item.cardLink ? "已生成 PH / PHP hosted 严格 0 链接" : "等待提取支付链接") +
         '</span><code>' + escapeHtml(item.cardLink || "尚无链接") + '</code><span>Session：' +
         sessionName(item.sessionStatus) + "</span>";
+    }
+
+    renderPayPal(state) {
+      const service = state.paypal || {};
+      const status = $("paypalServiceStatus");
+      const navState = $("paypalNavState");
+      const frame = $("paypalPaymentFrame");
+      const empty = $("paypalPaymentEmpty");
+      if (service.running) {
+        status.className = "badge success";
+        status.textContent = "服务已连接";
+        navState.textContent = "在线";
+        empty.hidden = true;
+        frame.hidden = false;
+        if (!frame.dataset.loaded) {
+          frame.src = service.url || frame.dataset.src;
+          frame.dataset.loaded = "1";
+        }
+      } else {
+        status.className = "badge warning";
+        status.textContent = service.error ? "启动失败" : "正在启动";
+        navState.textContent = "—";
+        frame.hidden = true;
+        empty.hidden = false;
+        const detail = empty.querySelector("p");
+        if (detail) detail.textContent = service.error || "服务就绪后会自动载入协议支付工作台。";
+      }
     }
 
     verificationRows(state) {
@@ -817,9 +871,17 @@
         escapeHtml($("concurrency").value) + '"></label></section><section class="form-section"><h3>运行环境</h3><div class="connection-card"><strong>' +
         (runtime.available ? "✓ Camoufox 运行环境已连接" : "× Camoufox 运行环境不可用") +
         '</strong><span>' + escapeHtml(runtime.targetProject || (runtime.errors || []).join("；") || "未返回运行目录") +
-        '</span></div></section><section class="form-section"><h3>注册动态代理</h3><div class="connection-card"><strong>' +
-        (proxy.enabled ? "✓ 已启用 " + escapeHtml(proxy.countryLabel || proxy.country || "") + " 出口" : "本机 IP 直连") +
-        '</strong><span>代理连接：' + escapeHtml(proxy.endpoint || "未保存") + '</span><span>关闭动态代理时不会使用已保存的代理连接，注册全程走本机公网 IP；开启后每个账号自动生成独立 SID。</span></div></section><div class="settings-actions"><button class="button" data-action="set-registration-proxy-credential">更新代理连接</button><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
+        '</span></div></section><section class="form-section"><h3>注册代理</h3><div class="connection-card"><strong>' +
+        (proxy.enabled
+          ? "✓ 已启用 " + (proxy.mode === "clash" ? "Clash 日本节点轮询" : escapeHtml(proxy.countryLabel || proxy.country || "") + " 出口")
+          : "本机 IP 直连") +
+        '</strong><span>代理连接：' + escapeHtml(proxy.endpoint || "未保存") + '</span><span>' +
+        (proxy.mode === "clash"
+          ? "每个账号开始前选择新日本节点，延迟高于 " + escapeHtml(proxy.maxLatencyMs || 900) + " ms 自动跳过；选定后全程固定出口并强制串行。"
+          : "开启后每个账号自动生成独立 SID；关闭时注册全程走本机公网 IP。") +
+        '</span></div></section><div class="settings-actions"><button class="button" data-action="set-registration-proxy-credential">' +
+        (proxy.mode === "clash" ? "检测并切换日本 IP" : "更新代理连接") +
+        '</button><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
     }
 
     renderWorkbenchSettings() {
@@ -854,6 +916,7 @@
         registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         verificationTask: { status: "idle", runtime: {} },
+        paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
         selectedCardEmail: "",
@@ -866,6 +929,7 @@
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
         "card-links": () => this.renderer.renderCardLinks(this.store.state),
+        "pp-payment": () => this.renderer.renderPayPal(this.store.state),
         verification: () => this.renderer.renderVerification(this.store.state),
         settings: () => this.renderer.renderSettings(this.store.state),
       });
@@ -880,6 +944,7 @@
       this.renderer.renderAccounts(state);
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
+      if (this.router.current === "pp-payment") this.renderer.renderPayPal(state);
       if (this.router.current === "settings") this.renderer.renderSettings(state);
     }
 
@@ -966,6 +1031,11 @@
       this.store.patch({ inbox: data });
     }
 
+    async loadPayPal() {
+      const data = await this.api.get("/api/paypal/status");
+      this.store.patch({ paypal: data });
+    }
+
     async loadRegistrationProxy() {
       const data = await this.api.get("/api/registration-proxy/status");
       this.store.patch({ registrationProxy: data });
@@ -1045,8 +1115,18 @@
 
     bindCommands() {
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower()]);
+        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal()]);
         return "数据已刷新";
+      });
+      this.commands.register("reload-paypal", async () => {
+        await this.loadPayPal();
+        if (!this.store.state.paypal.running) {
+          throw new Error(this.store.state.paypal.error || "PP 支付服务尚未就绪");
+        }
+        const frame = $("paypalPaymentFrame");
+        frame.src = this.store.state.paypal.url || frame.dataset.src;
+        frame.dataset.loaded = "1";
+        return "PP 支付工作台已刷新";
       });
       this.commands.register("toggle-theme", async () => {
         this.applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
@@ -1120,12 +1200,22 @@
         return "验证码已提交，注册继续运行";
       });
       this.commands.register("set-registration-proxy-credential", async () => {
+        const current = this.store.state.registrationProxy || {};
+        if ((current.mode || "dynamic") === "clash") {
+          await this.api.post("/api/registration-proxy/config", {
+            mode: "clash", country: "JP", enabled: true, maxLatencyMs: 900,
+          });
+          const data = await this.api.post("/api/registration-proxy/rotate", {});
+          this.store.patch({ registrationProxy: data });
+          return "Clash 日本出口已固定：" + (data.currentNode || "日本节点") +
+            "，延迟 " + (data.lastLatencyMs || 0) + " ms";
+        }
         const proxyLine = prompt("输入动态代理连接（host:port:username:password）。凭据只保存在本地，不会显示在日志中：", "");
         if (proxyLine === null) throw Object.assign(new Error(), { name: "AbortError" });
         if (!proxyLine.trim()) throw new Error("代理连接不能为空");
         const country = $("registrationProxyCountry").value || "NL";
         const data = await this.api.post("/api/registration-proxy/config", {
-          proxyLine, country, enabled: true,
+          mode: "dynamic", proxyLine, country, enabled: true,
         });
         this.store.patch({ registrationProxy: data });
         return "动态代理已保存并启用：" + (data.countryLabel || data.country);
@@ -1350,6 +1440,22 @@
           this.toast(error.message, "error");
         }
       });
+      $("registrationProxyMode").addEventListener("change", async (event) => {
+        try {
+          const mode = event.target.value;
+          const data = await this.api.post("/api/registration-proxy/config", {
+            mode,
+            country: mode === "clash" ? "JP" : ($("registrationProxyCountry").value || "NL"),
+          });
+          this.store.patch({ registrationProxy: data });
+          this.toast(mode === "clash"
+            ? "已切换为 Clash 日本节点轮询，点击检测按钮验证出口"
+            : "已切换为动态 SID 代理");
+        } catch (error) {
+          await this.loadRegistrationProxy();
+          this.toast(error.message, "error");
+        }
+      });
       $("registrationProxyCountry").addEventListener("change", async (event) => {
         try {
           const data = await this.api.post("/api/registration-proxy/config", {
@@ -1384,7 +1490,7 @@
       this.router.start();
       const results = await Promise.allSettled([
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(),
+        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal(),
       ]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");

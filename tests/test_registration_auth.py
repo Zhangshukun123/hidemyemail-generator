@@ -60,6 +60,78 @@ class RegistrationAuthTests(unittest.TestCase):
             )
         )
 
+    def test_home_auth_drawer_email_placeholder_and_japanese_continue_are_supported(self):
+        normalized_inputs = " ".join(OPENAI_EMAIL_LOGIN_INPUT_SELECTORS)
+        normalized_submits = " ".join(OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS)
+
+        self.assertIn('input[placeholder="Email address" i]', normalized_inputs)
+        self.assertIn('input[placeholder*="メールアドレス"]', normalized_inputs)
+        self.assertIn("aside", normalized_submits)
+        self.assertIn('button:text-is("続行")', normalized_submits)
+
+    def test_japanese_home_auth_drawer_fills_email_and_clicks_continue(self):
+        events = []
+        clipboard = {"value": ""}
+
+        class EmailInput:
+            value = ""
+
+            def click(self, **_kwargs):
+                events.append("email-focus")
+
+            def press(self, key, **_kwargs):
+                events.append(key)
+                if key == "Control+A":
+                    self.value = ""
+                elif key == "Control+V":
+                    self.value = clipboard["value"]
+
+            def input_value(self, **_kwargs):
+                return self.value
+
+        class ContinueButton:
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                events.append("続行-click")
+
+        page = type(
+            "Page",
+            (),
+            {"url": "https://chatgpt.com/"},
+        )()
+        email_input = EmailInput()
+        continue_button = ContinueButton()
+
+        def first_visible(_page, selectors, **_kwargs):
+            if any("aside" in selector and "続行" in selector for selector in selectors):
+                return continue_button
+            return None
+
+        def clipboard_write(value):
+            clipboard["value"] = value
+            events.append(("clipboard", value))
+
+        paste_email_and_submit(
+            page,
+            email_input,
+            "drawer@example.com",
+            log=lambda message: events.append(("log", message)),
+            activate=lambda _page: events.append("activate"),
+            wait=lambda _page, _milliseconds: None,
+            first_visible=first_visible,
+            clipboard_write=clipboard_write,
+            clipboard_lock=threading.Lock(),
+            submit_selectors=OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS,
+            submit_allowed_labels=("Continue", "继续", "続行"),
+            allow_enter_submit=False,
+        )
+
+        self.assertEqual(email_input.value, "drawer@example.com")
+        self.assertIn("続行-click", events)
+        self.assertNotIn("Enter", events)
+
     def test_existing_login_submit_still_contains_login_controls(self):
         normalized = " ".join(OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS).casefold()
 

@@ -20,6 +20,19 @@ DEFAULT_INBOX_CONFIG_FILE = "inbox_config.json"
 DEFAULT_EXPORT_DIR = "exports"
 DEFAULT_FOLDER = "INBOX"
 DEFAULT_IMAP_TIMEOUT = 20
+JUNK_FOLDER_ALIASES = frozenset(
+    {
+        "junk",
+        "junk e-mail",
+        "junk email",
+        "junk mail",
+        "spam",
+        "bulk mail",
+        "垃圾邮件",
+        "垃圾箱",
+        "广告邮件",
+    }
+)
 
 ADDRESS_STATES = ("unused", "used", "trash")
 BATCH_STATES = ("running", "paused", "stopped", "finished")
@@ -631,8 +644,99 @@ def insert_message(conn: sqlite3.Connection, record: dict) -> bool:
     return True
 
 
+def _listed_mailbox_parts(row: bytes | str) -> tuple[set[str], str]:
+    text = (
+        row.decode("ascii", errors="backslashreplace")
+        if isinstance(row, bytes)
+        else str(row or "")
+    ).strip()
+    match = re.match(r"^\((?P<flags>[^)]*)\)\s+(?:NIL|\"(?:\\.|[^\"])*\")\s+(?P<name>.+)$", text)
+    if not match:
+        return set(), ""
+    flags = {flag.casefold() for flag in match.group("flags").split()}
+    name = match.group("name").strip()
+    if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+        name = name[1:-1].replace(r"\"", '"').replace(r"\\", "\\")
+    return flags, name
+
+
+def _sync_folders(mailbox, primary_folder: str) -> list[str]:
+    folders = [primary_folder]
+    try:
+        status, rows = mailbox.list()
+    except (imaplib.IMAP4.error, OSError, AttributeError):
+        return folders
+    if status != "OK":
+        return folders
+    for row in rows or []:
+        flags, name = _listed_mailbox_parts(row)
+        if not name or name in folders:
+            continue
+        short_name = name.rsplit("/", 1)[-1].casefold()
+        if "\\junk" in flags or short_name in JUNK_FOLDER_ALIASES:
+            folders.append(name)
+    return folders
+
+
+def _sync_selected_folder(
+    mailbox,
+    conn: sqlite3.Connection,
+    config: InboxConfig,
+    limit: int,
+) -> list[dict]:
+    status, _ = mailbox.select(config.folder)
+    if status != "OK":
+        raise RuntimeError(f"Could not select IMAP folder: {config.folder}")
+
+    status, data = mailbox.uid("search", None, "ALL")
+    if status != "OK":
+        raise RuntimeError(f"IMAP search failed: {config.folder}")
+
+    uids = data[0].split()
+    if limit > 0:
+        uids = uids[-limit:]
+    # Process the newest messages first.  On a fresh or delayed sync there
+    # may be many unseen messages, and callers waiting for a newly-arrived
+    # verification code should not be blocked behind the older backlog.
+    uids.reverse()
+
+    inserted: list[dict] = []
+    for raw_uid in uids:
+        uid = raw_uid.decode("ascii", errors="ignore")
+        exists = conn.execute(
+            """
+            SELECT 1 FROM messages
+            WHERE account_key = ? AND folder = ? AND uid = ?
+            """,
+            (config.account_key, config.folder, uid),
+        ).fetchone()
+        if exists:
+            continue
+
+        # BODY.PEEK[] is standards-based and does not mark the message as read.
+        status, msg_data = mailbox.uid("fetch", raw_uid, "(BODY.PEEK[])")
+        if status != "OK" or not msg_data:
+            continue
+
+        raw_message = b""
+        for part in msg_data:
+            if isinstance(part, tuple):
+                raw_message += part[1]
+        if not raw_message:
+            continue
+
+        record = message_to_record(conn, config, uid, raw_message)
+        if insert_message(conn, record):
+            inserted.append(record)
+    return inserted
+
+
 def sync_inbox(
-    config: InboxConfig, db_file: str = DEFAULT_DB_FILE, limit: int = 50
+    config: InboxConfig,
+    db_file: str = DEFAULT_DB_FILE,
+    limit: int = 50,
+    *,
+    include_junk: bool = True,
 ) -> list[dict]:
     conn = connect_db(db_file)
     mailbox = (
@@ -642,52 +746,24 @@ def sync_inbox(
     )
     try:
         mailbox.login(config.username, config.password)
-        status, _ = mailbox.select(config.folder)
-        if status != "OK":
-            raise RuntimeError(f"Could not select IMAP folder: {config.folder}")
-
-        status, data = mailbox.uid("search", None, "ALL")
-        if status != "OK":
-            raise RuntimeError("IMAP search failed")
-
-        uids = data[0].split()
-        if limit > 0:
-            uids = uids[-limit:]
-        # Process the newest messages first.  On a fresh or delayed sync there
-        # may be many unseen messages, and callers waiting for a newly-arrived
-        # verification code should not be blocked behind the older backlog.
-        uids.reverse()
-
         inserted: list[dict] = []
-        for raw_uid in uids:
-            uid = raw_uid.decode("ascii", errors="ignore")
-            exists = conn.execute(
-                """
-                SELECT 1 FROM messages
-                WHERE account_key = ? AND folder = ? AND uid = ?
-                """,
-                (config.account_key, config.folder, uid),
-            ).fetchone()
-            if exists:
-                continue
-
-            # iCloud's IMAP server may acknowledge RFC822 without returning the
-            # message literal. BODY.PEEK[] is standards-based, works with iCloud,
-            # and does not mark the message as read.
-            status, msg_data = mailbox.uid("fetch", raw_uid, "(BODY.PEEK[])")
-            if status != "OK" or not msg_data:
-                continue
-
-            raw_message = b""
-            for part in msg_data:
-                if isinstance(part, tuple):
-                    raw_message += part[1]
-            if not raw_message:
-                continue
-
-            record = message_to_record(conn, config, uid, raw_message)
-            if insert_message(conn, record):
-                inserted.append(record)
+        folders = _sync_folders(mailbox, config.folder) if include_junk else [config.folder]
+        for folder in folders:
+            folder_config = InboxConfig(
+                host=config.host,
+                port=config.port,
+                username=config.username,
+                password=config.password,
+                folder=folder,
+                use_ssl=config.use_ssl,
+            )
+            try:
+                inserted.extend(
+                    _sync_selected_folder(mailbox, conn, folder_config, limit)
+                )
+            except RuntimeError:
+                if folder == config.folder:
+                    raise
         return inserted
     finally:
         try:
