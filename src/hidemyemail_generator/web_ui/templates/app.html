@@ -12,6 +12,7 @@
   <svg class="icon-sprite" aria-hidden="true">
     <symbol id="i-dashboard" viewBox="0 0 24 24"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></symbol>
     <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m4 7 8 6 8-6"/></symbol>
+    <symbol id="i-protocol" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></symbol>
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
     <symbol id="i-paypal" viewBox="0 0 24 24"><path d="M7 20 9.3 4h6.2a4.8 4.8 0 0 1 0 9.6h-4.7"/><path d="m10.1 20 1.4-9.5h4.4a3.6 3.6 0 0 1 0 7.2h-3.4"/></symbol>
     <symbol id="i-checklist" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="m8 9 1.5 1.5L12 8M13 10h3M8 15h8"/></symbol>
@@ -29,6 +30,7 @@
       <nav class="nav-list">
         <button class="nav-item" type="button" data-route="overview"><svg><use href="#i-dashboard"/></svg><span>概览</span></button>
         <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>邮箱账号</span><b id="accountNavCount">—</b></button>
+        <button class="nav-item" type="button" data-route="protocol-registration"><svg><use href="#i-protocol"/></svg><span>协议注册</span><b id="protocolNavState">—</b></button>
         <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>直卡提链接</span><b id="cardLinkNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="pp-payment"><svg><use href="#i-paypal"/></svg><span>PP 支付</span><b id="paypalNavState">—</b></button>
         <button class="nav-item" type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span>验证记录</span></button>
@@ -166,6 +168,38 @@
           <div class="panel-head account-list-head"><div><h2>邮箱账号</h2><p id="accountSummary">正在加载…</p></div><div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select></div></div>
           <div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>注册状态</th><th>套餐</th><th>Session 状态</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
         </article>
+      </section>
+
+      <section class="view protocol-registration-view" id="protocolRegistrationView" data-view="protocol-registration" hidden>
+        <article class="panel protocol-registration-toolbar">
+          <div class="protocol-heading"><span class="protocol-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></svg></span><div><h2>Mail Auth 协议注册</h2><p>无浏览器完成邮箱验证、Session 获取、密码确认与 TOTP 2FA 激活</p></div></div>
+          <div class="protocol-actions">
+            <span id="protocolRuntimeStatus" class="badge">检查运行环境</span>
+            <label class="protocol-concurrency" for="protocolConcurrency"><span>并发</span><input id="protocolConcurrency" type="number" min="1" max="5" value="1"></label>
+            <button id="startProtocolSelectedButton" class="button primary" type="button" data-action="start-protocol-selected">协议注册选中</button>
+            <button id="startProtocolAllButton" class="button" type="button" data-action="start-protocol-all">协议注册全部</button>
+            <button id="stopProtocolButton" class="button danger" type="button" data-action="stop-protocol-registration" disabled>停止</button>
+          </div>
+        </article>
+        <div id="protocolMetrics" class="metric-grid compact"></div>
+        <div class="protocol-workspace-grid">
+          <article class="panel protocol-account-panel">
+            <div class="panel-head"><div><h2>待注册账号</h2><p id="protocolAccountSummary">选择需要通过 Mail Auth 处理的邮箱</p></div><label class="protocol-select-all"><input id="protocolSelectAll" type="checkbox">选择全部待处理</label></div>
+            <div class="filter-bar padded"><input id="protocolSearch" type="search" placeholder="搜索邮箱账号"><select id="protocolStatusFilter"><option value="all">状态：全部</option><option value="pending">待处理</option><option value="ready">已完成</option></select></div>
+            <div id="protocolAccountList" class="protocol-account-list"><div class="empty-state">正在加载账号…</div></div>
+          </article>
+          <aside class="panel protocol-task-panel">
+            <div class="panel-head"><div><h2>协议任务</h2><p id="protocolTaskMessage">等待开始</p></div><span id="protocolTaskBadge" class="badge">空闲</span></div>
+            <div class="protocol-flow" aria-label="协议注册步骤">
+              <span data-protocol-stage="protocol_auth"><i>1</i>Mail Auth</span><span data-protocol-stage="email_verification"><i>2</i>邮箱 OTP</span><span data-protocol-stage="password"><i>3</i>添加密码</span><span data-protocol-stage="two_factor"><i>4</i>激活 2FA</span><span data-protocol-stage="completed"><i>5</i>保存 Session</span>
+            </div>
+            <div class="protocol-current"><small>当前账号</small><strong id="protocolCurrentEmail">尚未开始</strong><span id="protocolCurrentStage">等待任务</span></div>
+            <div class="protocol-progress-row"><progress id="protocolTaskProgress" value="0" max="100"></progress><strong id="protocolTaskProgressValue">0 / 0</strong></div>
+            <div class="protocol-result-grid"><div><span>成功</span><strong id="protocolTaskSuccess">0</strong></div><div><span>失败</span><strong id="protocolTaskFailed">0</strong></div><div><span>耗时</span><strong id="protocolTaskElapsed">00:00</strong></div></div>
+            <div class="protocol-log-head"><strong>实时日志</strong><span id="protocolLogCount">0 条</span></div>
+            <div id="protocolTaskLog" class="inline-log protocol-task-log" role="log" aria-live="polite"><div class="task-log-empty">暂无协议任务日志</div></div>
+          </aside>
+        </div>
       </section>
 
       <section class="view" id="cardLinksView" data-view="card-links" hidden>

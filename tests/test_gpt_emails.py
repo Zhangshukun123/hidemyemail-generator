@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -14,9 +15,11 @@ from hidemyemail_generator.webapp import (
     _gpt_credential,
     _effective_gpt_code_since,
     _latest_gpt_code,
+    _claim_single_unmapped_gpt_code,
     _inbox_error_message,
     _match_relay_identity,
     _save_account_card_link,
+    _wait_for_shared_inbox_code_sync,
     _workbench_import_payload,
     _valid_supported_account_email,
 )
@@ -41,7 +44,131 @@ IDENTITIES = [
 ]
 
 
+class InboxCodeSyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_short_code_polls_reuse_one_shielded_inbox_sync(self):
+        state = {"inbox_code_sync_task": None}
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow_sync():
+            nonlocal calls
+            calls += 1
+            await release.wait()
+
+        self.assertFalse(
+            await _wait_for_shared_inbox_code_sync(
+                state,
+                slow_sync,
+                wait_seconds=0.01,
+            )
+        )
+        first_task = state["inbox_code_sync_task"]
+        self.assertFalse(first_task.done())
+        self.assertFalse(
+            await _wait_for_shared_inbox_code_sync(
+                state,
+                slow_sync,
+                wait_seconds=0.01,
+            )
+        )
+        self.assertIs(state["inbox_code_sync_task"], first_task)
+        self.assertEqual(calls, 1)
+
+        release.set()
+        self.assertTrue(
+            await _wait_for_shared_inbox_code_sync(
+                state,
+                slow_sync,
+                wait_seconds=1,
+            )
+        )
+        self.assertIsNone(state["inbox_code_sync_task"])
+        self.assertEqual(calls, 1)
+
+
 class GptEmailTests(unittest.TestCase):
+    def test_claims_one_fresh_unmapped_code_for_waiting_registration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            conn = connect_db(str(db_file))
+            try:
+                insert_message(
+                    conn,
+                    {
+                        "account_key": "test",
+                        "folder": "INBOX",
+                        "uid": "fresh-unmapped",
+                        "sender": "noreply_at_tm_openai_com_unknown@icloud.com",
+                        "recipients": "",
+                        "hme_address": "",
+                        "subject": "ChatGPT temporary verification code",
+                        "code": "753837",
+                        "body_preview": "Enter this verification code to continue: 753837",
+                        "received_at": "2026-08-12T08:15:13+00:00",
+                        "created_at": "2026-08-12T08:15:13+00:00",
+                    },
+                )
+            finally:
+                conn.close()
+
+            item = _claim_single_unmapped_gpt_code(
+                db_file,
+                "precept.wildest_3g@icloud.com",
+                "2026-08-12T08:14:18+00:00",
+            )
+
+            self.assertEqual(item["code"], "753837")
+            conn = connect_db(str(db_file))
+            try:
+                mapped = conn.execute(
+                    "SELECT hme_address FROM messages WHERE uid = 'fresh-unmapped'"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(
+                mapped["hme_address"], "precept.wildest_3g@icloud.com"
+            )
+            self.assertIsNone(
+                _claim_single_unmapped_gpt_code(
+                    db_file,
+                    "precept.wildest_3g@icloud.com",
+                    "2026-08-12T08:14:18+00:00",
+                )
+            )
+
+    def test_does_not_guess_between_multiple_unmapped_codes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            conn = connect_db(str(db_file))
+            try:
+                for index, code in enumerate(("123456", "654321"), start=1):
+                    insert_message(
+                        conn,
+                        {
+                            "account_key": "test",
+                            "folder": "INBOX",
+                            "uid": f"ambiguous-{index}",
+                            "sender": "noreply_at_tm_openai_com_unknown@icloud.com",
+                            "recipients": "",
+                            "hme_address": "",
+                            "subject": "ChatGPT temporary verification code",
+                            "code": code,
+                            "body_preview": f"Verification code: {code}",
+                            "received_at": f"2026-08-12T08:15:1{index}+00:00",
+                            "created_at": f"2026-08-12T08:15:1{index}+00:00",
+                        },
+                    )
+            finally:
+                conn.close()
+
+            self.assertIsNone(
+                _claim_single_unmapped_gpt_code(
+                    db_file,
+                    "precept.wildest_3g@icloud.com",
+                    "2026-08-12T08:14:18+00:00",
+                )
+            )
+
     def test_manual_non_icloud_account_is_visible_without_relay_identity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "messages.db"

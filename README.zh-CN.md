@@ -405,6 +405,16 @@ OPENAI_REGISTER_PYTHON=D:\path\to\openai-register-project\.venv\Scripts\python.e
 `openai-register-runtime/`（只放目标项目顶层 Python 源文件，不要复制 `state.json`、
 日志、代理或账号数据）。服务器强制使用无头浏览器。
 
+### Mail Auth 协议注册
+
+账号工作台左侧新增 **协议注册** 入口，可勾选待处理账号或运行“协议注册全部”。
+该流程不启动浏览器，直接执行 Mail Auth、邮箱 OTP、OAuth callback 与 Session 获取；
+返回 Session 后会继续确认至少 12 位密码，并创建、验证及激活 TOTP 2FA。只有
+Session、密码和 2FA 三项均完成时，账号才显示“协议注册完成（密码+2FA）”。
+
+协议内核默认从同级目录 `gptfree-register` 或 `D:\AI\gptfree-register` 加载；也可用
+`GPTFREE_REGISTER_ROOT` 和 `GPTFREE_REGISTER_PYTHON` 指定内核目录与 Python 运行时。
+
 ### 一键验证与账号分类
 
 “一键验证账号”会并发查询所有已保存 Access Token 的账号，并把在线有效账号归类为

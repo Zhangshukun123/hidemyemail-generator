@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Apple Hide My Email Navigator",
+  "version": "1.0.0",
+  "description": "Automatically opens Privacy and then Hide My Email on the Apple Account page.",
+  "host_permissions": [
+    "https://account.apple.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://account.apple.com/account/manage/*"
+      ],
+      "js": [
+        "MODIFIED_FILE.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Apple Hide My Email Navigator",
+    "default_popup": "popup.html"
+  }
+}

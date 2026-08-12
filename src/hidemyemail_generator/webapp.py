@@ -51,6 +51,10 @@ from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
 from .paypal_protocol_service import PayPalProtocolService
+from .protocol_registration import (
+    PROTOCOL_CODE_PREFIX,
+    ProtocolRegistrationManager,
+)
 from .registration_inventory import (
     DEFAULT_LEASE_SECONDS,
     available_generated_inventory_count,
@@ -89,6 +93,8 @@ from .web_ui import build_app_page, build_login_page
 
 SESSION_COOKIE_NAME = "hme_session"
 SESSION_MAX_AGE = 12 * 60 * 60
+WORKBENCH_OPENAI_CODE_PATH = "/api/integrations/workbench/openai-code"
+WORKBENCH_INVENTORY_IMPORT_PATH = "/api/integrations/apple-hme/inventory"
 PUBLIC_PATHS = {
     "/login",
     "/api/login",
@@ -96,14 +102,16 @@ PUBLIC_PATHS = {
     "/code",
     "/api/code/latest",
     "/healthz",
+    WORKBENCH_INVENTORY_IMPORT_PATH,
 }
-WORKBENCH_OPENAI_CODE_PATH = "/api/integrations/workbench/openai-code"
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
 ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 15
 ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS = 60
 ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS = 15 * 60
 ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS = 60 * 60
+OPENAI_CODE_INBOX_SYNC_LIMIT = 3
+OPENAI_CODE_INBOX_WAIT_SECONDS = 7.0
 DEACTIVATION_SCAN_INTERVAL_SECONDS = 5 * 60
 REGISTRATION_PROCESS_FAILURE_PREFIX = "registration_process_failure:"
 CARD_LINK_REGIONS = {
@@ -123,6 +131,33 @@ class InboxSyncDeferredError(RuntimeError):
     def __init__(self, public_message: str):
         super().__init__(public_message)
         self.public_message = public_message
+
+
+async def _wait_for_shared_inbox_code_sync(
+    state: dict,
+    sync_factory,
+    *,
+    wait_seconds: float = OPENAI_CODE_INBOX_WAIT_SECONDS,
+) -> bool:
+    """Reuse one shielded IMAP task across short-lived HTTP code polls."""
+
+    task = state.get("inbox_code_sync_task")
+    if task is None:
+        task = asyncio.create_task(sync_factory())
+        state["inbox_code_sync_task"] = task
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=max(0.01, float(wait_seconds)),
+        )
+    except asyncio.TimeoutError:
+        # The browser worker uses a short HTTP timeout. Keep the IMAP task alive
+        # so the next poll can read the message instead of opening another scan.
+        return False
+    finally:
+        if task.done():
+            state["inbox_code_sync_task"] = None
+    return True
 
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -2565,6 +2600,13 @@ async def auth_middleware(
     if (
         request.path in PUBLIC_PATHS
         or (
+            request.path.startswith(PROTOCOL_CODE_PREFIX)
+            and request.app.get("protocol_registration_manager") is not None
+            and request.app["protocol_registration_manager"].valid_code_token(
+                request.path.removeprefix(PROTOCOL_CODE_PREFIX)
+            )
+        )
+        or (
             request.path
             in ({WORKBENCH_OPENAI_CODE_PATH} | INVENTORY_INTEGRATION_PATHS)
             and _workbench_import_token_valid(request, request.app)
@@ -3220,6 +3262,78 @@ def _latest_gpt_code(
         conn.close()
 
 
+def _claim_single_unmapped_gpt_code(
+    db_file: Path,
+    email: str,
+    since: str,
+) -> dict | None:
+    """Claim one unambiguous fresh relay message for the only waiting account."""
+
+    target = email.strip().lower()
+    since_at = _parse_timestamp(since)
+    if not target or since_at is None:
+        return None
+    conn = connect_db(str(db_file))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor_key = f"{GPT_CODE_CURSOR_PREFIX}{target}"
+        cursor_row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (cursor_key,)
+        ).fetchone()
+        try:
+            consumed_message_id = int(cursor_row["value"] if cursor_row else 0)
+        except (TypeError, ValueError):
+            consumed_message_id = 0
+        rows = conn.execute(
+            """
+            SELECT id, received_at, code, subject, body_preview
+            FROM messages
+            WHERE id > ?
+              AND COALESCE(hme_address, '') = ''
+              AND code IS NOT NULL AND code != ''
+              AND (
+                lower(COALESCE(sender, '') || ' ' || COALESCE(subject, '') || ' ' || COALESCE(body_preview, '')) LIKE '%chatgpt%'
+                OR lower(COALESCE(sender, '') || ' ' || COALESCE(subject, '') || ' ' || COALESCE(body_preview, '')) LIKE '%openai%'
+              )
+            ORDER BY COALESCE(received_at, created_at) DESC
+            LIMIT 20
+            """,
+            (consumed_message_id,),
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            received_at = str(row["received_at"] or "")
+            received = _parse_timestamp(received_at)
+            if received is None or received < since_at:
+                continue
+            code = re.sub(r"[^A-Za-z0-9]", "", str(row["code"] or ""))
+            if 4 <= len(code) <= 10:
+                candidates.append((row, code, received_at))
+        if len(candidates) != 1:
+            conn.commit()
+            return None
+        row, code, received_at = candidates[0]
+        message_id = int(row["id"])
+        conn.execute(
+            "UPDATE messages SET hme_address = ? WHERE id = ? AND COALESCE(hme_address, '') = ''",
+            (target, message_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (cursor_key, str(message_id)),
+        )
+        conn.commit()
+        return {"code": code, "receivedAt": received_at}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _latest_code_for_email(
     db_file: Path, email: str, identities: list[dict]
 ) -> dict | None:
@@ -3334,6 +3448,17 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 if isinstance(account.get("two_factor"), dict)
                 else "",
                 "hasSession": bool(session and access_token),
+                "protocolReady": bool(
+                    _account_has_confirmed_password(account)
+                    and isinstance(account.get("two_factor"), dict)
+                    and account["two_factor"].get("enabled")
+                    and session
+                    and access_token
+                    and not token_expired
+                ),
+                "sessionAcquisitionMethod": str(
+                    account.get("session_acquisition_method") or ""
+                ),
                 "hasCookies": bool(account_saved_cookies(account)),
                 "hasImportableSession": bool(
                     session and access_token and not token_expired
@@ -3433,6 +3558,7 @@ def create_app(
     app["inbox_on_demand_next_attempt"] = 0.0
     app["inbox_on_demand_failures"] = 0
     app["inbox_on_demand_retry_after"] = 0
+    app["inbox_code_sync_task"] = None
     app["deactivation_scan_state"] = {
         "intervalSeconds": max(0.05, float(deactivation_scan_interval_seconds)),
         "status": "waiting",
@@ -3456,6 +3582,11 @@ def create_app(
         token=inventory_service_token,
     )
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
+    app["protocol_registration_manager"] = ProtocolRegistrationManager(
+        base_dir=base_dir,
+        db_file=app["db_file"],
+        proxy_store=app["registration_proxy_store"],
+    )
     app["smsbower_config_store"] = SMSBowerConfigStore(
         app["db_file"],
         api_key=smsbower_api_key,
@@ -3573,9 +3704,8 @@ def create_app(
 
     async def acquire_registration_inventory_email(label: str) -> str:
         # The remote inventory database cannot see account records saved on
-        # this workstation.  Drain and permanently consume any address that
-        # already has local registration history before returning a clean one
-        # to the browser workflow.
+        # this workstation.  Consume only completed accounts; a password-only
+        # record from a failed attempt stays retryable and reuses that password.
         for _attempt in range(100):
             email = await app["inventory_client"].acquire_email(label)
             if not email:
@@ -3583,12 +3713,17 @@ def create_app(
             record = await asyncio.to_thread(
                 load_account_record, app["db_file"], email
             )
-            if not record:
+            completed_locally = bool(
+                account_session_access_token(record)
+                or account_saved_cookies(record)
+                or account_session(record)
+            )
+            if not completed_locally:
                 return email
             await app["inventory_client"].complete_email(
                 email,
                 True,
-                "本地已有 OpenAI 注册或尝试记录，已从远端库存永久去重",
+                "本地已有已完成的 OpenAI 账号，已从远端库存标记使用",
             )
         raise RuntimeError("远端邮箱库存连续返回已有账号，已停止领取")
 
@@ -3977,6 +4112,14 @@ def create_app(
             await app["registration_manager"].close()
 
     app.cleanup_ctx.append(registration_manager_context)
+
+    async def protocol_registration_manager_context(_: web.Application):
+        try:
+            yield
+        finally:
+            await app["protocol_registration_manager"].close()
+
+    app.cleanup_ctx.append(protocol_registration_manager_context)
 
     async def deactivation_scan_context(_: web.Application):
         state: dict = app["deactivation_scan_state"]
@@ -4486,7 +4629,10 @@ def create_app(
             return item, "", 200
 
         try:
-            await sync_inbox_on_demand(30)
+            await _wait_for_shared_inbox_code_sync(
+                app,
+                lambda: sync_inbox_on_demand(OPENAI_CODE_INBOX_SYNC_LIMIT),
+            )
         except Exception as error:
             return None, _inbox_error_message(error), 502
 
@@ -4504,6 +4650,52 @@ def create_app(
         if item:
             return item, "", 200
 
+        # Some iCloud relays omit both the original recipient and a currently
+        # resolvable relay identity.  When exactly one registration is waiting
+        # and exactly one new OpenAI code arrived after it started, attribution
+        # is unambiguous; bind that message to the waiting address atomically.
+        registration_snapshot = app["registration_manager"].snapshot()
+        waiting_emails = {
+            str(value or "").strip().lower()
+            for value in registration_snapshot.get("emails", [])
+            if str(value or "").strip()
+        }
+        if not waiting_emails:
+            waiting_email = str(registration_snapshot.get("email") or "").strip().lower()
+            if waiting_email:
+                waiting_emails.add(waiting_email)
+        protocol_snapshot = app["protocol_registration_manager"].snapshot()
+        protocol_waiting_email = str(
+            protocol_snapshot.get("currentEmail") or ""
+        ).strip().lower()
+        if (
+            protocol_snapshot.get("running")
+            and protocol_snapshot.get("phase") == "email_verification"
+            and protocol_waiting_email
+        ):
+            waiting_emails.add(protocol_waiting_email)
+        if (
+            (
+                (
+                    registration_snapshot.get("running")
+                    and registration_snapshot.get("phase") == "email_verification"
+                )
+                or (
+                    protocol_snapshot.get("running")
+                    and protocol_snapshot.get("phase") == "email_verification"
+                )
+            )
+            and waiting_emails == {email}
+        ):
+            item = await asyncio.to_thread(
+                _claim_single_unmapped_gpt_code,
+                app["db_file"],
+                email,
+                since,
+            )
+            if item:
+                return item, "", 200
+
         if (
             not gpt_code_identity_cache
             or time.monotonic() - gpt_code_identity_cache_at > 120
@@ -4511,8 +4703,15 @@ def create_app(
             try:
                 gpt_code_identity_cache = await active_icloud_identities()
                 gpt_code_identity_cache_at = time.monotonic()
-            except RuntimeError as error:
-                return None, str(error), 502
+            except RuntimeError:
+                # The iCloud web cookie is only needed for the legacy relay-
+                # sender mapping fallback.  IMAP recipient parsing is the
+                # primary code path, so an expired global session must not end
+                # the 60-second code poll with an unrelated 502 toast.  Cache
+                # the empty fallback briefly and let the caller continue
+                # polling for a directly attributable message.
+                gpt_code_identity_cache = []
+                gpt_code_identity_cache_at = time.monotonic()
         item = await asyncio.to_thread(
             _latest_gpt_code,
             app["db_file"],
@@ -4587,6 +4786,36 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "请输入有效的 iCloud 子邮箱"}, status=400
             )
+        config_path: Path = app["inbox_config_file"]
+        if not config_path.exists():
+            return web.json_response(
+                {"ok": False, "error": "iCloud 收件箱尚未配置"}, status=503
+            )
+        try:
+            # A verification code is a newly arrived message.  Scanning 100
+            # UIDs also backfills old incomplete rows and can hold the public
+            # lookup open for minutes on iCloud; the newest few messages are
+            # sufficient and match the authenticated OpenAI-code endpoint.
+            await sync_inbox_on_demand(OPENAI_CODE_INBOX_SYNC_LIMIT)
+        except Exception as error:
+            return web.json_response(
+                {"ok": False, "error": _inbox_error_message(error)}, status=502
+            )
+        # Prefer an exact recipient parsed from the IMAP message.  This path
+        # remains available when the iCloud web cookie used to list aliases has
+        # expired; possession of the exact alias is already the portal's lookup
+        # credential.
+        item = await asyncio.to_thread(
+            _latest_code_for_email, app["db_file"], email, []
+        )
+        if item:
+            return web.json_response(
+                {"ok": True, "email": email, **item},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        # Older relay rows may only be attributable through the iCloud identity
+        # list.  Use that fallback only when no direct message match exists.
         try:
             identities = await active_icloud_identities()
         except RuntimeError as error:
@@ -4594,22 +4823,11 @@ def create_app(
                 {"ok": False, "error": str(error)}, status=502
             )
         if not any(
-            str(item.get("hme") or "").strip().lower() == email
-            for item in identities
+            str(identity.get("hme") or "").strip().lower() == email
+            for identity in identities
         ):
             return web.json_response(
                 {"ok": False, "error": "未找到这个 iCloud 子邮箱"}, status=404
-            )
-        config_path: Path = app["inbox_config_file"]
-        if not config_path.exists():
-            return web.json_response(
-                {"ok": False, "error": "iCloud 收件箱尚未配置"}, status=503
-            )
-        try:
-            await sync_inbox_on_demand(100)
-        except Exception as error:
-            return web.json_response(
-                {"ok": False, "error": _inbox_error_message(error)}, status=502
             )
         item = await asyncio.to_thread(
             _latest_code_for_email, app["db_file"], email, identities
@@ -4834,6 +5052,64 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def import_workbench_inventory(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(body.get("email") or "").strip().lower()
+        if not _valid_supported_account_email(email) or not email.endswith(
+            "@icloud.com"
+        ):
+            return web.json_response(
+                {"ok": False, "error": "请输入有效的 iCloud 邮箱"}, status=400
+            )
+        if not app["workbench_url"] or not app["workbench_import_token"]:
+            return web.json_response(
+                {"ok": False, "error": "OpenAI 账户工作台导入尚未配置"},
+                status=503,
+            )
+        payload = {
+            "email": email,
+            "inventoryOnly": True,
+            "label": str(body.get("label") or "")[:200],
+            "note": str(body.get("note") or "")[:1000],
+            "createdAt": str(body.get("createdAt") or "")[:100],
+            "source": "apple-hide-my-email-extension",
+        }
+        target = f'{app["workbench_url"]}/api/integrations/hidemyemail/import'
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as client:
+                async with client.post(
+                    target,
+                    json=payload,
+                    headers={
+                        "X-HME-Import-Token": app["workbench_import_token"],
+                    },
+                ) as response:
+                    result = await response.json(content_type=None)
+                    if response.status >= 400 or not result.get("success"):
+                        message = str(result.get("error") or "工作台拒绝库存导入")
+                        raise RuntimeError(message)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as error:
+            return web.json_response(
+                {"ok": False, "error": f"加入工作台未注册库存失败：{error}"},
+                status=502,
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "email": email,
+                "inventory": "unregistered",
+                "imported": bool(result.get("imported")),
+                "updated": bool(result.get("updated")),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def registration_start(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
@@ -4948,6 +5224,141 @@ def create_app(
             )
         task = await app["registration_manager"].stop()
         return web.json_response({"ok": True, "task": task})
+
+    async def protocol_registration_status(_: web.Request) -> web.Response:
+        return web.json_response(
+            {"ok": True, **app["protocol_registration_manager"].snapshot()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def protocol_registration_start(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        try:
+            concurrency = int(payload.get("concurrency") or 1)
+        except (TypeError, ValueError):
+            concurrency = 0
+        if not 1 <= concurrency <= 5:
+            return web.json_response(
+                {"ok": False, "error": "协议注册并发必须是 1–5"}, status=400
+            )
+
+        try:
+            identities = await active_icloud_identities()
+        except RuntimeError:
+            identities = []
+        items = await asyncio.to_thread(
+            _browser_email_items, app["db_file"], identities
+        )
+        accounts_by_email = {
+            str(item.get("email") or "").strip().lower(): item
+            for item in items
+            if str(item.get("email") or "").strip()
+        }
+        run_all = bool(payload.get("all"))
+        if run_all:
+            requested = list(accounts_by_email)
+        else:
+            raw_emails = payload.get("emails")
+            if not isinstance(raw_emails, list):
+                raw_emails = []
+            requested = []
+            for value in raw_emails:
+                email = str(value or "").strip().lower()
+                if email and email not in requested:
+                    requested.append(email)
+        invalid = [
+            email
+            for email in requested
+            if email not in accounts_by_email
+            or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
+        ]
+        if invalid:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": f"协议注册账号不存在：{invalid[0]}",
+                },
+                status=404,
+            )
+        pending = [
+            email
+            for email in requested
+            if not bool(accounts_by_email[email].get("protocolReady"))
+        ]
+        skipped = len(requested) - len(pending)
+        if not pending:
+            message = (
+                "全部账号均已完成协议注册（密码+2FA）"
+                if requested
+                else "当前没有可协议注册的邮箱账号"
+            )
+            return web.json_response(
+                {"ok": False, "error": message}, status=409
+            )
+        try:
+            task = app["protocol_registration_manager"].start(
+                emails=pending,
+                base_url=f"{request.scheme}://{request.host}",
+                concurrency=concurrency,
+            )
+        except ValueError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=400
+            )
+        except RuntimeError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=409
+            )
+        task["skipped"] = skipped
+        return web.json_response(
+            {"ok": True, "started": True, "skipped": skipped, "task": task}
+        )
+
+    async def protocol_registration_stop(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        task = await app["protocol_registration_manager"].stop()
+        return web.json_response({"ok": True, "task": task})
+
+    async def protocol_registration_code(request: web.Request) -> web.Response:
+        token = str(request.match_info.get("token") or "")
+        record = app["protocol_registration_manager"].token_record(token)
+        if not record:
+            return web.Response(
+                text="协议取码令牌已失效",
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        item, error, status = await resolve_gpt_code(
+            str(record.get("email") or ""),
+            str(record.get("since") or ""),
+        )
+        if not item:
+            return web.Response(
+                text=error or "验证码尚未到达",
+                status=status,
+                headers={"Cache-Control": "no-store"},
+            )
+        return web.Response(
+            text=str(item.get("code") or ""),
+            content_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def smsbower_status(_: web.Request) -> web.Response:
         return web.json_response(
@@ -6034,6 +6445,9 @@ def create_app(
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_post(WORKBENCH_OPENAI_CODE_PATH, workbench_openai_code)
+    app.router.add_post(
+        WORKBENCH_INVENTORY_IMPORT_PATH, import_workbench_inventory
+    )
     app.router.add_get("/api/browser/status", browser_status)
     app.router.add_post("/api/browser/fetch-all", browser_fetch_all)
     app.router.add_post("/api/browser/fetch-selected", browser_fetch_selected)
@@ -6043,6 +6457,18 @@ def create_app(
     app.router.add_post("/api/registration/code", registration_code_submit)
     app.router.add_post("/api/registration/code/poll", registration_code_poll)
     app.router.add_post("/api/registration/stop", registration_stop)
+    app.router.add_get(
+        "/api/protocol-registration/status", protocol_registration_status
+    )
+    app.router.add_post(
+        "/api/protocol-registration/start", protocol_registration_start
+    )
+    app.router.add_post(
+        "/api/protocol-registration/stop", protocol_registration_stop
+    )
+    app.router.add_get(
+        f"{PROTOCOL_CODE_PREFIX}{{token}}", protocol_registration_code
+    )
     app.router.add_get("/api/smsbower/status", smsbower_status)
     app.router.add_post("/api/smsbower/config", smsbower_config)
     app.router.add_get(

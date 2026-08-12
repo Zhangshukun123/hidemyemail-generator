@@ -6,6 +6,7 @@
   const pageDetails = {
     overview: ["DASHBOARD", "概览", "集中查看账号、任务与服务状态"],
     accounts: ["ACCOUNT WORKSPACE", "邮箱账号", "管理 iCloud 邮箱、OpenAI Session 与账号凭据"],
+    "protocol-registration": ["MAIL AUTH WORKSPACE", "协议注册", "通过 Mail Auth 完成 Session、密码与 TOTP 2FA"],
     "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "使用 PH / PHP hosted 双代理流程提取严格 0 链接"],
     "pp-payment": ["PAYPAL WORKSPACE", "PP 支付", "PayPal BA 协议授权与支付任务"],
     verification: ["VERIFICATION WORKSPACE", "验证记录", "批量验证账号、套餐与 Session 状态"],
@@ -74,7 +75,7 @@
 
   function taskStageLabel(stage) {
     const labels = {
-      idle: "准备", running: "执行", prepare: "准备", provider: "邮箱服务",
+      idle: "准备", running: "执行", prepare: "准备", provider: "邮箱服务", protocol_auth: "Mail Auth",
       network: "网络", browser: "浏览器", openai_auth: "OpenAI 登录",
       google_oauth: "页面纠正", security: "安全验证", password: "密码",
       email_verification: "邮箱验证", profile: "基础资料", session: "Session",
@@ -262,6 +263,10 @@
       const links = state.accounts.filter((item) => item.cardLink).length;
       $("cardLinkNavCount").textContent = links || "—";
       $("paypalNavState").textContent = state.paypal?.running ? "在线" : "—";
+      const protocol = state.protocolRegistrationTask || {};
+      $("protocolNavState").textContent = protocol.running
+        ? "运行中"
+        : state.accounts.filter((item) => item.protocolReady).length || "—";
       const runtime = state.browserTask.runtime || {};
       const available = Boolean(runtime.available);
       $("runtimeDot").className = available ? "ok" : "bad";
@@ -600,6 +605,101 @@
         (disabled ? " disabled" : "") + ">" + label + "</button>";
     }
 
+    filteredProtocolAccounts(state) {
+      const query = $("protocolSearch")?.value.trim().toLowerCase() || "";
+      const status = $("protocolStatusFilter")?.value || "all";
+      return state.accounts.filter((item) =>
+        (!query || item.email.toLowerCase().includes(query)) &&
+        (status === "all" ||
+          (status === "ready" && item.protocolReady) ||
+          (status === "pending" && !item.protocolReady))
+      );
+    }
+
+    renderProtocolRegistration(state) {
+      const task = state.protocolRegistrationTask || {};
+      const runtime = task.runtime || {};
+      const selected = new Set(state.selectedProtocolEmails || []);
+      const pending = state.accounts.filter((item) => !item.protocolReady);
+      const ready = state.accounts.filter((item) => item.protocolReady);
+      const passwordReady = state.accounts.filter((item) => item.hasPassword);
+      const twoFactorReady = state.accounts.filter((item) => item.hasTwoFactor);
+      $("protocolMetrics").innerHTML = [
+        metricCard("待协议注册", pending.length, "缺少 Session、密码或 2FA", "amber", "◷"),
+        metricCard("密码已确认", passwordReady.length, "至少 12 位并已保存", "green", "K"),
+        metricCard("TOTP 2FA", twoFactorReady.length, "验证器已激活", "purple", "2"),
+        metricCard("协议就绪", ready.length, "Session + 密码 + 2FA", "green", "✓"),
+      ].join("");
+
+      const runtimeBadge = $("protocolRuntimeStatus");
+      runtimeBadge.className = "badge " + (runtime.available ? "success" : "error");
+      runtimeBadge.textContent = runtime.available ? "Mail Auth 环境可用" : "运行环境未就绪";
+      runtimeBadge.title = runtime.error || runtime.projectRoot || "";
+      $("startProtocolSelectedButton").disabled = Boolean(task.running) || !runtime.available || !selected.size;
+      $("startProtocolAllButton").disabled = Boolean(task.running) || !runtime.available || !pending.length;
+      $("stopProtocolButton").disabled = !task.running;
+      $("protocolConcurrency").disabled = Boolean(task.running);
+
+      const items = this.filteredProtocolAccounts(state);
+      $("protocolAccountSummary").textContent = "显示 " + items.length + " / " + state.accounts.length +
+        " 个账号，已选 " + selected.size + " 个";
+      $("protocolAccountList").innerHTML = items.length ? items.map((item) => {
+        const checked = selected.has(item.email);
+        const passwordState = item.hasPassword ? "已确认" : "待添加";
+        const factorState = item.hasTwoFactor ? "已开启" : "待激活";
+        const sessionState = item.sessionStatus === "ready" ? "可用" : "待获取";
+        return '<label class="protocol-account-row ' + (item.protocolReady ? "ready" : "pending") + '">' +
+          '<input type="checkbox" data-protocol-email="' + escapeHtml(item.email) + '" ' +
+          (checked ? "checked " : "") + (item.protocolReady || task.running ? "disabled" : "") + '>' +
+          '<span class="protocol-account-identity"><strong>' + escapeHtml(item.email) + '</strong><small>' +
+          (item.protocolReady ? "协议注册完成（密码+2FA）" : "等待 Mail Auth 协议注册") + '</small></span>' +
+          '<span class="protocol-account-field"><small>密码</small><b class="' + (item.hasPassword ? "ok" : "") + '">' + passwordState + '</b></span>' +
+          '<span class="protocol-account-field"><small>2FA</small><b class="' + (item.hasTwoFactor ? "ok" : "") + '">' + factorState + '</b></span>' +
+          '<span class="protocol-account-field"><small>Session</small><b class="' + (item.sessionStatus === "ready" ? "ok" : "") + '">' + sessionState + '</b></span></label>';
+      }).join("") : '<div class="empty-state">没有匹配的账号</div>';
+
+      const selectAll = $("protocolSelectAll");
+      const visiblePending = items.filter((item) => !item.protocolReady);
+      const selectedVisible = visiblePending.filter((item) => selected.has(item.email)).length;
+      selectAll.disabled = Boolean(task.running) || !visiblePending.length;
+      selectAll.checked = Boolean(visiblePending.length && selectedVisible === visiblePending.length);
+      selectAll.indeterminate = Boolean(selectedVisible && selectedVisible < visiblePending.length);
+
+      const meta = taskStatusMeta(task.status || "idle");
+      $("protocolTaskBadge").className = "badge " + (task.status === "failed" ? "error" : task.status === "completed" ? "success" : task.running ? "blue" : "");
+      $("protocolTaskBadge").textContent = meta[0];
+      $("protocolTaskMessage").textContent = task.message || "等待开始";
+      $("protocolCurrentEmail").textContent = task.currentEmail || "尚未开始";
+      $("protocolCurrentStage").textContent = taskStageLabel(task.phase || "idle");
+      const total = Number(task.total || 0);
+      const completed = Number(task.completed || 0);
+      const progress = total ? Math.round(completed / total * 100) : 0;
+      $("protocolTaskProgress").value = progress;
+      $("protocolTaskProgressValue").textContent = completed + " / " + total;
+      $("protocolTaskSuccess").textContent = Number(task.succeeded || 0);
+      $("protocolTaskFailed").textContent = Number(task.failed || 0);
+      $("protocolTaskElapsed").textContent = formatElapsed(task.startedAt, task.finishedAt);
+
+      const stageOrder = ["protocol_auth", "email_verification", "password", "two_factor", "completed"];
+      let activeStage = task.phase || "";
+      if (activeStage === "session") activeStage = "completed";
+      const activeIndex = stageOrder.indexOf(activeStage);
+      document.querySelectorAll("[data-protocol-stage]").forEach((element) => {
+        const index = stageOrder.indexOf(element.dataset.protocolStage);
+        element.classList.toggle("active", Boolean(task.running && index === activeIndex));
+        element.classList.toggle("done", Boolean((activeIndex > index) || (!task.running && task.status === "completed")));
+      });
+
+      const logs = task.logs || [];
+      $("protocolLogCount").textContent = logs.length + " 条";
+      $("protocolTaskLog").innerHTML = logs.length ? logs.map((item) =>
+        '<div class="protocol-log-row ' + escapeHtml(item.status || "") + '"><time>' +
+        formatClock(item.at) + '</time><b title="' + escapeHtml(item.email || "") + '">' +
+        escapeHtml(abbreviateEmail(item.email)) + '</b><span>' + escapeHtml(item.message || "") + '</span></div>'
+      ).join("") : '<div class="task-log-empty">暂无协议任务日志</div>';
+      $("protocolTaskLog").scrollTop = $("protocolTaskLog").scrollHeight;
+    }
+
     filteredCardAccounts(state) {
       const query = $("cardSearch")?.value.trim().toLowerCase() || "";
       const status = $("cardStatusFilter")?.value || "all";
@@ -913,12 +1013,14 @@
         accounts: [],
         browserTask: { status: "idle", runtime: {} },
         registrationTask: { status: "idle", phase: "idle" },
+        protocolRegistrationTask: { status: "idle", phase: "idle", runtime: {} },
         registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
+        selectedProtocolEmails: [],
         selectedCardEmail: "",
         selectedVerificationEmail: "",
         verificationFilter: "all",
@@ -928,6 +1030,7 @@
       this.router = new HashRouter({
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
+        "protocol-registration": () => this.renderer.renderProtocolRegistration(this.store.state),
         "card-links": () => this.renderer.renderCardLinks(this.store.state),
         "pp-payment": () => this.renderer.renderPayPal(this.store.state),
         verification: () => this.renderer.renderVerification(this.store.state),
@@ -942,6 +1045,7 @@
       this.renderer.renderShell(state);
       this.renderer.renderOverview(state);
       this.renderer.renderAccounts(state);
+      this.renderer.renderProtocolRegistration(state);
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
       if (this.router.current === "pp-payment") this.renderer.renderPayPal(state);
@@ -974,7 +1078,12 @@
 
     async loadAccounts() {
       const data = await this.api.get("/api/gpt-emails");
-      const patch = { accounts: data.items || [] };
+      const accounts = data.items || [];
+      const pendingEmails = new Set(accounts.filter((item) => !item.protocolReady).map((item) => item.email));
+      const patch = {
+        accounts,
+        selectedProtocolEmails: (this.store.state.selectedProtocolEmails || []).filter((email) => pendingEmails.has(email)),
+      };
       if (!this.store.state.selectedCardEmail && data.items?.length) {
         patch.selectedCardEmail = data.items.find((item) => item.sessionStatus === "ready")?.email || data.items[0].email;
       }
@@ -1010,6 +1119,22 @@
       } catch (error) {
         this.toast(error.message, "error");
         this.schedule("registration", () => this.loadRegistrationTask(), 2500);
+      }
+    }
+
+    async loadProtocolRegistrationTask() {
+      try {
+        const data = await this.api.get("/api/protocol-registration/status");
+        const wasRunning = Boolean(this.store.state.protocolRegistrationTask.running);
+        this.store.patch({ protocolRegistrationTask: data });
+        if (data.running) {
+          this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 1200);
+        } else if (wasRunning) {
+          await this.loadAccounts();
+        }
+      } catch (error) {
+        this.toast(error.message, "error");
+        this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 2500);
       }
     }
 
@@ -1058,6 +1183,14 @@
       const concurrency = Number($("verificationConcurrency").value);
       if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
         throw new Error("验证并发必须是 1–10 的整数");
+      }
+      return concurrency;
+    }
+
+    protocolConcurrency() {
+      const concurrency = Number($("protocolConcurrency").value);
+      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 5) {
+        throw new Error("协议注册并发必须是 1–5 的整数");
       }
       return concurrency;
     }
@@ -1115,7 +1248,7 @@
 
     bindCommands() {
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal()]);
+        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal()]);
         return "数据已刷新";
       });
       this.commands.register("reload-paypal", async () => {
@@ -1176,6 +1309,40 @@
         return source === "gmail"
           ? "已启动 SMSBower Gmail 获取与自动注册（" + (options.headless ? "无头" : "前台窗口") + "）"
           : "已启动 iCloud 库存邮箱注册";
+      });
+      this.commands.register("start-protocol-selected", async () => {
+        const emails = [...(this.store.state.selectedProtocolEmails || [])];
+        if (!emails.length) throw new Error("请先选择待协议注册账号");
+        if (!confirm("对选中的 " + emails.length + " 个账号执行 Mail Auth，并强制完成密码与 TOTP 2FA？")) {
+          throw Object.assign(new Error(), { name: "AbortError" });
+        }
+        const data = await this.api.post("/api/protocol-registration/start", {
+          emails, concurrency: this.protocolConcurrency(), all: false,
+        });
+        this.store.patch({ protocolRegistrationTask: data.task });
+        this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
+        return "协议注册选中任务已启动";
+      });
+      this.commands.register("start-protocol-all", async () => {
+        const pending = this.store.state.accounts.filter((item) => !item.protocolReady).length;
+        if (!pending) throw new Error("全部账号均已完成协议注册（密码+2FA）");
+        if (!confirm("协议注册全部待处理账号，共 " + pending + " 个，是否继续？")) {
+          throw Object.assign(new Error(), { name: "AbortError" });
+        }
+        const data = await this.api.post("/api/protocol-registration/start", {
+          all: true, concurrency: this.protocolConcurrency(), emails: [],
+        });
+        this.store.patch({ protocolRegistrationTask: data.task, selectedProtocolEmails: [] });
+        this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
+        return "协议注册全部任务已启动" + (data.skipped ? "，已跳过 " + data.skipped + " 个完整账号" : "");
+      });
+      this.commands.register("stop-protocol-registration", async () => {
+        if (!confirm("停止当前协议注册任务？")) {
+          throw Object.assign(new Error(), { name: "AbortError" });
+        }
+        const data = await this.api.post("/api/protocol-registration/stop", {});
+        this.store.patch({ protocolRegistrationTask: data.task });
+        return data.task.message || "协议注册任务已停止";
       });
       this.commands.register("set-smsbower-key", async () => {
         const apiKey = prompt("输入 SMSBower API Key。Key 只保存在本地数据库，接口和日志不会回传：", "");
@@ -1419,6 +1586,24 @@
       ["accountSearch", "accountPlanFilter", "accountSessionFilter"].forEach((id) => {
         $(id).addEventListener(id === "accountSearch" ? "input" : "change", () => this.renderer.renderAccounts(this.store.state));
       });
+      ["protocolSearch", "protocolStatusFilter"].forEach((id) => {
+        $(id).addEventListener(id === "protocolSearch" ? "input" : "change", () => this.renderer.renderProtocolRegistration(this.store.state));
+      });
+      $("protocolAccountList").addEventListener("change", (event) => {
+        const checkbox = event.target.closest("[data-protocol-email]");
+        if (!checkbox) return;
+        const selected = new Set(this.store.state.selectedProtocolEmails || []);
+        if (checkbox.checked) selected.add(checkbox.dataset.protocolEmail);
+        else selected.delete(checkbox.dataset.protocolEmail);
+        this.store.patch({ selectedProtocolEmails: [...selected] });
+      });
+      $("protocolSelectAll").addEventListener("change", (event) => {
+        const selected = new Set(this.store.state.selectedProtocolEmails || []);
+        this.renderer.filteredProtocolAccounts(this.store.state)
+          .filter((item) => !item.protocolReady)
+          .forEach((item) => event.target.checked ? selected.add(item.email) : selected.delete(item.email));
+        this.store.patch({ selectedProtocolEmails: [...selected] });
+      });
       ["cardSearch", "cardStatusFilter"].forEach((id) => {
         $(id).addEventListener(id === "cardSearch" ? "input" : "change", () => this.renderer.renderCardLinks(this.store.state));
       });
@@ -1489,7 +1674,7 @@
       this.bindEvents();
       this.router.start();
       const results = await Promise.allSettled([
-        this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
+        this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(),
         this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal(),
       ]);
       const failure = results.find((result) => result.status === "rejected");

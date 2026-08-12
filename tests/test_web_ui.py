@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from hidemyemail_generator.web_ui import build_app_page, build_login_page
 from hidemyemail_generator.webapp import create_app
+from hidemyemail_generator.browser_tasks import _save_account_record, load_account_record
 
 
 class StructuredWebUiTests(unittest.TestCase):
@@ -15,6 +17,7 @@ class StructuredWebUiTests(unittest.TestCase):
         for view in (
             "overviewView",
             "accountsView",
+            "protocolRegistrationView",
             "cardLinksView",
             "ppPaymentView",
             "verificationView",
@@ -24,6 +27,7 @@ class StructuredWebUiTests(unittest.TestCase):
         for route in (
             "overview",
             "accounts",
+            "protocol-registration",
             "card-links",
             "pp-payment",
             "verification",
@@ -44,6 +48,15 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-src="/paypal-pay/"', page)
         self.assertIn("/api/paypal/status", page)
         self.assertIn("renderPayPal", page)
+        self.assertIn("协议注册", page)
+        self.assertIn("Mail Auth 协议注册", page)
+        self.assertIn("协议注册选中", page)
+        self.assertIn("协议注册全部", page)
+        self.assertIn("/api/protocol-registration/start", page)
+        self.assertIn("/api/protocol-registration/status", page)
+        self.assertIn("renderProtocolRegistration", page)
+        self.assertIn("添加密码", page)
+        self.assertIn("激活 2FA", page)
         self.assertIn('id="registrationProxyMode"', page)
         self.assertIn("Clash 日本轮询", page)
         self.assertIn("/api/registration-proxy/rotate", page)
@@ -250,6 +263,71 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["available"])
         self.assertFalse(payload["running"])
         self.assertEqual(payload["url"], "/paypal-pay/")
+
+    async def test_protocol_registration_status_exposes_mail_auth_runtime(self):
+        response = await self.client.get("/api/protocol-registration/status")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "idle")
+        self.assertIn("available", payload["runtime"])
+        self.assertIn("projectRoot", payload["runtime"])
+
+    async def test_protocol_registration_start_rejects_empty_account_pool(self):
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"all": True, "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 409)
+        self.assertFalse(payload["ok"])
+        self.assertIn("没有可协议注册", payload["error"])
+
+    async def test_protocol_registration_api_persists_complete_credentials(self):
+        email = "api-protocol@icloud.com"
+        _save_account_record(self.app["db_file"], email)
+
+        async def runner(payload, on_event):
+            on_event({"stage": "two_factor", "message": "TOTP 2FA 已激活"})
+            return {
+                "status": "success",
+                "email": payload["email"],
+                "access_token": "header.payload.signature",
+                "session_json": json.dumps(
+                    {"accessToken": "header.payload.signature", "sessionToken": "session"}
+                ),
+                "storage_state_json": json.dumps({"cookies": [], "origins": []}),
+                "session_acquisition_method": "gptfree_mail_auth",
+                "password": "GeneratedPassword!1",
+                "two_factor": {
+                    "enabled": True,
+                    "status": "enabled",
+                    "type": "totp",
+                    "secret": "JBSWY3DPEHPK3PXP",
+                },
+            }
+
+        manager = self.app["protocol_registration_manager"]
+        manager.worker_runner = runner
+        manager._runtime_cache = None
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"emails": [email], "concurrency": 1},
+        )
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["started"])
+
+        final = await manager.wait()
+        self.assertEqual(final["status"], "completed")
+        record = load_account_record(self.app["db_file"], email)
+        self.assertEqual(record["password"], "GeneratedPassword!1")
+        self.assertTrue(record["two_factor"]["enabled"])
+        self.assertEqual(record["session_acquisition_method"], "gptfree_mail_auth")
 
     async def test_registration_failure_record_is_persisted_in_status(self):
         manager = self.app["registration_manager"]

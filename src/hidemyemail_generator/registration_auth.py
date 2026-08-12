@@ -331,13 +331,55 @@ def _click_candidate(candidate) -> None:
         try:
             candidate.click(timeout=15000)
         except Exception as error:
-            raise RuntimeError(
-                "ChatGPT 首页入口按钮点击失败"
-            ) from error
+            try:
+                candidate.evaluate("element => element.click()")
+            except Exception:
+                raise RuntimeError(
+                    "ChatGPT 首页入口按钮点击失败"
+                ) from error
     except Exception as error:
-        raise RuntimeError(
-            "ChatGPT 首页入口按钮点击失败"
-        ) from error
+        detail = str(error or "").lower()
+        pointer_failure = any(
+            marker in detail
+            for marker in (
+                "intercept",
+                "obscur",
+                "receives pointer",
+                "not visible",
+                "not stable",
+                "outside of the viewport",
+                "detached",
+            )
+        )
+        if not pointer_failure:
+            # A non-pointer timeout may mean the first click already initiated
+            # navigation. The caller checks the page transition before retrying.
+            raise RuntimeError(
+                "ChatGPT 首页入口按钮点击后等待页面响应超时"
+            ) from error
+        try:
+            candidate.click(
+                timeout=5000,
+                no_wait_after=True,
+                force=True,
+            )
+        except TypeError:
+            try:
+                candidate.click(timeout=5000, force=True)
+            except Exception:
+                try:
+                    candidate.evaluate("element => element.click()")
+                except Exception:
+                    raise RuntimeError(
+                        "ChatGPT 首页入口按钮强制点击失败"
+                    ) from error
+        except Exception:
+            try:
+                candidate.evaluate("element => element.click()")
+            except Exception:
+                raise RuntimeError(
+                    "ChatGPT 首页入口按钮强制点击失败"
+                ) from error
 
 
 def click_chatgpt_home_login(
@@ -695,9 +737,22 @@ def click_email_submit(
             try:
                 current.click(timeout=5000)
             except Exception:
-                return False
+                try:
+                    current.evaluate("element => element.click()")
+                except Exception:
+                    return False
         except Exception:
-            return False
+            try:
+                current.click(
+                    timeout=5000,
+                    no_wait_after=True,
+                    force=True,
+                )
+            except Exception:
+                try:
+                    current.evaluate("element => element.click()")
+                except Exception:
+                    return False
         return True
 
     for selector in submit_selectors:
@@ -795,27 +850,67 @@ def paste_email_and_submit(
         BrowserDiagnosticCode.AUTH_EMAIL_FOCUS,
         "点击 OpenAI 邮箱输入框，准备从系统剪贴板粘贴注册邮箱",
     )
+    pointer_focus_failed = False
     try:
         email_input.click(timeout=5000)
     except TypeError:
-        email_input.click()
-    try:
-        email_input.press("Control+A", timeout=2000)
-    except TypeError:
-        email_input.press("Control+A")
-    with clipboard_lock:
-        clipboard_write(email)
         try:
+            email_input.click()
+        except Exception:
+            pointer_focus_failed = True
+    except Exception:
+        pointer_focus_failed = True
+    if pointer_focus_failed:
+        try:
+            email_input.click(
+                timeout=5000,
+                no_wait_after=True,
+                force=True,
+            )
+        except Exception:
+            evaluate = getattr(email_input, "evaluate", None)
+            if callable(evaluate):
+                evaluate("element => element.focus()")
+
+    dom_filled = False
+    try:
+        try:
+            email_input.press("Control+A", timeout=2000)
+        except TypeError:
+            email_input.press("Control+A")
+    except Exception:
+        fill = getattr(email_input, "fill", None)
+        if not callable(fill):
+            raise
+        try:
+            fill(email, timeout=5000, force=True)
+        except TypeError:
+            fill(email)
+        dom_filled = True
+
+    if not dom_filled:
+        with clipboard_lock:
+            clipboard_write(email)
             try:
-                email_input.press("Control+V", timeout=5000)
-            except TypeError:
-                email_input.press("Control+V")
-            wait(page, 250)
-        finally:
-            try:
-                clipboard_write("")
+                try:
+                    email_input.press("Control+V", timeout=5000)
+                except TypeError:
+                    email_input.press("Control+V")
+                wait(page, 250)
             except Exception:
-                pass
+                fill = getattr(email_input, "fill", None)
+                if not callable(fill):
+                    raise
+                try:
+                    fill(email, timeout=5000, force=True)
+                except TypeError:
+                    fill(email)
+                dom_filled = True
+            finally:
+                try:
+                    clipboard_write("")
+                except Exception:
+                    pass
     pasted_value = input_value(email_input)
     if pasted_value is not None and pasted_value.strip() != email.strip():
         fill = getattr(email_input, "fill", None)

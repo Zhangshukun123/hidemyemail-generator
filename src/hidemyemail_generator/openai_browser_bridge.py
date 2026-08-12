@@ -349,6 +349,20 @@ def ensure_password_in_security_settings(
     )
 
 
+def add_password_via_account_api(
+    worker,
+    context,
+    access_token: str,
+    password: str,
+) -> bool:
+    return _account_security.add_password_via_account_api(
+        worker,
+        context,
+        access_token,
+        password,
+    )
+
+
 def _reauthenticate_for_mfa(worker, context) -> dict:
     return _account_security._reauthenticate_for_mfa(
         worker,
@@ -411,7 +425,7 @@ def configure_post_registration_password_setup(
         force_reset_password=force_reset_password,
         enable_2fa=enable_2fa,
         pending_two_factor=pending_two_factor,
-        ensure_password=ensure_password_in_security_settings,
+        add_password=add_password_via_account_api,
         extract_session=extract_session_without_navigation,
         emit_event=emit,
         enable_two_factor=_enable_two_factor_before_browser_closes,
@@ -472,6 +486,13 @@ def require_registration_proxy_country(health, expected_country: str) -> str:
     if expected and actual != expected:
         raise RuntimeError(
             f"注册代理出口国家不符：要求 {expected}，实际 {actual or '未知'}；已拒绝直连或跨区注册"
+        )
+    chatgpt_status = int(getattr(health, "chatgpt_status", 0) or 0)
+    if chatgpt_status != 200:
+        status_label = str(chatgpt_status) if chatgpt_status else "未知"
+        raise RuntimeError(
+            "注册代理访问 ChatGPT 不可用："
+            f"HTTP {status_label}；注册仅接受 HTTP 200，已拒绝受限或未验证的出口"
         )
     return actual
 

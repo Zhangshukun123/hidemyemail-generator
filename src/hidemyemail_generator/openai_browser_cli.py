@@ -5,7 +5,72 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
+
+
+REGISTRATION_CHATGPT_403_MAX_ATTEMPTS = 5
+REGISTRATION_CHATGPT_403_RETRY_DELAYS_SECONDS = (1.0, 2.0, 3.0, 5.0)
+
+
+def prepare_registration_proxy(
+    worker,
+    api,
+    proxy,
+    expected_proxy_country: str,
+    *,
+    sleep=time.sleep,
+):
+    """Retry a transient ChatGPT 403 before accepting or rejecting an exit."""
+
+    for attempt in range(1, REGISTRATION_CHATGPT_403_MAX_ATTEMPTS + 1):
+        try:
+            health = worker._prepare_fingerprint_for_proxy(
+                proxy, "注册", check_stripe=False
+            )
+        except Exception as error:
+            if attempt >= REGISTRATION_CHATGPT_403_MAX_ATTEMPTS:
+                raise
+            delay = REGISTRATION_CHATGPT_403_RETRY_DELAYS_SECONDS[attempt - 1]
+            api.emit(
+                "log",
+                message=(
+                    "[代理] ChatGPT 探测请求暂时失败"
+                    f"（{attempt}/{REGISTRATION_CHATGPT_403_MAX_ATTEMPTS}）："
+                    f"{str(error)[:240]}；{delay:g} 秒后使用同一粘性出口重新请求"
+                ),
+            )
+            sleep(delay)
+            continue
+        try:
+            actual_country = api.require_registration_proxy_country(
+                health, expected_proxy_country
+            )
+        except RuntimeError:
+            chatgpt_status = int(getattr(health, "chatgpt_status", 0) or 0)
+            expected = str(expected_proxy_country or "").strip().upper()
+            actual = str(getattr(health, "country", "") or "").strip().upper()
+            retryable_403 = chatgpt_status == 403 and (
+                not expected or actual == expected
+            )
+            if (
+                not retryable_403
+                or attempt >= REGISTRATION_CHATGPT_403_MAX_ATTEMPTS
+            ):
+                raise
+            delay = REGISTRATION_CHATGPT_403_RETRY_DELAYS_SECONDS[attempt - 1]
+            api.emit(
+                "log",
+                message=(
+                    "[代理] ChatGPT 探测暂时返回 HTTP 403"
+                    f"（{attempt}/{REGISTRATION_CHATGPT_403_MAX_ATTEMPTS}）；"
+                    f"{delay:g} 秒后使用同一粘性出口重新请求"
+                ),
+            )
+            sleep(delay)
+            continue
+        return health, actual_country
+    raise RuntimeError("注册代理 ChatGPT 探测重试未返回结果")
 
 
 def run(api) -> int:
@@ -22,6 +87,9 @@ def run(api) -> int:
         os.environ.get("HME_OPENAI_PASSWORD_CONFIRMED", "") == "1"
     )
     enable_2fa = os.environ.get("HME_ENABLE_OPENAI_2FA", "") == "1"
+    force_reset_password = (
+        os.environ.get("HME_FORCE_RESET_OPENAI_PASSWORD", "") == "1"
+    )
     cookie_refresh_only = os.environ.get("HME_COOKIE_SESSION_REFRESH", "") == "1"
     manual_otp_entry = os.environ.get("HME_MANUAL_OTP_ENTRY", "") == "1"
     gmail_account = (
@@ -129,11 +197,11 @@ def run(api) -> int:
             worker._register = reject_cookie_fallback
         direct_location = {"country": "", "locale": "", "timezone": ""}
         if proxy_url:
-            health = worker._prepare_fingerprint_for_proxy(
-                proxy, "注册", check_stripe=False
-            )
-            actual_country = api.require_registration_proxy_country(
-                health, expected_proxy_country
+            health, actual_country = prepare_registration_proxy(
+                worker,
+                api,
+                proxy,
+                expected_proxy_country,
             )
             api.emit(
                 "log",
@@ -147,13 +215,13 @@ def run(api) -> int:
             direct_location = api.detect_direct_registration_location(app_backend, log)
         api.configure_password_first_login(
             worker,
-            enabled=ensure_password,
-            required=password_first_required,
+            enabled=False,
+            required=False,
         )
         api.configure_email_verification_priority(worker)
         api.configure_email_password_only_registration(
             worker,
-            enabled=password_first_required,
+            enabled=ensure_password,
         )
         api.configure_chatgpt_home_login_entry(worker)
         api.configure_security_challenge_monitoring(worker)
@@ -225,6 +293,15 @@ def run(api) -> int:
         # stall indefinitely while exporting a complete browser storage snapshot;
         # the database merge keeps any previously saved snapshot intact.
         worker.skip_storage_state_capture = True
+        api.configure_post_registration_password_setup(
+            app_backend,
+            worker,
+            password,
+            enabled=bool(ensure_password and not saved_password_confirmed),
+            force_reset_password=force_reset_password,
+            enable_2fa=enable_2fa,
+            pending_two_factor=pending_2fa,
+        )
         result = worker.run()
         password_confirmed = api._password_confirmed_for_two_factor(
             worker, saved_password_confirmed

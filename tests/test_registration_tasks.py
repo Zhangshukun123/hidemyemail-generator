@@ -954,6 +954,12 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.snapshot()["status"], "failed")
         self.assertEqual(completed[0][0:2], ("retry@icloud.com", False))
         self.assertIn("confirmation failed", completed[0][2])
+        self.assertTrue(
+            any(
+                "注册失败，已释放，可再次注册" in item["message"]
+                for item in manager.snapshot()["logs"]
+            )
+        )
 
     async def test_concurrency_three_claims_three_accounts_and_starts_three_browsers(self):
         browser = FakeBrowserManager()

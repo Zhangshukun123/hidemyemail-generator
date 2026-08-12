@@ -78,6 +78,85 @@ except ImportError:
     from openai_mfa import MfaSetupError, enable_totp_mfa
 
 ICloudOtpReader = None
+PASSWORD_ADD_URL = "https://chatgpt.com/api/accounts/password/add"
+
+
+def _api_response_status(response) -> int:
+    try:
+        return int(getattr(response, "status", None) or response.status_code)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _api_response_detail(response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            value = error.get("message") or error.get("errorMessage")
+            if value:
+                return str(value)[:300]
+        for key in ("detail", "message"):
+            if payload.get(key):
+                return str(payload[key])[:300]
+    try:
+        value = response.text
+        if callable(value):
+            value = value()
+        return str(value or "")[:300]
+    except Exception:
+        return ""
+
+
+def add_password_via_account_api(
+    worker,
+    context,
+    access_token: str,
+    password: str,
+    *,
+    timeout_seconds: int = 60,
+) -> bool:
+    """Add a password after registration with the authenticated account API."""
+
+    target_password = str(password or "")
+    if len(target_password) < 12:
+        raise RuntimeError("待设置的 OpenAI 密码长度不足 12 位")
+    token = str(access_token or "").strip()
+    if not token:
+        raise RuntimeError("注册成功但尚未取得 Access Token，不能后置密码")
+    request = getattr(context, "request", None)
+    if request is None or not callable(getattr(request, "post", None)):
+        raise RuntimeError("当前浏览器上下文不支持账号密码接口")
+
+    response = request.post(
+        PASSWORD_ADD_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": "https://chatgpt.com/",
+        },
+        data=json.dumps({"password": target_password}),
+        timeout=max(15, int(timeout_seconds)) * 1000,
+    )
+    status = _api_response_status(response)
+    if not 200 <= status < 300:
+        detail = _api_response_detail(response)
+        worker.log(
+            f"[密码] POST /api/accounts/password/add 失败：HTTP {status}"
+            + (f" · {detail}" if detail else "")
+        )
+        raise RuntimeError(
+            f"POST /api/accounts/password/add 返回 HTTP {status}"
+            + (f" · {detail}" if detail else "")
+        )
+    worker._password_step_submitted = True
+    worker.log("[密码] POST /api/accounts/password/add 已确认后置密码成功")
+    return True
 
 
 def _retained_registration_context(app_backend, email: str):
@@ -599,13 +678,25 @@ def configure_post_registration_password_setup(
     enable_2fa: bool = False,
     pending_two_factor: dict | None = None,
     ensure_password=None,
+    add_password=None,
     extract_session=None,
     emit_event=None,
     enable_two_factor=None,
 ) -> bool:
     """Save the authenticated Session before attempting optional account setup."""
 
-    ensure_password = ensure_password or ensure_password_in_security_settings
+    if add_password is None:
+        if ensure_password is not None:
+            def add_password(target_worker, context, _access_token, target_password):
+                return ensure_password(
+                    app_backend,
+                    target_worker,
+                    target_password,
+                    context=context,
+                    force_reset_password=force_reset_password,
+                )
+        else:
+            add_password = add_password_via_account_api
     extract_session = extract_session or extract_session_without_navigation
     emit_event = emit_event or emit
     enable_two_factor = enable_two_factor or _enable_two_factor_before_browser_closes
@@ -636,17 +727,17 @@ def configure_post_registration_password_setup(
             worker.log("[密码] 邮箱重置后已成功建立会话，确认唯一密码生效")
         if not getattr(worker, "_password_step_submitted", False):
             try:
-                ensure_password(
-                    app_backend,
+                add_password(
                     worker,
+                    context,
+                    str(result.get("access_token") or ""),
                     password,
-                    context=context,
-                    force_reset_password=force_reset_password,
                 )
             except Exception as error:
                 worker._hme_password_setup_error = safe_log_message(str(error))
                 worker.log(
-                    "[密码] 自动设置未成功；注册 Session 已保存，可稍后单独设置密码"
+                    "[密码] 自动设置未成功；注册 Session 已保存，可稍后单独设置密码："
+                    + worker._hme_password_setup_error
                 )
         if getattr(worker, "_password_step_submitted", False):
             # Password changes may rotate the authenticated token.  Refresh the

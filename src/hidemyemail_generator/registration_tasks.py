@@ -891,7 +891,7 @@ class RegistrationTaskManager:
                             )
                             self._append_log(
                                 f"已向远端库存回执（{email}）："
-                                f"{'注册成功，标记已使用' if success else '注册失败，已永久隔离'}"
+                                f"{'注册成功，标记已使用' if success else '注册失败，已释放，可再次注册'}"
                             )
                         elif provider == "inventory" and self.release_email is not None:
                             await self.release_email(email)

@@ -72,7 +72,7 @@ class RegistrationInventoryTests(unittest.TestCase):
                 "newer@icloud.com",
             )
 
-    def test_release_quarantines_failed_claim_permanently(self):
+    def test_release_returns_failed_claim_for_retry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
             conn = connect_db(str(db_file))
@@ -93,8 +93,11 @@ class RegistrationInventoryTests(unittest.TestCase):
             self.assertEqual(available_generated_inventory_count(db_file), 0)
             self.assertEqual(claim_generated_inventory_email(db_file), "")
             release_generated_inventory_email(db_file, "retry@icloud.com")
-            self.assertEqual(available_generated_inventory_count(db_file), 0)
-            self.assertEqual(claim_generated_inventory_email(db_file), "")
+            self.assertEqual(available_generated_inventory_count(db_file), 1)
+            self.assertEqual(
+                claim_generated_inventory_email(db_file),
+                "retry@icloud.com",
+            )
             conn = connect_db(str(db_file))
             try:
                 state = conn.execute(
@@ -103,7 +106,7 @@ class RegistrationInventoryTests(unittest.TestCase):
                 ).fetchone()["state"]
             finally:
                 conn.close()
-            self.assertEqual(state, "trash")
+            self.assertEqual(state, "unused")
 
     def test_concurrent_claims_receive_different_inventory_addresses(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -131,7 +134,7 @@ class RegistrationInventoryTests(unittest.TestCase):
             self.assertEqual(set(claimed), {"first@icloud.com", "second@icloud.com"})
             self.assertEqual(claim_generated_inventory_email(db_file), "")
 
-    def test_skips_inventory_address_with_any_registration_history(self):
+    def test_password_only_registration_history_remains_retryable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
             conn = connect_db(str(db_file))
@@ -166,10 +169,10 @@ class RegistrationInventoryTests(unittest.TestCase):
 
             self.assertEqual(
                 claim_generated_inventory_email(db_file),
-                "available@icloud.com",
+                "registered@icloud.com",
             )
 
-    def test_startup_cleanup_quarantines_abandoned_claims(self):
+    def test_startup_cleanup_releases_abandoned_claims_for_retry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
             conn = connect_db(str(db_file))
@@ -185,9 +188,12 @@ class RegistrationInventoryTests(unittest.TestCase):
             claim_generated_inventory_email(db_file)
 
             self.assertEqual(clear_generated_inventory_claims(db_file), 1)
-            self.assertEqual(claim_generated_inventory_email(db_file), "")
+            self.assertEqual(
+                claim_generated_inventory_email(db_file),
+                "abandoned@icloud.com",
+            )
 
-    def test_success_marks_used_and_failure_quarantines_address(self):
+    def test_failure_retries_same_address_and_success_marks_used(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
             conn = connect_db(str(db_file))
@@ -206,7 +212,7 @@ class RegistrationInventoryTests(unittest.TestCase):
                 success=False,
                 message="registration failed",
             )
-            self.assertEqual(registration_inventory_status(db_file)["available"], 1)
+            self.assertEqual(registration_inventory_status(db_file)["available"], 2)
             conn = connect_db(str(db_file))
             try:
                 failed_state = conn.execute(
@@ -215,9 +221,10 @@ class RegistrationInventoryTests(unittest.TestCase):
                 ).fetchone()["state"]
             finally:
                 conn.close()
-            self.assertEqual(failed_state, "trash")
+            self.assertEqual(failed_state, "unused")
 
             succeeded = lease_generated_inventory_email(db_file)
+            self.assertEqual(succeeded["email"], "failed@icloud.com")
             complete_generated_inventory_lease(
                 db_file,
                 lease_id=succeeded["leaseId"],
@@ -228,12 +235,12 @@ class RegistrationInventoryTests(unittest.TestCase):
             try:
                 state = conn.execute(
                     "SELECT state FROM addresses WHERE email = ?",
-                    ("succeeded@icloud.com",),
+                    ("failed@icloud.com",),
                 ).fetchone()["state"]
             finally:
                 conn.close()
             self.assertEqual(state, "used")
-            self.assertEqual(registration_inventory_status(db_file)["available"], 0)
+            self.assertEqual(registration_inventory_status(db_file)["available"], 1)
 
     def test_unanswered_lease_expires_after_ten_minutes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -255,7 +262,7 @@ class RegistrationInventoryTests(unittest.TestCase):
             )
 
             self.assertEqual(status["expiredLeases"], 1)
-            self.assertEqual(status["available"], 0)
+            self.assertEqual(status["available"], 1)
             expired_result = complete_generated_inventory_lease(
                 db_file,
                 lease_id=lease["leaseId"],
@@ -272,7 +279,7 @@ class RegistrationInventoryTests(unittest.TestCase):
                 ).fetchone()["state"]
             finally:
                 conn.close()
-            self.assertEqual(state, "trash")
+            self.assertEqual(state, "unused")
 
 
 class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -324,7 +331,7 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 conn.close()
 
-    async def test_local_registration_history_is_removed_from_remote_inventory(self):
+    async def test_completed_local_account_is_removed_from_remote_inventory(self):
         with tempfile.TemporaryDirectory() as remote_dir, tempfile.TemporaryDirectory() as local_dir:
             token = "test-token-at-least-32-characters-long"
             remote_app = create_app(
@@ -357,8 +364,7 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
                             "gpt_account:existing@icloud.com",
                             json.dumps(
                                 {
-                                    "password": "previous-attempt-password",
-                                    "password_confirmed": False,
+                                    "access_token": "completed-session-token",
                                 }
                             ),
                         ),
@@ -383,6 +389,59 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 conn.close()
             self.assertEqual(state, "used")
+
+    async def test_password_only_local_history_retries_remote_inventory_address(self):
+        with tempfile.TemporaryDirectory() as remote_dir, tempfile.TemporaryDirectory() as local_dir:
+            token = "test-token-at-least-32-characters-long"
+            remote_app = create_app(
+                base_dir=Path(remote_dir),
+                inventory_server_enabled=True,
+                workbench_import_token=token,
+                web_password="admin-password",
+            )
+            conn = connect_db(str(remote_app["db_file"]))
+            try:
+                upsert_address(
+                    conn,
+                    "retry-local@icloud.com",
+                    state="unused",
+                    source="generated",
+                )
+            finally:
+                conn.close()
+            remote_server = TestServer(remote_app)
+            await remote_server.start_server()
+            try:
+                local_app = create_app(
+                    base_dir=Path(local_dir),
+                    inventory_service_url=str(remote_server.make_url("/")).rstrip("/"),
+                    inventory_service_token=token,
+                )
+                conn = connect_db(str(local_app["db_file"]))
+                try:
+                    conn.execute(
+                        "INSERT INTO settings(key, value) VALUES (?, ?)",
+                        (
+                            "gpt_account:retry-local@icloud.com",
+                            json.dumps(
+                                {
+                                    "password": "same-password-on-retry",
+                                    "password_confirmed": False,
+                                }
+                            ),
+                        ),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                email = await local_app["registration_manager"].acquire_email(
+                    "retry password-only account"
+                )
+            finally:
+                await remote_server.close()
+
+        self.assertEqual(email, "retry-local@icloud.com")
 
     async def test_registration_endpoint_forwards_manual_email_with_single_worker(self):
         class RegistrationManagerStub:
@@ -632,7 +691,7 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(locked_payload["available"], 0)
         self.assertEqual(locked_payload["activeLeases"], 1)
         self.assertEqual(completed_payload["status"], "failed")
-        self.assertEqual(released_payload["available"], 0)
+        self.assertEqual(released_payload["available"], 1)
         self.assertEqual(released_payload["activeLeases"], 0)
 
 
