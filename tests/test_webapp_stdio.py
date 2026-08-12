@@ -23,6 +23,7 @@ from hidemyemail_generator.inbox import (
     save_config,
 )
 from hidemyemail_generator.webapp import (
+    OPENAI_CODE_INBOX_SYNC_LIMIT,
     WORKBENCH_OPENAI_CODE_PATH,
     _configured_inventory_service_token,
     _configured_workbench_import_token,
@@ -576,6 +577,14 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await client.start_server()
                 try:
+                    # The deactivation scanner performs one startup sync.  Let
+                    # it finish, then isolate the public code-lookup requests.
+                    for _ in range(100):
+                        if sync.call_count:
+                            break
+                        await asyncio.sleep(0.01)
+                    sync.reset_mock()
+                    app["inbox_on_demand_next_attempt"] = 0.0
                     first = await client.post(
                         "/api/code/latest", json={"email": "one@icloud.com"}
                     )
@@ -588,6 +597,7 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.status, 404)
         self.assertEqual(second.status, 404)
         self.assertEqual(sync.call_count, 1)
+        self.assertEqual(sync.call_args.args[2], OPENAI_CODE_INBOX_SYNC_LIMIT)
 
     async def test_gpt_code_returns_direct_junk_match_with_expired_icloud_cookie(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -649,15 +659,81 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
                         headers={"X-Local-Token": app["local_token"]},
                     )
                     payload = await response.json()
+                    public_response = await client.post(
+                        "/api/code/latest",
+                        json={"email": "relay@icloud.com"},
+                    )
+                    public_payload = await public_response.json()
                 finally:
                     await client.close()
 
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["code"], "938388")
+<<<<<<< HEAD
         self.assertTrue(
             any(call.kwargs.get("junk_first") for call in sync.call_args_list)
         )
+=======
+        self.assertEqual(public_response.status, 200)
+        self.assertEqual(public_payload["code"], "938388")
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
         icloud_client.assert_not_called()
+
+    async def test_gpt_code_treats_expired_icloud_cookie_as_no_code_yet(self):
+        class ExpiredSessionHideMyEmail:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def list_email(self):
+                return {"success": False, "error": "Invalid global session"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "cookies.txt").write_text("expired-cookie", encoding="utf-8")
+            save_config(
+                InboxConfig(
+                    host="imap.example.com",
+                    port=993,
+                    username="inbox@example.com",
+                    password="app-password",
+                ),
+                str(root / "inbox_config.json"),
+            )
+            app = create_app(base_dir=root)
+            client = TestClient(TestServer(app))
+            with (
+                mock.patch(
+                    "hidemyemail_generator.webapp.sync_inbox",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "hidemyemail_generator.webapp.RichHideMyEmail",
+                    ExpiredSessionHideMyEmail,
+                ),
+            ):
+                await client.start_server()
+                try:
+                    response = await client.post(
+                        "/api/gpt-code",
+                        json={
+                            "email": "relay@icloud.com",
+                            "since": "2026-08-12T10:00:00+00:00",
+                        },
+                        headers={"X-Local-Token": app["local_token"]},
+                    )
+                    payload = await response.json()
+                finally:
+                    await client.close()
+
+        self.assertEqual(response.status, 404)
+        self.assertEqual(payload["error"], "暂未获取到该邮箱的 OpenAI 验证码")
+        self.assertNotIn("Invalid global session", payload["error"])
 
     async def test_authentication_failure_enters_backoff(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -551,11 +551,39 @@ def parse_received_at(message: EmailMessage) -> str:
 
 
 def header_addresses(message: EmailMessage, names: Iterable[str]) -> list[str]:
-    raw_values: list[str] = []
+    addresses: list[str] = []
     for name in names:
-        raw_values.extend(message.get_all(name, []))
-    parsed = getaddresses(raw_values)
-    return [addr.lower() for _, addr in parsed if addr]
+        # Parse one header value at a time.  Python 3.13's strict getaddresses()
+        # rejects the complete batch when iCloud's valid To header is followed
+        # by its non-RFC ``Original-Recipient: rfc822;...`` metadata header.
+        # That made every recipient disappear and prevented verification codes
+        # from being associated with their Hide My Email address.
+        for raw_value in message.get_all(name, []):
+            value = str(raw_value or "")
+            parsed = getaddresses([value])
+            parsed_addresses = [addr.lower() for _, addr in parsed if addr]
+            if parsed_addresses:
+                addresses.extend(parsed_addresses)
+                continue
+            # Metadata-style recipient headers are not address-list syntax.
+            # Keep their literal addresses without allowing one malformed value
+            # to invalidate ordinary To/Cc headers.
+            addresses.extend(match.lower() for match in EMAIL_RE.findall(value))
+    return list(dict.fromkeys(addresses))
+
+
+def icloud_hme_primary_address(message: EmailMessage) -> str:
+    """Return iCloud's authoritative Hide My Email alias from X-ICLOUD-HME."""
+
+    for raw_value in message.get_all("X-ICLOUD-HME", []):
+        match = re.search(
+            r"(?:^|;)\s*p\s*=\s*([^;\s]+@icloud\.com)(?:\s*;|$)",
+            str(raw_value or ""),
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).lower()
+    return ""
 
 
 def find_hme_address(
@@ -572,6 +600,9 @@ def find_hme_address(
         "Cc",
     ]
     recipients = header_addresses(message, recipient_headers)
+    icloud_hme = icloud_hme_primary_address(message)
+    if icloud_hme:
+        return icloud_hme, ", ".join(recipients)
     haystack = "\n".join(
         [message.get(name, "") for name in recipient_headers] + [body]
     ).lower()
@@ -644,6 +675,43 @@ def insert_message(conn: sqlite3.Connection, record: dict) -> bool:
     return True
 
 
+def repair_incomplete_message(
+    conn: sqlite3.Connection, existing: sqlite3.Row, record: dict
+) -> bool:
+    """Backfill fields that an earlier parser failed to extract from an IMAP message."""
+
+    repairable_fields = (
+        "sender",
+        "recipients",
+        "hme_address",
+        "subject",
+        "code",
+        "body_preview",
+        "received_at",
+    )
+    updates = {
+        field: record.get(field)
+        for field in repairable_fields
+        if not str(existing[field] or "").strip()
+        and str(record.get(field) or "").strip()
+    }
+    if not updates:
+        return False
+
+    assignments = ", ".join(f"{field} = :{field}" for field in updates)
+    conn.execute(
+        f"UPDATE messages SET {assignments} WHERE id = :message_id",
+        {**updates, "message_id": existing["id"]},
+    )
+    repaired_hme = str(updates.get("hme_address") or "").strip()
+    if repaired_hme:
+        # Match insert_message(): discovering an alias must not overwrite its
+        # existing user-managed state, label, or note.
+        upsert_address(conn, repaired_hme, state="unused", source="inbox")
+    conn.commit()
+    return True
+
+
 def _listed_mailbox_parts(row: bytes | str) -> tuple[set[str], str]:
     text = (
         row.decode("ascii", errors="backslashreplace")
@@ -692,7 +760,10 @@ def _sync_selected_folder(
     if status != "OK":
         raise RuntimeError(f"IMAP search failed: {config.folder}")
 
-    uids = data[0].split()
+    # RFC-conforming servers may represent an empty SEARCH result as either
+    # b"" or None.  iCloud uses [None] for an empty Junk mailbox.
+    raw_uids = data[0] if data else None
+    uids = raw_uids.split() if raw_uids else []
     if limit > 0:
         uids = uids[-limit:]
     # Process the newest messages first.  On a fresh or delayed sync there
@@ -703,14 +774,16 @@ def _sync_selected_folder(
     inserted: list[dict] = []
     for raw_uid in uids:
         uid = raw_uid.decode("ascii", errors="ignore")
-        exists = conn.execute(
+        existing = conn.execute(
             """
-            SELECT 1 FROM messages
+            SELECT id, sender, recipients, hme_address, subject, code,
+                   body_preview, received_at
+            FROM messages
             WHERE account_key = ? AND folder = ? AND uid = ?
             """,
             (config.account_key, config.folder, uid),
         ).fetchone()
-        if exists:
+        if existing and str(existing["hme_address"] or "").strip():
             continue
 
         # BODY.PEEK[] is standards-based and does not mark the message as read.
@@ -726,7 +799,9 @@ def _sync_selected_folder(
             continue
 
         record = message_to_record(conn, config, uid, raw_message)
-        if insert_message(conn, record):
+        if existing:
+            repair_incomplete_message(conn, existing, record)
+        elif insert_message(conn, record):
             inserted.append(record)
     return inserted
 

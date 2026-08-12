@@ -37,16 +37,21 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return _as_utc(parsed)
 
 
-def _account_has_registration_history(value: Any) -> bool:
+def _account_has_completed_registration(value: Any) -> bool:
     try:
         account = json.loads(str(value or ""))
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
-    # Any persisted GPT account record means this address has already entered
-    # a registration workflow.  Reusing it is unsafe even when the workflow
-    # failed before a Session was captured: OpenAI may already have committed
-    # the account creation on its side.
-    return isinstance(account, dict) and bool(account)
+    if not isinstance(account, dict):
+        return False
+    return bool(
+        str(account.get("access_token") or account.get("accessToken") or "").strip()
+        or account.get("session")
+        or str(account.get("session_json") or "").strip()
+        or account.get("cookies")
+        or str(account.get("cookies_json") or "").strip()
+        or str(account.get("storage_state_json") or "").strip()
+    )
 
 
 def _init_lease_table(conn) -> None:
@@ -97,13 +102,13 @@ def _expire_leases(conn, now: datetime) -> int:
 
 
 def _reconcile_terminal_addresses(conn, now_text: str) -> None:
-    """Permanently remove every attempted address from automatic inventory."""
+    """Return failed/expired attempts to inventory; keep successes consumed."""
 
     conn.execute(
         """
         UPDATE addresses AS address
-        SET state = 'trash', updated_at = ?
-        WHERE address.state = 'unused'
+        SET state = 'unused', updated_at = ?
+        WHERE address.state != 'used'
           AND address.source = 'generated'
           AND EXISTS (
               SELECT 1 FROM registration_inventory_leases AS lease
@@ -114,6 +119,11 @@ def _reconcile_terminal_addresses(conn, now_text: str) -> None:
               SELECT 1 FROM registration_inventory_leases AS lease
               WHERE lower(lease.email) = lower(address.email)
                 AND lease.status = 'succeeded'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM registration_inventory_leases AS lease
+              WHERE lower(lease.email) = lower(address.email)
+                AND lease.status = 'active'
           )
         """,
         (now_text,),
@@ -163,6 +173,7 @@ def _available_rows(conn) -> list[Any]:
           AND NOT EXISTS (
               SELECT 1 FROM registration_inventory_leases AS lease
               WHERE lower(lease.email) = lower(a.email)
+                AND lease.status IN ('active', 'succeeded')
           )
         ORDER BY a.created_at ASC, lower(a.email) ASC
         """
@@ -189,7 +200,7 @@ def lease_generated_inventory_email(
         email = ""
         for row in _available_rows(conn):
             candidate = str(row["email"] or "").strip().lower()
-            if candidate and not _account_has_registration_history(
+            if candidate and not _account_has_completed_registration(
                 row["account_value"]
             ):
                 email = candidate
@@ -294,7 +305,7 @@ def complete_generated_inventory_lease(
             WHERE lower(email) = lower(?)
             """,
             (
-                "used" if outcome == "succeeded" else "trash",
+                "used" if outcome == "succeeded" else "unused",
                 completed_at,
                 leased_email,
             ),
@@ -325,7 +336,7 @@ def registration_inventory_status(
         available = sum(
             1
             for row in _available_rows(conn)
-            if not _account_has_registration_history(row["account_value"])
+            if not _account_has_completed_registration(row["account_value"])
         )
         counts = {
             str(row["status"]): int(row["total"])

@@ -16,6 +16,7 @@ from hidemyemail_generator.inbox import (
     list_batches,
     list_messages,
     mark_messages_read,
+    message_to_record,
     set_address_metadata,
     set_batch_state,
     sync_inbox,
@@ -73,6 +74,27 @@ class JunkAwareFakeMailbox(FakeMailbox):
     def select(self, folder):
         self.selected_folders.append(folder)
         return "OK", []
+
+
+class EmptyJunkFakeMailbox(JunkAwareFakeMailbox):
+    def uid(self, command, *args):
+        if command == "search" and self.selected_folders[-1] == "Junk":
+            return "OK", [None]
+        return super().uid(command, *args)
+
+
+class ExistingMessageFakeMailbox(FakeMailbox):
+    def __init__(self, raw_message):
+        super().__init__()
+        self.raw_message = raw_message
+
+    def uid(self, command, *args):
+        if command == "search":
+            return "OK", [b"1312"]
+        if command == "fetch":
+            self.fetched_uids.append(args[0])
+            return "OK", [(b"metadata", self.raw_message)]
+        raise AssertionError(f"Unexpected IMAP command: {command}")
 
 
 class InboxSyncTests(unittest.TestCase):
@@ -171,6 +193,7 @@ class InboxSyncTests(unittest.TestCase):
             [("INBOX", "4"), ("Junk", "4")],
         )
 
+<<<<<<< HEAD
     def test_latency_sensitive_sync_can_scan_junk_before_inbox(self):
         mailbox = JunkAwareFakeMailbox()
         config = InboxConfig(
@@ -183,6 +206,17 @@ class InboxSyncTests(unittest.TestCase):
         def record_for_folder(_conn, folder_config, uid, _raw_message):
             return {"folder": folder_config.folder, "uid": uid}
 
+=======
+    def test_sync_accepts_icloud_none_for_empty_junk_search(self):
+        mailbox = EmptyJunkFakeMailbox()
+        config = InboxConfig(
+            host="imap.mail.me.com",
+            port=993,
+            username="user@icloud.com",
+            password="app-password",
+        )
+
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "inbox.db"
             with (
@@ -192,13 +226,21 @@ class InboxSyncTests(unittest.TestCase):
                 ),
                 patch(
                     "hidemyemail_generator.inbox.message_to_record",
+<<<<<<< HEAD
                     side_effect=record_for_folder,
+=======
+                    side_effect=lambda _conn, folder, uid, _raw: {
+                        "folder": folder.folder,
+                        "uid": uid,
+                    },
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
                 ),
                 patch(
                     "hidemyemail_generator.inbox.insert_message",
                     return_value=True,
                 ),
             ):
+<<<<<<< HEAD
                 inserted = sync_inbox(
                     config,
                     str(db_file),
@@ -212,6 +254,186 @@ class InboxSyncTests(unittest.TestCase):
             [("Junk", "4"), ("INBOX", "4")],
         )
 
+=======
+                inserted = sync_inbox(config, str(db_file), limit=1)
+
+        self.assertEqual(mailbox.selected_folders, ["INBOX", "Junk"])
+        self.assertEqual(
+            [(item["folder"], item["uid"]) for item in inserted],
+            [("INBOX", "4")],
+        )
+
+    def test_sync_repairs_existing_message_and_makes_code_match_alias(self):
+        from hidemyemail_generator.webapp import _latest_gpt_code
+
+        target = "fallers.relax-7m@icloud.com"
+        raw_message = (
+            "From: noreply@openai.com\r\n"
+            f"To: {target}\r\n"
+            "Original-Recipient: rfc822;user@icloud.com\r\n"
+            f"X-ICLOUD-HME: p={target}; d=; f=user@icloud.com; "
+            "r=to; s=noreply@openai.com\r\n"
+            "Date: Wed, 12 Aug 2026 05:26:24 +0000\r\n"
+            "Subject: Your temporary ChatGPT verification code\r\n"
+            "\r\n"
+            "Your verification code is 193982.\r\n"
+        ).encode("ascii")
+        mailbox = ExistingMessageFakeMailbox(raw_message)
+        config = InboxConfig(
+            host="imap.mail.me.com",
+            port=993,
+            username="user@icloud.com",
+            password="app-password",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "inbox.db"
+            conn = connect_db(str(db_file))
+            try:
+                insert_message(
+                    conn,
+                    {
+                        "account_key": config.account_key,
+                        "folder": "INBOX",
+                        "uid": "1312",
+                        "sender": "noreply@openai.com",
+                        "recipients": "",
+                        "hme_address": "",
+                        "subject": "Your temporary ChatGPT verification code",
+                        "code": "193982",
+                        "body_preview": "Your verification code is 193982.",
+                        "received_at": "2026-08-12T05:26:24+00:00",
+                        "created_at": "2026-08-12T05:26:24+00:00",
+                    },
+                )
+            finally:
+                conn.close()
+
+            with patch(
+                "hidemyemail_generator.inbox.imaplib.IMAP4_SSL",
+                return_value=mailbox,
+            ):
+                inserted = sync_inbox(
+                    config, str(db_file), limit=10, include_junk=False
+                )
+
+            conn = connect_db(str(db_file))
+            try:
+                repaired = conn.execute(
+                    "SELECT recipients, hme_address FROM messages WHERE uid = '1312'"
+                ).fetchone()
+            finally:
+                conn.close()
+            matched = _latest_gpt_code(
+                db_file,
+                target,
+                [],
+                since="2026-08-12T05:26:00+00:00",
+                consume=False,
+            )
+
+        self.assertEqual(inserted, [])
+        self.assertEqual(mailbox.fetched_uids, [b"1312"])
+        self.assertEqual(repaired["recipients"], f"{target}, user@icloud.com")
+        self.assertEqual(repaired["hme_address"], target)
+        self.assertEqual(matched["code"], "193982")
+
+    def test_sync_does_not_refetch_message_after_alias_is_known(self):
+        target = "known.alias@icloud.com"
+        mailbox = ExistingMessageFakeMailbox(b"unused")
+        config = InboxConfig(
+            host="imap.mail.me.com",
+            port=993,
+            username="user@icloud.com",
+            password="app-password",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "inbox.db"
+            conn = connect_db(str(db_file))
+            try:
+                insert_message(
+                    conn,
+                    {
+                        "account_key": config.account_key,
+                        "folder": "INBOX",
+                        "uid": "1312",
+                        "sender": "noreply@openai.com",
+                        "recipients": "",
+                        "hme_address": target,
+                        "subject": "Your temporary ChatGPT verification code",
+                        "code": "193982",
+                        "body_preview": "Your verification code is 193982.",
+                        "received_at": "2026-08-12T05:26:24+00:00",
+                        "created_at": "2026-08-12T05:26:24+00:00",
+                    },
+                )
+            finally:
+                conn.close()
+
+            with patch(
+                "hidemyemail_generator.inbox.imaplib.IMAP4_SSL",
+                return_value=mailbox,
+            ):
+                inserted = sync_inbox(
+                    config, str(db_file), limit=10, include_junk=False
+                )
+
+        self.assertEqual(inserted, [])
+        self.assertEqual(mailbox.fetched_uids, [])
+
+
+class ICloudRecipientParsingTests(unittest.TestCase):
+    def _record(self, raw_message: bytes) -> dict:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect_db(str(Path(temp_dir) / "inbox.db"))
+            try:
+                return message_to_record(
+                    conn,
+                    InboxConfig(
+                        host="imap.mail.me.com",
+                        port=993,
+                        username="user@icloud.com",
+                        password="app-password",
+                    ),
+                    "1",
+                    raw_message,
+                )
+            finally:
+                conn.close()
+
+    def test_malformed_original_recipient_does_not_hide_valid_to_address(self):
+        target = "pacts.bascule.4w@icloud.com"
+        record = self._record(
+            (
+                f"To: Hide My Email <{target}>\r\n"
+                "Original-Recipient: rfc822;user@icloud.com\r\n"
+                "Subject: Your temporary ChatGPT verification code\r\n"
+                "\r\nYour verification code is 675632.\r\n"
+            ).encode("ascii")
+        )
+
+        self.assertEqual(record["recipients"], f"{target}, user@icloud.com")
+        self.assertEqual(record["hme_address"], target)
+        self.assertEqual(record["code"], "675632")
+
+    def test_x_icloud_hme_primary_alias_is_authoritative(self):
+        target = "cosines_cookery.8v@icloud.com"
+        record = self._record(
+            (
+                "To: user@icloud.com\r\n"
+                "Original-Recipient: rfc822;user@icloud.com\r\n"
+                f"X-ICLOUD-HME: p={target}; d=; f=user@icloud.com; "
+                "r=to; s=noreply@openai.com\r\n"
+                "Subject: Your temporary ChatGPT verification code\r\n"
+                "\r\nYour verification code is 352838.\r\n"
+            ).encode("ascii")
+        )
+
+        self.assertEqual(record["hme_address"], target)
+        self.assertEqual(record["code"], "352838")
+
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
 
 class VerificationCodeExtractionTests(unittest.TestCase):

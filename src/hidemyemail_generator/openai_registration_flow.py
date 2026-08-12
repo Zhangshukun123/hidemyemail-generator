@@ -64,6 +64,16 @@ OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS = (
 _REGISTRATION_CLIPBOARD_LOCK = registration_clipboard_lock()
 _copy_registration_clipboard_text = copy_registration_clipboard_text
 
+PASSWORD_OTP_RESEND_SELECTORS = (
+    'button:has-text("Resend email")',
+    '[role="button"]:has-text("Resend email")',
+    'button:has-text("Resend code")',
+    'button:has-text("メールを再送信する")',
+    '[role="button"]:has-text("メールを再送信する")',
+    'button:has-text("重新发送邮件")',
+    'button:has-text("重新傳送電子郵件")',
+)
+
 
 class _PostPasswordEmailVerificationRequired(RuntimeError):
     """Leave the first-code wait so a fresh post-password code can be fetched."""
@@ -355,6 +365,7 @@ def configure_password_first_login(
         None,
     )
     original_fill_password = getattr(worker, "_fill_password_step", None)
+    original_submit_email_code = getattr(worker, "_submit_email_code", None)
     original_continue_registration = getattr(
         worker, "_continue_chatgpt_registration_complete", None
     )
@@ -791,10 +802,72 @@ def configure_password_first_login(
         return False
 
     def fill_saved_password(self, page):
+        # OpenAI sends a fresh verification code after the password step.  Keep
+        # an epoch marker from immediately before submission so the following
+        # OTP lookup cannot reuse the earlier one-time login code.  Keep one
+        # second of tolerance because mail Received timestamps may omit
+        # fractional seconds.
+        self._hme_password_submitted_at_epoch = max(0.0, time.time() - 1.0)
         original_fill_password(page)
         self._hme_password_entry_pending = False
         self._password_step_submitted = True
         self.log("[认证] 已提交创建邮箱时保存的唯一密码")
+
+    def submit_email_code_after_password(
+        self,
+        page,
+        min_timestamp,
+        *args,
+        **kwargs,
+    ):
+        # The upstream worker checks the /email-verification URL before it
+        # calls _has_otp_input().  That URL check short-circuits our password
+        # chooser, so enforce the same ordering at the final OTP submission
+        # boundary as well.
+        if required and not getattr(self, "_password_step_submitted", False):
+            password_completed = choose_password_if_available(self, page)
+            if not password_completed:
+                password_completed = wait_for_required_password_choice(self, page)
+            if not password_completed or not getattr(
+                self, "_password_step_submitted", False
+            ):
+                raise RuntimeError(
+                    "注册必须先完成密码设置，再读取密码步骤后发送的新验证码"
+                )
+        password_submitted_at = float(
+            getattr(self, "_hme_password_submitted_at_epoch", 0.0) or 0.0
+        )
+        if password_submitted_at and not getattr(
+            self, "_hme_password_code_resend_clicked", False
+        ):
+            _activate_visible_registration_page(self, page)
+            resend_started_at = max(0.0, time.time() - 30.0)
+            if _click_first_visible(
+                page,
+                PASSWORD_OTP_RESEND_SELECTORS,
+                timeout=900,
+            ):
+                self._hme_password_code_resend_clicked = True
+                self._hme_password_submitted_at_epoch = resend_started_at
+                password_submitted_at = resend_started_at
+                self.log(
+                    "[验证码] 密码提交后的验证码页未自动发送新邮件；"
+                    "已单次点击重新发送，并只读取本轮新验证码"
+                )
+                _page_wait(page, 750)
+        effective_min_timestamp = max(
+            float(min_timestamp or 0.0), password_submitted_at
+        )
+        if password_submitted_at:
+            self.log(
+                "[验证码] 密码步骤已完成；正在读取密码提交后发送的本轮新验证码"
+            )
+        return original_submit_email_code(
+            page,
+            effective_min_timestamp,
+            *args,
+            **kwargs,
+        )
 
     def reject_existing_account_password_error(self, page) -> bool:
         detected = bool(original_has_password_auth_error(page))
@@ -821,6 +894,10 @@ def configure_password_first_login(
 
     worker._has_otp_input = types.MethodType(has_otp_or_choose_password, worker)
     worker._fill_password_step = types.MethodType(fill_saved_password, worker)
+    if callable(original_submit_email_code):
+        worker._submit_email_code = types.MethodType(
+            submit_email_code_after_password, worker
+        )
     if callable(original_has_password_auth_error):
         worker._has_password_auth_error = types.MethodType(
             reject_existing_account_password_error,
@@ -854,10 +931,62 @@ def configure_email_verification_priority(worker) -> bool:
             return False
         return bool(original_has_password(page))
 
+    original_wait_after_otp_submit = getattr(worker, "_wait_after_otp_submit", None)
+
+    def wait_after_otp_submit_with_home_code_priority(
+        self,
+        page,
+        timeout=45,
+    ):
+        url = str(getattr(page, "url", "") or "")
+        hostname = (urlparse(url).hostname or "").casefold()
+        has_otp_input = getattr(self, "_has_otp_input", None)
+        submit_email_code = getattr(self, "_submit_email_code", None)
+        has_chatgpt_session = getattr(self, "_has_chatgpt_session", None)
+        if hostname in {"chatgpt.com", "www.chatgpt.com"} and callable(
+            has_otp_input
+        ):
+            for attempt in range(20):
+                if bool(has_otp_input(page)):
+                    break
+                if callable(has_chatgpt_session) and bool(
+                    has_chatgpt_session(page)
+                ):
+                    break
+                if attempt < 19:
+                    _page_wait(page, 500)
+        should_submit_home_code = (
+            hostname in {"chatgpt.com", "www.chatgpt.com"}
+            and callable(has_otp_input)
+            and bool(has_otp_input(page))
+            and callable(submit_email_code)
+            and not bool(getattr(self, "_hme_home_otp_submit_in_progress", False))
+        )
+        if should_submit_home_code:
+            self.log(
+                "[验证码] ChatGPT 首页注册弹窗仍显示验证码输入框；"
+                "先读取并提交本轮邮箱验证码，再确认 Session"
+            )
+            self._hme_home_otp_submit_in_progress = True
+            try:
+                submit_email_code(
+                    page,
+                    time.time() - 10.0,
+                    wait_for_session=False,
+                )
+            finally:
+                self._hme_home_otp_submit_in_progress = False
+        return original_wait_after_otp_submit(page, timeout=timeout)
+
     worker._has_visible_password = types.MethodType(
         has_password_outside_email_verification,
         worker,
     )
+    if callable(original_wait_after_otp_submit):
+        worker._wait_after_otp_submit = types.MethodType(
+            wait_after_otp_submit_with_home_code_priority,
+            worker,
+        )
     worker._hme_email_verification_priority_configured = True
     return True
 
@@ -1052,10 +1181,52 @@ def configure_resilient_about_you_input(
     original_keyboard_fill = getattr(worker, "_fill_visible_input_by_keyboard", None)
     original_profile_fill = getattr(worker, "_fill_about_you_inputs", None)
     original_profile_submit = getattr(worker, "_submit_about_you", None)
+    original_auth_ready = getattr(worker, "_wait_for_auth_page_ready", None)
     dom_profile_fill = getattr(worker, "_fill_about_you_inputs_by_dom", None)
     focus_submit = getattr(worker, "_focus_about_you_submit_or_body", None)
     if not callable(original_keyboard_fill) or not callable(original_profile_fill):
         return False
+
+    def auth_ready_without_full_load_stall(
+        self,
+        page,
+        action: str,
+        *,
+        ready_selectors=(),
+        require_editable: bool = False,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        if action != "基础资料" or not tuple(ready_selectors):
+            if callable(original_auth_ready):
+                return original_auth_ready(
+                    page,
+                    action,
+                    ready_selectors=ready_selectors,
+                    require_editable=require_editable,
+                    timeout_seconds=timeout_seconds,
+                )
+            return None
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        deadline = time.monotonic() + min(20.0, max(2.0, float(timeout_seconds)))
+        stable_checks = 0
+        while time.monotonic() < deadline:
+            metrics = _control_metrics(
+                page,
+                ready_selectors,
+                require_editable=require_editable,
+            )
+            stable_checks = stable_checks + 1 if metrics["actionable"] else 0
+            if stable_checks >= 2:
+                self.log(
+                    "[基础资料] 页面输入控件已连续两次可操作；"
+                    "跳过会卡住的完整 load 等待，继续填写"
+                )
+                return None
+            _page_wait(page, 250)
+        raise RuntimeError("基础资料页面已打开，但输入控件在 20 秒内仍不可操作")
 
     def keyboard_fill_with_foreground(self, page, index: int, value: str):
         activated = activate_page(self, page)
@@ -1124,6 +1295,11 @@ def configure_resilient_about_you_input(
     worker._fill_visible_input_by_keyboard = types.MethodType(
         keyboard_fill_with_foreground, worker
     )
+    if callable(original_auth_ready):
+        worker._wait_for_auth_page_ready = types.MethodType(
+            auth_ready_without_full_load_stall,
+            worker,
+        )
     worker._fill_about_you_inputs = types.MethodType(profile_fill_with_readback, worker)
     if callable(original_profile_submit):
 

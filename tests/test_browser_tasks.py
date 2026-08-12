@@ -43,6 +43,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     _mfa_token_was_invalidated,
     _open_settings_from_profile,
     _password_confirmed_for_two_factor,
+    add_password_via_account_api,
     configure_chatgpt_home_login_entry,
     configure_email_verification_priority,
     configure_password_first_login,
@@ -66,7 +67,9 @@ from hidemyemail_generator.openai_browser_bridge import (
     resilient_force_fill_locator,
     safe_log_message,
 )
+from hidemyemail_generator.openai_browser_cli import prepare_registration_proxy
 from hidemyemail_generator.openai_mfa import MfaSetupError
+from hidemyemail_generator.openai_registration_otp import EmailVerificationPageAdvanced
 from hidemyemail_generator.registration_proxy import RegistrationProxyStore
 
 
@@ -78,6 +81,51 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_post_registration_password_uses_account_api(self):
+        calls = []
+
+        class Response:
+            status = 200
+
+            @staticmethod
+            def json():
+                return {"success": True}
+
+        class Request:
+            @staticmethod
+            def post(url, **kwargs):
+                calls.append((url, kwargs))
+                return Response()
+
+        worker = SimpleNamespace(
+            _password_step_submitted=False,
+            logs=[],
+        )
+        worker.log = worker.logs.append
+
+        confirmed = add_password_via_account_api(
+            worker,
+            SimpleNamespace(request=Request()),
+            "at-registration",
+            "Strong!Password123",
+        )
+
+        self.assertTrue(confirmed)
+        self.assertTrue(worker._password_step_submitted)
+        self.assertEqual(
+            calls[0][0],
+            "https://chatgpt.com/api/accounts/password/add",
+        )
+        self.assertEqual(
+            json.loads(calls[0][1]["data"]),
+            {"password": "Strong!Password123"},
+        )
+        self.assertEqual(
+            calls[0][1]["headers"]["Authorization"],
+            "Bearer at-registration",
+        )
+        self.assertIn("POST /api/accounts/password/add", worker.logs[-1])
+
     def test_password_readiness_timeout_logs_dom_state_and_screenshot(self):
         class Candidate:
             def is_visible(self, **_kwargs):
@@ -460,6 +508,74 @@ class BrowserTaskHelperTests(unittest.TestCase):
             )
         )
 
+    def test_home_email_drawer_still_on_home_uses_real_auth_url(self):
+        actions = []
+
+        class Page:
+            def __init__(self):
+                self.url = "about:blank"
+
+            def goto(self, url, **_kwargs):
+                actions.append(("goto", url))
+                self.url = url
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _fill_email_if_visible(self, _page):
+                return False
+
+            def _create_openai_signin_url(self, _context):
+                actions.append("signup-url")
+                return "https://auth.openai.com/create-account"
+
+            def _create_login_url(self, _context):
+                return "https://auth.openai.com/log-in"
+
+            def _goto_auth_page(self, page, url):
+                actions.append(("auth", url))
+                page.goto(url)
+
+            def _register(self, page, context, **_kwargs):
+                page.goto("https://chatgpt.com/")
+                # The home drawer was clicked and submitted, but ChatGPT kept
+                # the URL on its homepage while OpenAI auth state loaded.
+                signin_url = self._create_openai_signin_url(context)
+                self._goto_auth_page(page, signin_url)
+                return page.url
+
+        worker = Worker()
+        page = Page()
+        self.assertTrue(configure_chatgpt_home_login_entry(worker))
+
+        # Exercise the post-click branch without depending on the home-button
+        # selectors, whose behavior is covered by the integration-style test.
+        original_register = worker._register
+        page.url = "https://chatgpt.com/"
+
+        class ClickedWorker(Worker):
+            pass
+
+        # Reproduce a drawer click using the normal registration wrapper: the
+        # first homepage goto triggers signup, while the fake page remains on
+        # the homepage after the email drawer submission.
+        with patch(
+            "hidemyemail_generator.openai_registration_navigation."
+            "_click_chatgpt_home_signup",
+            side_effect=lambda _page, _worker, **_kwargs: None,
+        ):
+            # The wrapper records the click before it calls the patched helper.
+            result = original_register(page, object(), existing_login_only=False)
+
+        self.assertEqual(result, "https://auth.openai.com/create-account")
+        self.assertIn("signup-url", actions)
+        self.assertIn(("auth", "https://auth.openai.com/create-account"), actions)
+        self.assertTrue(any("避免把首页误判" in log for log in worker.logs))
+
     def test_home_login_waits_for_full_load_then_retries_once(self):
         events = []
 
@@ -639,6 +755,27 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "已取消邮箱激活"):
             reader.wait_for_code(123.5)
+
+    def test_registration_code_reader_stops_when_browser_passes_otp_page(self):
+        calls = []
+
+        class Session:
+            def post(self, *_args, **_kwargs):
+                calls.append("post")
+                raise AssertionError("mail API must not be polled after page advance")
+
+        reader = ManualOtpReader.__new__(ManualOtpReader)
+        reader.email = "advanced@icloud.com"
+        reader.icloud_inbox = True
+        reader.log = lambda _message: None
+        reader.service_url = "http://127.0.0.1:8765"
+        reader.session = Session()
+        reader.token = "worker-token"
+        reader.page_advanced = lambda: True
+
+        with self.assertRaises(EmailVerificationPageAdvanced):
+            reader.wait_for_code(123.5)
+        self.assertEqual(calls, [])
 
     def test_gmail_registration_submits_email_without_google_oauth(self):
         events = []
@@ -1294,18 +1431,28 @@ class BrowserTaskHelperTests(unittest.TestCase):
             any("已结合当前注册上下文" in message for message in worker.logs)
         )
         self.assertTrue(
-            any("正在自动填写并提交" in message for message in worker.logs)
+            any("准备填写本轮验证码" in message for message in worker.logs)
         )
 
+<<<<<<< HEAD
     def test_icloud_otp_fill_timeout_is_accepted_when_code_was_written(self):
         class Reader:
             def __init__(self, _account, _log, _proxy_url):
                 pass
+=======
+    def test_icloud_code_wait_stops_after_browser_leaves_verification_page(self):
+        events = []
+
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                self.page_advanced = None
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
             def connect(self):
                 return None
 
             def wait_for_code(self, _min_timestamp):
+<<<<<<< HEAD
                 return "938388"
 
         class Field:
@@ -1321,10 +1468,17 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
             def input_value(self, **_kwargs):
                 return self.value
+=======
+                events.append("wait")
+                if callable(self.page_advanced) and self.page_advanced():
+                    raise EmailVerificationPageAdvanced
+                raise AssertionError("page advance was not detected")
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
         class Body:
             @staticmethod
             def inner_text(**_kwargs):
+<<<<<<< HEAD
                 return (
                     "受信箱を確認してください "
                     "relay@icloud.com にお送りした検証コードを入力してください。"
@@ -1333,6 +1487,12 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         class Page:
             url = "https://auth.openai.com/email-verification"
+=======
+                return ""
+
+        class Page:
+            url = "https://auth.openai.com/about-you"
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
             @staticmethod
             def locator(selector):
@@ -1342,11 +1502,17 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         class Worker:
             def __init__(self):
+<<<<<<< HEAD
                 self.account = SimpleNamespace(email="relay@icloud.com")
                 self.otp_reader = None
                 self.field = Field()
                 self.logs = []
                 self.validated = False
+=======
+                self.account = SimpleNamespace(email="advanced@icloud.com")
+                self.otp_reader = None
+                self.logs = []
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
             def log(self, message):
                 self.logs.append(message)
@@ -1358,11 +1524,16 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 return "original"
 
             def _visible_inputs(self, _page, _selectors):
+<<<<<<< HEAD
                 return [self.field]
+=======
+                return []
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
             def _submit_email_code(
                 self, page, min_timestamp, *, wait_for_session=True
             ):
+<<<<<<< HEAD
                 del wait_for_session
                 code = self._wait_for_openai_email_code(min_timestamp)
                 inputs = self._visible_inputs(
@@ -1370,12 +1541,19 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 )
                 inputs[0].fill(code)
                 self.validated = True
+=======
+                del page, wait_for_session
+                events.append("submit")
+                self._wait_for_openai_email_code(min_timestamp)
+                events.append("fill")
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
         backend = SimpleNamespace(
             OpenAIRegisterPayLinkWorker=Worker,
             HotmailOtpReader=Reader,
         )
         self.assertTrue(
+<<<<<<< HEAD
             configure_registration_otp_reader(backend, "relay@icloud.com")
         )
 
@@ -1407,6 +1585,159 @@ class BrowserTaskHelperTests(unittest.TestCase):
         rejected_worker.field = RejectingField()
         with self.assertRaisesRegex(TimeoutError, "value was not written"):
             rejected_worker._submit_email_code(Page(), 0)
+=======
+            configure_registration_otp_reader(backend, "advanced@icloud.com")
+        )
+
+        worker = Worker()
+        worker._preconnect_otp_reader()
+        self.assertIsNone(worker._submit_email_code(Page(), 0))
+
+        self.assertEqual(events, ["submit", "wait"])
+        self.assertTrue(
+            any("页面已离开邮箱验证码页" in message for message in worker.logs)
+        )
+
+    def test_icloud_code_network_error_falls_back_to_visible_continue(self):
+        actions = []
+
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                self.page_advanced = None
+
+            def connect(self):
+                return None
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="fallback@icloud.com")
+                self.otp_reader = None
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "123456"
+
+            def _visible_inputs(self, _page, _selectors):
+                return []
+
+            def _click_continue(self, _page):
+                actions.append("click-continue")
+                return True
+
+            def _wait_after_otp_submit(self, _page):
+                actions.append("wait-after-submit")
+
+            def _submit_email_code(
+                self, page, min_timestamp, *, wait_for_session=True
+            ):
+                del page, min_timestamp, wait_for_session
+                raise RuntimeError(
+                    "Page.evaluate: NetworkError when attempting to fetch resource."
+                )
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "fallback@icloud.com")
+        )
+
+        worker = Worker()
+        self.assertIsNone(worker._submit_email_code(Page(), 0))
+
+        self.assertEqual(actions, ["click-continue", "wait-after-submit"])
+        self.assertTrue(
+            any("已改用页面可见的继续按钮提交" in message for message in worker.logs)
+        )
+
+    def test_icloud_code_resend_accepts_mail_header_clock_skew(self):
+        actions = []
+        submitted_timestamps = []
+
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                self.page_advanced = None
+
+            def connect(self):
+                return None
+
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def click(self, **_kwargs):
+                actions.append("resend")
+
+        class Collection:
+            def __init__(self, items=()):
+                self.items = list(items)
+
+            def count(self):
+                return len(self.items)
+
+            @property
+            def first(self):
+                return self.items[0]
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def locator(self, selector):
+                if "Resend email" in selector:
+                    return Collection([Candidate()])
+                return Collection()
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="skew@icloud.com")
+                self.otp_reader = None
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "123456"
+
+            def _visible_inputs(self, _page, _selectors):
+                return []
+
+            def _submit_email_code(
+                self, _page, min_timestamp, *, wait_for_session=True
+            ):
+                del wait_for_session
+                submitted_timestamps.append(min_timestamp)
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(configure_registration_otp_reader(backend, "skew@icloud.com"))
+
+        worker = Worker()
+        worker._submit_email_code(Page(), 0)
+
+        self.assertEqual(actions, ["resend"])
+        self.assertGreater(submitted_timestamps[0], time.time() - 40)
+        self.assertLess(submitted_timestamps[0], time.time() - 20)
+        self.assertTrue(any("本次任务的新验证码" in line for line in worker.logs))
+>>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
     def test_stalled_otp_session_reenters_without_closing_visible_pages(self):
         actions = []
@@ -1572,11 +1903,116 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
     def test_registration_proxy_country_must_match_detected_exit(self):
         self.assertEqual(
-            require_registration_proxy_country(SimpleNamespace(country="NL"), "NL"),
+            require_registration_proxy_country(
+                SimpleNamespace(country="NL", chatgpt_status=200), "NL"
+            ),
             "NL",
         )
         with self.assertRaisesRegex(RuntimeError, "NL"):
-            require_registration_proxy_country(SimpleNamespace(country="BR"), "NL")
+            require_registration_proxy_country(
+                SimpleNamespace(country="BR", chatgpt_status=200), "NL"
+            )
+
+    def test_registration_proxy_rejects_chatgpt_403(self):
+        with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+            require_registration_proxy_country(
+                SimpleNamespace(country="JP", chatgpt_status=403), "JP"
+            )
+
+    def test_registration_proxy_rejects_unknown_chatgpt_status(self):
+        with self.assertRaisesRegex(RuntimeError, "HTTP 未知"):
+            require_registration_proxy_country(SimpleNamespace(country="JP"), "JP")
+
+    def test_registration_proxy_retries_403_until_200(self):
+        health_results = [
+            SimpleNamespace(country="JP", chatgpt_status=status)
+            for status in (403, 403, 200)
+        ]
+        calls = []
+        logs = []
+        delays = []
+
+        def prepare(*args, **kwargs):
+            calls.append((args, kwargs))
+            return health_results.pop(0)
+
+        health, country = prepare_registration_proxy(
+            SimpleNamespace(_prepare_fingerprint_for_proxy=prepare),
+            SimpleNamespace(
+                require_registration_proxy_country=require_registration_proxy_country,
+                emit=lambda kind, **payload: logs.append((kind, payload)),
+            ),
+            "proxy",
+            "JP",
+            sleep=delays.append,
+        )
+
+        self.assertEqual(health.chatgpt_status, 200)
+        self.assertEqual(country, "JP")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(delays, [1.0, 2.0])
+        self.assertEqual(len(logs), 2)
+        self.assertTrue(all("HTTP 403" in item[1]["message"] for item in logs))
+
+    def test_registration_proxy_stops_after_five_403_responses(self):
+        calls = []
+        delays = []
+
+        def prepare(*args, **kwargs):
+            calls.append((args, kwargs))
+            return SimpleNamespace(country="JP", chatgpt_status=403)
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+            prepare_registration_proxy(
+                SimpleNamespace(_prepare_fingerprint_for_proxy=prepare),
+                SimpleNamespace(
+                    require_registration_proxy_country=require_registration_proxy_country,
+                    emit=lambda *_args, **_kwargs: None,
+                ),
+                "proxy",
+                "JP",
+                sleep=delays.append,
+            )
+
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(delays, [1.0, 2.0, 3.0, 5.0])
+
+    def test_registration_proxy_retries_probe_timeout_until_200(self):
+        outcomes = iter(
+            (
+                RuntimeError("curl: (28) Connection timed out"),
+                SimpleNamespace(country="JP", chatgpt_status=403),
+                SimpleNamespace(country="JP", chatgpt_status=200),
+            )
+        )
+        calls = []
+        logs = []
+        delays = []
+
+        def prepare(*args, **kwargs):
+            calls.append((args, kwargs))
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        health, country = prepare_registration_proxy(
+            SimpleNamespace(_prepare_fingerprint_for_proxy=prepare),
+            SimpleNamespace(
+                require_registration_proxy_country=require_registration_proxy_country,
+                emit=lambda kind, **payload: logs.append((kind, payload)),
+            ),
+            "proxy",
+            "JP",
+            sleep=delays.append,
+        )
+
+        self.assertEqual(health.chatgpt_status, 200)
+        self.assertEqual(country, "JP")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(delays, [1.0, 2.0])
+        self.assertIn("探测请求暂时失败", logs[0][1]["message"])
+        self.assertIn("HTTP 403", logs[1][1]["message"])
 
     def test_reads_chatgpt_plan_from_jwt_without_a_request(self):
         payload = base64.urlsafe_b64encode(
@@ -1791,6 +2227,174 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(worker._has_otp_input(page))
         self.assertEqual(actions, ["password"])
         self.assertEqual(worker.continue_calls, 1)
+
+    def test_direct_email_code_submit_forces_password_then_uses_new_code_window(self):
+        actions = []
+        submitted_timestamps = []
+
+        class Candidate:
+            def __init__(self, page):
+                self.page = page
+
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                actions.append("password-choice")
+                self.page.state = "password"
+                self.page.url = "https://auth.openai.com/create-account/password"
+
+        class Collection:
+            def __init__(self, items=(), text=""):
+                self.items = list(items)
+                self.text = text
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            def __init__(self):
+                self.state = "otp"
+                self.url = "https://auth.openai.com/email-verification"
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Collection(text="受信箱を確認してください パスワードで続行")
+                if self.state == "otp" and "パスワードで続行" in selector:
+                    return Collection([Candidate(self)])
+                return Collection()
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Worker:
+            headless = False
+
+            def __init__(self):
+                self.logs = []
+
+            def _continue_chatgpt_registration_complete(self, _page):
+                return False
+
+            def _has_otp_input(self, page):
+                return page.state == "otp"
+
+            def _has_visible_password(self, page):
+                return page.state == "password"
+
+            def _fill_password_step(self, page):
+                actions.append("password-submit")
+                page.state = "post_password_otp"
+                page.url = "https://auth.openai.com/email-verification"
+
+            def _submit_email_code(self, _page, min_timestamp, **_kwargs):
+                actions.append("otp-submit")
+                submitted_timestamps.append(min_timestamp)
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        page = Page()
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
+
+        worker._submit_email_code(page, 100.0, wait_for_session=True)
+
+        self.assertEqual(
+            actions, ["password-choice", "password-submit", "otp-submit"]
+        )
+        self.assertTrue(worker._password_step_submitted)
+        self.assertGreater(submitted_timestamps[0], 100.0)
+        self.assertTrue(
+            any("密码提交后发送的本轮新验证码" in line for line in worker.logs)
+        )
+
+    def test_password_submission_resends_code_before_mailbox_read(self):
+        events = []
+        submitted_timestamps = []
+
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                events.append("resend")
+
+        class Collection:
+            def __init__(self, items=(), text=""):
+                self.items = list(items)
+                self.text = text
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Collection(text="Check your inbox Resend email")
+                if "Resend email" in selector:
+                    return Collection([Candidate()])
+                return Collection()
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def _continue_chatgpt_registration_complete(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                return True
+
+            def _has_visible_password(self, _page):
+                return False
+
+            def _fill_password_step(self, _page):
+                return None
+
+            def _submit_email_code(self, _page, min_timestamp, **_kwargs):
+                events.append("mailbox")
+                submitted_timestamps.append(min_timestamp)
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        self.assertTrue(configure_password_first_login(worker, enabled=True))
+        worker._password_step_submitted = True
+        worker._hme_password_submitted_at_epoch = 1.0
+
+        worker._submit_email_code(Page(), 0)
+
+        self.assertEqual(events, ["resend", "mailbox"])
+        self.assertGreater(submitted_timestamps[0], time.time() - 40)
+        self.assertLess(submitted_timestamps[0], time.time() - 20)
+        self.assertTrue(any("已单次点击重新发送" in line for line in worker.logs))
 
     def test_password_entry_waits_through_security_verification_past_15_seconds(self):
         actions = []
@@ -2270,6 +2874,116 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(worker._has_visible_password(reset_page))
         self.assertEqual(worker.password_checks, 1)
 
+    def test_chatgpt_home_otp_is_submitted_before_session_wait(self):
+        class Worker:
+            def __init__(self):
+                self.events = []
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _has_visible_password(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                return True
+
+            def _submit_email_code(self, _page, min_timestamp, wait_for_session=True):
+                self.events.append(("submit", wait_for_session, min_timestamp))
+
+            def _wait_after_otp_submit(self, _page, timeout=45):
+                self.events.append(("wait", timeout))
+                return "session-ready"
+
+        worker = Worker()
+        self.assertTrue(configure_email_verification_priority(worker))
+        before = time.time()
+
+        result = worker._wait_after_otp_submit(
+            SimpleNamespace(url="https://chatgpt.com/"),
+            timeout=12,
+        )
+
+        self.assertEqual(result, "session-ready")
+        self.assertEqual(worker.events[0][0:2], ("submit", False))
+        self.assertGreaterEqual(worker.events[0][2], before - 10.1)
+        self.assertEqual(worker.events[1], ("wait", 12))
+        self.assertIn("先读取并提交本轮邮箱验证码", worker.logs[-1])
+
+    def test_non_chatgpt_otp_wait_keeps_original_order(self):
+        class Worker:
+            def __init__(self):
+                self.events = []
+
+            def log(self, _message):
+                return None
+
+            def _has_visible_password(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                return True
+
+            def _submit_email_code(self, *_args, **_kwargs):
+                self.events.append("submit")
+
+            def _wait_after_otp_submit(self, _page, timeout=45):
+                self.events.append(("wait", timeout))
+
+        worker = Worker()
+        self.assertTrue(configure_email_verification_priority(worker))
+
+        worker._wait_after_otp_submit(
+            SimpleNamespace(url="https://auth.openai.com/email-verification"),
+            timeout=9,
+        )
+
+        self.assertEqual(worker.events, [("wait", 9)])
+
+    def test_chatgpt_home_waits_for_delayed_otp_control(self):
+        class Page:
+            url = "https://chatgpt.com/"
+
+            def __init__(self):
+                self.waits = []
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+        class Worker:
+            def __init__(self):
+                self.events = []
+                self.otp_checks = 0
+
+            def log(self, _message):
+                return None
+
+            def _has_visible_password(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                self.otp_checks += 1
+                return self.otp_checks >= 3
+
+            def _has_chatgpt_session(self, _page):
+                return False
+
+            def _submit_email_code(self, *_args, **kwargs):
+                self.events.append(("submit", kwargs.get("wait_for_session")))
+
+            def _wait_after_otp_submit(self, _page, timeout=45):
+                self.events.append(("wait", timeout))
+
+        page = Page()
+        worker = Worker()
+        self.assertTrue(configure_email_verification_priority(worker))
+
+        worker._wait_after_otp_submit(page, timeout=7)
+
+        self.assertEqual(page.waits, [500, 500])
+        self.assertEqual(worker.events, [("submit", False), ("wait", 7)])
+
     def test_required_password_first_never_falls_back_to_email_code(self):
         class Collection:
             def count(self):
@@ -2718,15 +3432,9 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         worker = Worker()
 
-        def ensure_password(
-            _backend,
-            target_worker,
-            _password,
-            *,
-            context,
-            force_reset_password=False,
-        ):
-            self.assertFalse(force_reset_password)
+        def add_password(target_worker, context, access_token, password):
+            self.assertEqual(access_token, "at-test")
+            self.assertEqual(password, "Strong!Password123")
             events.append(("password", context))
             target_worker._password_step_submitted = True
             return True
@@ -2738,8 +3446,8 @@ class BrowserTaskHelperTests(unittest.TestCase):
         with (
             patch(
                 "hidemyemail_generator.openai_browser_bridge."
-                "ensure_password_in_security_settings",
-                side_effect=ensure_password,
+                "add_password_via_account_api",
+                side_effect=add_password,
             ),
             patch(
                 "hidemyemail_generator.openai_browser_bridge."
@@ -2789,7 +3497,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
         with (
             patch(
                 "hidemyemail_generator.openai_browser_bridge."
-                "ensure_password_in_security_settings",
+                "add_password_via_account_api",
                 side_effect=RuntimeError("settings unavailable"),
             ),
             patch(
@@ -2880,16 +3588,10 @@ class BrowserTaskHelperTests(unittest.TestCase):
         mfa_tokens = []
         mfa_client = SimpleNamespace(close=lambda: None)
 
-        def ensure_password(
-            _backend,
-            target_worker,
-            _password,
-            *,
-            context,
-            force_reset_password=False,
-        ):
+        def add_password(target_worker, context, access_token, password):
             self.assertIsNotNone(context)
-            self.assertFalse(force_reset_password)
+            self.assertEqual(access_token, "at-registered")
+            self.assertEqual(password, "Strong!Password123")
             target_worker._password_step_submitted = True
             return True
 
@@ -2915,8 +3617,8 @@ class BrowserTaskHelperTests(unittest.TestCase):
         with (
             patch(
                 "hidemyemail_generator.openai_browser_bridge."
-                "ensure_password_in_security_settings",
-                side_effect=ensure_password,
+                "add_password_via_account_api",
+                side_effect=add_password,
             ),
             patch(
                 "hidemyemail_generator.openai_browser_bridge."
@@ -4280,6 +4982,66 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertNotIn("window-focus", events)
         self.assertIn("dom-repair", events)
         self.assertTrue(any("DOM 重填后回读校验通过" in item for item in worker.logs))
+
+    def test_about_you_ready_skips_stalled_full_load_wait(self):
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def is_enabled(self, **_kwargs):
+                return True
+
+            def is_editable(self, **_kwargs):
+                return True
+
+        class Collection:
+            def count(self):
+                return 1
+
+            def nth(self, _index):
+                return Candidate()
+
+        class Page:
+            def wait_for_load_state(self, state, **_kwargs):
+                self.state = state
+
+            def locator(self, _selector):
+                return Collection()
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Worker:
+            headless = True
+
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _wait_for_auth_page_ready(self, *_args, **_kwargs):
+                raise AssertionError("full load wait must not run for about-you")
+
+            def _fill_visible_input_by_keyboard(self, *_args):
+                return None
+
+            def _fill_about_you_inputs(self, *_args):
+                return None
+
+        worker = Worker()
+        page = Page()
+        self.assertTrue(configure_resilient_about_you_input(worker))
+
+        worker._wait_for_auth_page_ready(
+            page,
+            "基础资料",
+            ready_selectors=("input",),
+            require_editable=True,
+        )
+
+        self.assertEqual(page.state, "domcontentloaded")
+        self.assertTrue(any("跳过会卡住的完整 load 等待" in line for line in worker.logs))
 
     def test_about_you_input_stops_before_submit_when_readback_stays_wrong(self):
         class Page:

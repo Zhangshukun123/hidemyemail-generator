@@ -5,6 +5,7 @@ from unittest.mock import patch
 from hidemyemail_generator import openai_registration_navigation
 from hidemyemail_generator.registration_auth import (
     CHATGPT_HOME_LOGIN_SELECTORS,
+    CHATGPT_HOME_SIGNUP_SELECTORS,
     CHATGPT_HOME_INTERACTIVE_SELECTOR,
     OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
     OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS,
@@ -404,6 +405,76 @@ class RegistrationAuthTests(unittest.TestCase):
         self.assertIn("Enter", events)
         self.assertTrue(any("DOM 填写并校验" in line for line in logs))
 
+    def test_email_submission_force_focuses_and_fills_obscured_mobile_input(self):
+        events = []
+
+        class Input:
+            value = ""
+
+            def click(self, **kwargs):
+                events.append(("click", bool(kwargs.get("force"))))
+                if not kwargs.get("force"):
+                    raise RuntimeError("element is not stable")
+
+            def press(self, key, **_kwargs):
+                events.append(key)
+                if key == "Control+A":
+                    raise RuntimeError("keyboard focus unavailable")
+
+            def fill(self, value, **kwargs):
+                events.append(("fill", bool(kwargs.get("force"))))
+                self.value = value
+
+            def input_value(self, **_kwargs):
+                return self.value
+
+        logs = []
+        paste_email_and_submit(
+            object(),
+            Input(),
+            "mobile@example.com",
+            log=logs.append,
+            activate=lambda _page: None,
+            wait=lambda _page, _milliseconds: None,
+            first_visible=lambda *_args, **_kwargs: None,
+            clipboard_write=lambda _value: None,
+            clipboard_lock=threading.RLock(),
+        )
+
+        self.assertEqual(
+            events[:4],
+            [("click", False), ("click", True), "Control+A", ("fill", True)],
+        )
+        self.assertIn("Enter", events)
+        self.assertTrue(any(line.startswith("[AUTH_EMAIL_PASTE]") for line in logs))
+
+    def test_email_submit_uses_dom_click_when_mobile_button_is_obscured(self):
+        events = []
+
+        class Candidate:
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **kwargs):
+                events.append(("click", bool(kwargs.get("force"))))
+                raise RuntimeError("button is obscured")
+
+            def evaluate(self, _script):
+                events.append("dom-click")
+
+            def inner_text(self, **_kwargs):
+                return "続行"
+
+        candidate = Candidate()
+        self.assertTrue(
+            click_email_submit(
+                object(),
+                first_visible=lambda *_args, **_kwargs: candidate,
+                submit_selectors=("button[type=submit]",),
+            )
+        )
+        self.assertEqual(events, [("click", False), ("click", True), "dom-click"])
+
     def test_home_entry_activates_background_tab_before_both_click_attempts(self):
         events = []
 
@@ -567,6 +638,52 @@ class RegistrationAuthTests(unittest.TestCase):
             CHATGPT_HOME_INTERACTIVE_SELECTOR,
         )
         self.assertTrue(any("可见控件文字或链接识别" in line for line in logs))
+
+    def test_home_signup_uses_dom_click_when_pointer_click_is_intercepted(self):
+        events = []
+
+        class Candidate:
+            def is_enabled(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **kwargs):
+                events.append(("click", bool(kwargs.get("force"))))
+                raise RuntimeError("pointer click intercepted")
+
+            def evaluate(self, _script):
+                events.append("dom-click")
+                page.url = "https://auth.openai.com/create-account"
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            def wait_for_load_state(self, _state, **_kwargs):
+                return None
+
+        page = Page()
+        candidate = Candidate()
+
+        def first_visible(_page, selectors, **_kwargs):
+            if selectors == CHATGPT_HOME_SIGNUP_SELECTORS:
+                return candidate
+            if selectors == OPENAI_EMAIL_LOGIN_INPUT_SELECTORS:
+                return None
+            return None
+
+        self.assertTrue(
+            click_chatgpt_home_signup(
+                page,
+                lambda _message: None,
+                first_visible=first_visible,
+                wait=lambda _page, _milliseconds: None,
+                timeout_seconds=0.01,
+                transition_timeout_seconds=0.01,
+            )
+        )
+        self.assertEqual(events, [("click", False), ("click", True), "dom-click"])
 
     def test_home_signup_semantic_fallback_does_not_click_login(self):
         events = []

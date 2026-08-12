@@ -540,15 +540,29 @@ def configure_chatgpt_home_login_entry(
         def registration_url_from_clicked_page(request_context):
             nonlocal auth_navigation_pending
             if clicked_home_login and not auth_navigation_handoff_complete:
+                current_url = str(getattr(page, "url", "") or "")
+                if _is_chatgpt_homepage(current_url):
+                    self.log(
+                        "[认证] 首页邮箱抽屉提交后仍停留在 ChatGPT 首页；"
+                        "改用本次新注册认证 URL，避免把首页误判为已完成登录"
+                    )
+                    return original_create_registration_url(request_context)
                 auth_navigation_pending = True
-                return str(getattr(page, "url", "") or "")
+                return current_url
             return original_create_registration_url(request_context)
 
         def login_url_from_clicked_page(request_context):
             nonlocal auth_navigation_pending
             if clicked_home_login and not auth_navigation_handoff_complete:
+                current_url = str(getattr(page, "url", "") or "")
+                if _is_chatgpt_homepage(current_url):
+                    self.log(
+                        "[认证] 首页邮箱抽屉提交后仍停留在 ChatGPT 首页；"
+                        "改用本次登录认证 URL，避免把首页误判为已完成登录"
+                    )
+                    return original_create_login_url(request_context)
                 auth_navigation_pending = True
-                return str(getattr(page, "url", "") or "")
+                return current_url
             return original_create_login_url(request_context)
 
         def keep_clicked_auth_page(target_page, url):

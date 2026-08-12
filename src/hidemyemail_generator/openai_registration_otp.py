@@ -27,12 +27,26 @@ def iso_timestamp(value: float) -> str:
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
+class EmailVerificationPageAdvanced(RuntimeError):
+    """Stop a mailbox poll once the browser has already passed the OTP page."""
+
+
 EMAIL_VERIFICATION_CONTEXT_INPUT_SELECTORS = (
     'input:not([type])',
     'input[type="text"]',
     'input[type="number"]',
     'input[type="tel"]',
     'input[role="textbox"]',
+)
+
+EMAIL_VERIFICATION_RESEND_SELECTORS = (
+    'button:has-text("Resend email")',
+    '[role="button"]:has-text("Resend email")',
+    'button:has-text("Resend code")',
+    'button:has-text("メールを再送信する")',
+    '[role="button"]:has-text("メールを再送信する")',
+    'button:has-text("重新发送邮件")',
+    'button:has-text("重新傳送電子郵件")',
 )
 EMAIL_VERIFICATION_UI_MARKERS = {
     "日文": (
@@ -201,6 +215,9 @@ class ManualOtpReader:
         )
         while time.time() < deadline:
             try:
+                page_advanced = getattr(self, "page_advanced", None)
+                if callable(page_advanced) and page_advanced():
+                    raise EmailVerificationPageAdvanced
                 if icloud_inbox:
                     response = self.session.post(
                         self.service_url + "/api/gpt-code",
@@ -255,7 +272,7 @@ class ManualOtpReader:
                         self.log("已安全取得本次所需的邮箱验证码")
                         return code
                 last_error = str(payload.get("error") or f"HTTP {response.status_code}")
-            except RuntimeError:
+            except (EmailVerificationPageAdvanced, RuntimeError):
                 raise
             except Exception as error:
                 last_error = str(error)
@@ -344,8 +361,8 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
             ):
                 worker._hme_otp_fill_context_logged = True
                 worker.log(
-                    f"[验证码] 新验证码已到达；已再次确认目标邮箱、页面 URL、"
-                    f"{ui_state['locale']}验证文案和 Code 输入框，正在自动填写并提交"
+                    f"[验证码] 已再次确认目标邮箱、页面 URL、"
+                    f"{ui_state['locale']}验证文案和 Code 输入框，准备填写本轮验证码"
                 )
             return stable_inputs(inputs)
         page_url = str(getattr(page, "url", "") or "").lower()
@@ -388,9 +405,9 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                     if not getattr(worker, "_hme_otp_fill_context_logged", False):
                         worker._hme_otp_fill_context_logged = True
                         worker.log(
-                            f"[验证码] 新验证码已到达；已结合目标邮箱、页面 URL、"
+                            f"[验证码] 已结合目标邮箱、页面 URL、"
                             f"{ui_state['locale']}界面文案识别唯一 Code 输入框，"
-                            "正在自动填写并提交"
+                            "准备填写本轮验证码"
                         )
                     return stable_inputs(context_inputs)
             if "email-verification" in current_page_url:
@@ -434,16 +451,116 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                 "[验证码] 当前注册流程已进入邮箱验证码分支；"
                 "正在继续核对页面 URL、目标邮箱、可见文案和 Code 输入框"
             )
+        reader = getattr(worker, "otp_reader", None)
+        previous_page_advanced = getattr(reader, "page_advanced", None)
+
+        def page_advanced() -> bool:
+            try:
+                current_url = str(getattr(page, "url", "") or "").casefold()
+            except Exception:
+                return False
+            if "email-verification" in current_url:
+                return False
+            try:
+                return not bool(
+                    original_visible_inputs(
+                        worker,
+                        page,
+                        list(LOCALIZED_EMAIL_OTP_INPUT_SELECTORS),
+                    )
+                )
+            except Exception:
+                return False
+
+        if reader is not None:
+            reader.page_advanced = page_advanced
         worker._hme_waiting_to_fill_otp_input = True
         try:
-            return original_submit_email_code(
-                worker,
-                page,
-                min_timestamp,
-                wait_for_session=wait_for_session,
-            )
+            if not getattr(worker, "_hme_otp_resend_clicked", False):
+                resend_clicked = False
+                for selector in EMAIL_VERIFICATION_RESEND_SELECTORS:
+                    try:
+                        locator = page.locator(selector)
+                        if int(locator.count()) < 1:
+                            continue
+                        candidate = locator.first
+                        if not candidate.is_visible(timeout=500):
+                            continue
+                        try:
+                            candidate.click(timeout=3000, no_wait_after=True)
+                        except Exception:
+                            try:
+                                candidate.click(
+                                    timeout=3000,
+                                    no_wait_after=True,
+                                    force=True,
+                                )
+                            except Exception:
+                                candidate.evaluate("element => element.click()")
+                        resend_clicked = True
+                        break
+                    except Exception:
+                        continue
+                if resend_clicked:
+                    worker._hme_otp_resend_clicked = True
+                    min_timestamp = max(
+                        float(min_timestamp or 0.0),
+                        time.time() - 30.0,
+                    )
+                    worker.log(
+                        "[验证码] 已单次点击重新发送邮件；"
+                        "正在等待并只读取本次任务的新验证码"
+                    )
+                    wait = getattr(page, "wait_for_timeout", None)
+                    if callable(wait):
+                        wait(750)
+            try:
+                return original_submit_email_code(
+                    worker,
+                    page,
+                    min_timestamp,
+                    wait_for_session=wait_for_session,
+                )
+            except EmailVerificationPageAdvanced:
+                worker.log(
+                    "[验证码] 页面已离开邮箱验证码页；停止等待邮件并继续当前流程"
+                )
+                return None
+            except Exception as error:
+                detail = str(error)
+                if not (
+                    "Page.evaluate:" in detail
+                    and "NetworkError when attempting to fetch resource" in detail
+                ):
+                    raise
+                if page_advanced():
+                    worker.log(
+                        "[验证码] 邮箱验证码接口返回网络异常时页面已完成跳转；"
+                        "停止重复提交并继续当前流程"
+                    )
+                    return None
+                click_continue = getattr(worker, "_click_continue", None)
+                if not callable(click_continue) or not click_continue(page):
+                    raise
+                worker.log(
+                    "[验证码] 邮箱验证码接口 fetch 出现瞬时网络异常；"
+                    "已改用页面可见的继续按钮提交"
+                )
+                if wait_for_session:
+                    wait_after_submit = getattr(worker, "_wait_after_otp_submit", None)
+                    if callable(wait_after_submit):
+                        wait_after_submit(page)
+                return None
         finally:
             worker._hme_waiting_to_fill_otp_input = False
+            if reader is not None:
+                if previous_page_advanced is None:
+                    try:
+                        del reader.page_advanced
+                    except AttributeError:
+                        pass
+                else:
+                    reader.page_advanced = previous_page_advanced
 
     worker_type._preconnect_otp_reader = preconnect_otp_reader
     worker_type._wait_for_openai_email_code = wait_for_openai_email_code
