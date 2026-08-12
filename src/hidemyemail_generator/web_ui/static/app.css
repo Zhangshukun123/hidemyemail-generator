@@ -121,17 +121,6 @@ html[data-theme="light"] .sidebar { background: #ffffff; }
 .registration-code-panel > div { display: grid; gap: 4px; }
 .registration-code-panel small { color: var(--muted); }
 .registration-code-panel input { min-height: 38px; font-size: 15px; letter-spacing: .12em; }
-.registration-failure-panel { margin-top: 12px; border: 1px solid color-mix(in srgb, var(--red) 42%, var(--border)); border-radius: 10px; padding: 12px; display: grid; gap: 9px; background: color-mix(in srgb, var(--red-soft) 64%, var(--surface)); }
-.registration-failure-panel[hidden] { display: none; }
-.registration-failure-head, .registration-failure-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.registration-failure-head > div, .registration-failure-copy { min-width: 0; display: grid; gap: 3px; }
-.registration-failure-head strong { color: var(--red); font-size: 11px; }
-.registration-failure-head small, .registration-failure-copy small { color: var(--muted); font-size: 8px; }
-.registration-failure-head > span { flex: 0 0 auto; border-radius: 999px; padding: 3px 7px; color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); font-size: 8px; font-weight: 800; }
-.registration-failure-list { display: grid; gap: 7px; }
-.registration-failure-row { border: 1px solid color-mix(in srgb, var(--red) 20%, var(--border)); border-radius: 8px; padding: 8px 9px; background: color-mix(in srgb, var(--surface) 84%, transparent); }
-.registration-failure-copy strong { overflow: hidden; color: var(--text); font: 10px/1.3 Consolas, "SFMono-Regular", monospace; text-overflow: ellipsis; white-space: nowrap; }
-.registration-failure-row .button { flex: 0 0 auto; }
 .task-live-context {
   margin-top: 18px; border: 1px solid color-mix(in srgb, var(--task-tone) 28%, var(--border)); border-radius: 12px;
   padding: 14px 16px; display: grid; grid-template-columns: minmax(260px, .9fr) minmax(320px, 1.4fr); gap: 16px;

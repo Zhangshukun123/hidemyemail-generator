@@ -73,61 +73,6 @@ EMAIL_VERIFICATION_UI_MARKERS = {
 }
 
 
-def _normalized_otp_value(value: object) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", str(value or ""))
-
-
-class _StableOtpInput:
-    """Treat a completed controlled-input write as success after React locks it."""
-
-    def __init__(self, locator, worker) -> None:
-        self._locator = locator
-        self._worker = worker
-
-    def __getattr__(self, name):
-        return getattr(self._locator, name)
-
-    def _value(self) -> str:
-        try:
-            value = self._locator.input_value(timeout=500)
-        except TypeError:
-            value = self._locator.input_value()
-        except Exception:
-            return ""
-        return _normalized_otp_value(value)
-
-    def _log_recovered_fill(self, message: str) -> None:
-        if getattr(self._worker, "_hme_otp_fill_recovered_logged", False):
-            return
-        self._worker._hme_otp_fill_recovered_logged = True
-        self._worker.log(message)
-
-    def fill(self, value, *args, **kwargs):
-        expected = _normalized_otp_value(value)
-        if expected and self._value() == expected:
-            self._log_recovered_fill(
-                "[验证码] Code 输入框已经包含本次验证码；跳过重复填写并继续提交"
-            )
-            return None
-
-        try:
-            if args or "timeout" in kwargs:
-                return self._locator.fill(value, *args, **kwargs)
-            try:
-                return self._locator.fill(value, timeout=5000)
-            except TypeError as error:
-                if "timeout" not in str(error).casefold():
-                    raise
-                return self._locator.fill(value)
-        except Exception:
-            if expected and self._value() == expected:
-                self._log_recovered_fill(
-                    "[验证码] Code 已写入；输入框随后进入提交锁定状态，继续完成验证"
-                )
-                return None
-            raise
-
-
 def _email_verification_ui_state(
     page,
     expected_email: str,
@@ -332,12 +277,6 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
         inputs = original_visible_inputs(worker, page, selectors)
         if not is_supported_worker(worker):
             return inputs
-
-        def stable_inputs(candidates):
-            if not getattr(worker, "_hme_waiting_to_fill_otp_input", False):
-                return candidates
-            return [_StableOtpInput(candidate, worker) for candidate in candidates]
-
         selector_text = " ".join(str(selector or "") for selector in selectors)
         is_email_code_lookup = any(
             marker in selector_text
@@ -364,7 +303,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                     f"[验证码] 已再次确认目标邮箱、页面 URL、"
                     f"{ui_state['locale']}验证文案和 Code 输入框，准备填写本轮验证码"
                 )
-            return stable_inputs(inputs)
+            return inputs
         page_url = str(getattr(page, "url", "") or "").lower()
         retry_count = (
             20
@@ -385,7 +324,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                 inputs = original_visible_inputs(worker, page, selectors)
                 if inputs:
                     worker.log("[验证码] Code 输入框重渲染后已恢复，继续自动填写")
-                    return stable_inputs(inputs)
+                    return inputs
             for selector in LOCALIZED_EMAIL_OTP_INPUT_SELECTORS:
                 localized_inputs = original_visible_inputs(worker, page, [selector])
                 if not localized_inputs:
@@ -393,7 +332,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                 if not getattr(worker, "_hme_localized_otp_input_logged", False):
                     worker._hme_localized_otp_input_logged = True
                     worker.log("[验证码] 已识别本地化 Code 输入框，准备自动填写")
-                return stable_inputs(localized_inputs)
+                return localized_inputs
             ui_state = _email_verification_ui_state(
                 page,
                 target_email,
@@ -409,7 +348,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                             f"{ui_state['locale']}界面文案识别唯一 Code 输入框，"
                             "准备填写本轮验证码"
                         )
-                    return stable_inputs(context_inputs)
+                    return context_inputs
             if "email-verification" in current_page_url:
                 text_inputs = original_visible_inputs(
                     worker,
@@ -418,8 +357,8 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                 )
                 if len(text_inputs) == 1:
                     worker.log("[验证码] 已按邮箱验证页面的唯一文本框定位 Code 输入框")
-                    return stable_inputs(text_inputs)
-        return stable_inputs(inputs)
+                    return text_inputs
+        return inputs
 
     def submit_email_code_with_stable_input(
         worker,

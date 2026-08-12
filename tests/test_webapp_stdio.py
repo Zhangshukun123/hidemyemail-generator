@@ -580,7 +580,11 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
                     # The deactivation scanner performs one startup sync.  Let
                     # it finish, then isolate the public code-lookup requests.
                     for _ in range(100):
-                        if sync.call_count:
+                        if (
+                            sync.call_count
+                            and app["deactivation_scan_state"].get("status")
+                            != "running"
+                        ):
                             break
                         await asyncio.sleep(0.01)
                     sync.reset_mock()
@@ -614,9 +618,7 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
             )
             app = create_app(base_dir=root)
 
-            def sync_junk(_config, db_file, _limit, **_kwargs):
-                if not _kwargs.get("junk_first"):
-                    return []
+            def sync_junk(_config, db_file, _limit):
                 conn = connect_db(str(db_file))
                 try:
                     record = {
@@ -642,17 +644,13 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch(
                     "hidemyemail_generator.webapp.sync_inbox",
                     side_effect=sync_junk,
-                ) as sync,
+                ),
                 mock.patch(
                     "hidemyemail_generator.webapp.RichHideMyEmail"
                 ) as icloud_client,
             ):
                 await client.start_server()
                 try:
-                    await asyncio.sleep(0.05)
-                    async with app["inbox_sync_lock"]:
-                        pass
-                    app["inbox_on_demand_next_attempt"] = 0.0
                     response = await client.post(
                         "/api/gpt-code",
                         json={"email": "relay@icloud.com"},
@@ -669,14 +667,8 @@ class CodePortalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["code"], "938388")
-<<<<<<< HEAD
-        self.assertTrue(
-            any(call.kwargs.get("junk_first") for call in sync.call_args_list)
-        )
-=======
         self.assertEqual(public_response.status, 200)
         self.assertEqual(public_payload["code"], "938388")
->>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
         icloud_client.assert_not_called()
 
     async def test_gpt_code_treats_expired_icloud_cookie_as_no_code_yet(self):
@@ -1189,18 +1181,17 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
             email="protocol@gmail.com",
         )
         self.assertEqual(response.status, 200)
-        self.assertEqual(payload["mode"], "verify")
+        self.assertEqual(payload["mode"], "refresh_cookie")
         self.assertEqual(
-            verification_manager.verify_starts,
+            verification_manager.browser_refresh_starts,
             [
                 {
-                    "concurrency": 1,
                     "emails": ["protocol@gmail.com"],
-                    "force_online": True,
+                    "concurrency": 1,
+                    "force_refresh": True,
                 }
             ],
         )
-        self.assertEqual(verification_manager.browser_refresh_starts, [])
 
         response, payload, verification_manager, browser_manager = await run_case(
             has_valid_session=True,
@@ -1226,18 +1217,18 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
             refresh_with_cookie=True,
         )
         self.assertEqual(response.status, 200)
-        self.assertEqual(payload["mode"], "verify")
+        self.assertEqual(payload["mode"], "refresh_cookie")
         self.assertEqual(
-            verification_manager.verify_starts,
+            verification_manager.browser_refresh_starts,
             [
                 {
-                    "concurrency": 1,
                     "emails": ["protocol@icloud.com"],
-                    "force_online": True,
+                    "concurrency": 1,
+                    "force_refresh": True,
                 }
             ],
         )
-        self.assertEqual(verification_manager.browser_refresh_starts, [])
+        self.assertEqual(verification_manager.verify_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
 
 

@@ -193,20 +193,6 @@ class InboxSyncTests(unittest.TestCase):
             [("INBOX", "4"), ("Junk", "4")],
         )
 
-<<<<<<< HEAD
-    def test_latency_sensitive_sync_can_scan_junk_before_inbox(self):
-        mailbox = JunkAwareFakeMailbox()
-        config = InboxConfig(
-            host="imap.example.com",
-            port=993,
-            username="user@example.com",
-            password="password",
-        )
-
-        def record_for_folder(_conn, folder_config, uid, _raw_message):
-            return {"folder": folder_config.folder, "uid": uid}
-
-=======
     def test_sync_accepts_icloud_none_for_empty_junk_search(self):
         mailbox = EmptyJunkFakeMailbox()
         config = InboxConfig(
@@ -216,7 +202,6 @@ class InboxSyncTests(unittest.TestCase):
             password="app-password",
         )
 
->>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "inbox.db"
             with (
@@ -226,35 +211,16 @@ class InboxSyncTests(unittest.TestCase):
                 ),
                 patch(
                     "hidemyemail_generator.inbox.message_to_record",
-<<<<<<< HEAD
-                    side_effect=record_for_folder,
-=======
                     side_effect=lambda _conn, folder, uid, _raw: {
                         "folder": folder.folder,
                         "uid": uid,
                     },
->>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
                 ),
                 patch(
                     "hidemyemail_generator.inbox.insert_message",
                     return_value=True,
                 ),
             ):
-<<<<<<< HEAD
-                inserted = sync_inbox(
-                    config,
-                    str(db_file),
-                    limit=1,
-                    junk_first=True,
-                )
-
-        self.assertEqual(mailbox.selected_folders, ["Junk", "INBOX"])
-        self.assertEqual(
-            [(item["folder"], item["uid"]) for item in inserted],
-            [("Junk", "4"), ("INBOX", "4")],
-        )
-
-=======
                 inserted = sync_inbox(config, str(db_file), limit=1)
 
         self.assertEqual(mailbox.selected_folders, ["INBOX", "Junk"])
@@ -433,7 +399,6 @@ class ICloudRecipientParsingTests(unittest.TestCase):
         self.assertEqual(record["hme_address"], target)
         self.assertEqual(record["code"], "352838")
 
->>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
 
 
 class VerificationCodeExtractionTests(unittest.TestCase):

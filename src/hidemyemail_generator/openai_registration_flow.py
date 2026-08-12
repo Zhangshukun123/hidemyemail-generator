@@ -75,10 +75,6 @@ PASSWORD_OTP_RESEND_SELECTORS = (
 )
 
 
-class _PostPasswordEmailVerificationRequired(RuntimeError):
-    """Leave the first-code wait so a fresh post-password code can be fetched."""
-
-
 def _locator_state(candidate, method: str, *, default: bool) -> bool:
     callback = getattr(candidate, method, None)
     if not callable(callback):
@@ -369,8 +365,6 @@ def configure_password_first_login(
     original_continue_registration = getattr(
         worker, "_continue_chatgpt_registration_complete", None
     )
-    original_submit_email_code = getattr(worker, "_submit_email_code", None)
-    post_password_code_retry_supported = callable(original_submit_email_code)
     if (
         not enabled
         or not callable(original_has_otp)
@@ -570,7 +564,6 @@ def configure_password_first_login(
                     "密码提交=未完成；Session 判定=暂缓；"
                     "决策=填写并提交创建邮箱时保存的唯一密码"
                 )
-                self._hme_password_submitted_at = time.time()
                 self._fill_password_step(page)
                 submitted_url = current_url
                 self.log(
@@ -598,11 +591,6 @@ def configure_password_first_login(
                             f"密码已提交并完成页面切换：{route}；"
                             "现在允许继续验证码或 Session 判断",
                         )
-                        if (
-                            post_password_code_retry_supported
-                            and "email-verification" in current_url.casefold()
-                        ):
-                            self._hme_post_password_email_verification_pending = True
                         return True
                     monitor_password_entry_wait(
                         self,
@@ -669,16 +657,6 @@ def configure_password_first_login(
         )
 
     def continue_registration_and_choose_password(self, page):
-        if getattr(
-            self, "_hme_post_password_email_verification_pending", False
-        ):
-            current_url = str(getattr(page, "url", "") or "").casefold()
-            if "email-verification" not in current_url:
-                self._hme_post_password_email_verification_pending = False
-            elif original_has_otp(page):
-                raise _PostPasswordEmailVerificationRequired
-            else:
-                return False
         password_path_started = bool(
             getattr(self, "_hme_password_entry_selected", False)
             or getattr(self, "_hme_password_entry_pending", False)
@@ -723,49 +701,6 @@ def configure_password_first_login(
                 )
             )
         return result
-
-    def submit_email_code_with_post_password_followup(
-        self,
-        page,
-        min_timestamp,
-        *,
-        wait_for_session=True,
-    ):
-        try:
-            return original_submit_email_code(
-                page,
-                min_timestamp,
-                wait_for_session=wait_for_session,
-            )
-        except _PostPasswordEmailVerificationRequired:
-            retry_count = int(
-                getattr(self, "_hme_post_password_email_code_retry_count", 0) or 0
-            )
-            if retry_count >= 1:
-                raise RuntimeError(
-                    "密码提交后的第二次邮箱验证码已处理一次，"
-                    "页面仍重复要求验证码；已停止继续提交"
-                ) from None
-            self._hme_post_password_email_code_retry_count = retry_count + 1
-            self._hme_post_password_email_verification_pending = False
-            submitted_at = float(
-                getattr(self, "_hme_password_submitted_at", 0.0) or 0.0
-            )
-            fresh_min_timestamp = max(
-                float(min_timestamp or 0.0),
-                max(0.0, submitted_at - 1.0),
-            )
-            self._hme_otp_fill_context_logged = False
-            self._hme_localized_otp_input_logged = False
-            self.log(
-                "[验证码] 密码提交后进入第二次邮箱验证；"
-                "正在等待该步骤生成的新验证码 (1/1)，不会复用首次验证码"
-            )
-            return original_submit_email_code(
-                page,
-                fresh_min_timestamp,
-                wait_for_session=wait_for_session,
-            )
 
     def has_otp_or_choose_password(self, page):
         if click_password_reset_confirmation(self, page):
@@ -906,11 +841,6 @@ def configure_password_first_login(
     if callable(original_continue_registration):
         worker._continue_chatgpt_registration_complete = types.MethodType(
             continue_registration_and_choose_password, worker
-        )
-    if post_password_code_retry_supported:
-        worker._submit_email_code = types.MethodType(
-            submit_email_code_with_post_password_followup,
-            worker,
         )
     worker._hme_password_first_login_configured = True
     return True
@@ -1111,63 +1041,6 @@ def _about_you_profile_values_match(
     return bool(semantic_validator(values, second_kind)), values, second_kind
 
 
-def _about_you_page_text(page) -> str:
-    try:
-        return re.sub(
-            r"\s+",
-            " ",
-            str(page.locator("body").inner_text(timeout=700) or ""),
-        ).strip()
-    except Exception:
-        return ""
-
-
-def _japanese_about_you_age_recovery_needed(page) -> bool:
-    text = _about_you_page_text(page)
-    return (
-        "ご入力の情報ではアカウントを作成できません" in text
-        and "もう一度お試しください" in text
-        and ("生年月日" in text or "年齢を確認します" in text)
-    )
-
-
-def _japanese_about_you_confirmation_visible(page) -> bool:
-    text = _about_you_page_text(page)
-    return (
-        "生年月日を" in text
-        and "設定しています" in text
-        and "記録用です" in text
-    )
-
-
-def _click_first_visible_control(page, selectors: tuple[str, ...]) -> bool:
-    for selector in selectors:
-        try:
-            candidate = page.locator(selector).first
-            if not candidate.is_visible(timeout=500):
-                continue
-            is_enabled = getattr(candidate, "is_enabled", None)
-            if callable(is_enabled) and not is_enabled(timeout=500):
-                continue
-            candidate.scroll_into_view_if_needed(timeout=3000)
-            candidate.click(timeout=5000)
-            return True
-        except Exception:
-            continue
-    return False
-
-
-def _about_you_second_field_kind(worker, page) -> str:
-    context_reader = getattr(worker, "_about_you_second_field_context", None)
-    kind_reader = getattr(worker, "_about_you_second_field_kind_from_context", None)
-    if not callable(context_reader) or not callable(kind_reader):
-        return "unknown"
-    try:
-        return str(kind_reader(str(context_reader(page) or "")) or "unknown")
-    except Exception:
-        return "unknown"
-
-
 def configure_resilient_about_you_input(
     worker,
     *,
@@ -1244,12 +1117,6 @@ def configure_resilient_about_you_input(
         age: str,
     ):
         activate_page(self, page)
-        self._hme_about_you_profile_values = {
-            "name": str(name or ""),
-            "birthdate": str(birthdate or ""),
-            "birth_year": str(birth_year or ""),
-            "age": str(age or ""),
-        }
         result = original_profile_fill(page, name, birthdate, birth_year, age)
         matched, values, second_kind = _about_you_profile_values_match(
             self, page, name, birthdate, birth_year, age
@@ -1303,7 +1170,7 @@ def configure_resilient_about_you_input(
     worker._fill_about_you_inputs = types.MethodType(profile_fill_with_readback, worker)
     if callable(original_profile_submit):
 
-        def call_original_with_bounded_timeout(self, page):
+        def submit_profile_with_one_retry(self, page):
             backend_module = sys.modules.get(
                 str(getattr(original_profile_submit, "__module__", "") or "")
             )
@@ -1317,186 +1184,27 @@ def configure_resilient_about_you_input(
                 if backend_module is not None and original_timeout is not None:
                     setattr(backend_module, timeout_name, min(30, original_timeout))
                 return original_profile_submit(page)
+            except RuntimeError as error:
+                if "基础资料按钮点击后" not in str(error):
+                    raise
             finally:
                 if backend_module is not None and original_timeout is not None:
                     setattr(backend_module, timeout_name, original_timeout)
 
-        def submit_profile_with_recovery(self, page):
-            finish_click = getattr(self, "_click_finish_creating_account", None)
-            continue_click = getattr(self, "_click_continue", None)
-            text_click = getattr(self, "_click_button_by_text", None)
-            submit_done = getattr(self, "_about_you_submit_done", None)
-            rejection_check = getattr(
-                self, "_raise_if_account_creation_rejected", None
-            )
-            required = (finish_click, continue_click, text_click, submit_done)
-            if not all(callable(method) for method in required):
-                try:
-                    return call_original_with_bounded_timeout(self, page)
-                except RuntimeError as error:
-                    if "基础资料按钮点击后" not in str(error):
-                        raise
-                self.log(
-                    "[基础资料] 第一次提交 30 秒后页面仍未跳转；"
-                    "确认仍在当前表单，重新激活后台标签并只重试一次"
-                )
-                activate_page(self, page)
-                _page_wait(page, 1000)
-                return call_original_with_bounded_timeout(self, page)
-
-            def click_submit() -> bool:
-                if finish_click(page) or continue_click(page):
-                    return True
-                return bool(
-                    text_click(
-                        page,
-                        [
-                            "Finish creating account",
-                            "アカウントの作成を完了する",
-                            "作成を完了",
-                            "完成帐户创建",
-                            "完成账户创建",
-                            "Create account",
-                            "Continue",
-                            "完成",
-                        ],
-                    )
-                )
-
-            def wait_after_submit(
-                before_url: str,
-                *,
-                timeout_seconds: float,
-                allow_age_recovery: bool,
-            ) -> str:
-                started = time.time()
-                confirmation_clicked = False
-                while time.time() - started < timeout_seconds:
-                    if _japanese_about_you_confirmation_visible(page):
-                        if not confirmation_clicked and _click_first_visible_control(
-                            page,
-                            (
-                                '[role="dialog"] button:text-is("OK")',
-                                '[role="dialog"] [role="button"]:text-is("OK")',
-                                'button:text-is("OK")',
-                                '[role="button"]:text-is("OK")',
-                            ),
-                        ):
-                            confirmation_clicked = True
-                            self.log(
-                                "[基础资料] 已识别日文生日确认弹窗并单击 OK"
-                            )
-                            _page_wait(page, 300)
-                            continue
-                    if submit_done(page, before_url):
-                        return "done"
-                    if (
-                        allow_age_recovery
-                        and _japanese_about_you_age_recovery_needed(page)
-                    ):
-                        return "age_recovery"
-                    if callable(rejection_check):
-                        rejection_check(page)
-                    _page_wait(page, 250)
-                return "timeout"
-
-            before_url = str(getattr(page, "url", "") or "")
-            if not click_submit():
-                return False
-            outcome = wait_after_submit(
-                before_url,
-                timeout_seconds=30,
-                allow_age_recovery=True,
-            )
-            if outcome == "done":
-                return True
-            if outcome == "timeout":
-                self.log(
-                    "[基础资料] 第一次提交 30 秒后页面仍未跳转；"
-                    "确认仍在当前表单，重新激活后台标签并只重试一次"
-                )
-                activate_page(self, page)
-                _page_wait(page, 1000)
-                return call_original_with_bounded_timeout(self, page)
-
             self.log(
-                "[基础资料] 日文生日提交返回资料无效；"
-                "按页面状态再次提交一次，然后改用年龄字段"
+                "[基础资料] 第一次提交 30 秒后页面仍未跳转；"
+                "确认仍在当前表单，重新激活后台标签并只重试一次"
             )
             activate_page(self, page)
-            if not click_submit():
-                raise RuntimeError("日文基础资料错误页未找到再次提交按钮")
-            for _attempt in range(8):
-                if _about_you_second_field_kind(self, page) == "age":
-                    break
-                _page_wait(page, 250)
-            if _about_you_second_field_kind(self, page) != "age":
-                switched = _click_first_visible_control(
-                    page,
-                    (
-                        'button:has-text("年齢を使用する")',
-                        'a:has-text("年齢を使用する")',
-                        '[role="button"]:has-text("年齢を使用する")',
-                        'button:has-text("Use age")',
-                        'a:has-text("Use age")',
-                    ),
-                )
-                if not switched:
-                    raise RuntimeError(
-                        "日文生日校验失败后未切换到年龄输入，也未找到“使用年龄”入口"
-                    )
-                for _attempt in range(20):
-                    if _about_you_second_field_kind(self, page) == "age":
-                        break
-                    _page_wait(page, 250)
-            if _about_you_second_field_kind(self, page) != "age":
-                raise RuntimeError("已点击使用年龄，但年龄输入框未完成加载")
-
-            profile = dict(
-                getattr(self, "_hme_about_you_profile_values", {}) or {}
-            )
-            required_values = ("name", "birthdate", "birth_year", "age")
-            if not all(profile.get(key) for key in required_values):
-                raise RuntimeError("缺少基础资料缓存，无法安全改用年龄重新提交")
-            self._fill_about_you_inputs(
-                page,
-                profile["name"],
-                profile["birthdate"],
-                profile["birth_year"],
-                profile["age"],
-            )
-            matched, values, second_kind = _about_you_profile_values_match(
-                self,
-                page,
-                profile["name"],
-                profile["birthdate"],
-                profile["birth_year"],
-                profile["age"],
-            )
-            if not matched or second_kind != "age":
-                raise RuntimeError(
-                    "年龄字段回读校验失败，已停止最终提交；"
-                    f"字段类型={second_kind}，当前值={values}"
-                )
-            self.log(
-                "[基础资料] 年龄字段已填写并回读校验通过，正在再次提交"
-            )
-            before_url = str(getattr(page, "url", "") or "")
-            if not click_submit():
-                raise RuntimeError("年龄已填写，但未找到完成创建账号按钮")
-            final_outcome = wait_after_submit(
-                before_url,
-                timeout_seconds=60,
-                allow_age_recovery=False,
-            )
-            if final_outcome == "done":
-                return True
-            raise RuntimeError(
-                "年龄提交及生日确认后 60 秒内页面仍未完成跳转"
-            )
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            _page_wait(page, 1000)
+            return original_profile_submit(page)
 
         worker._submit_about_you = types.MethodType(
-            submit_profile_with_recovery,
+            submit_profile_with_one_retry,
             worker,
         )
     worker._hme_about_you_input_configured = True

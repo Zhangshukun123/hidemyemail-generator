@@ -459,43 +459,11 @@
         ? "验证码将用于 " + awaitingEmail
         : "等待注册页面请求验证码";
 
-      const completedRegistrationEmails = new Set(state.accounts
-        .filter((item) => item.hasSession && item.hasTwoFactor)
-        .map((item) => String(item.email || "").trim().toLowerCase()));
-      const activeRegistrationEmails = new Set((registration.tasks || [])
-        .filter((item) => item.running)
-        .flatMap((item) => item.emails || [item.email || ""])
-        .map((email) => String(email || "").trim().toLowerCase())
-        .filter(Boolean));
-      const failureByEmail = new Map();
-      for (const record of registration.failureRecords || []) {
-        const email = String(record.email || (record.emails || [])[0] || "").trim().toLowerCase();
-        if (!email || completedRegistrationEmails.has(email) || failureByEmail.has(email)) continue;
-        failureByEmail.set(email, { ...record, email });
-      }
-      const failureRecords = [...failureByEmail.values()];
-      const failurePanel = $("registrationFailurePanel");
-      failurePanel.hidden = failureRecords.length === 0;
-      $("registrationFailureCount").textContent = failureRecords.length + " 个";
-      $("registrationFailureList").innerHTML = failureRecords.map((record) => {
-        const active = activeRegistrationEmails.has(record.email);
-        const providerCancelled = record.provider === "smsbower";
-        const disabled = active || providerCancelled || !canStartNextRegistration;
-        const label = active ? "正在重新注册" : providerCancelled ? "需重新获取 Gmail" : "重新注册";
-        const reason = providerCancelled
-          ? "SMSBower 激活失败后已取消，不能复用该 Gmail"
-          : String(record.message || "注册失败").split("\n", 1)[0].slice(0, 160);
-        return '<div class="registration-failure-row"><div class="registration-failure-copy"><strong title="' +
-          escapeHtml(record.email) + '">' + escapeHtml(record.email) + '</strong><small title="' +
-          escapeHtml(reason) + '">' + escapeHtml(reason) + '</small></div><button class="button small primary" data-action="retry-registration" data-email="' +
-          escapeHtml(record.email) + '"' + (disabled ? " disabled" : "") + '>' + escapeHtml(label) + "</button></div>";
-      }).join("");
-
       const seenLogs = new Set();
-      const recordedFailureLogs = failureRecords.map((record) => ({
+      const recordedFailureLogs = (registration.failureRecords || []).map((record) => ({
         at: record.recordedAt || record.finishedAt || record.startedAt || "",
         email: record.email || (record.emails || [])[0] || "",
-        message: "失败邮箱已记录，可在失败邮箱列表重新注册：" + (record.message || "注册失败"),
+        message: "失败邮箱已记录，可重新点击注册：" + (record.message || "注册失败"),
         stage: record.currentStage || "failed",
         location: record.currentLocation || "注册失败记录",
         action: "失败邮箱已记录，可重新注册",
@@ -624,7 +592,7 @@
         this.credentialButton("复制 AT", "copy-credential", item, "access_token", !item.hasSession) +
         this.credentialButton("复制 Session", "copy-credential", item, "session", !item.hasSession) +
         this.credentialButton("获取验证码", "get-code", item) +
-        this.credentialButton(item.hasCookies ? "验证账号" : "尚未保存 Cookie", "verify-account", item, "", !item.hasCookies) +
+        this.credentialButton(item.hasCookies ? "Cookie 刷新状态" : "尚未保存 Cookie", "verify-account", item, "", !item.hasCookies) +
         this.credentialButton("一键导入工作台", "import-workbench", item, "", !item.hasImportableSession) +
         this.credentialButton("复制账号", "copy-account", item, "", !item.hasPassword) +
         this.credentialButton("删除邮箱", "delete-email", item, "", false, "danger") +
@@ -931,7 +899,7 @@
         (isError ? '<div class="detail-error">' + escapeHtml(item.message || "Access Token 已过期，请重新获取 Session") +
         '</div>' : "") + (isDeleted ? "" : '<div class="verification-detail-actions"><button class="button primary" data-action="verify-account" data-email="' +
         escapeHtml(item.email) + '"' + (state.verificationTask.running || !item.hasCookies ? " disabled" : "") + '>' +
-        (item.hasCookies ? "验证账号" : "尚未保存 Cookie") + "</button></div>");
+        (item.hasCookies ? "使用 Cookie 刷新状态" : "尚未保存 Cookie") + "</button></div>");
     }
 
     renderVerificationLogs(state) {
@@ -1257,11 +1225,9 @@
         return data.message || "无效邮箱已自动删除；请选择下一个账号继续验证";
       }
       this.schedule("verification", () => this.loadVerificationTask(), 800);
-      return data.mode === "verify"
-        ? "正在验证当前 AT；仅在 401/token_invalid 时刷新并复验"
-        : data.mode === "refresh_cookie"
-          ? "当前 AT 缺失，正在使用保存 Cookie 获取 Session"
-          : "正在获取 Session 并验证套餐";
+      return data.mode === "refresh_cookie"
+        ? "正在使用保存的 Cookie 刷新 Session 与账号状态"
+        : "正在获取 Session 并验证套餐";
     }
 
     async copyText(value) {
@@ -1318,20 +1284,6 @@
         this.store.patch({ registrationTask: data.task });
         this.schedule("registration", () => this.loadRegistrationTask(), 800);
         return "已添加邮箱并启动注册：" + email;
-      });
-      this.commands.register("retry-registration", async ({ element }) => {
-        const email = String(element.dataset.email || "").trim().toLowerCase();
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-          throw new Error("失败记录中的邮箱地址无效");
-        }
-        const options = this.browserOptions();
-        $("registrationEmail").value = email;
-        const data = await this.api.post("/api/registration/start", {
-          label: "失败邮箱重新注册", provider: "manual", email, ...options, concurrency: 1,
-        });
-        this.store.patch({ registrationTask: data.task });
-        this.schedule("registration", () => this.loadRegistrationTask(), 500);
-        return "已重新启动注册：" + email;
       });
       this.commands.register("register-provider", async () => {
         const options = this.browserOptions();

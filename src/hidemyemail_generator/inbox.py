@@ -812,7 +812,6 @@ def sync_inbox(
     limit: int = 50,
     *,
     include_junk: bool = True,
-    junk_first: bool = False,
 ) -> list[dict]:
     conn = connect_db(db_file)
     mailbox = (
@@ -824,11 +823,6 @@ def sync_inbox(
         mailbox.login(config.username, config.password)
         inserted: list[dict] = []
         folders = _sync_folders(mailbox, config.folder) if include_junk else [config.folder]
-        if junk_first and len(folders) > 1:
-            folders = [
-                *(folder for folder in folders if folder != config.folder),
-                config.folder,
-            ]
         for folder in folders:
             folder_config = InboxConfig(
                 host=config.host,

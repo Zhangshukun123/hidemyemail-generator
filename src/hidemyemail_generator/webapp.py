@@ -106,7 +106,7 @@ PUBLIC_PATHS = {
 }
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
-ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 3
+ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 15
 ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS = 60
 ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS = 15 * 60
 ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS = 60 * 60
@@ -1762,7 +1762,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
       if (!resetPassword && !item.hasCookies) {
         throw new Error("该账号尚未保存 Cookie，请先重新登录或注册获取 Cookie");
       }
-      const verifyPrompt = `将先验证 ${item.email} 当前 AT；仅在返回 401/token_invalid 时，才通过原注册代理和保存 Cookie 刷新 Session，并在复验成功后覆盖。不会设置密码或 2FA。是否继续？`;
+      const verifyPrompt = `将使用 ${item.email} 已保存的 Cookie 重新获取 Session、套餐和账号状态；不会设置密码或 2FA。是否继续？`;
       if (!resetPassword && !confirm(verifyPrompt)) {
         const error = new Error("已取消验证账号");
         error.name = "AbortError";
@@ -1780,10 +1780,6 @@ GPT_INDEX_HTML = r"""<!doctype html>
       if (data.mode === "refresh_cookie") {
         await loadVerification();
         return { successLabel: "正在使用 Cookie 刷新账号状态" };
-      }
-      if (data.mode === "verify") {
-        await loadVerification();
-        return { successLabel: "正在验证账号，失效时将自动刷新 Session" };
       }
       if (data.mode === "refresh_session") {
         await loadVerification();
@@ -2222,10 +2218,10 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const secondaryActions = document.createElement("div");
         secondaryActions.className = "secondary-actions";
         secondaryActions.append(importWorkbenchButton);
-        const verifyAccountButton = actionButton("验证账号", () => verifyOrRegisterAccount(item), "验证已启动");
+        const verifyAccountButton = actionButton("Cookie 刷新状态", () => verifyOrRegisterAccount(item), "刷新已启动");
         verifyAccountButton.disabled = !item.hasCookies;
         verifyAccountButton.title = item.hasCookies
-          ? "先验证当前 AT；仅在 401/token_invalid 时通过原注册代理和 Cookie 刷新"
+          ? "使用保存的 Cookie 重新获取 Session、套餐和账号状态"
           : "该账号尚未保存 Cookie";
         secondaryActions.append(verifyAccountButton);
         if (!item.hasPassword) {
@@ -3905,12 +3901,7 @@ def create_app(
         app["inbox_on_demand_retry_after"] = 0
         app["inbox_background_error"] = ""
 
-    async def sync_inbox_on_demand(
-        limit: int,
-        *,
-        force: bool = False,
-        junk_first: bool = False,
-    ) -> list[dict]:
+    async def sync_inbox_on_demand(limit: int, *, force: bool = False) -> list[dict]:
         """Connect only for an active code request, with shared rate limiting."""
 
         config_path: Path = app["inbox_config_file"]
@@ -3926,18 +3917,9 @@ def create_app(
 
             config = load_config(str(config_path))
             try:
-                if junk_first:
-                    inserted = await asyncio.to_thread(
-                        sync_inbox,
-                        config,
-                        str(app["db_file"]),
-                        limit,
-                        junk_first=True,
-                    )
-                else:
-                    inserted = await asyncio.to_thread(
-                        sync_inbox, config, str(app["db_file"]), limit
-                    )
+                inserted = await asyncio.to_thread(
+                    sync_inbox, config, str(app["db_file"]), limit
+                )
             except Exception as error:
                 public_message = _inbox_error_message(error)
                 failures = app["inbox_on_demand_failures"] + 1
@@ -4647,14 +4629,10 @@ def create_app(
             return item, "", 200
 
         try:
-<<<<<<< HEAD
-            await sync_inbox_on_demand(30, junk_first=True)
-=======
             await _wait_for_shared_inbox_code_sync(
                 app,
                 lambda: sync_inbox_on_demand(OPENAI_CODE_INBOX_SYNC_LIMIT),
             )
->>>>>>> 14836723b4d819eab73a80ff8fb80ffdf5fb79b3
         except Exception as error:
             return None, _inbox_error_message(error), 502
 
@@ -5535,20 +5513,9 @@ def create_app(
                     status=409,
                 )
             try:
-                if session and access_token:
-                    task = app["verification_manager"].start(
-                        concurrency=1, emails=[email], force_online=True
-                    )
-                    mode = "verify"
-                    message = (
-                        "正在验证当前 Access Token；仅在 401/token_invalid 时使用原注册代理和 Cookie 刷新"
-                    )
-                else:
-                    task = app["verification_manager"].start_with_browser(
-                        emails=[email], concurrency=1, force_refresh=True
-                    )
-                    mode = "refresh_cookie"
-                    message = "当前账号缺少 AT，正在使用保存 Cookie 获取 Session"
+                task = app["verification_manager"].start_with_browser(
+                    emails=[email], concurrency=1, force_refresh=True
+                )
             except RuntimeError as error:
                 return web.json_response(
                     {"ok": False, "error": str(error)}, status=409
@@ -5557,8 +5524,8 @@ def create_app(
                 {
                     "ok": True,
                     "started": True,
-                    "mode": mode,
-                    "message": message,
+                    "mode": "refresh_cookie",
+                    "message": "正在使用保存的 Cookie 重新获取 Session 与账号状态",
                     "task": task,
                 }
             )
