@@ -32,11 +32,13 @@
         <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换主题">◐</button>
         <div class="login-form-copy">
           <h2 id="loginTitle">安全登录</h2>
-          <p>输入管理密码继续</p>
+          <p>输入服务器账号和密码继续</p>
         </div>
+        <label class="field-label" for="username">登录账号</label>
+        <input class="login-username" id="username" type="text" autocomplete="username" placeholder="请输入登录账号" autofocus>
         <label class="field-label" for="password">管理密码</label>
         <div class="password-field">
-          <input id="password" type="password" autocomplete="current-password" placeholder="请输入管理密码" autofocus required>
+          <input id="password" type="password" autocomplete="current-password" placeholder="请输入登录密码" required>
           <button id="passwordToggle" type="button" aria-label="显示或隐藏密码">显示</button>
         </div>
         <div class="login-options">

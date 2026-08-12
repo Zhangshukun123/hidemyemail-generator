@@ -5,12 +5,38 @@
   const localToken = window.__HME_LOCAL_TOKEN__;
   const pageDetails = {
     overview: ["DASHBOARD", "概览", "集中查看账号、任务与服务状态"],
-    accounts: ["ACCOUNT WORKSPACE", "邮箱账号", "管理 iCloud 邮箱、OpenAI Session 与账号凭据"],
-    "protocol-registration": ["MAIL AUTH WORKSPACE", "协议注册", "通过 Mail Auth 完成 Session、密码与 TOTP 2FA"],
-    "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "使用 PH / PHP hosted 双代理流程提取严格 0 链接"],
+    accounts: ["ACCOUNT SETTINGS", "账号设置", "发起注册任务、跟踪执行状态并维护账号资产"],
+    network: ["NETWORK ROUTING", "代理与线路", "独立管理所有注册方式共用的代理出口"],
+    "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "提取 gpt-link 严格 0 链接或 PayPal DE/EUR OAICS 授权链接"],
     "pp-payment": ["PAYPAL WORKSPACE", "PP 支付", "PayPal BA 协议授权与支付任务"],
     verification: ["VERIFICATION WORKSPACE", "验证记录", "批量验证账号、套餐与 Session 状态"],
     settings: ["SYSTEM SETTINGS", "系统设置", "管理邮箱、浏览器、集成与安全配置"],
+  };
+  const cardLinkExtractionModes = {
+    ph_hosted: {
+      country: "PH",
+      summary: "选择账号后生成严格 0 hosted 链接",
+      label: "gpt-link · PH / PHP hosted · 双代理严格 0",
+      checks: ["✓ Session 可用", "✓ 地区 PH", "✓ 币种 PHP", "✓ 金额必须为 0"],
+      button: "提取严格 0",
+      success: "严格 0 hosted 链接已提取并复制",
+      singleProxy: false,
+      createProxyPreference: "phCreate",
+      createProxyCountry: "US",
+      promotionProxyPreference: "phPromotion",
+      promotionProxyCountry: "TR",
+    },
+    de_oaics_paypal: {
+      country: "DE",
+      summary: "创建 DE/EUR oaics_ Checkout 并提取 PayPal BA 授权链接",
+      label: "PayPal / 德国 · EUR · OAICS 严格 0",
+      checks: ["✓ Session 可用", "✓ oaics_ Checkout", "✓ 德国 / EUR", "✓ 优惠后金额 0"],
+      button: "提取 PayPal 链接",
+      success: "PayPal DE/EUR 链接已提取并复制",
+      singleProxy: true,
+      createProxyPreference: "de",
+      createProxyCountry: "DE",
+    },
   };
 
   function escapeHtml(value) {
@@ -144,6 +170,40 @@
       escapeHtml(value) + '</strong><small>' + escapeHtml(note) + "</small></div></article>";
   }
 
+  function countryOptionLabel(item) {
+    return (item?.label || item?.code || "") + " (" + (item?.code || "") + ")";
+  }
+
+  function matchProxyCountry(value, countries) {
+    const query = String(value || "").trim().toLocaleLowerCase("zh-CN");
+    if (!query) return null;
+    const exact = countries.find((item) =>
+      item.code.toLocaleLowerCase("zh-CN") === query ||
+      item.label.toLocaleLowerCase("zh-CN") === query ||
+      countryOptionLabel(item).toLocaleLowerCase("zh-CN") === query
+    );
+    if (exact) return exact;
+    const matches = countries.filter((item) =>
+      item.code.toLocaleLowerCase("zh-CN").includes(query) ||
+      item.label.toLocaleLowerCase("zh-CN").includes(query) ||
+      countryOptionLabel(item).toLocaleLowerCase("zh-CN").includes(query)
+    );
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function cardLinkMarkedForMethod(item, method) {
+    return item?.cardLinkStatus === "cs_live" && item?.cardLinkMethod === method;
+  }
+
+  function cardLinkEligible(item, method) {
+    return Boolean(
+      item?.email?.toLowerCase().endsWith("@icloud.com") &&
+      item.sessionStatus === "ready" &&
+      !item.cardLink &&
+      !cardLinkMarkedForMethod(item, method)
+    );
+  }
+
   class ApiGateway {
     constructor(token) { this.token = token; }
 
@@ -260,13 +320,10 @@
 
     renderShell(state) {
       $("accountNavCount").textContent = state.accounts.length || "—";
+      $("networkNavState").textContent = state.registrationProxy?.enabled ? "已启用" : "直连";
       const links = state.accounts.filter((item) => item.cardLink).length;
       $("cardLinkNavCount").textContent = links || "—";
       $("paypalNavState").textContent = state.paypal?.running ? "在线" : "—";
-      const protocol = state.protocolRegistrationTask || {};
-      $("protocolNavState").textContent = protocol.running
-        ? "运行中"
-        : state.accounts.filter((item) => item.protocolReady).length || "—";
       const runtime = state.browserTask.runtime || {};
       const available = Boolean(runtime.available);
       $("runtimeDot").className = available ? "ok" : "bad";
@@ -358,30 +415,23 @@
         metricCard("Session 可用", sessions, "可直接验证与提链", "", "S"),
         metricCard("已开启 2FA", twoFactor, "双重验证", "amber", "2"),
       ].join("");
-      const registrationProxy = state.registrationProxy || {};
-      const clashProxyMode = registrationProxy.mode === "clash";
-      $("registrationProxyEnabled").checked = Boolean(registrationProxy.enabled);
-      $("registrationProxyEnabled").disabled = !registrationProxy.configured;
-      $("registrationProxyEnabled").title = registrationProxy.configured
-        ? (clashProxyMode
-          ? "每个账号开始前轮询新的日本节点，任务期间固定出口"
-          : "开启时使用所选国家的粘性动态代理；关闭时使用本机公网 IP 直连")
-        : "请先设置代理连接";
-      const networkMode = $("registrationNetworkMode");
-      networkMode.className = "badge " + (registrationProxy.enabled ? "success" : "blue");
-      networkMode.textContent = registrationProxy.enabled && clashProxyMode
-        ? "Clash 日本轮询" + (registrationProxy.currentNode
-          ? " · " + registrationProxy.currentNode + " · " + (registrationProxy.lastLatencyMs || 0) + "ms"
-          : " · ≤" + (registrationProxy.maxLatencyMs || 900) + "ms")
-        : (registrationProxy.enabled
-          ? "动态代理 · " + (registrationProxy.countryLabel || registrationProxy.country || "")
-          : "本机 IP 直连 · 语言随出口");
-      $("registrationProxyMode").value = registrationProxy.mode || "dynamic";
-      $("registrationProxyCountry").disabled = clashProxyMode;
-      $("registrationProxySetupButton").textContent = clashProxyMode ? "检测并切换日本 IP" : "代理连接";
-      if (registrationProxy.country) {
-        $("registrationProxyCountry").value = registrationProxy.country;
-      }
+      const registrationMode = ["headless", "headed", "roxy", "protocol"].includes(state.registrationMode)
+        ? state.registrationMode : "headed";
+      const protocolMode = registrationMode === "protocol";
+      const roxyMode = registrationMode === "roxy";
+      const forceHeadless = Boolean(state.browserTask.runtime?.forceHeadless);
+      document.querySelectorAll('input[name="registrationMode"]').forEach((input) => {
+        input.checked = input.value === registrationMode;
+        input.disabled = input.value === "headed" && forceHeadless;
+        input.closest("label")?.classList.toggle("selected", input.checked);
+      });
+      $("headless").checked = registrationMode === "headless" ||
+        (roxyMode && $("roxyWindowMode").value === "background");
+      this.renderRoxyRegistration(state, roxyMode);
+      $("protocolRegistrationPanel").hidden = !protocolMode;
+      $("taskPanel").hidden = protocolMode;
+      $("registrationSourceBlock").classList.remove("mode-disabled");
+      $("registrationManualBlock").classList.toggle("mode-disabled", protocolMode);
       const smsBower = state.smsBower || {};
       const smsBowerStatus = $("smsbowerStatus");
       smsBowerStatus.className = "badge " + (smsBower.configured ? "success" : "warning");
@@ -392,14 +442,31 @@
       const registration = state.registrationTask || {};
       const canStartNextRegistration = registration.canStartNext !== false;
       const activeRegistrationProcesses = Number(registration.runningCount || 0);
+      const protocolRegistration = state.protocolRegistrationTask || {};
       const registrationProvider = $("registrationEmailProvider").value || "icloud";
-      $("smsbowerControls").hidden = registrationProvider !== "gmail";
-      $("registerProviderButton").textContent = registrationProvider === "gmail"
+      $("registrationEmailProvider").disabled = false;
+      $("smsbowerControls").hidden = protocolMode || registrationProvider !== "gmail";
+      $("registerProviderButton").textContent = protocolMode && registrationProvider === "icloud"
+        ? (protocolRegistration.running ? "iCloud 协议注册运行中" : "开始 iCloud 协议注册")
+        : registrationProvider === "gmail"
         ? (activeRegistrationProcesses ? "启动下一个 Gmail 注册进程" : "开始 Gmail 注册")
         : (activeRegistrationProcesses ? "启动下一个 iCloud 注册进程" : "开始 iCloud 注册");
-      $("registerProviderButton").disabled = !canStartNextRegistration ||
-        (registrationProvider === "gmail" && !smsBower.configured);
-      $("registerEmailButton").disabled = !canStartNextRegistration;
+      if (roxyMode && registrationProvider === "icloud") {
+        const roxyWindows = Number($("roxyConcurrency").value || 1);
+        const roxyTargetCount = Number($("roxyTargetCount").value || roxyWindows);
+        $("registerProviderButton").textContent = activeRegistrationProcesses
+          ? "Roxy 并发注册运行中"
+          : "开始 iCloud 注册（" + roxyWindows + " 窗口 · 目标 " +
+            roxyTargetCount + " 个）";
+      }
+      $("registerProviderButton").disabled = protocolMode
+        ? registrationProvider !== "icloud" || Boolean(protocolRegistration.running)
+        : !canStartNextRegistration ||
+          (roxyMode && activeRegistrationProcesses > 0) ||
+          (registrationProvider === "gmail" && !smsBower.configured);
+      $("registrationEmail").disabled = protocolMode;
+      $("registerEmailButton").disabled = protocolMode || !canStartNextRegistration;
+      $("fetchAllButton").disabled = protocolMode;
       $("registerEmailButton").textContent = activeRegistrationProcesses
         ? `启动下一个注册进程（运行中 ${activeRegistrationProcesses}）`
         : "添加邮箱并注册";
@@ -480,13 +547,34 @@
         return true;
       }).sort((left, right) => new Date(left.at || 0) - new Date(right.at || 0))
         .slice(-16).map(inferLogContext);
-      const latestContext = logs.at(-1) || inferLogContext({
+      let latestContext = logs.at(-1) || inferLogContext({
         stage: primaryTask.currentStage || "idle",
         location: primaryTask.currentLocation || "等待任务",
         action: primaryTask.currentAction || "尚未开始",
         status: primaryTask.currentStatus || "idle",
         email: registration.email || "",
       });
+      const pageRecognition = task.pageState || (task.accounts || [])
+        .filter((item) => item.pageState)
+        .sort((left, right) => new Date(right.pageState.updatedAt || 0) -
+          new Date(left.pageState.updatedAt || 0))
+        .map((item) => ({ ...item.pageState, email: item.email }))[0] || null;
+      const registrationChain = task.registrationChain || (task.accounts || [])
+        .filter((item) => item.registrationChain)
+        .sort((left, right) => new Date(right.registrationChain.updatedAt || 0) -
+          new Date(left.registrationChain.updatedAt || 0))
+        .map((item) => ({ ...item.registrationChain, email: item.email }))[0] || null;
+      if (pageRecognition?.currentPage) {
+        latestContext = inferLogContext({
+          ...latestContext,
+          stage: pageRecognition.stage || latestContext.stage,
+          location: pageRecognition.currentPage,
+          action: pageRecognition.nextAction || latestContext.action,
+          status: pageRecognition.actionMode === "error" ? "error" :
+            pageRecognition.actionMode === "manual" ? "waiting" : "active",
+          email: pageRecognition.email || latestContext.email,
+        });
+      }
       const stageGroup = taskStageGroup(latestContext.stage);
       $("taskPanel").dataset.currentStage = latestContext.stage;
       $("taskPanel").dataset.stageGroup = stageGroup;
@@ -501,6 +589,49 @@
       $("taskCurrentAction").textContent = latestContext.action;
       $("taskCurrentAccount").textContent = latestContext.email
         ? abbreviateEmail(latestContext.email) : "未选择账号";
+      if (registrationChain?.currentStep) {
+        latestContext.action = registrationChain.nextAction || latestContext.action;
+        latestContext.email = registrationChain.email || latestContext.email;
+        $("taskCurrentAction").textContent = registrationChain.currentStep;
+        $("taskCurrentAccount").textContent = latestContext.email
+          ? abbreviateEmail(latestContext.email) : "未选择账号";
+      }
+      const completedSteps = registrationChain?.completedSteps ||
+        pageRecognition?.completedSteps || [];
+      $("taskCompletedSteps").textContent = completedSteps.length
+        ? completedSteps.join(" → ")
+        : "等待识别注册进度";
+      $("taskNextAction").textContent = registrationChain?.nextAction ||
+        pageRecognition?.nextAction ||
+        latestContext.action || "继续监测页面变化";
+      const recognitionSource = {
+        dom: "DOM 结构", url: "URL 路由", ocr: "截图 OCR",
+      }[pageRecognition?.source] || "日志推断";
+      const requestActivity = registrationChain?.requestActivity || {};
+      $("taskRecognitionMeta").textContent = registrationChain
+        ? "步骤 " + (registrationChain.currentCode || "等待") +
+          " · 当前完成=" + (registrationChain.currentCompleted ? "是" : "否") +
+          " · 下一步骤=" + (registrationChain.nextCode || "完成") +
+          " · 请求 " + Number(requestActivity.requestCount || 0) +
+          " / 响应 " + Number(requestActivity.responseCount || 0) +
+          (requestActivity.lastStatus ? " · HTTP " + requestActivity.lastStatus : "")
+        : pageRecognition
+        ? recognitionSource + " · 置信度 " + Number(pageRecognition.confidence || 0) + "%" +
+          (pageRecognition.stalledSeconds
+            ? " · 当前界面停留 " + pageRecognition.stalledSeconds + " 秒"
+            : "")
+        : "DOM / URL 实时识别";
+      const ledger = registrationChain?.steps || [];
+      $("taskStepLedger").innerHTML = ledger.length
+        ? ledger.map((step) => '<div class="task-ledger-step" data-status="' +
+          escapeHtml(step.status || "pending") + '"><i>' +
+          escapeHtml(step.completed ? "✓" : String(step.index || "·")) +
+          '</i><span><strong title="' + escapeHtml(step.label || "") + '">' +
+          escapeHtml(step.label || step.code || "待处理") +
+          '</strong><small title="' + escapeHtml(step.value || "") + '">' +
+          escapeHtml(step.value || ({ pending: "等待前一步完成", running: "执行中", completed: "已完成", failed: "失败", skipped: "已跳过" }[step.status] || "等待")) +
+          '</small></span></div>').join("")
+        : '<div class="task-step-ledger-empty">等待完整注册步骤开始</div>';
       let assistance = {
         mode: "automatic", badge: "自动化执行", title: "页面状态持续监测",
         text: "遇到页面跳转时会自动识别并继续",
@@ -531,6 +662,33 @@
           text: "Session、Cookie 与 2FA 状态已写入账号记录",
         };
       }
+      if (pageRecognition?.actionMode === "manual") {
+        assistance = {
+          mode: "manual", badge: "需要人工操作",
+          title: pageRecognition.currentPage,
+          text: pageRecognition.nextAction,
+        };
+      } else if (pageRecognition?.actionMode === "recovering") {
+        assistance = {
+          mode: "recovering", badge: "正在自动恢复",
+          title: pageRecognition.currentPage,
+          text: pageRecognition.nextAction,
+        };
+      } else if (pageRecognition?.actionMode === "error") {
+        assistance = {
+          mode: "error", badge: "页面异常",
+          title: pageRecognition.currentPage,
+          text: pageRecognition.nextAction,
+        };
+      } else if (pageRecognition?.stalled) {
+        assistance = {
+          mode: "recovering", badge: "页面停留过久",
+          title: pageRecognition.currentPage,
+          text: (pageRecognition.diagnosticScreenshot
+            ? "已保存诊断截图；"
+            : "页面状态持续未变化；") + pageRecognition.nextAction,
+        };
+      }
       $("taskAssistance").dataset.mode = assistance.mode;
       $("taskAssistanceBadge").textContent = assistance.badge;
       $("taskAssistanceTitle").textContent = assistance.title;
@@ -555,6 +713,140 @@
       ).join("") : '<tr><td colspan="6"><div class="empty-state compact">没有匹配的账号</div></td></tr>';
     }
 
+    renderNetwork(state) {
+      const proxy = state.registrationProxy || {};
+      const clashMode = proxy.mode === "clash";
+      const kookeeyMode = proxy.mode === "kookeey";
+      $("registrationProxyEnabled").checked = Boolean(proxy.enabled);
+      $("registrationProxyEnabled").disabled = !proxy.configured;
+      $("registrationProxyEnabled").title = proxy.configured
+        ? (clashMode
+          ? "所有注册方式在每个账号开始前轮询新的日本节点，任务期间固定出口"
+          : "所有注册方式使用所选国家的粘性动态代理；关闭时使用本机公网 IP 直连")
+        : "请先在代理与线路模块设置代理连接";
+      const networkMode = $("registrationNetworkMode");
+      networkMode.className = "badge " + (proxy.enabled ? "success" : "blue");
+      networkMode.textContent = proxy.enabled && clashMode
+        ? "Clash 日本轮询" + (proxy.currentNode
+          ? " · " + proxy.currentNode + " · " + (proxy.lastLatencyMs || 0) + "ms"
+          : " · ≤" + (proxy.maxLatencyMs || 900) + "ms")
+        : (proxy.enabled
+          ? (kookeeyMode ? "Kookeey" : "动态代理") + " · " + (proxy.countryLabel || proxy.country || "")
+          : "本机 IP 直连 · 语言随出口");
+      const countries = proxy.countries || [];
+      $("registrationProxyCountryOptions").innerHTML = countries.map((item) =>
+        '<option value="' + escapeHtml(countryOptionLabel(item)) + '"></option>'
+      ).join("");
+      $("registrationProxyMode").value = proxy.mode || "dynamic";
+      $("registrationProxyMode").disabled = false;
+      $("registrationProxySetupButton").textContent = "代理设置";
+      $("registrationProxySetupButton").disabled = false;
+      if (proxy.country) $("registrationProxyCountry").value = proxy.country;
+      const countrySearch = $("registrationProxyCountrySearch");
+      countrySearch.disabled = clashMode;
+      if (document.activeElement !== countrySearch || clashMode) {
+        countrySearch.value = countryOptionLabel(
+          countries.find((item) => item.code === (proxy.country || "NL")) ||
+          { code: proxy.country || "NL", label: proxy.countryLabel || proxy.country || "荷兰" }
+        );
+      }
+      $("registrationProxyStatus").className = "badge " + (proxy.enabled ? "success" : "blue");
+      $("registrationProxyStatus").textContent = proxy.enabled
+        ? "已启用 · " + (proxy.countryLabel || proxy.country || "")
+        : "本机 IP 直连";
+      $("networkUsageState").textContent = proxy.enabled
+        ? "无头、有头、Roxy 和协议注册共用 " + (proxy.countryLabel || proxy.country || "") + " 出口"
+        : "当前所有注册方式使用本机 IP 直连";
+      $("registrationProxyModeHint").textContent = clashMode
+        ? "Clash 模式固定为日本出口；每个账号开始前选择新的可用节点"
+        : kookeeyMode
+          ? "Kookeey 模式会自动把国家、8 位 Session 和 5m 写入连接密码"
+          : "通用模式会自动把 region、8 位 SID 和 5 分钟粘性时长写入用户名";
+      $("registrationProxyCredentialFields").hidden = clashMode;
+      $("rotateRegistrationProxyButton").hidden = !clashMode;
+      $("rotateRegistrationProxyButton").disabled = false;
+      const endpointInput = $("registrationProxyEndpoint");
+      if (!endpointInput.dataset.dirty && document.activeElement !== endpointInput) {
+        endpointInput.value = proxy.dynamicEndpoint || (clashMode ? "" : (proxy.endpoint || ""));
+      }
+      $("registrationProxyUsername").placeholder = proxy.usernameConfigured
+        ? "已保存，留空保持原用户名"
+        : (kookeeyMode ? "用户ID-安全策略用户名" : "代理用户名");
+      $("registrationProxyPassword").placeholder = proxy.passwordConfigured
+        ? "已保存，留空保持原密码"
+        : "代理基础密码";
+      ["registrationProxyUsername", "registrationProxyPassword", "registrationProxyEndpoint", "saveRegistrationProxyButton"].forEach((id) => {
+        $(id).disabled = clashMode;
+      });
+      $("registrationProxyRoutePreview").innerHTML = proxy.enabled
+        ? '<small>当前注册出口</small><strong>' + escapeHtml(proxy.countryLabel || proxy.country || "") +
+          '</strong><span>无头浏览器、有头浏览器、Roxy 和协议注册都会使用该出口</span>'
+        : '<small>当前注册出口</small><strong>本机 IP 直连</strong><span>保存并启用代理后，所有注册方式都会使用所选出口</span>';
+      const testResult = proxy.testResult || {};
+      $("registrationProxyTestResult").className = "proxy-test-result" +
+        (testResult.ok === true ? " success" : testResult.ok === false ? " error" : "");
+      $("registrationProxyTestResult").innerHTML = testResult.testedAt
+        ? '<small>代理测试</small><strong>' + escapeHtml(testResult.ok ? "测试通过" : "测试失败") +
+          '</strong><span>' + escapeHtml(testResult.message || "") + '</span>'
+        : '<small>代理测试</small><strong>尚未测试</strong><span>点击“测试代理”检查出口 IP、国家与 ChatGPT 连通性</span>';
+      $("testRegistrationProxyButton").disabled = !proxy.configured;
+    }
+
+    renderRoxyRegistration(state, selected) {
+      const roxy = state.roxyRegistration || {};
+      const controls = $("roxyRegistrationControls");
+      controls.hidden = !selected;
+      const workspace = $("roxyWorkspace");
+      const profile = $("roxyProfile");
+      const savedWorkspace = String(roxy.workspaceId || "");
+      workspace.innerHTML = '<option value="">选择工作区</option>' +
+        (roxy.workspaces || []).map((item) =>
+          '<option value="' + escapeHtml(item.id) + '">' + escapeHtml(item.name) + '</option>'
+        ).join("");
+      workspace.value = savedWorkspace;
+      profile.innerHTML = '<option value="">选择专用环境（会被清理）</option>' +
+        (roxy.profiles || []).map((item) =>
+          '<option value="' + escapeHtml(item.id) + '"' + (item.open ? " disabled" : "") + '>' +
+          escapeHtml((item.sortNumber ? "#" + item.sortNumber + " · " : "") + item.name +
+            (item.open ? "（已打开）" : "")) +
+          '</option>'
+        ).join("");
+      profile.value = String(roxy.profileId || "");
+      profile.disabled = !savedWorkspace || !roxy.available;
+      profile.classList.toggle("needs-selection", selected && roxy.available && !roxy.configured);
+      workspace.disabled = !roxy.available;
+      const concurrencyInput = $("roxyConcurrency");
+      const targetCountInput = $("roxyTargetCount");
+      const maxConcurrency = Math.max(1, Math.min(5, Number(roxy.maxConcurrency || 1)));
+      concurrencyInput.max = String(maxConcurrency);
+      if (Number(concurrencyInput.value) > maxConcurrency) {
+        concurrencyInput.value = String(maxConcurrency);
+      }
+      concurrencyInput.disabled = !roxy.available || maxConcurrency < 1;
+      targetCountInput.disabled = !roxy.available;
+      const selectedIndex = (roxy.profiles || []).findIndex((item) => item.id === profile.value);
+      const orderedProfiles = selectedIndex < 0 ? [] : [
+        roxy.profiles[selectedIndex],
+        ...(roxy.profiles || []).filter((_, index) => index !== selectedIndex),
+      ].filter((item) => !item.open).slice(0, Number(concurrencyInput.value || 1));
+      const concurrency = Number(concurrencyInput.value || 1);
+      const targetCount = Math.max(1, Number(targetCountInput.value || concurrency));
+      const rounds = Math.ceil(targetCount / concurrency);
+      const finalRoundCount = targetCount % concurrency || concurrency;
+      $("roxyProfileAllocation").textContent = orderedProfiles.length
+        ? "本次将使用：" + orderedProfiles.map((item) =>
+          (item.sortNumber ? "#" + item.sortNumber + " " : "") + item.name
+        ).join("、") + "；目标 " + targetCount + " 个账号，自动执行 " + rounds +
+          " 轮" + (rounds > 1 ? "（最后一轮 " + finalRoundCount + " 个）" : "") +
+          "；同一环境不会并行执行两个账号。"
+        : "选择首个环境后，将按目标账号数自动分轮使用最多 5 个互不重复的 Roxy 环境。";
+      const status = $("roxyRegistrationStatus");
+      status.className = "badge " + (roxy.configured ? "success" : roxy.available ? "warning" : "error");
+      status.textContent = roxy.configured
+        ? "Roxy 已就绪 · 可并发 " + maxConcurrency
+        : roxy.error || (roxy.available ? "请选择专用指纹环境" : "Roxy OpenAPI 未连接");
+    }
+
     registrationLabel(task) {
       const labels = {
         idle: "空闲", generating_email: "正在创建邮箱", purchasing_gmail: "正在获取 Gmail", preparing_email: "正在准备邮箱", claiming_inventory: "正在领取库存", confirming_email: "正在确认邮箱",
@@ -566,6 +858,12 @@
 
     accountRows(item, selected) {
       const registered = item.hasPassword || item.hasSession;
+      const checkoutKind = item.checkoutIdType === "oaics" ? "success" :
+        item.checkoutProbeStatus === "error" ? "error" : "warning";
+      const checkoutLabel = item.checkoutIdType === "oaics" ? "OAICS" :
+        item.checkoutIdType === "cs_live" ? "CS LIVE" :
+        item.checkoutIdType === "cs" ? "CS" :
+        item.checkoutProbeStatus === "error" ? "检测失败" : "待检测";
       const planKind = item.accountType === "plus" ? "plus" : item.accountType === "free" ? "" : "warning";
       const sessionKind = item.sessionStatus === "ready" ? "success" : item.sessionStatus === "expired" ? "error" : "warning";
       const main = '<tr data-selectable data-action="select-account" data-email="' + escapeHtml(item.email) +
@@ -573,6 +871,7 @@
         initials(item.email) + '</span><span class="identity-copy"><strong>' + escapeHtml(item.email) +
         '</strong><small>' + (item.hasTwoFactor ? "2FA 已开启" : "2FA 未开启") +
         '</small></span></div></td><td>' + badge(registered ? "已注册" : "未注册", registered ? "success" : "warning") +
+        (registered ? " " + badge(checkoutLabel, checkoutKind) : "") +
         '</td><td>' + badge(planName(item.accountType), planKind) + '</td><td>' +
         badge(sessionName(item.sessionStatus), sessionKind) + '</td><td>' +
         formatDate(item.lastActivity || item.createdAt) + '</td><td><div class="row-actions"><button class="row-action" data-action="copy-email" data-email="' +
@@ -585,7 +884,12 @@
       return main + '<tr class="account-detail-row"><td colspan="6"><div class="account-detail"><div class="credential-summary">' +
         '<span><b>账号</b><code>' + escapeHtml(item.email) + '</code></span><span><b>密码</b><code>' +
         (item.hasPassword ? "••••••••••••" : "尚未保存") + '</code></span><span><b>2FA</b><code>' +
-        (item.hasTwoFactor ? "已开启" : "未开启") + '</code></span></div><div class="credential-actions">' +
+        (item.hasTwoFactor ? "已开启" : "未开启") + '</code></span><span><b>注册方式</b><code>' +
+        escapeHtml(item.registrationMode || "未记录") + '</code></span><span><b>注册出口</b><code>' +
+        escapeHtml([item.registrationProxyMode, item.registrationProxyCountry, item.registrationProxyEndpoint, item.registrationExitIp].filter(Boolean).join(" · ") || "直连/未记录") +
+        '</code></span><span><b>Checkout</b><code>' + escapeHtml(checkoutLabel + " · " +
+        ([item.checkoutProxyMode, item.checkoutProxyCountry, item.checkoutProxyEndpoint, item.checkoutExitIp].filter(Boolean).join(" · ") || "等待检测")) +
+        '</code></span></div><div class="credential-actions">' +
         this.credentialButton("复制密码", "copy-credential", item, "password", !item.hasPassword) +
         twoFactorPrimaryAction +
         this.credentialButton("复制 2FA 码", "copy-credential", item, "totp_code", !item.hasTwoFactor) +
@@ -593,6 +897,9 @@
         this.credentialButton("复制 Session", "copy-credential", item, "session", !item.hasSession) +
         this.credentialButton("获取验证码", "get-code", item) +
         this.credentialButton(item.hasCookies ? "Cookie 刷新状态" : "尚未保存 Cookie", "verify-account", item, "", !item.hasCookies) +
+        (item.checkoutProbeStatus === "error"
+          ? this.credentialButton("重新检测 Checkout", "retry-checkout-probe", item, "", !item.hasSession)
+          : "") +
         this.credentialButton("一键导入工作台", "import-workbench", item, "", !item.hasImportableSession) +
         this.credentialButton("复制账号", "copy-account", item, "", !item.hasPassword) +
         this.credentialButton("删除邮箱", "delete-email", item, "", false, "danger") +
@@ -605,65 +912,20 @@
         (disabled ? " disabled" : "") + ">" + label + "</button>";
     }
 
-    filteredProtocolAccounts(state) {
-      const query = $("protocolSearch")?.value.trim().toLowerCase() || "";
-      const status = $("protocolStatusFilter")?.value || "all";
-      return state.accounts.filter((item) =>
-        (!query || item.email.toLowerCase().includes(query)) &&
-        (status === "all" ||
-          (status === "ready" && item.protocolReady) ||
-          (status === "pending" && !item.protocolReady))
-      );
-    }
-
     renderProtocolRegistration(state) {
       const task = state.protocolRegistrationTask || {};
-      const runtime = task.runtime || {};
-      const selected = new Set(state.selectedProtocolEmails || []);
-      const pending = state.accounts.filter((item) => !item.protocolReady);
-      const ready = state.accounts.filter((item) => item.protocolReady);
+      const pending = state.accounts.filter((item) => !item.registrationComplete);
+      const registered = state.accounts.filter((item) => item.registrationComplete);
       const passwordReady = state.accounts.filter((item) => item.hasPassword);
       const twoFactorReady = state.accounts.filter((item) => item.hasTwoFactor);
       $("protocolMetrics").innerHTML = [
-        metricCard("待协议注册", pending.length, "缺少 Session、密码或 2FA", "amber", "◷"),
+        metricCard("待协议注册", pending.length, "尚未保存注册 Session", "amber", "◷"),
+        metricCard("已注册", registered.length, "已保存 Session 与 Access Token", "green", "✓"),
         metricCard("密码已确认", passwordReady.length, "至少 12 位并已保存", "green", "K"),
         metricCard("TOTP 2FA", twoFactorReady.length, "验证器已激活", "purple", "2"),
-        metricCard("协议就绪", ready.length, "Session + 密码 + 2FA", "green", "✓"),
       ].join("");
 
-      const runtimeBadge = $("protocolRuntimeStatus");
-      runtimeBadge.className = "badge " + (runtime.available ? "success" : "error");
-      runtimeBadge.textContent = runtime.available ? "Mail Auth 环境可用" : "运行环境未就绪";
-      runtimeBadge.title = runtime.error || runtime.projectRoot || "";
-      $("startProtocolSelectedButton").disabled = Boolean(task.running) || !runtime.available || !selected.size;
-      $("startProtocolAllButton").disabled = Boolean(task.running) || !runtime.available || !pending.length;
       $("stopProtocolButton").disabled = !task.running;
-      $("protocolConcurrency").disabled = Boolean(task.running);
-
-      const items = this.filteredProtocolAccounts(state);
-      $("protocolAccountSummary").textContent = "显示 " + items.length + " / " + state.accounts.length +
-        " 个账号，已选 " + selected.size + " 个";
-      $("protocolAccountList").innerHTML = items.length ? items.map((item) => {
-        const checked = selected.has(item.email);
-        const passwordState = item.hasPassword ? "已确认" : "待添加";
-        const factorState = item.hasTwoFactor ? "已开启" : "待激活";
-        const sessionState = item.sessionStatus === "ready" ? "可用" : "待获取";
-        return '<label class="protocol-account-row ' + (item.protocolReady ? "ready" : "pending") + '">' +
-          '<input type="checkbox" data-protocol-email="' + escapeHtml(item.email) + '" ' +
-          (checked ? "checked " : "") + (item.protocolReady || task.running ? "disabled" : "") + '>' +
-          '<span class="protocol-account-identity"><strong>' + escapeHtml(item.email) + '</strong><small>' +
-          (item.protocolReady ? "协议注册完成（密码+2FA）" : "等待 Mail Auth 协议注册") + '</small></span>' +
-          '<span class="protocol-account-field"><small>密码</small><b class="' + (item.hasPassword ? "ok" : "") + '">' + passwordState + '</b></span>' +
-          '<span class="protocol-account-field"><small>2FA</small><b class="' + (item.hasTwoFactor ? "ok" : "") + '">' + factorState + '</b></span>' +
-          '<span class="protocol-account-field"><small>Session</small><b class="' + (item.sessionStatus === "ready" ? "ok" : "") + '">' + sessionState + '</b></span></label>';
-      }).join("") : '<div class="empty-state">没有匹配的账号</div>';
-
-      const selectAll = $("protocolSelectAll");
-      const visiblePending = items.filter((item) => !item.protocolReady);
-      const selectedVisible = visiblePending.filter((item) => selected.has(item.email)).length;
-      selectAll.disabled = Boolean(task.running) || !visiblePending.length;
-      selectAll.checked = Boolean(visiblePending.length && selectedVisible === visiblePending.length);
-      selectAll.indeterminate = Boolean(selectedVisible && selectedVisible < visiblePending.length);
 
       const meta = taskStatusMeta(task.status || "idle");
       $("protocolTaskBadge").className = "badge " + (task.status === "failed" ? "error" : task.status === "completed" ? "success" : task.running ? "blue" : "");
@@ -703,32 +965,42 @@
     filteredCardAccounts(state) {
       const query = $("cardSearch")?.value.trim().toLowerCase() || "";
       const status = $("cardStatusFilter")?.value || "all";
+      const method = $("cardLinkMethod")?.value || "ph_hosted";
       return state.accounts.filter((item) =>
         (!query || item.email.toLowerCase().includes(query)) &&
         (status === "all" ||
           (status === "generated" && item.cardLink) ||
-          (status === "available" && item.sessionStatus === "ready") ||
+          (status === "cs_live" && item.cardLinkStatus === "cs_live") ||
+          (status === "available" && cardLinkEligible(item, method)) ||
           (status === "unavailable" && item.sessionStatus !== "ready"))
       );
     }
 
     renderCardLinks(state) {
-      const payable = state.accounts.filter((item) => item.sessionStatus === "ready").length;
+      this.renderCardLinkMethod();
+      const method = $("cardLinkMethod").value;
+      const payable = state.accounts.filter((item) => cardLinkEligible(item, method)).length;
       const generated = state.accounts.filter((item) => item.cardLink).length;
+      const classified = state.accounts.filter((item) =>
+        cardLinkMarkedForMethod(item, method)
+      ).length;
       $("cardMetrics").innerHTML = [
         metricCard("全部", state.accounts.length, "账号总数", "", "◎"),
-        metricCard("可提取", payable, "Session 可用", "green", "✓"),
+        metricCard("可提取", payable, "当前模式待处理", "green", "✓"),
         metricCard("已生成", generated, "支付链接", "purple", "↗"),
+        metricCard("cs_live", classified, "当前模式不再提链", "amber", "!"),
       ].join("");
       const items = this.filteredCardAccounts(state);
-      $("cardLinkSummary").textContent = "显示 " + items.length + " 个账号，已生成 " + generated + " 个链接";
+      $("cardLinkSummary").textContent = "显示 " + items.length + " 个账号，待提链 " + payable +
+        " 个，cs_live 已标注 " + classified + " 个";
       $("cardAccountList").innerHTML = items.length ? items.map((item) => {
         const selected = state.selectedCardEmail === item.email;
         return '<button class="select-row ' + (selected ? "selected" : "") +
           '" data-action="select-card-account" data-email="' + escapeHtml(item.email) +
           '"><span class="select-indicator"></span><span class="identity-cell"><span class="avatar">' +
           initials(item.email) + '</span><span class="identity-copy"><strong>' + escapeHtml(item.email) +
-          '</strong><small>' + (item.cardLink ? "已生成链接" : "未生成") + '</small></span></span><span>' +
+          '</strong><small>' + (item.cardLink ? "已生成链接" : item.cardLinkStatus === "cs_live"
+            ? "DE OAICS · cs_live 已标注" : "未生成") + '</small></span></span><span>' +
           badge(planName(item.accountType), item.accountType === "plus" ? "plus" : "") + '</span><span>' +
           badge(sessionName(item.sessionStatus), item.sessionStatus === "ready" ? "success" : "warning") +
           "</span></button>";
@@ -736,12 +1008,103 @@
       this.renderCardSelection(state);
     }
 
+    renderCardLinkMethod() {
+      const method = $("cardLinkMethod").value;
+      const config = cardLinkExtractionModes[method] || cardLinkExtractionModes.ph_hosted;
+      const proxy = this.store.state.registrationProxy || {};
+      const savedCountries = proxy.cardLinkCountries || {};
+      const savedModes = proxy.cardLinkModes || {};
+      const proxyModeSelect = $("cardLinkProxyMode");
+      const selectedProxyMode = proxyModeSelect.dataset.method === method
+        ? proxyModeSelect.value
+        : (savedModes[method] || proxy.mode || "dynamic");
+      const proxyModes = proxy.modes || [];
+      proxyModeSelect.innerHTML = proxyModes.map((item) =>
+        '<option value="' + escapeHtml(item.code) + '"' +
+        (item.configured === false ? " disabled" : "") + '>' +
+        escapeHtml(item.label) + (item.configured === false ? "（未配置）" : "") +
+        "</option>"
+      ).join("");
+      proxyModeSelect.value = proxyModes.some((item) => item.code === selectedProxyMode)
+        ? selectedProxyMode : (proxyModes.find((item) => item.configured)?.code || "");
+      proxyModeSelect.dataset.method = method;
+      const modeConfigured = Boolean(
+        proxyModes.find((item) => item.code === proxyModeSelect.value)?.configured
+      );
+      proxyModeSelect.disabled = !proxyModes.some((item) => item.configured);
+      const countries = (proxy.countries || []).filter((item) =>
+        proxyModeSelect.value !== "clash" || item.code === "JP"
+      );
+      const renderCountrySelect = (select, preferenceKey, fallbackCountry) => {
+        const selected = select.dataset.preferenceKey === preferenceKey
+          ? select.value
+          : (savedCountries[preferenceKey] || fallbackCountry);
+        select.innerHTML = countries.map((item) =>
+          '<option value="' + escapeHtml(item.code) + '">' +
+          escapeHtml(countryOptionLabel(item)) + "</option>"
+        ).join("");
+        select.value = countries.some((item) => item.code === selected)
+          ? selected : (countries[0]?.code || "");
+        select.dataset.preferenceKey = preferenceKey;
+        select.disabled = !modeConfigured || !countries.length;
+      };
+      $("cardLinkModeSummary").textContent = config.summary;
+      $("cardLinkModeLabel").textContent = config.label;
+      $("cardLinkChecks").innerHTML = config.checks.map((item) =>
+        "<span>" + escapeHtml(item) + "</span>"
+      ).join("");
+      $("generateCardLinkButton").textContent = config.button;
+      $("cardLinkPromotionProxyLabel").hidden = config.singleProxy;
+      renderCountrySelect(
+        $("cardLinkCreateProxyCountry"),
+        config.createProxyPreference,
+        config.createProxyCountry,
+      );
+      renderCountrySelect(
+        $("cardLinkPromotionProxyCountry"),
+        config.promotionProxyPreference || "phPromotion",
+        config.promotionProxyCountry || "TR",
+      );
+      $("cardLinkPromotionProxyCountry").disabled = config.singleProxy || !modeConfigured;
+      $("cardLinkCreateProxyLabel").firstChild.textContent = config.singleProxy
+        ? "提链代理国家" : "建单代理国家";
+      $("cardLinkProxyHint").textContent = modeConfigured
+        ? "使用“代理与线路”中已保存的" +
+          (proxyModeSelect.selectedOptions[0]?.textContent || "代理") +
+          "；代理模式与国家都会自动保存"
+        : "当前提链代理模式尚未配置，请先到“代理与线路”保存对应配置";
+    }
+
     renderCardSelection(state) {
       const item = state.accounts.find((candidate) => candidate.email === state.selectedCardEmail);
       const generate = $("generateCardLinkButton");
       const copy = $("copyCardLinkButton");
       const open = $("openCardLinkButton");
-      generate.disabled = !item || item.sessionStatus !== "ready";
+      const config = cardLinkExtractionModes[$("cardLinkMethod").value] || cardLinkExtractionModes.ph_hosted;
+      const method = $("cardLinkMethod").value;
+      const selectedMode = $("cardLinkProxyMode").value;
+      const modeConfigured = Boolean(
+        state.registrationProxy?.modes?.find((candidate) => candidate.code === selectedMode)?.configured
+      );
+      const proxyReady = Boolean(
+        modeConfigured &&
+        $("cardLinkCreateProxyCountry").value &&
+        (config.singleProxy || $("cardLinkPromotionProxyCountry").value)
+      );
+      const markedForCurrentMode = cardLinkMarkedForMethod(item, method);
+      generate.disabled = !item || item.sessionStatus !== "ready" || !proxyReady || markedForCurrentMode;
+      generate.title = markedForCurrentMode
+        ? "该账号在当前模式返回 cs_live，已设置为不再提链"
+        : proxyReady ? "" : "请先在代理与线路中保存所选代理模式";
+      const batch = $("generateAllCardLinksButton");
+      const batchCandidates = state.accounts.filter((candidate) =>
+        cardLinkEligible(candidate, method)
+      );
+      if (!batch.dataset.running) {
+        batch.textContent = "一键提链（" + batchCandidates.length + "）";
+        batch.disabled = !proxyReady || !batchCandidates.length;
+        batch.title = proxyReady ? "" : "请先在代理与线路中保存所选代理模式";
+      }
       copy.disabled = !item?.cardLink;
       open.disabled = !item?.cardLink;
       if (!item) {
@@ -750,8 +1113,16 @@
         return;
       }
       $("cardOperationState").className = "operation-result";
+      const generatedMode = item.cardLinkMethod === "de_oaics_paypal"
+        ? "已生成 PayPal / 德国 · EUR OAICS 严格 0 链接"
+        : item.cardLinkMethod === "ph_hosted"
+          ? "已生成 PH / PHP hosted 严格 0 链接"
+          : "已生成支付链接";
+      const operationMessage = markedForCurrentMode
+        ? "当前模式返回 cs_live，已标注且以后不再提链"
+        : item.cardLink ? generatedMode : "等待提取支付链接";
       $("cardOperationState").innerHTML = '<strong>' + escapeHtml(item.email) + '</strong><span>' +
-        (item.cardLink ? "已生成 PH / PHP hosted 严格 0 链接" : "等待提取支付链接") +
+        operationMessage +
         '</span><code>' + escapeHtml(item.cardLink || "尚无链接") + '</code><span>Session：' +
         sessionName(item.sessionStatus) + "</span>";
     }
@@ -962,26 +1333,29 @@
 
     renderBrowserSettings(state) {
       const runtime = state.browserTask.runtime || {};
-      const proxy = state.registrationProxy || {};
+      const mode = ["headless", "headed", "roxy", "protocol"].includes(state.registrationMode)
+        ? state.registrationMode : "headed";
+      const roxy = state.roxyRegistration || {};
       $("settingsStatus").className = "badge " + (runtime.available ? "success" : "error");
       $("settingsStatus").textContent = runtime.available ? "运行环境可用" : "运行环境不可用";
       $("settingsPanel").innerHTML =
-        '<div class="settings-form"><section class="form-section"><h3>任务默认值</h3><div class="toggle-row"><span>无头浏览器<small style="display:block;color:var(--muted)">服务器环境推荐开启</small></span><input id="settingsHeadless" type="checkbox" ' +
-        ($("headless").checked ? "checked" : "") + '></div><label class="field-label" style="margin-top:14px">验证并发<input id="settingsConcurrency" type="number" min="1" max="10" value="' +
+        '<div class="settings-form"><section class="form-section"><h3>账号注册方式</h3><div class="settings-registration-modes" role="radiogroup" aria-label="账号注册方式">' +
+        '<label><input type="radio" name="settingsRegistrationMode" value="headless" ' + (mode === "headless" ? "checked" : "") + '><span><b>无头浏览器</b><small>后台运行 Camoufox</small></span></label>' +
+        '<label><input type="radio" name="settingsRegistrationMode" value="headed" ' + (mode === "headed" ? "checked" : "") + (runtime.forceHeadless ? " disabled" : "") + '><span><b>有头浏览器</b><small>显示前台浏览器窗口</small></span></label>' +
+        '<label><input type="radio" name="settingsRegistrationMode" value="roxy" ' + (mode === "roxy" ? "checked" : "") + '><span><b>Roxy 注册</b><small>专用环境 · 随机指纹</small></span></label>' +
+        '<label><input type="radio" name="settingsRegistrationMode" value="protocol" ' + (mode === "protocol" ? "checked" : "") + '><span><b>协议注册</b><small>Mail Auth · 无浏览器</small></span></label></div>' +
+        '<label class="field-label" style="margin-top:14px">验证并发<input id="settingsConcurrency" type="number" min="1" max="10" value="' +
         escapeHtml($("concurrency").value) + '"></label></section><section class="form-section"><h3>运行环境</h3><div class="connection-card"><strong>' +
         (runtime.available ? "✓ Camoufox 运行环境已连接" : "× Camoufox 运行环境不可用") +
         '</strong><span>' + escapeHtml(runtime.targetProject || (runtime.errors || []).join("；") || "未返回运行目录") +
-        '</span></div></section><section class="form-section"><h3>注册代理</h3><div class="connection-card"><strong>' +
-        (proxy.enabled
-          ? "✓ 已启用 " + (proxy.mode === "clash" ? "Clash 日本节点轮询" : escapeHtml(proxy.countryLabel || proxy.country || "") + " 出口")
-          : "本机 IP 直连") +
-        '</strong><span>代理连接：' + escapeHtml(proxy.endpoint || "未保存") + '</span><span>' +
-        (proxy.mode === "clash"
-          ? "每个账号开始前选择新日本节点，延迟高于 " + escapeHtml(proxy.maxLatencyMs || 900) + " ms 自动跳过；选定后全程固定出口并强制串行。"
-          : "开启后每个账号自动生成独立 SID；关闭时注册全程走本机公网 IP。") +
-        '</span></div></section><div class="settings-actions"><button class="button" data-action="set-registration-proxy-credential">' +
-        (proxy.mode === "clash" ? "检测并切换日本 IP" : "更新代理连接") +
-        '</button><button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
+        '</span></div><div class="connection-card" style="margin-top:10px"><strong>' +
+        escapeHtml(roxy.available ? "✓ Roxy OpenAPI 已连接" : "× Roxy OpenAPI 未连接") +
+        '</strong><span>' + escapeHtml(roxy.configured
+          ? "已选择首个专用环境；最多可并发 " + (roxy.maxConcurrency || 1) +
+            " 个独立窗口；后台模式使用隐藏窗口实现"
+          : roxy.error || "请在账号页选择一个会被注册流程清理的专用环境") +
+        '</span></div></section><div class="settings-actions"><button class="button" data-action="focus-registration-proxy">打开独立代理模块</button>' +
+        '<button class="button primary" data-action="save-browser-settings">保存设置</button></div></div>';
     }
 
     renderWorkbenchSettings() {
@@ -1015,12 +1389,13 @@
         registrationTask: { status: "idle", phase: "idle" },
         protocolRegistrationTask: { status: "idle", phase: "idle", runtime: {} },
         registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
+        roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
-        selectedProtocolEmails: [],
+        registrationMode: "headed",
         selectedCardEmail: "",
         selectedVerificationEmail: "",
         verificationFilter: "all",
@@ -1030,7 +1405,7 @@
       this.router = new HashRouter({
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
-        "protocol-registration": () => this.renderer.renderProtocolRegistration(this.store.state),
+        network: () => this.renderer.renderNetwork(this.store.state),
         "card-links": () => this.renderer.renderCardLinks(this.store.state),
         "pp-payment": () => this.renderer.renderPayPal(this.store.state),
         verification: () => this.renderer.renderVerification(this.store.state),
@@ -1044,6 +1419,7 @@
     render(state) {
       this.renderer.renderShell(state);
       this.renderer.renderOverview(state);
+      this.renderer.renderNetwork(state);
       this.renderer.renderAccounts(state);
       this.renderer.renderProtocolRegistration(state);
       this.renderer.renderCardLinks(state);
@@ -1079,11 +1455,7 @@
     async loadAccounts() {
       const data = await this.api.get("/api/gpt-emails");
       const accounts = data.items || [];
-      const pendingEmails = new Set(accounts.filter((item) => !item.protocolReady).map((item) => item.email));
-      const patch = {
-        accounts,
-        selectedProtocolEmails: (this.store.state.selectedProtocolEmails || []).filter((email) => pendingEmails.has(email)),
-      };
+      const patch = { accounts };
       if (!this.store.state.selectedCardEmail && data.items?.length) {
         patch.selectedCardEmail = data.items.find((item) => item.sessionStatus === "ready")?.email || data.items[0].email;
       }
@@ -1094,12 +1466,13 @@
       try {
         const data = await this.api.get("/api/browser/status");
         const wasRunning = Boolean(this.store.state.browserTask.running);
-        this.store.patch({ browserTask: data });
-        if (data.runtime?.forceHeadless) {
-          $("headless").checked = true;
-          $("headless").disabled = true;
+        const patch = { browserTask: data };
+        if (data.runtime?.forceHeadless && this.store.state.registrationMode === "headed") {
+          patch.registrationMode = "headless";
+          localStorage.setItem("hme_registration_mode", "headless");
         }
-        if (data.running) this.schedule("browser", () => this.loadBrowserTask());
+        this.store.patch(patch);
+        if (data.running) this.schedule("browser", () => this.loadBrowserTask(), 500);
         else if (wasRunning) await this.loadAccounts();
       } catch (error) {
         this.toast(error.message, "error");
@@ -1126,7 +1499,12 @@
       try {
         const data = await this.api.get("/api/protocol-registration/status");
         const wasRunning = Boolean(this.store.state.protocolRegistrationTask.running);
-        this.store.patch({ protocolRegistrationTask: data });
+        const patch = { protocolRegistrationTask: data };
+        if (data.running) {
+          patch.registrationMode = "protocol";
+          localStorage.setItem("hme_registration_mode", "protocol");
+        }
+        this.store.patch(patch);
         if (data.running) {
           this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 1200);
         } else if (wasRunning) {
@@ -1166,6 +1544,11 @@
       this.store.patch({ registrationProxy: data });
     }
 
+    async loadRoxyRegistration() {
+      const data = await this.api.get("/api/roxy-registration/status");
+      this.store.patch({ roxyRegistration: data });
+    }
+
     async loadSmsBower() {
       const data = await this.api.get("/api/smsbower/status");
       this.store.patch({ smsBower: data });
@@ -1176,7 +1559,44 @@
       if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
         throw new Error("并发数必须是 1–10 的整数");
       }
-      return { headless: $("headless").checked, concurrency };
+      const mode = this.store.state.registrationMode || "headed";
+      if (mode === "protocol") {
+        throw new Error("协议注册请使用 iCloud 库存注册按钮");
+      }
+      if (mode === "roxy" && !this.store.state.roxyRegistration?.configured) {
+        const profile = $("roxyProfile");
+        profile.focus();
+        profile.scrollIntoView({ behavior: "smooth", block: "center" });
+        throw new Error("请先在上方“专用指纹环境”中选择一个 Roxy 环境，再点击注册");
+      }
+      const roxyConcurrency = Number($("roxyConcurrency").value);
+      if (mode === "roxy" && (
+        !Number.isInteger(roxyConcurrency) || roxyConcurrency < 1 || roxyConcurrency > 5
+      )) {
+        throw new Error("Roxy 并发窗口必须是 1–5 的整数");
+      }
+      const availableRoxyProfiles = Number(
+        this.store.state.roxyRegistration?.maxConcurrency || 0
+      );
+      if (mode === "roxy" && roxyConcurrency > availableRoxyProfiles) {
+        throw new Error(
+          "Roxy 未打开环境不足：需要 " + roxyConcurrency + " 个，当前可用 " +
+          availableRoxyProfiles + " 个"
+        );
+      }
+      const roxyTargetCount = Number($("roxyTargetCount").value);
+      if (mode === "roxy" && (
+        !Number.isInteger(roxyTargetCount) || roxyTargetCount < 1 || roxyTargetCount > 100
+      )) {
+        throw new Error("Roxy 目标账号数必须是 1–100 的整数");
+      }
+      return {
+        headless: mode === "headless" ||
+          (mode === "roxy" && $("roxyWindowMode").value === "background"),
+        concurrency: mode === "roxy" ? roxyConcurrency : concurrency,
+        target_count: mode === "roxy" ? roxyTargetCount : concurrency,
+        browser_engine: mode === "roxy" ? "roxy" : "camoufox",
+      };
     }
 
     verificationConcurrency() {
@@ -1187,12 +1607,12 @@
       return concurrency;
     }
 
-    protocolConcurrency() {
-      const concurrency = Number($("protocolConcurrency").value);
-      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 5) {
-        throw new Error("协议注册并发必须是 1–5 的整数");
+    assertProtocolRuntime() {
+      const runtime = this.store.state.protocolRegistrationTask?.runtime || {};
+      if (!runtime.available) {
+        throw new Error("协议运行环境未就绪：" + (runtime.error || "请重启账号工作台后重试"));
       }
-      return concurrency;
+      return runtime;
     }
 
     moveVerificationSelection(offset) {
@@ -1248,7 +1668,7 @@
 
     bindCommands() {
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal()]);
+        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal()]);
         return "数据已刷新";
       });
       this.commands.register("reload-paypal", async () => {
@@ -1260,6 +1680,12 @@
         frame.src = this.store.state.paypal.url || frame.dataset.src;
         frame.dataset.loaded = "1";
         return "PP 支付工作台已刷新";
+      });
+      this.commands.register("refresh-roxy", async () => {
+        await this.loadRoxyRegistration();
+        const roxy = this.store.state.roxyRegistration || {};
+        if (!roxy.available) throw new Error(roxy.error || "Roxy OpenAPI 未连接");
+        return roxy.configured ? "Roxy 专用环境已就绪" : "Roxy 已连接，请选择专用指纹环境";
       });
       this.commands.register("toggle-theme", async () => {
         this.applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
@@ -1286,9 +1712,23 @@
         return "已添加邮箱并启动注册：" + email;
       });
       this.commands.register("register-provider", async () => {
-        const options = this.browserOptions();
         const source = $("registrationEmailProvider").value || "icloud";
         const smsBower = this.store.state.smsBower || {};
+        const protocolMode = this.store.state.registrationMode === "protocol";
+        if (protocolMode) {
+          if (source !== "icloud") {
+            throw new Error("协议注册当前仅支持 iCloud 库存邮箱");
+          }
+          this.assertProtocolRuntime();
+          const data = await this.api.post("/api/protocol-registration/start", {
+            provider: "inventory",
+            concurrency: 1,
+          });
+          this.store.patch({ protocolRegistrationTask: data.task });
+          this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
+          return "已从库存领取 iCloud 邮箱并启动协议注册";
+        }
+        const options = this.browserOptions();
         if (source === "gmail") {
           if (!smsBower.configured) throw new Error("请先设置 SMSBower API Key");
           const maxPrice = Number($("smsbowerMaxPrice").value);
@@ -1302,39 +1742,13 @@
           label: source === "gmail" ? "SMSBower Gmail 注册" : "iCloud 邮箱注册",
           provider: source === "gmail" ? "smsbower" : "inventory",
           ...options,
-          concurrency: 1,
+          concurrency: source === "gmail" ? 1 : options.concurrency,
         });
         this.store.patch({ registrationTask: data.task });
         this.schedule("registration", () => this.loadRegistrationTask(), 500);
         return source === "gmail"
           ? "已启动 SMSBower Gmail 获取与自动注册（" + (options.headless ? "无头" : "前台窗口") + "）"
           : "已启动 iCloud 库存邮箱注册";
-      });
-      this.commands.register("start-protocol-selected", async () => {
-        const emails = [...(this.store.state.selectedProtocolEmails || [])];
-        if (!emails.length) throw new Error("请先选择待协议注册账号");
-        if (!confirm("对选中的 " + emails.length + " 个账号执行 Mail Auth，并强制完成密码与 TOTP 2FA？")) {
-          throw Object.assign(new Error(), { name: "AbortError" });
-        }
-        const data = await this.api.post("/api/protocol-registration/start", {
-          emails, concurrency: this.protocolConcurrency(), all: false,
-        });
-        this.store.patch({ protocolRegistrationTask: data.task });
-        this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
-        return "协议注册选中任务已启动";
-      });
-      this.commands.register("start-protocol-all", async () => {
-        const pending = this.store.state.accounts.filter((item) => !item.protocolReady).length;
-        if (!pending) throw new Error("全部账号均已完成协议注册（密码+2FA）");
-        if (!confirm("协议注册全部待处理账号，共 " + pending + " 个，是否继续？")) {
-          throw Object.assign(new Error(), { name: "AbortError" });
-        }
-        const data = await this.api.post("/api/protocol-registration/start", {
-          all: true, concurrency: this.protocolConcurrency(), emails: [],
-        });
-        this.store.patch({ protocolRegistrationTask: data.task, selectedProtocolEmails: [] });
-        this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
-        return "协议注册全部任务已启动" + (data.skipped ? "，已跳过 " + data.skipped + " 个完整账号" : "");
       });
       this.commands.register("stop-protocol-registration", async () => {
         if (!confirm("停止当前协议注册任务？")) {
@@ -1366,26 +1780,59 @@
         this.schedule("registration", () => this.loadRegistrationTask(), 400);
         return "验证码已提交，注册继续运行";
       });
-      this.commands.register("set-registration-proxy-credential", async () => {
+      this.commands.register("focus-registration-proxy", async () => {
+        this.router.navigate("network");
+        setTimeout(() => {
+          $("registrationProxyPanel").scrollIntoView({ behavior: "smooth", block: "center" });
+          $("registrationProxyMode").focus({ preventScroll: true });
+        }, 0);
+        return "已打开独立的代理与线路模块";
+      });
+      this.commands.register("save-registration-proxy", async () => {
         const current = this.store.state.registrationProxy || {};
-        if ((current.mode || "dynamic") === "clash") {
-          await this.api.post("/api/registration-proxy/config", {
-            mode: "clash", country: "JP", enabled: true, maxLatencyMs: 900,
-          });
-          const data = await this.api.post("/api/registration-proxy/rotate", {});
-          this.store.patch({ registrationProxy: data });
-          return "Clash 日本出口已固定：" + (data.currentNode || "日本节点") +
-            "，延迟 " + (data.lastLatencyMs || 0) + " ms";
+        const mode = $("registrationProxyMode").value || "kookeey";
+        if (mode === "clash") {
+          throw new Error("Clash 模式请使用“检测并切换日本 IP”");
         }
-        const proxyLine = prompt("输入动态代理连接（host:port:username:password）。凭据只保存在本地，不会显示在日志中：", "");
-        if (proxyLine === null) throw Object.assign(new Error(), { name: "AbortError" });
-        if (!proxyLine.trim()) throw new Error("代理连接不能为空");
-        const country = $("registrationProxyCountry").value || "NL";
-        const data = await this.api.post("/api/registration-proxy/config", {
-          mode: "dynamic", proxyLine, country, enabled: true,
-        });
+        const endpoint = $("registrationProxyEndpoint").value.trim();
+        const username = $("registrationProxyUsername").value.trim();
+        const password = $("registrationProxyPassword").value;
+        if (!current.configured && (!endpoint || !username || !password)) {
+          throw new Error("首次配置请填写用户名、密码和主机:端口");
+        }
+        const payload = {
+          mode,
+          country: $("registrationProxyCountry").value || "NL",
+          enabled: current.configured ? $("registrationProxyEnabled").checked : true,
+        };
+        if (endpoint) payload.proxyEndpoint = endpoint;
+        if (username) payload.proxyUsername = username;
+        if (password) payload.proxyPassword = password;
+        const data = await this.api.post("/api/registration-proxy/config", payload);
+        $("registrationProxyUsername").value = "";
+        $("registrationProxyPassword").value = "";
+        $("registrationProxyEndpoint").dataset.dirty = "";
         this.store.patch({ registrationProxy: data });
-        return "动态代理已保存并启用：" + (data.countryLabel || data.country);
+        return (data.mode === "kookeey" ? "Kookeey 动态住宅" : "动态代理") +
+          "已保存并" + (data.enabled ? "启用" : "保持关闭") + "：" +
+          (data.countryLabel || data.country);
+      });
+      this.commands.register("rotate-registration-proxy", async () => {
+        await this.api.post("/api/registration-proxy/config", {
+          mode: "clash", country: "JP", enabled: true, maxLatencyMs: 900,
+        });
+        const data = await this.api.post("/api/registration-proxy/rotate", {});
+        this.store.patch({ registrationProxy: data });
+        return "Clash 日本出口已固定：" + (data.currentNode || "日本节点") +
+          "，延迟 " + (data.lastLatencyMs || 0) + " ms";
+      });
+      this.commands.register("test-registration-proxy", async () => {
+        const data = await this.api.post("/api/registration-proxy/test", {});
+        this.store.patch({ registrationProxy: data });
+        if (!data.testResult?.ok) {
+          throw new Error(data.testResult?.message || "代理测试未通过");
+        }
+        return "代理测试通过：" + data.testResult.message;
       });
       this.commands.register("fetch-all", async () => {
         const options = this.browserOptions();
@@ -1459,6 +1906,17 @@
       this.commands.register("verify-account", async ({ element }) => {
         return this.startAccountVerification(element.dataset.email);
       });
+      this.commands.register("retry-checkout-probe", async ({ element }) => {
+        const data = await this.api.post("/api/account/checkout-probe", {
+          email: element.dataset.email,
+        });
+        await this.loadAccounts();
+        const labels = { oaics: "OAICS", cs_live: "CS LIVE", cs: "CS", other: "OTHER", error: "检测失败" };
+        const result = labels[data.checkout_id_type] || "待检测";
+        const attempts = Number(data.attempt_count || 1);
+        const maxAttempts = Number(data.max_attempts || 3);
+        return "Checkout 检测完成：" + result + "（第 " + attempts + "/" + maxAttempts + " 次）";
+      });
       this.commands.register("copy-account", async ({ element }) => {
         const response = await fetch("/api/gpt-accounts/export", {
           method: "POST",
@@ -1487,14 +1945,75 @@
       this.commands.register("generate-card-link", async () => {
         const item = this.selectedAccount(this.store.state.selectedCardEmail);
         if (!item) throw new Error("请先选择账号");
+        const method = $("cardLinkMethod").value;
+        const config = cardLinkExtractionModes[method] || cardLinkExtractionModes.ph_hosted;
         const data = await this.api.post("/api/account/card-link", {
-          email: item.email, method: "ph_hosted", country: "PH",
-          create_proxy: $("cardLinkCreateProxy").value.trim(),
-          promotion_proxy: $("cardLinkPromotionProxy").value.trim(),
+          email: item.email, method, country: config.country,
+          proxy_mode: $("cardLinkProxyMode").value,
+          create_proxy_country: $("cardLinkCreateProxyCountry").value,
+          promotion_proxy_country: config.singleProxy ? "" : $("cardLinkPromotionProxyCountry").value,
         });
-        await this.copyText(data.url);
+        if (data.cardLinkStatus !== "cs_live") await this.copyText(data.url);
         await this.loadAccounts();
-        return "严格 0 hosted 链接已提取并复制";
+        setTimeout(() => this.renderer.renderCardSelection(this.store.state), 0);
+        return data.cardLinkStatus === "cs_live"
+          ? "检测到 cs_live，已标注；此账号在当前模式不再提链"
+          : config.success;
+      });
+      this.commands.register("generate-all-card-links", async ({ element }) => {
+        const method = $("cardLinkMethod").value;
+        const config = cardLinkExtractionModes[method] || cardLinkExtractionModes.ph_hosted;
+        const candidates = this.store.state.accounts.filter((item) =>
+          cardLinkEligible(item, method)
+        );
+        if (!candidates.length) throw new Error("当前模式没有待提链账号");
+        const batchState = $("cardLinkBatchState");
+        const lockedControls = [
+          "cardLinkMethod", "cardLinkProxyMode", "cardLinkCreateProxyCountry",
+          "cardLinkPromotionProxyCountry", "generateCardLinkButton",
+        ].map($);
+        element.dataset.running = "1";
+        lockedControls.forEach((control) => { control.disabled = true; });
+        let generated = 0;
+        let classified = 0;
+        let failed = 0;
+        batchState.className = "operation-result";
+        try {
+          for (let index = 0; index < candidates.length; index += 1) {
+            const item = candidates[index];
+            element.textContent = "正在提链 " + (index + 1) + " / " + candidates.length;
+            batchState.innerHTML = '<strong>一键提链进行中</strong><span>' +
+              escapeHtml(item.email) + " · " + (index + 1) + " / " + candidates.length +
+              "</span><span>已生成 " + generated + " · cs_live " + classified +
+              " · 失败 " + failed + "</span>";
+            try {
+              const data = await this.api.post("/api/account/card-link", {
+                email: item.email,
+                method,
+                country: config.country,
+                proxy_mode: $("cardLinkProxyMode").value,
+                create_proxy_country: $("cardLinkCreateProxyCountry").value,
+                promotion_proxy_country: config.singleProxy
+                  ? "" : $("cardLinkPromotionProxyCountry").value,
+              });
+              if (data.cardLinkStatus === "cs_live") classified += 1;
+              else generated += 1;
+            } catch (_error) {
+              failed += 1;
+            }
+          }
+        } finally {
+          delete element.dataset.running;
+          lockedControls.forEach((control) => { control.disabled = false; });
+          await this.loadAccounts();
+          setTimeout(() => this.renderer.renderCardSelection(this.store.state), 0);
+        }
+        batchState.innerHTML = '<strong>一键提链完成</strong><span>已生成 ' + generated +
+          " · cs_live 已标注 " + classified + " · 失败 " + failed +
+          "</span><span>cs_live 账号只会在“" + escapeHtml(config.label) +
+          "”模式下自动跳过</span>";
+        return "一键提链完成：生成 " + generated + "，cs_live " + classified +
+          "，失败 " + failed;
       });
       this.commands.register("copy-card-link", async () => {
         const item = this.selectedAccount(this.store.state.selectedCardEmail);
@@ -1553,9 +2072,11 @@
         return "邮箱同步完成，新增 " + (data.inserted || 0) + " 封邮件";
       });
       this.commands.register("save-browser-settings", async () => {
-        $("headless").checked = $("settingsHeadless").checked;
+        const mode = document.querySelector('input[name="settingsRegistrationMode"]:checked')?.value || "headed";
+        localStorage.setItem("hme_registration_mode", mode);
         $("concurrency").value = $("settingsConcurrency").value;
-        return "浏览器默认设置已更新";
+        this.store.patch({ registrationMode: mode });
+        return "账号注册方式已更新";
       });
     }
 
@@ -1586,32 +2107,112 @@
       ["accountSearch", "accountPlanFilter", "accountSessionFilter"].forEach((id) => {
         $(id).addEventListener(id === "accountSearch" ? "input" : "change", () => this.renderer.renderAccounts(this.store.state));
       });
-      ["protocolSearch", "protocolStatusFilter"].forEach((id) => {
-        $(id).addEventListener(id === "protocolSearch" ? "input" : "change", () => this.renderer.renderProtocolRegistration(this.store.state));
-      });
-      $("protocolAccountList").addEventListener("change", (event) => {
-        const checkbox = event.target.closest("[data-protocol-email]");
-        if (!checkbox) return;
-        const selected = new Set(this.store.state.selectedProtocolEmails || []);
-        if (checkbox.checked) selected.add(checkbox.dataset.protocolEmail);
-        else selected.delete(checkbox.dataset.protocolEmail);
-        this.store.patch({ selectedProtocolEmails: [...selected] });
-      });
-      $("protocolSelectAll").addEventListener("change", (event) => {
-        const selected = new Set(this.store.state.selectedProtocolEmails || []);
-        this.renderer.filteredProtocolAccounts(this.store.state)
-          .filter((item) => !item.protocolReady)
-          .forEach((item) => event.target.checked ? selected.add(item.email) : selected.delete(item.email));
-        this.store.patch({ selectedProtocolEmails: [...selected] });
-      });
       ["cardSearch", "cardStatusFilter"].forEach((id) => {
         $(id).addEventListener(id === "cardSearch" ? "input" : "change", () => this.renderer.renderCardLinks(this.store.state));
+      });
+      $("cardLinkMethod").addEventListener("change", () => {
+        this.renderer.renderCardLinkMethod();
+        this.renderer.renderCardSelection(this.store.state);
+      });
+      $("cardLinkProxyMode").addEventListener("change", async (event) => {
+        const method = $("cardLinkMethod").value;
+        try {
+          const data = await this.api.post("/api/registration-proxy/config", {
+            cardLinkModes: { [method]: event.target.value },
+          });
+          this.store.patch({ registrationProxy: data });
+          this.toast("提链代理模式已保存为 " + event.target.selectedOptions[0].textContent);
+        } catch (error) {
+          await this.loadRegistrationProxy();
+          this.toast(error.message, "error");
+        }
+      });
+      ["cardLinkCreateProxyCountry", "cardLinkPromotionProxyCountry"].forEach((id) => {
+        $(id).addEventListener("change", async (event) => {
+          const preferenceKey = event.target.dataset.preferenceKey;
+          if (!preferenceKey || !event.target.value) return;
+          try {
+            const data = await this.api.post("/api/registration-proxy/config", {
+              cardLinkCountries: { [preferenceKey]: event.target.value },
+            });
+            this.store.patch({ registrationProxy: data });
+            this.toast("提链代理国家已保存为 " + event.target.selectedOptions[0].textContent);
+          } catch (error) {
+            await this.loadRegistrationProxy();
+            this.toast(error.message, "error");
+          }
+        });
       });
       $("verificationAccountSelect").addEventListener("change", (event) => {
         this.store.patch({ selectedVerificationEmail: event.target.value });
       });
+      document.querySelectorAll('input[name="registrationMode"]').forEach((input) => {
+        input.addEventListener("change", (event) => {
+          if (!event.target.checked) return;
+          const mode = event.target.value;
+          localStorage.setItem("hme_registration_mode", mode);
+          this.store.patch({ registrationMode: mode });
+          if (mode === "roxy" && !this.store.state.roxyRegistration?.configured) {
+            setTimeout(() => $("roxyProfile").focus(), 0);
+          }
+          this.toast(mode === "protocol"
+            ? "已切换为协议注册，点击上方按钮即可自动领取 iCloud 邮箱"
+            : mode === "roxy" ? "已切换为 Roxy 随机指纹注册"
+            : mode === "headless" ? "已切换为无头浏览器注册" : "已切换为有头浏览器注册");
+        });
+      });
+      $("roxyWorkspace").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/roxy-registration/config", {
+            workspaceId: event.target.value,
+            profileId: "",
+          });
+          this.store.patch({ roxyRegistration: data });
+          this.toast("Roxy 工作区已更新，请选择专用指纹环境");
+        } catch (error) {
+          await this.loadRoxyRegistration();
+          this.toast(error.message, "error");
+        }
+      });
+      $("roxyProfile").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/roxy-registration/config", {
+            workspaceId: $("roxyWorkspace").value,
+            profileId: event.target.value,
+          });
+          this.store.patch({ roxyRegistration: data });
+          this.toast(data.configured ? "Roxy 专用指纹环境已保存" : "请选择有效的 Roxy 环境");
+        } catch (error) {
+          await this.loadRoxyRegistration();
+          this.toast(error.message, "error");
+        }
+      });
+      $("roxyWindowMode").addEventListener("change", (event) => {
+        localStorage.setItem("hme_roxy_window_mode", event.target.value);
+        this.renderer.renderAccounts(this.store.state);
+        this.toast(event.target.value === "background"
+          ? "Roxy 将使用后台隐藏窗口运行"
+          : "Roxy 将显示有头窗口");
+      });
+      $("roxyConcurrency").addEventListener("change", (event) => {
+        const value = Math.max(1, Math.min(5, Number(event.target.value) || 1));
+        event.target.value = String(value);
+        localStorage.setItem("hme_roxy_concurrency", String(value));
+        this.renderer.renderAccounts(this.store.state);
+        this.toast("Roxy 并发窗口已设置为 " + value);
+      });
+      $("roxyTargetCount").addEventListener("change", (event) => {
+        const value = Math.max(1, Math.min(100, Number(event.target.value) || 1));
+        event.target.value = String(value);
+        localStorage.setItem("hme_roxy_target_count", String(value));
+        this.renderer.renderAccounts(this.store.state);
+        this.toast("Roxy 目标账号数已设置为 " + value);
+      });
       $("registrationEmailProvider").addEventListener("change", () => {
         this.renderer.renderAccounts(this.store.state);
+      });
+      $("registrationProxyEndpoint").addEventListener("input", (event) => {
+        event.target.dataset.dirty = "1";
       });
       $("registrationProxyEnabled").addEventListener("change", async (event) => {
         try {
@@ -1619,39 +2220,72 @@
             enabled: event.target.checked,
           });
           this.store.patch({ registrationProxy: data });
-          this.toast(data.enabled ? "注册动态代理已启用" : "动态代理已关闭，注册将使用本机 IP 直连");
+          this.toast(data.enabled ? "所有注册方式已启用代理" : "代理已关闭，所有注册方式将使用本机 IP 直连");
         } catch (error) {
           event.target.checked = !event.target.checked;
           this.toast(error.message, "error");
         }
       });
-      $("registrationProxyMode").addEventListener("change", async (event) => {
-        try {
-          const mode = event.target.value;
-          const data = await this.api.post("/api/registration-proxy/config", {
-            mode,
-            country: mode === "clash" ? "JP" : ($("registrationProxyCountry").value || "NL"),
-          });
-          this.store.patch({ registrationProxy: data });
-          this.toast(mode === "clash"
-            ? "已切换为 Clash 日本节点轮询，点击检测按钮验证出口"
-            : "已切换为动态 SID 代理");
-        } catch (error) {
-          await this.loadRegistrationProxy();
-          this.toast(error.message, "error");
+      $("registrationProxyMode").addEventListener("change", (event) => {
+        const mode = event.target.value;
+        const clashMode = mode === "clash";
+        $("registrationProxyCredentialFields").hidden = clashMode;
+        $("rotateRegistrationProxyButton").hidden = !clashMode;
+        $("registrationProxyCountry").value = clashMode
+          ? "JP"
+          : (this.store.state.registrationProxy?.country || "NL");
+        $("registrationProxyCountrySearch").disabled = clashMode;
+        if (clashMode) $("registrationProxyCountrySearch").value = "日本 (JP)";
+        ["registrationProxyUsername", "registrationProxyPassword", "registrationProxyEndpoint", "saveRegistrationProxyButton"].forEach((id) => {
+          $(id).disabled = clashMode;
+        });
+        $("registrationProxyModeHint").textContent = clashMode
+          ? "Clash 模式固定为日本出口；点击下方按钮检测并切换节点"
+          : mode === "kookeey"
+            ? "Kookeey 模式会自动把国家、8 位 Session 和 5m 写入连接密码"
+            : "通用模式会自动把 region、8 位 SID 和 5 分钟粘性时长写入用户名";
+        this.toast("代理模式已选择，请点击保存后用于注册");
+      });
+      $("registrationProxyCountrySearch").addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.target.blur();
         }
       });
-      $("registrationProxyCountry").addEventListener("change", async (event) => {
+      const commitProxyCountry = async (event, { reportInvalid = false } = {}) => {
+        const countries = this.store.state.registrationProxy?.countries || [];
+        const match = matchProxyCountry(event.target.value, countries);
+        if (!match) {
+          if (reportInvalid) {
+            this.renderer.renderNetwork(this.store.state);
+            this.toast("未找到唯一国家，请输入中文国家名或两位代码", "error");
+          }
+          return false;
+        }
+        if (event.target.dataset.countryCode === match.code) return true;
+        event.target.dataset.countryCode = match.code;
+        $("registrationProxyCountry").value = match.code;
         try {
           const data = await this.api.post("/api/registration-proxy/config", {
-            country: event.target.value,
+            country: match.code,
           });
           this.store.patch({ registrationProxy: data });
-          this.toast("注册代理出口已切换为 " + (data.countryLabel || data.country));
+          this.toast("注册出口已切换为 " + countryOptionLabel(match));
+          return true;
         } catch (error) {
-          await this.loadRegistrationProxy();
+          delete event.target.dataset.countryCode;
+          this.renderer.renderNetwork(this.store.state);
           this.toast(error.message, "error");
+          return false;
         }
+      };
+      $("registrationProxyCountrySearch").addEventListener("input", (event) => {
+        const value = event.target.value.trim();
+        if (!value || (/^[a-z]+$/i.test(value) && value.length < 2)) return;
+        void commitProxyCountry(event);
+      });
+      $("registrationProxyCountrySearch").addEventListener("change", async (event) => {
+        await commitProxyCountry(event, { reportInvalid: true });
       });
       $("smsbowerMaxPrice").addEventListener("change", async (event) => {
         try {
@@ -1669,13 +2303,30 @@
 
     async start() {
       const savedTheme = localStorage.getItem("hme_theme") || "dark";
+      const savedRegistrationMode = localStorage.getItem("hme_registration_mode");
+      const registrationMode = ["headless", "headed", "roxy", "protocol"].includes(savedRegistrationMode)
+        ? savedRegistrationMode : "headed";
+      const savedRoxyWindowMode = localStorage.getItem("hme_roxy_window_mode");
+      $("roxyWindowMode").value = savedRoxyWindowMode === "headed" ? "headed" : "background";
+      const savedRoxyConcurrency = Number(localStorage.getItem("hme_roxy_concurrency") || 5);
+      $("roxyConcurrency").value = String(
+        Number.isInteger(savedRoxyConcurrency) && savedRoxyConcurrency >= 1 && savedRoxyConcurrency <= 5
+          ? savedRoxyConcurrency : 5
+      );
+      const savedRoxyTargetCount = Number(localStorage.getItem("hme_roxy_target_count") || 5);
+      $("roxyTargetCount").value = String(
+        Number.isInteger(savedRoxyTargetCount) && savedRoxyTargetCount >= 1 && savedRoxyTargetCount <= 100
+          ? savedRoxyTargetCount : 5
+      );
       this.applyTheme(savedTheme, false);
+      this.store.patch({ registrationMode });
+      $("accountsView").insertBefore($("protocolRegistrationPanel"), $("taskPanel"));
       this.store.subscribe((state) => this.render(state));
       this.bindEvents();
       this.router.start();
       const results = await Promise.allSettled([
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadSmsBower(), this.loadPayPal(),
+        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal(),
       ]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");

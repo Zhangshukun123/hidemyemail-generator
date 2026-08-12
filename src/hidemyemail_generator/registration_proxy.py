@@ -28,7 +28,10 @@ REGISTRATION_PROXY_SETTING_KEY = "registration_proxy_config_v1"
 DEFAULT_PROXY_COUNTRY = "NL"
 DEFAULT_PROXY_DURATION_MINUTES = 5
 DEFAULT_PROXY_MODE = "dynamic"
-PROXY_MODES = {"dynamic", "clash"}
+PROXY_MODE_DYNAMIC = "dynamic"
+PROXY_MODE_KOOKEEY = "kookeey"
+PROXY_MODE_CLASH = "clash"
+PROXY_MODES = {PROXY_MODE_DYNAMIC, PROXY_MODE_KOOKEEY, PROXY_MODE_CLASH}
 PROXY_COUNTRIES = {
     "NL": "荷兰",
     "US": "美国",
@@ -45,11 +48,44 @@ PROXY_COUNTRIES = {
     "BR": "巴西",
     "IN": "印度",
     "TR": "土耳其",
+    "ES": "西班牙",
+    "ID": "印度尼西亚",
+    "IT": "意大利",
+    "MX": "墨西哥",
+    "NZ": "新西兰",
+    "PT": "葡萄牙",
+    "TH": "泰国",
+    "VN": "越南",
+    "AT": "奥地利",
+    "BE": "比利时",
+    "CH": "瑞士",
+    "CN": "中国",
+    "IE": "爱尔兰",
+    "MY": "马来西亚",
+    "PH": "菲律宾",
+    "PL": "波兰",
+    "SE": "瑞典",
+    "AE": "阿联酋",
+    "AR": "阿根廷",
+    "CL": "智利",
+    "CO": "哥伦比亚",
+    "ZA": "南非",
 }
+CARD_LINK_PROXY_COUNTRY_DEFAULTS = {
+    "phCreate": "US",
+    "phPromotion": "TR",
+    "de": "DE",
+}
+CARD_LINK_PROXY_MODE_KEYS = {"ph_hosted", "de_oaics_paypal"}
 
 _STICKY_SUFFIX_RE = re.compile(
     r"-region-[A-Za-z]{2}-sid-[A-Za-z0-9]{4,32}-t-\d+$", re.IGNORECASE
 )
+_KOOKEEY_PASSWORD_SUFFIX_RE = re.compile(
+    r"(?P<base>.+)-(?:[A-Za-z]{2}|global)-[A-Za-z0-9]{8}(?:-\d+[mh])?$",
+    re.IGNORECASE,
+)
+_KOOKEEY_USERNAME_RE = re.compile(r"\d+-[A-Za-z0-9]{6,16}$")
 
 
 def _utc_now() -> str:
@@ -63,8 +99,49 @@ def _normalize_country(value: Any) -> str:
     return country
 
 
+def _normalize_card_link_countries(value: Any) -> dict[str, str]:
+    selections = dict(CARD_LINK_PROXY_COUNTRY_DEFAULTS)
+    if not isinstance(value, dict):
+        return selections
+    for key, default_country in CARD_LINK_PROXY_COUNTRY_DEFAULTS.items():
+        try:
+            selections[key] = _normalize_country(value.get(key) or default_country)
+        except ValueError:
+            selections[key] = default_country
+    return selections
+
+
+def _normalize_card_link_modes(value: Any) -> dict[str, str]:
+    selections = {key: "" for key in CARD_LINK_PROXY_MODE_KEYS}
+    if not isinstance(value, dict):
+        return selections
+    for key in CARD_LINK_PROXY_MODE_KEYS:
+        mode = str(value.get(key) or "").strip().casefold()
+        selections[key] = mode if mode in PROXY_MODES else ""
+    return selections
+
+
 def _base_username(value: str) -> str:
     return _STICKY_SUFFIX_RE.sub("", str(value or "").strip())
+
+
+def _base_kookeey_password(value: str) -> str:
+    password = str(value or "")
+    match = _KOOKEEY_PASSWORD_SUFFIX_RE.fullmatch(password)
+    return match.group("base") if match else password
+
+
+def _detect_proxy_mode(endpoint: str) -> str:
+    try:
+        parsed = urlsplit(
+            endpoint if "://" in str(endpoint or "") else f"http://{endpoint}"
+        )
+        hostname = str(parsed.hostname or "").lower()
+    except ValueError:
+        hostname = ""
+    if hostname == "kookeey.info" or hostname.endswith(".kookeey.info"):
+        return PROXY_MODE_KOOKEEY
+    return PROXY_MODE_DYNAMIC
 
 
 def _validate_endpoint(value: str) -> str:
@@ -81,7 +158,9 @@ def _validate_endpoint(value: str) -> str:
     return f"{host_text}:{parsed.port}"
 
 
-def parse_proxy_credential(value: str) -> dict[str, str]:
+def parse_proxy_credential(
+    value: str, *, mode: str = DEFAULT_PROXY_MODE
+) -> dict[str, str]:
     """Parse URL or host:port:username:password without retaining a fixed SID."""
 
     text = str(value or "").strip()
@@ -100,7 +179,14 @@ def parse_proxy_credential(value: str) -> dict[str, str]:
             raise ValueError("代理格式应为 host:port:username:password")
         host, port, username, password = parts
         endpoint = _validate_endpoint(f"{host}:{port}")
+    normalized_mode = str(mode or DEFAULT_PROXY_MODE).strip().casefold()
+    if normalized_mode not in PROXY_MODES:
+        raise ValueError("注册代理模式无效")
+    if normalized_mode == PROXY_MODE_DYNAMIC and _detect_proxy_mode(endpoint) == PROXY_MODE_KOOKEEY:
+        normalized_mode = PROXY_MODE_KOOKEEY
     username = _base_username(username)
+    if normalized_mode == PROXY_MODE_KOOKEEY:
+        password = _base_kookeey_password(password)
     if not username:
         raise ValueError("代理用户名不能为空")
     if not password:
@@ -155,6 +241,8 @@ class RegistrationProxyStore:
             "lastProxyUrl": "",
             "lastSwitchedAt": "",
             "updatedAt": "",
+            "cardLinkCountries": dict(CARD_LINK_PROXY_COUNTRY_DEFAULTS),
+            "cardLinkModes": _normalize_card_link_modes({}),
         }
 
     def load(self) -> dict[str, Any]:
@@ -199,7 +287,17 @@ class RegistrationProxyStore:
         except (TypeError, ValueError):
             state["rotationCursor"] = 0
         state["enabled"] = bool(state.get("enabled"))
-        if state["mode"] == "clash":
+        state["cardLinkCountries"] = _normalize_card_link_countries(
+            state.get("cardLinkCountries")
+        )
+        state["cardLinkModes"] = _normalize_card_link_modes(
+            state.get("cardLinkModes")
+        )
+        if state["mode"] != PROXY_MODE_CLASH and _detect_proxy_mode(
+            str(state.get("endpoint") or "")
+        ) == PROXY_MODE_KOOKEEY:
+            state["mode"] = PROXY_MODE_KOOKEEY
+        if state["mode"] == PROXY_MODE_CLASH:
             state["country"] = "JP"
         return state
 
@@ -228,6 +326,14 @@ class RegistrationProxyStore:
             and str(state.get("password") or "")
         )
 
+    @classmethod
+    def _kookeey_configured(cls, state: dict[str, Any]) -> bool:
+        return cls._dynamic_configured(state) and bool(
+            _KOOKEEY_USERNAME_RE.fullmatch(
+                str(state.get("username") or "").strip()
+            )
+        )
+
     @staticmethod
     def _clash_connection(state: dict[str, Any]) -> ClashConnection:
         return discover_clash_connection(
@@ -238,19 +344,23 @@ class RegistrationProxyStore:
         )
 
     @classmethod
+    def _clash_mode_configured(cls, state: dict[str, Any]) -> bool:
+        try:
+            return cls._clash_connection(state).configured
+        except ValueError:
+            return False
+
+    @classmethod
     def _configured(cls, state: dict[str, Any]) -> bool:
-        if state.get("mode") == "clash":
-            try:
-                return cls._clash_connection(state).configured
-            except ValueError:
-                return False
+        if state.get("mode") == PROXY_MODE_CLASH:
+            return cls._clash_mode_configured(state)
         return cls._dynamic_configured(state)
 
     def _public_state_from(self, state: dict[str, Any]) -> dict[str, Any]:
         mode = str(state.get("mode") or DEFAULT_PROXY_MODE)
-        country = "JP" if mode == "clash" else str(state["country"])
+        country = "JP" if mode == PROXY_MODE_CLASH else str(state["country"])
         connection = None
-        if mode == "clash":
+        if mode == PROXY_MODE_CLASH:
             try:
                 connection = self._clash_connection(state)
             except ValueError:
@@ -260,7 +370,7 @@ class RegistrationProxyStore:
             if connection is not None
             else str(state.get("endpoint") or "")
         )
-        fixed_ports = self._fixed_port_proxies() if mode == "clash" else {}
+        fixed_ports = self._fixed_port_proxies() if mode == PROXY_MODE_CLASH else {}
         normal_endpoint = endpoint
         if fixed_ports:
             last_proxy_url = str(state.get("lastProxyUrl") or "").strip()
@@ -279,7 +389,10 @@ class RegistrationProxyStore:
             "country": country,
             "countryLabel": PROXY_COUNTRIES[country],
             "endpoint": endpoint,
-            "normalEndpoint": normal_endpoint if mode == "clash" else "",
+            "normalEndpoint": normal_endpoint if mode == PROXY_MODE_CLASH else "",
+            "dynamicEndpoint": str(state.get("endpoint") or ""),
+            "usernameConfigured": bool(str(state.get("username") or "").strip()),
+            "passwordConfigured": bool(str(state.get("password") or "")),
             "fixedPortsEnabled": bool(fixed_ports),
             "fixedPortBase": (
                 fixed_port_numbers[0] - 1 if fixed_port_numbers else 0
@@ -298,13 +411,28 @@ class RegistrationProxyStore:
             "exitIpVerified": bool(state.get("lastExitIp")),
             "lastSwitchedAt": str(state.get("lastSwitchedAt") or ""),
             "updatedAt": str(state.get("updatedAt") or ""),
+            "cardLinkCountries": dict(state["cardLinkCountries"]),
+            "cardLinkModes": dict(state["cardLinkModes"]),
             "countries": [
                 {"code": code, "label": label}
                 for code, label in PROXY_COUNTRIES.items()
             ],
             "modes": [
-                {"code": "dynamic", "label": "动态代理 SID"},
-                {"code": "clash", "label": "Clash 日本固定端口轮询"},
+                {
+                    "code": PROXY_MODE_KOOKEEY,
+                    "label": "Kookeey 动态住宅",
+                    "configured": self._kookeey_configured(state),
+                },
+                {
+                    "code": PROXY_MODE_DYNAMIC,
+                    "label": "通用 region/SID",
+                    "configured": self._dynamic_configured(state),
+                },
+                {
+                    "code": PROXY_MODE_CLASH,
+                    "label": "Clash 日本固定端口轮询",
+                    "configured": self._clash_mode_configured(state),
+                },
             ],
         }
 
@@ -318,6 +446,11 @@ class RegistrationProxyStore:
         mode: str | None = None,
         country: str | None = None,
         proxy_line: str | None = None,
+        proxy_endpoint: str | None = None,
+        proxy_username: str | None = None,
+        proxy_password: str | None = None,
+        card_link_countries: dict[str, str] | None = None,
+        card_link_modes: dict[str, str] | None = None,
         clash_controller: str | None = None,
         clash_secret: str | None = None,
         clash_selector: str | None = None,
@@ -332,9 +465,52 @@ class RegistrationProxyStore:
                     raise ValueError("注册代理模式无效")
                 state["mode"] = normalized_mode
             if proxy_line is not None and str(proxy_line).strip():
-                state.update(parse_proxy_credential(proxy_line))
+                state.update(
+                    parse_proxy_credential(
+                        proxy_line, mode=str(state.get("mode") or DEFAULT_PROXY_MODE)
+                    )
+                )
+            if proxy_endpoint is not None and str(proxy_endpoint).strip():
+                state["endpoint"] = _validate_endpoint(proxy_endpoint)
+            if (
+                state.get("mode") != PROXY_MODE_CLASH
+                and _detect_proxy_mode(str(state.get("endpoint") or ""))
+                == PROXY_MODE_KOOKEEY
+            ):
+                state["mode"] = PROXY_MODE_KOOKEEY
+            if proxy_username is not None and str(proxy_username).strip():
+                state["username"] = _base_username(proxy_username)
+            if proxy_password is not None and str(proxy_password):
+                state["password"] = (
+                    _base_kookeey_password(proxy_password)
+                    if state.get("mode") == PROXY_MODE_KOOKEEY
+                    else str(proxy_password)
+                )
             if country is not None:
                 state["country"] = _normalize_country(country)
+            if card_link_countries is not None:
+                if not isinstance(card_link_countries, dict):
+                    raise ValueError("提链代理国家配置无效")
+                selections = _normalize_card_link_countries(
+                    state.get("cardLinkCountries")
+                )
+                for key, selected_country in card_link_countries.items():
+                    if key not in CARD_LINK_PROXY_COUNTRY_DEFAULTS:
+                        raise ValueError("提链代理国家配置无效")
+                    selections[key] = _normalize_country(selected_country)
+                state["cardLinkCountries"] = selections
+            if card_link_modes is not None:
+                if not isinstance(card_link_modes, dict):
+                    raise ValueError("提链代理模式配置无效")
+                selections = _normalize_card_link_modes(state.get("cardLinkModes"))
+                for key, selected_mode in card_link_modes.items():
+                    if key not in CARD_LINK_PROXY_MODE_KEYS:
+                        raise ValueError("提链代理模式配置无效")
+                    mode_value = str(selected_mode or "").strip().casefold()
+                    if mode_value not in PROXY_MODES:
+                        raise ValueError("提链代理模式配置无效")
+                    selections[key] = mode_value
+                state["cardLinkModes"] = selections
             if clash_controller is not None:
                 state["clashController"] = _normalize_controller_url(
                     clash_controller
@@ -354,14 +530,24 @@ class RegistrationProxyStore:
                 if not 50 <= latency <= 10000:
                     raise ValueError("Clash 最大延迟必须在 50–10000 ms 之间")
                 state["maxLatencyMs"] = latency
-            if state.get("mode") == "clash":
+            if state.get("mode") == PROXY_MODE_CLASH:
                 state["country"] = "JP"
             if enabled is not None:
                 state["enabled"] = bool(enabled)
             if state["enabled"] and not self._configured(state):
-                if state.get("mode") == "clash":
+                if state.get("mode") == PROXY_MODE_CLASH:
                     raise ValueError("未发现可用的 Clash Controller 与本地代理端口")
                 raise ValueError("请先保存动态代理连接信息")
+            if (
+                state["enabled"]
+                and state.get("mode") == PROXY_MODE_KOOKEEY
+                and not _KOOKEEY_USERNAME_RE.fullmatch(
+                    str(state.get("username") or "").strip()
+                )
+            ):
+                raise ValueError(
+                    "Kookeey 用户名应填写完整线路连接用户名（用户ID-安全策略用户名）"
+                )
             state["updatedAt"] = _utc_now()
             self._save(state)
             return self._public_state_from(state)
@@ -371,7 +557,7 @@ class RegistrationProxyStore:
             state = self.load()
             if not self._configured(state) or (not state["enabled"] and not force):
                 return "", self._public_state_from(state)
-            if state.get("mode") == "clash":
+            if state.get("mode") == PROXY_MODE_CLASH:
                 connection = self._clash_connection(state)
                 client = self.clash_client_factory(connection)
                 fixed_ports = self._fixed_port_proxies()
@@ -404,26 +590,91 @@ class RegistrationProxyStore:
                 self._save(state)
                 return result.proxy_url, self._public_state_from(state)
 
-            country = _normalize_country(state["country"])
-            sid = "".join(
-                secrets.choice(string.ascii_letters + string.digits) for _ in range(8)
-            )
-            endpoint = _validate_endpoint(str(state["endpoint"]))
-            parsed = urlsplit(f"http://{endpoint}")
-            host = parsed.hostname or ""
-            host_text = f"[{host}]" if ":" in host else host
-            username = quote(str(state["username"]), safe="")
-            password = quote(str(state["password"]), safe="")
-            proxy_username = (
-                f"{username}-region-{country}-sid-{sid}-t-{int(state['duration'])}"
-            )
-            url = f"http://{proxy_username}:{password}@{host_text}:{parsed.port}"
+            url = self._dynamic_proxy_url(state, _normalize_country(state["country"]))
             return url, self._public_state_from(state)
+
+    @staticmethod
+    def _dynamic_proxy_url(state: dict[str, Any], country: str) -> str:
+        sid = "".join(
+            secrets.choice(string.ascii_letters + string.digits) for _ in range(8)
+        )
+        endpoint = _validate_endpoint(str(state["endpoint"]))
+        parsed = urlsplit(f"http://{endpoint}")
+        host = parsed.hostname or ""
+        host_text = f"[{host}]" if ":" in host else host
+        username = quote(str(state["username"]), safe="")
+        password = quote(str(state["password"]), safe="")
+        if state.get("mode") == PROXY_MODE_KOOKEEY:
+            proxy_password = quote(
+                f"{_base_kookeey_password(str(state['password']))}-{country}-{sid}-{int(state['duration'])}m",
+                safe="",
+            )
+            return f"http://{username}:{proxy_password}@{host_text}:{parsed.port}"
+        proxy_username = (
+            f"{username}-region-{country}-sid-{sid}-t-{int(state['duration'])}"
+        )
+        return f"http://{proxy_username}:{password}@{host_text}:{parsed.port}"
+
+    def proxy_for_country(
+        self, country: str, *, mode: str = ""
+    ) -> tuple[str, dict[str, Any]]:
+        """Build a fresh proxy for one card-link country without changing registration."""
+
+        with self._rotation_lock:
+            state = self.load()
+            selected_country = _normalize_country(country)
+            selected_mode = str(mode or state.get("mode") or "").strip().casefold()
+            if selected_mode not in PROXY_MODES:
+                raise ValueError("提链代理模式无效")
+            configured = (
+                self._clash_mode_configured(state)
+                if selected_mode == PROXY_MODE_CLASH
+                else (
+                    self._kookeey_configured(state)
+                    if selected_mode == PROXY_MODE_KOOKEEY
+                    else self._dynamic_configured(state)
+                )
+            )
+            if not configured:
+                return "", self._public_state_from(state)
+            if selected_mode == PROXY_MODE_CLASH:
+                if selected_country != "JP":
+                    raise ValueError("Clash 提链代理仅支持日本（JP）")
+                connection = self._clash_connection(state)
+                fixed_ports = self._fixed_port_proxies()
+                proxy_url = str(state.get("lastProxyUrl") or "").strip()
+                if fixed_ports and proxy_url not in fixed_ports.values():
+                    proxy_url = next(iter(fixed_ports.values()))
+                return proxy_url or connection.proxy_url, self._public_state_from(state)
+            proxy_state = dict(state)
+            proxy_state["mode"] = selected_mode
+            return (
+                self._dynamic_proxy_url(proxy_state, selected_country),
+                self._public_state_from(state),
+            )
+
+    def proxy_for_test(self) -> tuple[str, dict[str, Any]]:
+        """Return a configured proxy URL for diagnostics without rotating Clash."""
+
+        with self._rotation_lock:
+            state = self.load()
+            if not self._configured(state):
+                return "", self._public_state_from(state)
+            if state.get("mode") == PROXY_MODE_CLASH:
+                connection = self._clash_connection(state)
+                proxy_url = str(state.get("lastProxyUrl") or "").strip()
+                return proxy_url or connection.proxy_url, self._public_state_from(state)
+        return self.next_proxy(force=True)
 
 
 __all__ = [
+    "CARD_LINK_PROXY_MODE_KEYS",
+    "CARD_LINK_PROXY_COUNTRY_DEFAULTS",
     "DEFAULT_PROXY_COUNTRY",
     "DEFAULT_PROXY_MODE",
+    "PROXY_MODE_CLASH",
+    "PROXY_MODE_DYNAMIC",
+    "PROXY_MODE_KOOKEEY",
     "PROXY_COUNTRIES",
     "PROXY_MODES",
     "REGISTRATION_PROXY_SETTING_KEY",

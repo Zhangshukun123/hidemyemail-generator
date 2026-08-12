@@ -36,6 +36,7 @@ from loguru import logger
 from config import USER_AGENT
 from paypal.flow import PayPalFlow
 from paypal.elevation_flow import IdentityElevationPayPalFlow
+from paypal.checkout_validation import validate_oaics_checkout
 from paypal.manual_browser import ManualBrowserController
 from paypal.models import BillingAddress, CardInfo, UserInfo, generate_address, generate_card, generate_user
 from paypal.online_address import resolve_online_address
@@ -787,6 +788,8 @@ class WebJob:
     max_card_attempts: int = 5
     manual_funding: bool = False
     agreement_only: bool = False
+    oaics_validation_required: bool = False
+    oaics_validation_verified: bool = False
     exclude_public_metrics: bool = False
     proxy_enabled: bool = False
     proxy_label: str = "代理关闭"
@@ -1138,6 +1141,13 @@ class WebJob:
                 "max_card_attempts": self.max_card_attempts,
                 "manual_funding": self.manual_funding,
                 "agreement_only": self.agreement_only,
+                "oaics_validation": {
+                    "required": self.oaics_validation_required,
+                    "verified": self.oaics_validation_verified,
+                    "checkout_type": (
+                        "oaics_" if self.oaics_validation_verified else ""
+                    ),
+                },
                 "generated": sanitize_payload(self.generated),
                 "runtime_schema": sanitize_payload(self.runtime_schema),
                 "cancellable": self.status in ACTIVE_STATUSES,
@@ -1610,12 +1620,21 @@ def create_job(
     max_card_attempts: int,
     manual_funding: bool = False,
     agreement_only: bool = False,
+    require_oaics: bool = False,
+    checkout_reference: str = "",
     country: str = "BR",
     buyer_mode: str = "identity_elevation",
     proxy_pool: Any = None,
     exclude_public_metrics: bool = False,
 ) -> WebJob:
     ba_token = extract_ba_token(ba_token)
+    require_oaics = bool(require_oaics)
+    checkout_reference = str(checkout_reference or "").strip()
+    oaics_verified = False
+    if require_oaics or checkout_reference:
+        validate_oaics_checkout(checkout_reference)
+        require_oaics = True
+        oaics_verified = True
     phone = re.sub(r"[\s().-]+", "", (phone or "").strip())
     country = str(country or "BR").strip().upper()
     buyer_mode = str(buyer_mode or "identity_elevation").strip().lower()
@@ -1696,6 +1715,8 @@ def create_job(
         max_card_attempts=max_card_attempts,
         manual_funding=bool(manual_funding),
         agreement_only=bool(agreement_only),
+        oaics_validation_required=require_oaics,
+        oaics_validation_verified=oaics_verified,
         exclude_public_metrics=bool(exclude_public_metrics),
         proxy_enabled=proxy_config.enabled,
         proxy_label=proxy_config.label,
@@ -1759,6 +1780,10 @@ def create_job(
 def run_job(job: WebJob) -> None:
     with logger.contextualize(job_id=job.id):
         try:
+            if job.oaics_validation_required:
+                logger.info(
+                    "[OAICS验证] 来源 custom Checkout 已确认使用 oaics_，继续 PP 协议任务"
+                )
             job.set_status("queued", "Waiting for execution slot")
             job.acquire_execution_slot()
             job.check_cancelled()
@@ -2068,6 +2093,8 @@ class WebHandler(BaseHTTPRequestHandler):
                     # BUYER_NOT_SET.
                     manual_funding=False,
                     agreement_only=bool(data.get("agreement_only")),
+                    require_oaics=bool(data.get("require_oaics")),
+                    checkout_reference=data.get("checkout_reference", ""),
                     proxy_pool=data.get("proxies") or data.get("proxy_pool"),
                     exclude_public_metrics=internal_auto,
                 )

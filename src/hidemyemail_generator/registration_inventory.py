@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from .inbox import connect_db
+from .registration_inventory_sync import (
+    export_inventory_record,
+    import_inventory_records,
+)
 
 
 REGISTRATION_INVENTORY_CLAIM_PREFIX = "registration_inventory_claim:"
@@ -235,6 +239,7 @@ def lease_generated_inventory_email(
             "leasedAt": leased_at,
             "expiresAt": expires_at,
             "leaseSeconds": ttl,
+            "record": export_inventory_record(db_file, email),
         }
     except Exception:
         conn.rollback()
@@ -250,6 +255,7 @@ def complete_generated_inventory_lease(
     success: bool,
     email: str = "",
     message: str = "",
+    record: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Finish an active lease and mark successful registrations as used."""
@@ -280,6 +286,15 @@ def complete_generated_inventory_lease(
         if target_email and target_email != leased_email:
             conn.commit()
             return {"ok": False, "status": "conflict", "error": "租约邮箱不匹配"}
+        if record is not None:
+            record_email = str(record.get("email") or "").strip().lower()
+            if record_email and record_email != leased_email:
+                conn.commit()
+                return {
+                    "ok": False,
+                    "status": "conflict",
+                    "error": "同步账号与租约邮箱不匹配",
+                }
         if row["status"] != ACTIVE_LEASE_STATUS:
             conn.commit()
             return {
@@ -311,6 +326,8 @@ def complete_generated_inventory_lease(
             ),
         )
         conn.commit()
+        if record is not None:
+            import_inventory_records(db_file, [record])
         return {
             "ok": True,
             "leaseId": target_lease,

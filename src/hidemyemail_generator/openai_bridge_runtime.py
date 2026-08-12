@@ -211,6 +211,21 @@ def safe_log_message(message: str) -> str:
         text,
         flags=re.I,
     )
+    text = re.sub(
+        r"(?im)(authorization\s*:\s*bearer\s+)[^\s]+",
+        r"\1[已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}",
+        "Bearer [已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r"(?im)(cookie\s*:\s*)[^\r\n]+",
+        r"\1[已隐藏]",
+        text,
+    )
     return text[:1500]
 
 

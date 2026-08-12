@@ -75,6 +75,18 @@ function updateProxyCount() {
 }
 $('proxies').addEventListener('input', updateProxyCount);
 
+function checkoutId(value) {
+  return String(value || '').match(/(?:^|[^A-Za-z0-9_-])((?:oaics|cs)_[A-Za-z0-9_-]{4,})(?![A-Za-z0-9_-])/i)?.[1] || '';
+}
+
+function updateOaicsValidation() {
+  const required = $('requireOaics').checked;
+  $('oaicsCheckoutField').hidden = !required;
+  $('oaicsCheckout').required = required;
+}
+$('requireOaics').addEventListener('change', updateOaicsValidation);
+updateOaicsValidation();
+
 let paypalCountries = [];
 let dynamicCountriesEnabled = false;
 
@@ -618,7 +630,16 @@ $('protocolForm').addEventListener('submit', async (event) => {
   const phone = normalizePhone($('phone').value);
   const country = $('paypalCountry').value;
   const proxies = proxyLines();
+  const requireOaics = $('requireOaics').checked;
+  const checkoutReference = $('oaicsCheckout').value.trim();
   if (!extractBa(raw).startsWith('BA-')) return showClientError('请填写有效的 PayPal 链接或 BA Token');
+  if (requireOaics) {
+    const sourceCheckoutId = checkoutId(checkoutReference);
+    if (!sourceCheckoutId) return showClientError('DE/EUR OAICS 验证需要填写 Checkout ID 或 ChatGPT Checkout URL');
+    if (!sourceCheckoutId.toLowerCase().startsWith('oaics_')) {
+      return showClientError(`PayPal DE/EUR OAICS 模式要求 custom Checkout 返回 oaics_；当前为 ${sourceCheckoutId.slice(0, 24)}`);
+    }
+  }
   if (!/^\+?\d{8,20}$/.test(phone)) return showClientError('请填写有效手机号');
   if (country === 'BR' && !/^\+?55\d{8,15}$/.test(phone)) return showClientError('巴西 PayPal 请填写 +55 手机号');
   if (country === 'GB' && !/^\+?44\d{9,12}$/.test(phone)) return showClientError('英国 PayPal 请填写 +44 手机号');
@@ -638,6 +659,8 @@ $('protocolForm').addEventListener('submit', async (event) => {
   try {
     const data = await api('/jobs', {method:'POST', body:JSON.stringify({
       paypal_url: raw, phone, country, proxies, agreement_only: false,
+      require_oaics: requireOaics,
+      checkout_reference: requireOaics ? checkoutReference : '',
       buyer_mode: $('buyerMode').value,
     })});
     state.logPinned = true;

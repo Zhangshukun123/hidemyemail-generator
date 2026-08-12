@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$SshHost = "cac",
+    [string]$SshHost = "aliyun-ecs",
     [string]$RemoteDirectory = "/opt/icloud-code-server",
     [ValidateRange(1, 65535)]
     [int]$RemotePort = 18767,
@@ -34,6 +34,32 @@ function Get-RemoteServiceToken {
     return $token
 }
 
+function Get-InventoryLogin {
+    $username = [Environment]::GetEnvironmentVariable(
+        "HIDEMYEMAIL_WEB_USERNAME", "Process"
+    )
+    $password = [Environment]::GetEnvironmentVariable(
+        "HIDEMYEMAIL_WEB_PASSWORD", "Process"
+    )
+    if (-not $username) {
+        $username = [Environment]::GetEnvironmentVariable(
+            "HIDEMYEMAIL_INVENTORY_USERNAME", "User"
+        )
+    }
+    if (-not $password) {
+        $password = [Environment]::GetEnvironmentVariable(
+            "HIDEMYEMAIL_INVENTORY_PASSWORD", "User"
+        )
+    }
+    if (-not $username -or $username.Length -gt 200) {
+        throw "Configure HIDEMYEMAIL_INVENTORY_USERNAME before deploying."
+    }
+    if (-not $password -or $password.Length -lt 8 -or $password.Length -gt 1024) {
+        throw "Configure HIDEMYEMAIL_INVENTORY_PASSWORD (8-1024 characters) before deploying."
+    }
+    return [pscustomobject]@{ Username = $username; Password = $password }
+}
+
 $projectDirectory = Split-Path -Parent $PSScriptRoot
 $requiredFiles = @(
     "Dockerfile",
@@ -56,15 +82,18 @@ if ($RemoteDirectory -notmatch '^/[A-Za-z0-9._/-]+$') {
 }
 
 $token = Get-RemoteServiceToken
+$inventoryLogin = Get-InventoryLogin
 $tempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) (
     "icloud-code-server-" + [Guid]::NewGuid().ToString("N")
 )
 New-Item -ItemType Directory -Path $tempDirectory | Out-Null
 $envFile = Join-Path $tempDirectory ".env"
+$sourceArchive = Join-Path $tempDirectory "source.tar.gz"
 try {
     $envLines = @(
         "ACCOUNT_WORKBENCH_IMPORT_TOKEN=$token"
-        "HIDEMYEMAIL_WEB_PASSWORD=$token"
+        "HIDEMYEMAIL_WEB_USERNAME=$($inventoryLogin.Username)"
+        "HIDEMYEMAIL_WEB_PASSWORD=$($inventoryLogin.Password)"
         "HIDEMYEMAIL_INBOX_SYNC_INTERVAL=0"
         "HIDEMYEMAIL_REGION=china"
         "HIDEMYEMAIL_INVENTORY_SERVER=1"
@@ -99,17 +128,26 @@ try {
         "install -d -m 700 $quotedRemoteDirectory $quotedRemoteDirectory/data"
     )
 
-    Write-Host "Uploading server source (Git history and logs are excluded)..."
-    foreach ($name in $requiredFiles) {
-        Invoke-CheckedCommand -FilePath scp -ArgumentList @(
-            (Join-Path $projectDirectory $name),
-            "${SshHost}:$RemoteDirectory/$name"
-        )
-    }
+    Write-Host "Packing and uploading server source (Git history and logs are excluded)..."
+    Invoke-CheckedCommand -FilePath tar.exe -ArgumentList @(
+        "-czf",
+        $sourceArchive,
+        "-C",
+        $projectDirectory,
+        "Dockerfile",
+        "pyproject.toml",
+        "README.md",
+        "README.zh-CN.md",
+        "compose.code-server.yaml",
+        "src"
+    )
     Invoke-CheckedCommand -FilePath scp -ArgumentList @(
-        "-r",
-        (Join-Path $projectDirectory "src"),
-        "${SshHost}:$RemoteDirectory/"
+        $sourceArchive,
+        "${SshHost}:$RemoteDirectory/source.tar.gz"
+    )
+    Invoke-CheckedCommand -FilePath ssh -ArgumentList @(
+        $SshHost,
+        "cd $quotedRemoteDirectory && tar -xzf source.tar.gz && rm -f source.tar.gz"
     )
     Invoke-CheckedCommand -FilePath scp -ArgumentList @(
         $envFile,
@@ -136,6 +174,9 @@ try {
         "chmod 600 .env data/inbox_config.json data/cookies.txt data/hidemyemail.db 2>/dev/null || true"
         "docker compose -f compose.code-server.yaml up -d --build"
         "docker compose -f compose.code-server.yaml ps"
+        "curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 2 http://127.0.0.1:$RemotePort/healthz"
+        "sed -i '/^HIDEMYEMAIL_WEB_USERNAME=/d; /^HIDEMYEMAIL_WEB_PASSWORD=/d' .env"
+        "docker compose -f compose.code-server.yaml up -d --force-recreate"
         "curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 2 http://127.0.0.1:$RemotePort/healthz"
     ) -join "; "
     Write-Host "Building and starting the server service..."

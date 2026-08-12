@@ -106,6 +106,11 @@ def _wait_for_home_email_modal_transition(
             is not None
         ):
             log(f"[认证] {location_label}已提交，正在继续认证流程")
+            _registration_auth.mark_page_registration_milestone(
+                page,
+                "email_responded",
+                f"{location_label}已离开邮箱输入状态",
+            )
             return True
         now = time.monotonic()
         if now >= next_notice_at:
@@ -464,6 +469,21 @@ def configure_chatgpt_home_login_entry(
                     direct_auth_entry or preopened_home_modal
                 ) and email_input is not None:
                     clicked_home_login = True
+                    _registration_auth.skip_page_registration_step(
+                        page,
+                        "registration_clicked",
+                        "页面已直接进入邮箱输入状态，无需点击注册入口",
+                    )
+                    _registration_auth.begin_page_registration_step(
+                        page,
+                        "registration_entry_ready",
+                        "正在确认直接出现的邮箱输入界面",
+                    )
+                    _registration_auth.mark_page_registration_milestone(
+                        page,
+                        "registration_entry_ready",
+                        "页面已直接显示邮箱输入框",
+                    )
                     if direct_auth_entry:
                         self.log(
                             "[认证] ChatGPT 首页直接跳入登录或新注册页；"

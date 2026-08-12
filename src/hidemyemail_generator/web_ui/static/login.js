@@ -3,6 +3,7 @@
   const form = document.getElementById("loginForm");
   const submit = document.getElementById("submit");
   const notice = document.getElementById("notice");
+  const username = document.getElementById("username");
   const password = document.getElementById("password");
   const passwordToggle = document.getElementById("passwordToggle");
   const themeToggle = document.getElementById("themeToggle");
@@ -31,7 +32,7 @@
       const response = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: password.value }),
+        body: JSON.stringify({ username: username.value, password: password.value }),
       });
       const data = await response.json().catch(() => ({ ok: false, error: "服务响应无效" }));
       if (!response.ok || !data.ok) throw new Error(data.error || "登录失败");

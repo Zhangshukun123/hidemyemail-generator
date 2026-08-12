@@ -185,6 +185,39 @@ class GptEmailTests(unittest.TestCase):
             self.assertEqual(items[0]["email"], "352121354@qq.com")
             self.assertTrue(items[0]["hasPassword"])
 
+    def test_registered_session_is_not_pending_when_password_or_2fa_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "messages.db"
+            _save_account_record(
+                db_file,
+                "registered@icloud.com",
+                result={
+                    "access_token": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                            "sessionToken": "saved-session-token",
+                        }
+                    ),
+                },
+                password="GeneratedPassword!1",
+                password_confirmed=False,
+            )
+
+            item = _browser_email_items(db_file, [
+                {
+                    "hme": "registered@icloud.com",
+                    "anonymousId": "registered",
+                    "isActive": True,
+                }
+            ])[0]
+
+            self.assertTrue(item["registrationComplete"])
+            self.assertFalse(item["protocolReady"])
+            self.assertEqual(item["sessionStatus"], "ready")
+            self.assertFalse(item["hasPassword"])
+            self.assertFalse(item["hasTwoFactor"])
+
     def test_card_link_is_saved_and_exposed_on_account_item(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "messages.db"
@@ -770,7 +803,8 @@ class GptEmailTests(unittest.TestCase):
         )
         self.assertIn('id="cardLinkCreateProxy"', GPT_INDEX_HTML)
         self.assertIn('id="cardLinkPromotionProxy"', GPT_INDEX_HTML)
-        self.assertIn('method: hosted ? "ph_hosted" : "standard"', GPT_INDEX_HTML)
+        self.assertIn('deOaicsPayPal ? "de_oaics_paypal" : "standard"', GPT_INDEX_HTML)
+        self.assertIn('"de_oaics_paypal", "PayPal / 德国 · EUR', GPT_INDEX_HTML)
         self.assertIn("cardLinkExtractionModes", GPT_INDEX_HTML)
         self.assertIn("重新提取严格 0", GPT_INDEX_HTML)
         self.assertNotIn("ph_paypal", GPT_INDEX_HTML)

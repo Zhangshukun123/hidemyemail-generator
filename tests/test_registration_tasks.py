@@ -52,13 +52,20 @@ class FakeBrowserManager:
         return self.snapshot()
 
     def start(
-        self, accounts, *, headless, concurrency, use_registration_proxy=False
+        self,
+        accounts,
+        *,
+        headless,
+        concurrency,
+        use_registration_proxy=False,
+        browser_engine="camoufox",
     ):
         self.started_accounts = accounts
         self.start_options = {
             "headless": headless,
             "concurrency": concurrency,
             "use_registration_proxy": use_registration_proxy,
+            "browser_engine": browser_engine,
         }
         self.started_batches.append([dict(item) for item in accounts])
         self.start_options_history.append(dict(self.start_options))
@@ -131,7 +138,16 @@ class FakeRegistrationProcess:
             "finishedAt": "",
         }
 
-    def start(self, *, label, headless, concurrency, email, provider):
+    def start(
+        self,
+        *,
+        label,
+        headless,
+        concurrency,
+        email,
+        provider,
+        browser_engine="camoufox",
+    ):
         del label, headless
         process_id = f"process-{self.process_number}"
         self.state.update(
@@ -140,6 +156,7 @@ class FakeRegistrationProcess:
             running=True,
             phase="registering_openai",
             provider=provider,
+            browserEngine=browser_engine,
             email=email,
             emails=[email],
             requested=concurrency,
@@ -185,6 +202,39 @@ class FakeRegistrationProcess:
 
 
 class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_manager_allows_only_one_roxy_profile_task(self):
+        processes = []
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            max_processes=3,
+        )
+        state = coordinator.start(
+            label="roxy",
+            headless=True,
+            concurrency=4,
+            email="first@icloud.com",
+            provider="manual",
+            browser_engine="roxy",
+        )
+
+        self.assertEqual(state["tasks"][0]["browserEngine"], "roxy")
+        with self.assertRaisesRegex(RuntimeError, "Roxy 专用指纹环境正在注册"):
+            coordinator.start(
+                label="roxy second",
+                headless=False,
+                concurrency=1,
+                email="second@icloud.com",
+                provider="manual",
+                browser_engine="roxy",
+            )
+        await coordinator.stop()
+
     async def test_concurrent_manager_starts_next_process_while_previous_runs(self):
         processes = []
 
@@ -1002,6 +1052,66 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({item["password"] for item in browser.started_accounts}), 3)
         self.assertEqual(len(released), 3)
         self.assertIn("成功 3/3", snapshot["message"])
+
+    async def test_roxy_concurrency_five_claims_five_accounts(self):
+        browser = FakeBrowserManager()
+        inventory = [f"roxy-{index}@icloud.com" for index in range(1, 6)]
+
+        async def acquire(_label):
+            return inventory.pop(0) if inventory else ""
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=acquire,
+            confirm_email=lambda _email: asyncio.sleep(0),
+            release_email=lambda _email: asyncio.sleep(0),
+        )
+        state = manager.start(
+            label="Roxy 五并发注册",
+            headless=False,
+            concurrency=5,
+            browser_engine="roxy",
+        )
+        self.assertEqual(state["requested"], 5)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["claimed"], 5)
+        self.assertEqual(browser.start_options["concurrency"], 5)
+        self.assertEqual(browser.start_options["browser_engine"], "roxy")
+        self.assertEqual(len(browser.started_accounts), 5)
+
+    async def test_roxy_target_count_claims_all_accounts_but_keeps_five_windows(self):
+        browser = FakeBrowserManager()
+        inventory = [f"target-{index}@icloud.com" for index in range(1, 13)]
+
+        async def acquire(_label):
+            return inventory.pop(0) if inventory else ""
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=acquire,
+            confirm_email=lambda _email: asyncio.sleep(0),
+            release_email=lambda _email: asyncio.sleep(0),
+        )
+        state = manager.start(
+            label="Roxy 目标注册",
+            headless=True,
+            concurrency=5,
+            target_count=12,
+            browser_engine="roxy",
+        )
+        self.assertEqual(state["requested"], 12)
+        self.assertEqual(state["targetCount"], 12)
+        self.assertEqual(state["concurrency"], 5)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["claimed"], 12)
+        self.assertEqual(snapshot["effectiveConcurrency"], 5)
+        self.assertEqual(browser.start_options["concurrency"], 5)
+        self.assertEqual(len(browser.started_accounts), 12)
 
     async def test_inventory_shortage_uses_available_minimum(self):
         browser = FakeBrowserManager()

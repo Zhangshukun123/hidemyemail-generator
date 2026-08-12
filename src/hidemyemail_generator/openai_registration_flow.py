@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import time
 import types
 from datetime import datetime, timezone
@@ -906,7 +905,48 @@ def configure_email_verification_priority(worker) -> bool:
                 )
             finally:
                 self._hme_home_otp_submit_in_progress = False
-        return original_wait_after_otp_submit(page, timeout=timeout)
+        result = original_wait_after_otp_submit(page, timeout=timeout)
+
+        # ChatGPT's in-page registration dialog can move directly from the OTP
+        # control to the about-you form without changing the top-level URL.  The
+        # linked backend returns from its Session wait for that intermediate
+        # form, then treats the still-chatgpt.com URL as authenticated.  Finish
+        # the required profile step here and do not let the caller continue
+        # until the Session endpoint actually exposes an access token.
+        has_about_you_form = getattr(self, "_has_about_you_form", None)
+        fill_about_you = getattr(self, "_fill_about_you", None)
+        session_ready = (
+            bool(has_chatgpt_session(page))
+            if callable(has_chatgpt_session)
+            else False
+        )
+        about_you_ready = (
+            bool(has_about_you_form(page))
+            if callable(has_about_you_form)
+            else False
+        )
+        if session_ready or not about_you_ready:
+            return result
+        if not callable(fill_about_you):
+            raise RuntimeError(
+                "邮箱验证码已通过，但姓名/年龄资料页无法自动填写；尚未获得 Session"
+            )
+
+        self.log(
+            "[基础资料] 邮箱验证码已通过，检测到姓名/年龄页面；"
+            "完成资料并确认 Access Token 后才会判定注册成功"
+        )
+        fill_about_you(page)
+        if callable(has_chatgpt_session) and bool(has_chatgpt_session(page)):
+            return result
+
+        result = original_wait_after_otp_submit(page, timeout=timeout)
+        if callable(has_chatgpt_session) and bool(has_chatgpt_session(page)):
+            return result
+        raise RuntimeError(
+            "姓名/年龄资料已提交，但 Session 接口尚未返回 Access Token；"
+            "未将中间页面误判为注册成功"
+        )
 
     worker._has_visible_password = types.MethodType(
         has_password_outside_email_verification,
@@ -1053,7 +1093,7 @@ def configure_resilient_about_you_input(
         return True
     original_keyboard_fill = getattr(worker, "_fill_visible_input_by_keyboard", None)
     original_profile_fill = getattr(worker, "_fill_about_you_inputs", None)
-    original_profile_submit = getattr(worker, "_submit_about_you", None)
+    original_finish_click = getattr(worker, "_click_finish_creating_account", None)
     original_auth_ready = getattr(worker, "_wait_for_auth_page_ready", None)
     dom_profile_fill = getattr(worker, "_fill_about_you_inputs_by_dom", None)
     focus_submit = getattr(worker, "_focus_about_you_submit_or_body", None)
@@ -1168,43 +1208,58 @@ def configure_resilient_about_you_input(
             worker,
         )
     worker._fill_about_you_inputs = types.MethodType(profile_fill_with_readback, worker)
-    if callable(original_profile_submit):
+    if callable(original_finish_click):
+        finish_selectors = (
+            'button:has-text("Finish creating account")',
+            'button:has-text("Finalizar la creación de la cuenta")',
+            'button:has-text("Finalizar la creacion de la cuenta")',
+            'button:has-text("アカウントの作成を完了する")',
+            'button:has-text("作成を完了")',
+            'button:has-text("完成帐户创建")',
+            'button:has-text("完成账户创建")',
+            'button[type="submit"]:has-text("Finish")',
+            'button[type="submit"]:has-text("作成")',
+        )
 
-        def submit_profile_with_one_retry(self, page):
-            backend_module = sys.modules.get(
-                str(getattr(original_profile_submit, "__module__", "") or "")
-            )
-            timeout_name = "OPENAI_ABOUT_YOU_SUBMIT_RESPONSE_TIMEOUT_SECONDS"
-            original_timeout = (
-                getattr(backend_module, timeout_name, None)
-                if backend_module is not None
-                else None
-            )
-            try:
-                if backend_module is not None and original_timeout is not None:
-                    setattr(backend_module, timeout_name, min(30, original_timeout))
-                return original_profile_submit(page)
-            except RuntimeError as error:
-                if "基础资料按钮点击后" not in str(error):
-                    raise
-            finally:
-                if backend_module is not None and original_timeout is not None:
-                    setattr(backend_module, timeout_name, original_timeout)
-
-            self.log(
-                "[基础资料] 第一次提交 30 秒后页面仍未跳转；"
-                "确认仍在当前表单，重新激活后台标签并只重试一次"
-            )
+        def click_finish_after_stable_form(self, page):
             activate_page(self, page)
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=5000)
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
             except Exception:
                 pass
-            _page_wait(page, 1000)
-            return original_profile_submit(page)
+            values_are_valid = getattr(self, "_about_you_current_values_ok", None)
+            deadline = time.monotonic() + 20.0
+            stable_checks = 0
+            while time.monotonic() < deadline:
+                values_ok = (
+                    bool(values_are_valid(page))
+                    if callable(values_are_valid)
+                    else True
+                )
+                button_metrics = _control_metrics(
+                    page,
+                    finish_selectors,
+                    require_editable=False,
+                )
+                stable_checks = (
+                    stable_checks + 1
+                    if values_ok and bool(button_metrics["actionable"])
+                    else 0
+                )
+                if stable_checks >= 6:
+                    self.log(
+                        "[基础资料] 姓名/年龄值与完成按钮已连续稳定约 2 秒；"
+                        "现在只执行一次正常点击"
+                    )
+                    return original_finish_click(page)
+                _page_wait(page, 400)
+            raise RuntimeError(
+                "基础资料值或完成按钮在 20 秒内未连续稳定；"
+                "为避免过早提交，本次未点击完成按钮"
+            )
 
-        worker._submit_about_you = types.MethodType(
-            submit_profile_with_one_retry,
+        worker._click_finish_creating_account = types.MethodType(
+            click_finish_after_stable_form,
             worker,
         )
     worker._hme_about_you_input_configured = True
@@ -1344,6 +1399,10 @@ def configure_email_password_only_registration(
             submit_diagnostic_message=(
                 "已点击注册继续；注册流程未按 Enter，且不会匹配登录按钮"
             ),
+        )
+        self.log(
+            "[认证] 注册邮箱已提交；正在等待验证码或姓名/年龄页面加载，"
+            "期间不会重复点击，也不会匹配登录按钮"
         )
         if _is_google_account_url(str(getattr(page, "url", "") or "")):
             require_fresh_fingerprint_after_google_oauth(self, page)

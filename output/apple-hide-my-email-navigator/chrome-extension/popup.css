@@ -57,6 +57,72 @@ button:hover {
   background: #0077ed;
 }
 
+.batch-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+  color: #3a3a3c;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.batch-field input {
+  width: 76px;
+  box-sizing: border-box;
+  padding: 8px 9px;
+  border: 1px solid #c7c7cc;
+  border-radius: 8px;
+  background: white;
+  color: #1d1d1f;
+  font: inherit;
+  text-align: center;
+}
+
+.batch-field input:disabled {
+  opacity: 0.65;
+}
+
+.actions {
+  display: grid;
+  gap: 8px;
+}
+
+button:disabled {
+  background: #86868b;
+  cursor: default;
+}
+
+button.secondary {
+  background: #d70015;
+}
+
+button.secondary:hover {
+  background: #e2182c;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.status {
+  display: none;
+  margin: 0 0 12px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: rgb(0 113 227 / 10%);
+  color: #0058a8;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.status:not(:empty) { display: block; }
+.status.success { background: rgb(36 138 61 / 12%); color: #17692d; }
+.status.warning { background: rgb(180 104 0 / 12%); color: #8a4f00; }
+.status.error { background: rgb(215 0 21 / 10%); color: #a40012; }
+
 small {
   display: block;
   margin-top: 11px;
@@ -67,4 +133,10 @@ small {
 @media (prefers-color-scheme: dark) {
   body { background: #1c1c1e; color: #f5f5f7; }
   p, small { color: #aeaeb2; }
+  .status { color: #64b5ff; }
+  .status.success { color: #6bd383; }
+  .status.warning { color: #ffbd66; }
+  .status.error { color: #ff7b88; }
+  .batch-field { color: #f5f5f7; }
+  .batch-field input { border-color: #555; background: #2c2c2e; color: #f5f5f7; }
 }

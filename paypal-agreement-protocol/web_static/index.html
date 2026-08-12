@@ -98,6 +98,18 @@
           <span class="field-note">任务仅使用当前提交的 BA Token，不关联提链任务。</span>
         </label>
 
+        <section class="oaics-validation-panel" aria-labelledby="oaicsValidationTitle">
+          <label class="oaics-validation-toggle">
+            <input id="requireOaics" type="checkbox">
+            <span><b id="oaicsValidationTitle">验证 DE/EUR OAICS Checkout</b><small>启动 PP 任务前拒绝 cs_live_ / cs_ hosted Checkout</small></span>
+          </label>
+          <label id="oaicsCheckoutField" class="field" hidden>
+            <span class="label-row"><b>来源 Checkout</b><small>必填</small></span>
+            <input id="oaicsCheckout" autocomplete="off" spellcheck="false" placeholder="oaics_... 或 https://chatgpt.com/checkout/.../oaics_...">
+            <span class="field-note">校验只确认 custom Checkout 为 oaics_；完整 Checkout ID 不写入任务结果。</span>
+          </label>
+        </section>
+
         <div id="legacyCountryFields" class="two-cols protocol-country-row">
           <label class="field">
             <span class="label-row"><b>PayPal 国家</b><small>决定注册资料与地址</small></span>
@@ -217,6 +229,6 @@
   <footer><span>PAY.153.INK / PAYPAL</span><p>协议支付任务与提链任务彼此独立；验证码等待期间可随时停止。</p></footer>
   <script src="https://js.braintreegateway.com/web/3.125.0/js/client.min.js"></script>
   <script src="https://js.braintreegateway.com/web/3.125.0/js/paypal-checkout.min.js"></script>
-  <script src="/paypal-pay/static/app.js?v=20260724-success-history01"></script>
+  <script src="/paypal-pay/static/app.js?v=20260812-oaics-validation01"></script>
 </body>
 </html>

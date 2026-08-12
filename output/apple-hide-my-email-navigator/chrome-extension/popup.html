@@ -3,16 +3,24 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Apple 隐藏邮件地址导航器</title>
+    <title>Apple Hide My Email Inventory</title>
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
     <main>
-      <div class="icon" aria-hidden="true">✉</div>
-      <h1>隐藏邮件地址导航器</h1>
-      <p>打开 Apple 账户页面后，扩展会自动点击“隐私”，再点击“隐藏邮件地址”。</p>
-      <button id="open-page" type="button">打开 Apple 账户页面</button>
-      <small>如果 Apple 要求登录，请登录后停留在账户管理页。</small>
+      <div class="icon" aria-hidden="true">&#9993;</div>
+      <h1>&#38544;&#34255;&#37038;&#31665;&#25209;&#37327;&#33258;&#21160;&#20837;&#24211;</h1>
+      <p id="description">&#35774;&#32622;&#25968;&#37327;&#21518;&#65292;&#25193;&#23637;&#20250;&#36880;&#20010;&#21019;&#24314; Apple &#38544;&#34255;&#37038;&#31665;&#24182;&#21152;&#20837;&#26381;&#21153;&#22120;&#26410;&#27880;&#20876;&#24211;&#23384;&#12290;</p>
+      <label class="batch-field" for="batch-count">
+        <span>&#26412;&#27425;&#21019;&#24314;&#25968;&#37327;</span>
+        <input id="batch-count" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
+      </label>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+      <div class="actions">
+        <button id="open-page" type="button">&#24320;&#22987;&#25209;&#37327;&#21019;&#24314;&#24182;&#20837;&#24211;</button>
+        <button id="stop-task" class="secondary" type="button" hidden>&#20572;&#27490;&#20219;&#21153;</button>
+      </div>
+      <small id="hint">&#25968;&#37327;&#33539;&#22260; 1&#8211;100&#12290;&#22914;&#26524; Apple &#35201;&#27714;&#23494;&#30721;&#65292;&#35831;&#22312;&#36134;&#25143;&#39029;&#38754;&#25163;&#21160;&#23436;&#25104;&#12290;</small>
     </main>
     <script src="popup.js"></script>
   </body>

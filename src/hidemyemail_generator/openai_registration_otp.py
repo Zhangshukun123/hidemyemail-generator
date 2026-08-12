@@ -72,6 +72,18 @@ EMAIL_VERIFICATION_UI_MARKERS = {
     ),
 }
 
+# Forwarded iCloud messages can carry a provider timestamp a few seconds
+# earlier than the browser observes the OTP page.  The server still clamps the
+# request to the active task start, so this tolerance cannot select an older
+# registration run's code.
+ICLOUD_CODE_TIMESTAMP_SKEW_SECONDS = 30.0
+
+
+def _icloud_code_since(min_timestamp: float) -> str:
+    return iso_timestamp(
+        max(0.0, float(min_timestamp or 0) - ICLOUD_CODE_TIMESTAMP_SKEW_SECONDS)
+    )
+
 
 def _email_verification_ui_state(
     page,
@@ -169,7 +181,7 @@ class ManualOtpReader:
                         headers={"X-Local-Token": self.token},
                         json={
                             "email": self.email,
-                            "since": iso_timestamp(float(_min_timestamp or 0)),
+                            "since": _icloud_code_since(_min_timestamp),
                         },
                         timeout=10,
                     )

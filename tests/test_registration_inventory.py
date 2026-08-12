@@ -5,8 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aiohttp
 from aiohttp.test_utils import TestClient, TestServer
 
+from hidemyemail_generator.browser_tasks import _save_account_record
 from hidemyemail_generator.inbox import connect_db, upsert_address
 from hidemyemail_generator.registration_inventory import (
     available_generated_inventory_count,
@@ -17,11 +19,93 @@ from hidemyemail_generator.registration_inventory import (
     registration_inventory_status,
     release_generated_inventory_email,
 )
-from hidemyemail_generator.registration_inventory_client import INVENTORY_STATUS_PATH
+from hidemyemail_generator.registration_inventory_auth import (
+    INVENTORY_AUTH_SETTING_KEY,
+    InventoryCredentialStore,
+)
+from hidemyemail_generator.registration_inventory_client import (
+    INVENTORY_LOGIN_PATH,
+    INVENTORY_STATUS_PATH,
+    INVENTORY_SYNC_PATH,
+    RemoteRegistrationInventoryClient,
+)
+from hidemyemail_generator.registration_inventory_sync import (
+    export_inventory_records,
+    import_inventory_records,
+)
 from hidemyemail_generator.webapp import create_app
 
 
 class RegistrationInventoryTests(unittest.TestCase):
+    def test_inventory_login_password_is_stored_as_salted_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            store = InventoryCredentialStore(db_file)
+
+            store.configure("inventory-user", "strong-test-password")
+
+            self.assertTrue(store.configured)
+            self.assertTrue(store.verify("inventory-user", "strong-test-password"))
+            self.assertFalse(store.verify("inventory-user", "wrong-password"))
+            self.assertFalse(store.verify("wrong-user", "strong-test-password"))
+            conn = connect_db(str(db_file))
+            try:
+                stored = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    (INVENTORY_AUTH_SETTING_KEY,),
+                ).fetchone()["value"]
+            finally:
+                conn.close()
+            self.assertNotIn("strong-test-password", stored)
+            self.assertIn('"scheme":"scrypt-v1"', stored)
+
+    def test_complete_record_round_trip_preserves_all_address_and_account_fields(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source_db = Path(source_dir) / "source.db"
+            target_db = Path(target_dir) / "target.db"
+            conn = connect_db(str(source_db))
+            try:
+                upsert_address(
+                    conn,
+                    "complete@icloud.com",
+                    label="完整标签",
+                    state="unused",
+                    source="generated",
+                    note="完整备注",
+                    is_active=False,
+                    batch_id="batch-all-fields",
+                    created_at="2026-08-01T01:02:03+00:00",
+                )
+                conn.execute(
+                    "UPDATE addresses SET updated_at = ? WHERE email = ?",
+                    ("2026-08-02T04:05:06+00:00", "complete@icloud.com"),
+                )
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:complete@icloud.com",
+                        json.dumps(
+                            {
+                                "email": "complete@icloud.com",
+                                "password": "saved-password",
+                                "password_confirmed": False,
+                                "custom_property": {"nested": [1, 2, 3]},
+                                "updated_at": "2026-08-02T04:05:06+00:00",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            records = export_inventory_records(source_db)
+            result = import_inventory_records(target_db, records)
+
+            self.assertEqual(result, {"records": 1, "addresses": 1, "accounts": 1})
+            self.assertEqual(export_inventory_records(target_db), records)
+
     def test_claims_only_oldest_generated_unused_address(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"
@@ -283,6 +367,209 @@ class RegistrationInventoryTests(unittest.TestCase):
 
 
 class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_loopback_inventory_client_is_automatically_upgraded_to_https(self):
+        client = RemoteRegistrationInventoryClient(
+            service_url="http://inventory.example.com",
+            token="test-token",
+        )
+
+        self.assertEqual(client.service_url, "https://inventory.example.com")
+        self.assertEqual(client.configuration_error, "")
+
+    async def test_inventory_client_adds_https_when_scheme_is_omitted(self):
+        client = RemoteRegistrationInventoryClient(
+            service_url="inventory.example.com",
+            token="test-token",
+        )
+
+        self.assertEqual(client.service_url, "https://inventory.example.com")
+        self.assertEqual(client.configuration_error, "")
+
+    async def test_inventory_client_retries_connector_error_before_request_is_sent(self):
+        client = RemoteRegistrationInventoryClient(
+            service_url="https://inventory.example.com",
+            token="test-token",
+            connect_retry_delays=(0, 0),
+        )
+        calls = 0
+
+        async def fake_send_once(method, path, *, payload=None, headers=None):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise aiohttp.ClientConnectorError(None, OSError("temporary failure"))
+            return 200, {"ok": True, "available": 1}
+
+        client._send_once = fake_send_once
+
+        status = await client.status()
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(calls, 3)
+
+    async def test_account_login_allows_sync_lease_and_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(
+                base_dir=Path(temp_dir),
+                inventory_server_enabled=True,
+                web_username="inventory-user",
+                web_password="strong-test-password",
+                workbench_import_token="legacy-token-at-least-32-characters",
+            )
+            server = TestServer(app)
+            http = TestClient(server)
+            await http.start_server()
+            remote = RemoteRegistrationInventoryClient(
+                service_url=str(server.make_url("/")).rstrip("/"),
+                username="inventory-user",
+                password="strong-test-password",
+            )
+            try:
+                unauthenticated = await http.get(INVENTORY_STATUS_PATH)
+                legacy = await http.get(
+                    INVENTORY_STATUS_PATH,
+                    headers={
+                        "X-HME-Import-Token": "legacy-token-at-least-32-characters"
+                    },
+                )
+                bad_login = await http.post(
+                    INVENTORY_LOGIN_PATH,
+                    json={"username": "inventory-user", "password": "wrong-password"},
+                )
+                sync_result = await remote.sync_records(
+                    [
+                        {
+                            "email": "account-login@icloud.com",
+                            "address": {
+                                "email": "account-login@icloud.com",
+                                "state": "unused",
+                                "source": "generated",
+                            },
+                            "account": {
+                                "email": "account-login@icloud.com",
+                                "custom": {"preserved": True},
+                            },
+                        }
+                    ]
+                )
+                leased_email = await remote.acquire_email("account login")
+                leased_record = remote.leased_record(leased_email)
+                await remote.complete_email(
+                    leased_email,
+                    True,
+                    "registered",
+                    record={
+                        **leased_record,
+                        "account": {
+                            **leased_record["account"],
+                            "password_confirmed": True,
+                        },
+                    },
+                )
+                app["inventory_access_tokens"].clear()
+                status_after_token_expiry = await remote.status()
+            finally:
+                await http.close()
+
+            self.assertEqual(unauthenticated.status, 401)
+            self.assertEqual(legacy.status, 401)
+            self.assertEqual(bad_login.status, 401)
+            self.assertEqual(sync_result["records"], 1)
+            self.assertEqual(leased_email, "account-login@icloud.com")
+            self.assertTrue(leased_record["account"]["custom"]["preserved"])
+            self.assertTrue(status_after_token_expiry["ok"])
+            exported = export_inventory_records(app["db_file"])
+            self.assertEqual(exported[0]["address"]["state"], "used")
+            self.assertTrue(exported[0]["account"]["password_confirmed"])
+
+    async def test_sync_api_and_lease_round_trip_complete_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token = "test-token-at-least-32-characters-long"
+            app = create_app(
+                base_dir=Path(temp_dir),
+                inventory_server_enabled=True,
+                workbench_import_token=token,
+                web_password="admin-password",
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            headers = {"X-HME-Import-Token": token}
+            address = {
+                "email": "sync-api@icloud.com",
+                "label": "远程完整属性",
+                "state": "unused",
+                "source": "generated",
+                "note": "同步备注",
+                "is_active": 0,
+                "batch_id": "server-batch",
+                "created_at": "2026-08-01T01:00:00+00:00",
+                "updated_at": "2026-08-02T02:00:00+00:00",
+            }
+            try:
+                synced = await client.post(
+                    INVENTORY_SYNC_PATH,
+                    json={
+                        "schemaVersion": 1,
+                        "records": [
+                            {
+                                "email": address["email"],
+                                "address": address,
+                                "account": {
+                                    "email": address["email"],
+                                    "password": "reserved-password",
+                                    "password_confirmed": False,
+                                    "custom": {"keep": True},
+                                },
+                            }
+                        ],
+                    },
+                    headers=headers,
+                )
+                sync_payload = await synced.json()
+                leased = await client.post(
+                    "/api/integrations/registration-inventory/lease",
+                    json={"clientId": "test-client", "label": "round trip"},
+                    headers=headers,
+                )
+                lease_payload = await leased.json()
+                completed_account = {
+                    **lease_payload["lease"]["record"]["account"],
+                    "password_confirmed": True,
+                    "access_token": "complete-token",
+                    "session": {"accessToken": "complete-token"},
+                    "cookies": [{"name": "session", "value": "cookie-value"}],
+                    "two_factor": {"enabled": True, "secret": "TOTP-SECRET"},
+                }
+                completed = await client.post(
+                    "/api/integrations/registration-inventory/result",
+                    json={
+                        "leaseId": lease_payload["lease"]["leaseId"],
+                        "email": address["email"],
+                        "success": True,
+                        "message": "registered",
+                        "record": {
+                            "email": address["email"],
+                            "address": address,
+                            "account": completed_account,
+                        },
+                    },
+                    headers=headers,
+                )
+            finally:
+                await client.close()
+
+            self.assertEqual(synced.status, 200)
+            self.assertEqual(sync_payload["accounts"], 1)
+            self.assertEqual(leased.status, 200)
+            self.assertEqual(lease_payload["lease"]["record"]["address"], address)
+            self.assertEqual(completed.status, 200)
+            exported = export_inventory_records(app["db_file"])
+            self.assertEqual(exported[0]["address"]["state"], "used")
+            self.assertEqual(exported[0]["account"]["access_token"], "complete-token")
+            self.assertEqual(
+                exported[0]["account"]["two_factor"]["secret"], "TOTP-SECRET"
+            )
+
     async def test_webapp_registration_manager_acquires_from_remote_inventory(self):
         with tempfile.TemporaryDirectory() as remote_dir, tempfile.TemporaryDirectory() as local_dir:
             token = "test-token-at-least-32-characters-long"
@@ -313,6 +600,28 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
                 email = await local_app["registration_manager"].acquire_email(
                     "remote test"
                 )
+                local_record = export_inventory_records(
+                    local_app["db_file"], emails=[email]
+                )[0]
+                _save_account_record(
+                    local_app["db_file"],
+                    email,
+                    result={
+                        "access_token": "registered-access-token",
+                        "session_json": json.dumps(
+                            {
+                                "accessToken": "registered-access-token",
+                                "account": {"planType": "free"},
+                            }
+                        ),
+                        "cookies_json": json.dumps(
+                            [{"name": "session", "value": "registered-cookie"}]
+                        ),
+                    },
+                    password="registered-password",
+                    password_confirmed=True,
+                    two_factor={"enabled": True, "secret": "REGISTERED-TOTP"},
+                )
                 await local_app["registration_manager"].complete_email(
                     email, True, "registration succeeded"
                 )
@@ -320,6 +629,7 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
                 await remote_server.close()
 
             self.assertEqual(email, "inventory@icloud.com")
+            self.assertEqual(local_record["address"]["source"], "generated")
             conn = connect_db(str(remote_app["db_file"]))
             try:
                 self.assertEqual(
@@ -328,8 +638,20 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone()["state"],
                     "used",
                 )
+                saved_account = json.loads(
+                    conn.execute(
+                        "SELECT value FROM settings WHERE key = ?",
+                        (f"gpt_account:{email}",),
+                    ).fetchone()["value"]
+                )
             finally:
                 conn.close()
+            self.assertEqual(
+                saved_account["access_token"], "registered-access-token"
+            )
+            self.assertEqual(
+                saved_account["two_factor"]["secret"], "REGISTERED-TOTP"
+            )
 
     async def test_completed_local_account_is_removed_from_remote_inventory(self):
         with tempfile.TemporaryDirectory() as remote_dir, tempfile.TemporaryDirectory() as local_dir:

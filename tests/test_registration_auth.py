@@ -353,6 +353,7 @@ class RegistrationAuthTests(unittest.TestCase):
                 "Control+V",
                 ("wait", 250),
                 ("clipboard", ""),
+                ("wait", 2000),
                 "activate",
                 "Enter",
                 ("wait", 500),

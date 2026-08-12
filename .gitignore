@@ -2,6 +2,7 @@
 .env
 venv/
 .venv/
+**/node_modules/
 .build/
 .swiftpm/
 .cookie-browser-profile/

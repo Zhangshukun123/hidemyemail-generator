@@ -13,6 +13,8 @@ try:
     from . import openai_registration_flow as _registration_flow
     from . import openai_registration_navigation as _registration_navigation
     from . import openai_registration_otp as _registration_otp
+    from . import openai_registration_state as _registration_state
+    from . import registration_activity as _registration_activity
     from .browser_diagnostics import (  # noqa: F401 - CLI service exports
         BrowserDiagnosticCode,
         emit_browser_diagnostic,
@@ -34,6 +36,7 @@ try:
         enable_totp_mfa,
         generate_totp,
     )
+    from .roxy_registration import RoxyRegistrationBrowser  # noqa: F401
 except ImportError:
     import openai_account_security as _account_security
     import openai_bridge_runtime as _runtime
@@ -42,6 +45,8 @@ except ImportError:
     import openai_registration_flow as _registration_flow
     import openai_registration_navigation as _registration_navigation
     import openai_registration_otp as _registration_otp
+    import openai_registration_state as _registration_state
+    import registration_activity as _registration_activity
     from browser_diagnostics import (  # noqa: F401 - CLI service exports
         BrowserDiagnosticCode,
         emit_browser_diagnostic,
@@ -63,6 +68,7 @@ except ImportError:
         enable_totp_mfa,
         generate_totp,
     )
+    from roxy_registration import RoxyRegistrationBrowser  # noqa: F401
 
 
 # Public selector/configuration compatibility exports.
@@ -190,6 +196,19 @@ configure_password_first_login = _registration_flow.configure_password_first_log
 configure_password_readiness_diagnostics = (
     _registration_flow.configure_password_readiness_diagnostics
 )
+recognize_registration_page = _registration_state.recognize_registration_page
+configure_registration_state_recognition = (
+    _registration_state.configure_registration_state_recognition
+)
+configure_request_driven_registration = (
+    _registration_activity.configure_request_driven_registration
+)
+registration_chain_snapshot = _registration_activity.registration_chain_snapshot
+begin_registration_step = _registration_activity.begin_registration_step
+skip_registration_step = _registration_activity.skip_registration_step
+mark_registration_chain = _registration_activity.mark_registration_chain
+finalize_registration_chain = _registration_activity.finalize_registration_chain
+fail_registration_chain = _registration_activity.fail_registration_chain
 configure_email_verification_priority = (
     _registration_flow.configure_email_verification_priority
 )
@@ -473,7 +492,7 @@ def ensure_tkinter_importable() -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="iCloud OpenAI Camoufox bridge")
+    parser = argparse.ArgumentParser(description="iCloud OpenAI browser bridge")
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--email", required=True)
     parser.add_argument("--headless", action="store_true")
@@ -488,11 +507,11 @@ def require_registration_proxy_country(health, expected_country: str) -> str:
             f"注册代理出口国家不符：要求 {expected}，实际 {actual or '未知'}；已拒绝直连或跨区注册"
         )
     chatgpt_status = int(getattr(health, "chatgpt_status", 0) or 0)
-    if chatgpt_status != 200:
+    if chatgpt_status not in {200, 403}:
         status_label = str(chatgpt_status) if chatgpt_status else "未知"
         raise RuntimeError(
             "注册代理访问 ChatGPT 不可用："
-            f"HTTP {status_label}；注册仅接受 HTTP 200，已拒绝受限或未验证的出口"
+            f"HTTP {status_label}；代理探测未确认出口可达"
         )
     return actual
 

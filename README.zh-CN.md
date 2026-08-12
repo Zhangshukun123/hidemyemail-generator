@@ -376,15 +376,18 @@ cookies.txt.bak
 - 有效 Access Token 自动跳过，过期 Token 自动重新获取；
 - 支持单个邮箱和全部邮箱、1–10 并发、可见或无头 Camoufox；
 - 只接受本次认证开始后、与目标隐藏邮箱匹配的 OpenAI 验证码；
-- 一键注册不再在本机定时生成邮箱；每次注册都从远端 iCloud 服务领取库存邮箱；
+- 一键注册不再在本机定时生成邮箱；每次注册都从远端 iCloud 服务领取包含完整属性的库存邮箱；
 - 邮箱账号页可设置 SMSBower API Key，按最高价自动购买真实 `@gmail.com` 激活，
   使用 OpenAI 服务代码 `dr` 自动轮询邮件验证码；成功注册后，本机会保留激活 ID 最多
   24 小时并请求继续接收下一封验证码。SMSBower 获取邮箱接口不支持指定有效时长，
   因而 24 小时是本机复用上限，不是服务商保证；服务商若提前终止激活会立即标记失效；
 - 远端每个整点尝试生成 5 个库存邮箱，领取后锁定 10 分钟；每个邮箱只会被自动领取
   一次，成功标记为 `used`，失败、取消或超时则标记为 `trash` 并永久退出自动库存；
-- 成功后把 OpenAI 密码、Session、Access Token 和浏览器 storage state 保存在
-  `hidemyemail.db` 的本地设置表中；敏感结果不会写入任务日志；
+- 本地现有邮箱的全部地址属性和账号属性会通过 HTTPS 分批上传到远端；领取时把完整
+  记录拉回本机，注册成功后立即同步 OpenAI 密码、Session、Access Token、Cookie、
+  storage state、2FA 和其他账号属性；敏感结果不会写入任务日志；
+- 远端库存使用账号密码登录，服务器 SQLite 只保存 `scrypt` 加盐哈希；登录成功后签发
+  12 小时临时令牌，令牌在服务器重启或过期后由本地客户端自动重新登录；
 - 可以在网页中停止当前任务。真实浏览器任务不会在测试或服务启动时自动执行。
 
 Windows 本地会依次查找以下同级目录：
@@ -412,8 +415,11 @@ OPENAI_REGISTER_PYTHON=D:\path\to\openai-register-project\.venv\Scripts\python.e
 返回 Session 后会继续确认至少 12 位密码，并创建、验证及激活 TOTP 2FA。只有
 Session、密码和 2FA 三项均完成时，账号才显示“协议注册完成（密码+2FA）”。
 
-协议内核默认从同级目录 `gptfree-register` 或 `D:\AI\gptfree-register` 加载；也可用
-`GPTFREE_REGISTER_ROOT` 和 `GPTFREE_REGISTER_PYTHON` 指定内核目录与 Python 运行时。
+协议内核已作为当前项目的内置模块放在
+`src/hidemyemail_generator/vendor/gptfree_register`，默认随工作台直接加载。需要调试其他
+版本时，仍可用 `GPTFREE_REGISTER_ROOT` 和 `GPTFREE_REGISTER_PYTHON` 覆盖内核目录与
+Python 运行时。项目依赖已包含 `curl-cffi`；`start-web-ui.ps1` 首次启动时会根据内置
+`package-lock.json` 自动安装 Sentinel 所需的 `jsdom`。
 
 ### 一键验证与账号分类
 
@@ -435,13 +441,18 @@ Session、密码和 2FA 三项均完成时，账号才显示“协议注册完�
 | `HIDEMYEMAIL_BROWSER_SERVICE_URL` | URL | 浏览器工作器回调本服务读取 iCloud 验证码的本机地址。 |
 | `HIDEMYEMAIL_FORCE_BROWSER_HEADLESS` | `0`, `1` | 设为 `1` 时强制所有浏览器任务使用无头模式。 |
 | `HIDEMYEMAIL_INVENTORY_URL` | URL | 远端 iCloud 邮箱库存服务地址。 |
-| `HIDEMYEMAIL_INVENTORY_TOKEN` | 令牌 | 领取邮箱和提交注册回执使用的共享令牌。 |
+| `HIDEMYEMAIL_INVENTORY_USERNAME` | 账号 | 登录远端库存服务的账号。 |
+| `HIDEMYEMAIL_INVENTORY_PASSWORD` | 密码 | 登录远端库存服务的密码；只保存在客户端环境配置中。 |
+| `HIDEMYEMAIL_INVENTORY_TOKEN` | 令牌 | 旧版共享令牌兼容项；配置账号密码后不再使用。 |
+| `HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS` | 秒数 | 完整邮箱和账号记录的补偿同步间隔，默认 `300` 秒。 |
 | `SMSBOWER_API_KEY` | 令牌 | 可选的 SMSBower API Key；也可在邮箱账号页点击「SMSBower API」保存在本地数据库。 |
 | `SMSBOWER_MAIL_SERVICE` | 服务代码 | SMSBower 邮件服务代码，OpenAI (ChatGPT) 默认为 `dr`。 |
 | `SMSBOWER_MAX_PRICE` | 美元 | 单个 Gmail 激活的最高价，默认 `0.05`。 |
 | `ACCOUNT_WORKBENCH_IMPORT_TOKEN` | 令牌 | 仅用于本地 OpenAI 账户工作台导入；必须与工作台 `.env` 的 `HME_IMPORT_TOKEN` 相同。 |
 | `HIDEMYEMAIL_REMOTE_TOKEN` | 令牌 | 仅供部署脚本和手动访问远端验证码服务使用。 |
 | `HIDEMYEMAIL_INVENTORY_SERVER` | `0`, `1` | 仅在后台服务设为 `1`，启用定时库存生成和租约 API。 |
+| `HIDEMYEMAIL_WEB_USERNAME` | 账号 | 首次启动服务器时配置登录账号；账号和密码验证信息写入 SQLite。 |
+| `HIDEMYEMAIL_WEB_PASSWORD` | 密码 | 首次启动服务器时用于生成加盐哈希；不应提交到仓库。 |
 | `HIDEMYEMAIL_INVENTORY_LEASE_SECONDS` | 秒数 | 邮箱领取锁定时间，默认 `600` 秒。 |
 | `HIDEMYEMAIL_INVENTORY_BATCH_SIZE` | 数量 | 后台每轮生成数量，默认 `5`。 |
 | `HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS` | 秒数 | 后台生成间隔，默认 `3600` 秒；该值为 `3600` 时对齐到每个整点。 |

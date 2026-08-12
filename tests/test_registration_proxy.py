@@ -11,10 +11,34 @@ from hidemyemail_generator.registration_proxy import (
     parse_proxy_credential,
 )
 from hidemyemail_generator.clash_proxy import ClashRotationResult
-from hidemyemail_generator.webapp import create_app
+from hidemyemail_generator.webapp import (
+    _chatgpt_proxy_status_reachable,
+    _registration_proxy_test_error,
+    create_app,
+)
+from aiohttp import ClientHttpProxyError
 
 
 class RegistrationProxyStoreTests(unittest.TestCase):
+    def test_chatgpt_403_still_proves_proxy_destination_is_reachable(self):
+        self.assertTrue(_chatgpt_proxy_status_reachable(200))
+        self.assertTrue(_chatgpt_proxy_status_reachable(403))
+        self.assertFalse(_chatgpt_proxy_status_reachable(0))
+        self.assertFalse(_chatgpt_proxy_status_reachable(502))
+
+    def test_proxy_http_tunnel_error_has_actionable_safe_message(self):
+        error = ClientHttpProxyError(
+            request_info=None,
+            history=(),
+            status=407,
+            message="Proxy Authentication Required",
+        )
+
+        detail = _registration_proxy_test_error(error)
+
+        self.assertIn("代理网关拒绝 HTTPS 连接", detail)
+        self.assertNotIn("Proxy Authentication Required", detail)
+
     def test_replaces_supplied_country_and_sid_with_a_fresh_selected_session(self):
         credential = (
             "proxy.example:3010:customer-region-BR-sid-AbCd1234-t-5:local-secret"
@@ -48,6 +72,35 @@ class RegistrationProxyStoreTests(unittest.TestCase):
         self.assertNotEqual(first_username, second_username)
         self.assertEqual(unquote(first.password or ""), "local-secret")
 
+    def test_kookeey_builds_country_session_and_duration_in_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RegistrationProxyStore(Path(temp_dir) / "hme.db")
+            public = store.configure(
+                enabled=True,
+                mode="kookeey",
+                country="BR",
+                proxy_endpoint="gate.kookeey.info:1000",
+                proxy_username="1234567-AbCdEf1234",
+                proxy_password="secret-global-OldSid01-5m",
+            )
+            first_url, _ = store.next_proxy()
+            second_url, _ = store.next_proxy()
+
+        first = urlsplit(first_url)
+        second = urlsplit(second_url)
+        first_password = unquote(first.password or "")
+        second_password = unquote(second.password or "")
+
+        self.assertEqual(public["mode"], "kookeey")
+        self.assertEqual(public["country"], "BR")
+        self.assertEqual(public["dynamicEndpoint"], "gate.kookeey.info:1000")
+        self.assertTrue(public["usernameConfigured"])
+        self.assertTrue(public["passwordConfigured"])
+        self.assertEqual(unquote(first.username or ""), "1234567-AbCdEf1234")
+        self.assertRegex(first_password, r"^secret-BR-[A-Za-z0-9]{8}-5m$")
+        self.assertRegex(second_password, r"^secret-BR-[A-Za-z0-9]{8}-5m$")
+        self.assertNotEqual(first_password, second_password)
+
     def test_public_state_never_returns_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = RegistrationProxyStore(Path(temp_dir) / "hme.db")
@@ -66,6 +119,52 @@ class RegistrationProxyStoreTests(unittest.TestCase):
             disabled = store.configure(enabled=False, country="JP")
             self.assertFalse(disabled["enabled"])
             self.assertEqual(disabled["country"], "JP")
+
+    def test_card_link_country_choices_persist_without_changing_registration_country(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RegistrationProxyStore(Path(temp_dir) / "hme.db")
+            store.configure(
+                enabled=False,
+                country="NL",
+                proxy_line="proxy.example:3010:private-user:private-password",
+            )
+            saved = store.configure(
+                card_link_countries={"phCreate": "US", "phPromotion": "TR", "de": "DE"}
+            )
+            proxy_url, _ = store.proxy_for_country("DE")
+            persisted = store.public_state()
+
+        parsed = urlsplit(proxy_url)
+        self.assertEqual(saved["cardLinkCountries"]["de"], "DE")
+        self.assertIn("-region-DE-sid-", unquote(parsed.username or ""))
+        self.assertEqual(persisted["country"], "NL")
+        self.assertEqual(persisted["cardLinkCountries"]["phPromotion"], "TR")
+
+    def test_card_link_proxy_mode_is_saved_and_does_not_change_registration_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RegistrationProxyStore(Path(temp_dir) / "hme.db")
+            store.configure(
+                enabled=True,
+                mode="kookeey",
+                country="BR",
+                proxy_endpoint="gate.kookeey.info:1000",
+                proxy_username="1234567-AbCdEf1234",
+                proxy_password="private-secret",
+            )
+            saved = store.configure(
+                card_link_modes={"de_oaics_paypal": "dynamic"}
+            )
+            proxy_url, _ = store.proxy_for_country("DE", mode="dynamic")
+            persisted = store.public_state()
+
+        self.assertEqual(saved["cardLinkModes"]["de_oaics_paypal"], "dynamic")
+        self.assertIn("-region-DE-sid-", unquote(urlsplit(proxy_url).username or ""))
+        self.assertEqual(persisted["mode"], "kookeey")
+        self.assertTrue(
+            next(item for item in persisted["modes"] if item["code"] == "dynamic")[
+                "configured"
+            ]
+        )
 
     def test_clash_mode_persists_rotation_and_never_returns_secret(self):
         calls = []
@@ -223,6 +322,64 @@ class RegistrationProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-user", status_body)
         self.assertNotIn("private-password", status_body)
 
+    async def test_kookeey_proxy_config_accepts_separate_workbench_fields(self):
+        response = await self.client.post(
+            "/api/registration-proxy/config",
+            json={
+                "enabled": True,
+                "mode": "kookeey",
+                "country": "BR",
+                "proxyEndpoint": "gate.kookeey.info:1000",
+                "proxyUsername": "1234567-AbCdEf1234",
+                "proxyPassword": "private-base-password",
+            },
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+        body = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("1234567-AbCdEf1234", body)
+        self.assertNotIn("private-base-password", body)
+        state = json.loads(body)
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["mode"], "kookeey")
+        self.assertEqual(state["country"], "BR")
+        self.assertEqual(state["endpoint"], "gate.kookeey.info:1000")
+        self.assertTrue(state["usernameConfigured"])
+        self.assertTrue(state["passwordConfigured"])
+
+    async def test_card_link_country_choices_are_saved_through_proxy_config(self):
+        response = await self.client.post(
+            "/api/registration-proxy/config",
+            json={"cardLinkCountries": {"de": "GB", "phPromotion": "TR"}},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+        status = await self.client.get("/api/registration-proxy/status")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["cardLinkCountries"]["de"], "GB")
+        self.assertEqual(
+            (await status.json())["cardLinkCountries"]["phPromotion"], "TR"
+        )
+
+    async def test_card_link_proxy_mode_is_saved_through_proxy_config(self):
+        response = await self.client.post(
+            "/api/registration-proxy/config",
+            json={"cardLinkModes": {"de_oaics_paypal": "clash"}},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+        status = await self.client.get("/api/registration-proxy/status")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            (await response.json())["cardLinkModes"]["de_oaics_paypal"],
+            "clash",
+        )
+        self.assertEqual(
+            (await status.json())["cardLinkModes"]["de_oaics_paypal"],
+            "clash",
+        )
+
     async def test_clash_config_does_not_return_controller_secret(self):
         response = await self.client.post(
             "/api/registration-proxy/config",
@@ -243,6 +400,53 @@ class RegistrationProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("controller-private-secret", body)
         self.assertNotIn("clashSecret", body)
         self.assertEqual(json.loads(body)["mode"], "clash")
+
+    async def test_proxy_test_uses_configured_country_and_returns_safe_result(self):
+        await self.client.post(
+            "/api/registration-proxy/config",
+            json={
+                "enabled": True,
+                "country": "JP",
+                "proxyLine": "proxy.example:3010:private-user:private-password",
+            },
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+        captured = {}
+
+        async def tester(proxy_url, expected_country):
+            captured["proxy_url"] = proxy_url
+            captured["expected_country"] = expected_country
+            return {
+                "ok": True,
+                "exitIp": "203.0.113.8",
+                "country": "JP",
+                "expectedCountry": "JP",
+                "countryMatches": True,
+                "chatgptStatus": 200,
+                "latencyMs": 123,
+                "message": "出口 203.0.113.8 · JP · 延迟 123 ms · ChatGPT HTTP 200",
+                "testedAt": "2026-08-12T00:00:00+00:00",
+            }
+
+        self.app["registration_proxy_tester"] = tester
+        denied = await self.client.post("/api/registration-proxy/test", json={})
+        response = await self.client.post(
+            "/api/registration-proxy/test",
+            json={},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+        body = await response.text()
+
+        self.assertEqual(denied.status, 403)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(captured["expected_country"], "JP")
+        self.assertIn("private-user", captured["proxy_url"])
+        self.assertNotIn("private-user", body)
+        self.assertNotIn("private-password", body)
+        result = json.loads(body)["testResult"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["country"], "JP")
+        self.assertEqual(result["chatgptStatus"], 200)
 
 
 if __name__ == "__main__":

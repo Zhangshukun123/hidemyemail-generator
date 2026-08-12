@@ -15,7 +15,11 @@ import sys
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
-from .browser_tasks import _save_account_record, load_account_record
+from .browser_tasks import (
+    _save_account_record,
+    build_registration_environment,
+    load_account_record,
+)
 
 
 EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
@@ -25,6 +29,8 @@ WorkerRunner = Callable[
     [dict[str, Any], Callable[[dict[str, Any]], None]],
     Awaitable[dict[str, Any]],
 ]
+AccountSaved = Callable[[str], Awaitable[dict[str, Any] | None]]
+AccountFinished = Callable[[str, bool, str], Awaitable[None]]
 
 
 def _utc_now() -> str:
@@ -60,11 +66,13 @@ class ProtocolRegistrationManager:
         gptfree_root: Path | None = None,
         python_executable: Path | None = None,
         worker_runner: WorkerRunner | None = None,
+        on_account_saved: AccountSaved | None = None,
     ) -> None:
         self.base_dir = Path(base_dir).resolve()
         self.db_file = Path(db_file).resolve()
         self.proxy_store = proxy_store
         self.worker_runner = worker_runner
+        self.on_account_saved = on_account_saved
         self.worker_script = Path(__file__).with_name(
             "protocol_registration_worker.py"
         ).resolve()
@@ -78,11 +86,13 @@ class ProtocolRegistrationManager:
         self._state = self._idle_state()
 
     def _resolve_root(self, explicit: Path | None) -> Path:
+        bundled_root = Path(__file__).with_name("vendor") / "gptfree_register"
         candidates = [
             explicit,
             Path(os.environ["GPTFREE_REGISTER_ROOT"])
             if os.environ.get("GPTFREE_REGISTER_ROOT")
             else None,
+            bundled_root,
             self.base_dir.parent / "gptfree-register",
             Path(r"D:\AI\gptfree-register"),
         ]
@@ -92,49 +102,105 @@ class ProtocolRegistrationManager:
             root = Path(candidate).expanduser().resolve()
             if (root / "core" / "chatgpt_register.py").is_file():
                 return root
-        return Path(explicit or self.base_dir.parent / "gptfree-register").resolve()
+        return Path(explicit or bundled_root).resolve()
 
     def _resolve_python(self, explicit: Path | None) -> Path:
         configured = os.environ.get("GPTFREE_REGISTER_PYTHON")
+        current_python = Path(sys.executable).resolve()
+        console_python = (
+            current_python.with_name("python.exe")
+            if current_python.name.casefold() == "pythonw.exe"
+            else current_python
+        )
         candidates = [
             explicit,
             Path(configured) if configured else None,
             self.gptfree_root / ".venv" / "Scripts" / "python.exe",
             self.gptfree_root / ".venv" / "bin" / "python",
+            console_python,
+            current_python,
         ]
         for candidate in candidates:
             if candidate is not None and Path(candidate).is_file():
                 return Path(candidate).resolve()
-        return Path(explicit or sys.executable).resolve()
+        return Path(explicit or console_python).resolve()
 
     def _runtime_state(self) -> dict[str, Any]:
         if self._runtime_cache is not None:
             return deepcopy(self._runtime_cache)
         missing: list[str] = []
-        if not (self.gptfree_root / "core" / "chatgpt_register.py").is_file():
-            missing.append("gptfree-register/core/chatgpt_register.py")
+        core = self.gptfree_root / "core"
+        required_core = [
+            (core / "chatgpt_register.py", "gptfree-register/core/chatgpt_register.py"),
+            (core / "sentinel_token.py", "gptfree-register/core/sentinel_token.py"),
+            (core / "codex_oauth.py", "gptfree-register/core/codex_oauth.py"),
+            (
+                core / "sentinel_vm" / "runtime_worker.js",
+                "gptfree-register/core/sentinel_vm/runtime_worker.js",
+            ),
+            (core / "gen_token_jsdom.js", "gptfree-register/core/gen_token_jsdom.js"),
+        ]
+        protocol_module = core / "gpt_trial_protocol"
+        for name in (
+            "__init__.py",
+            "chatgpt.py",
+            "codex_oauth.py",
+            "email_code.py",
+            "errors.py",
+            "flows.py",
+            "http_client.py",
+            "local_email_code.py",
+            "models.py",
+            "risk_tokens.py",
+            "sentinel_http.py",
+            "service.py",
+            "sms.py",
+        ):
+            required_core.append(
+                (
+                    protocol_module / name,
+                    f"gptfree-register/core/gpt_trial_protocol/{name}",
+                )
+            )
+        for path, label in required_core:
+            if not path.is_file():
+                missing.append(label)
         if not self.python_executable.is_file():
             missing.append("gptfree Python")
         if not self.worker_script.is_file():
             missing.append("protocol_registration_worker.py")
         if self.worker_runner is None and not shutil.which("node"):
             missing.append("Node.js")
+        if (
+            self.worker_runner is None
+            and shutil.which("node")
+            and not (core / "node_modules" / "jsdom" / "package.json").is_file()
+        ):
+            missing.append("jsdom")
         if self.worker_runner is None and self.python_executable.is_file():
-            command = (
-                "import importlib.util;"
-                "raise SystemExit(0 if importlib.util.find_spec('curl_cffi') else 1)"
+            python_checks = (
+                ("curl_cffi", "import curl_cffi"),
+                (
+                    "gptfree Python 内核",
+                    "import sys;"
+                    f"sys.path.insert(0, {str(core)!r});"
+                    "from chatgpt_register import ChatGPTRegister;"
+                    "from sentinel_token import SentinelTokenProvider;"
+                    "SentinelTokenProvider()._browser_profile('runtime-check')",
+                ),
             )
-            try:
-                result = __import__("subprocess").run(
-                    [str(self.python_executable), "-c", command],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                if result.returncode:
-                    missing.append("curl_cffi")
-            except (OSError, TimeoutError):
-                missing.append("协议 Python 运行环境")
+            for label, command in python_checks:
+                try:
+                    result = __import__("subprocess").run(
+                        [str(self.python_executable), "-c", command],
+                        capture_output=True,
+                        timeout=20,
+                        check=False,
+                    )
+                    if result.returncode:
+                        missing.append(label)
+                except (OSError, TimeoutError):
+                    missing.append(label)
         self._runtime_cache = {
             "available": not missing or self.worker_runner is not None,
             "projectRoot": str(self.gptfree_root),
@@ -167,6 +233,11 @@ class ProtocolRegistrationManager:
         state = deepcopy(self._state)
         state["runtime"] = self._runtime_state()
         return state
+
+    def refresh_runtime(self) -> dict[str, Any]:
+        """Discard the cached dependency probe and return the current state."""
+        self._runtime_cache = None
+        return self._runtime_state()
 
     def token_record(self, token: str) -> dict[str, str] | None:
         return deepcopy(self._code_tokens.get(str(token or "")))
@@ -204,6 +275,7 @@ class ProtocolRegistrationManager:
         emails: list[str],
         base_url: str,
         concurrency: int = 1,
+        on_account_finished: AccountFinished | None = None,
     ) -> dict[str, Any]:
         if self._task is not None and not self._task.done():
             raise RuntimeError("协议注册任务正在运行")
@@ -259,7 +331,7 @@ class ProtocolRegistrationManager:
         }
         self._append_log(self._state["message"], stage="prepare")
         self._task = asyncio.create_task(
-            self._run(unique, origin, concurrency),
+            self._run(unique, origin, concurrency, on_account_finished),
             name=f"protocol-registration-{task_id}",
         )
         return self.snapshot()
@@ -287,14 +359,20 @@ class ProtocolRegistrationManager:
             await self._task
         return self.snapshot()
 
-    async def _run(self, emails: list[str], base_url: str, concurrency: int) -> None:
+    async def _run(
+        self,
+        emails: list[str],
+        base_url: str,
+        concurrency: int,
+        on_account_finished: AccountFinished | None,
+    ) -> None:
         semaphore = asyncio.Semaphore(concurrency)
 
         async def guarded(email: str) -> None:
             async with semaphore:
                 if self._cancel_requested:
                     return
-                await self._run_one(email, base_url)
+                await self._run_one(email, base_url, on_account_finished)
 
         try:
             await asyncio.gather(*(guarded(email) for email in emails))
@@ -327,11 +405,18 @@ class ProtocolRegistrationManager:
                 status="success" if self._state["status"] == "completed" else "warning",
             )
 
-    async def _run_one(self, email: str, base_url: str) -> None:
+    async def _run_one(
+        self,
+        email: str,
+        base_url: str,
+        on_account_finished: AccountFinished | None,
+    ) -> None:
         account_state = next(
             item for item in self._state["accounts"] if item["email"] == email
         )
         account_state["status"] = "running"
+        completion_success = False
+        completion_message = ""
         self._state["currentEmail"] = email
         self._state["phase"] = "protocol_auth"
         self._state["message"] = f"正在协议注册 {email}"
@@ -351,6 +436,7 @@ class ProtocolRegistrationManager:
             else ""
         )
         proxy_url = ""
+        proxy_state: dict[str, Any] = {}
         if self.proxy_store is not None:
             proxy_url, proxy_state = await asyncio.to_thread(
                 self.proxy_store.next_proxy
@@ -366,6 +452,9 @@ class ProtocolRegistrationManager:
             "code_url": f"{base_url}{PROTOCOL_CODE_PREFIX}{quote(token)}",
             "proxy_url": proxy_url,
             "existing_password": str(record.get("password") or ""),
+            "existing_password_confirmed": bool(
+                record.get("password") and record.get("password_confirmed")
+            ),
             "existing_totp_secret": existing_totp,
             "project_root": str(self.gptfree_root),
             "source_root": str(Path(__file__).resolve().parents[1]),
@@ -396,6 +485,13 @@ class ProtocolRegistrationManager:
                 and two_factor.get("secret")
             ):
                 raise RuntimeError("协议注册未确认 TOTP 2FA")
+            result = dict(result)
+            result["registration_environment"] = build_registration_environment(
+                email,
+                registration_mode="protocol",
+                proxy_url=proxy_url,
+                proxy_state=proxy_state,
+            )
             await asyncio.to_thread(
                 _save_account_record,
                 self.db_file,
@@ -405,9 +501,51 @@ class ProtocolRegistrationManager:
                 password_confirmed=True,
                 two_factor=two_factor,
             )
+            if self.on_account_saved is not None:
+                try:
+                    saved_callback_result = await self.on_account_saved(email)
+                    if isinstance(saved_callback_result, dict):
+                        checkout_type = str(
+                            saved_callback_result.get("checkout_id_type") or ""
+                        ).strip().lower()
+                        account_state["checkoutIdType"] = checkout_type
+                        account_state["checkoutProbeStatus"] = str(
+                            saved_callback_result.get("status") or ""
+                        )
+                        checkout_labels = {
+                            "oaics": "OAICS",
+                            "cs_live": "CS LIVE",
+                            "cs": "CS",
+                            "other": "OTHER",
+                            "error": "检测失败",
+                        }
+                        self._append_log(
+                            "Checkout 自动验证："
+                            + checkout_labels.get(checkout_type, "待检测")
+                            + (
+                                f"（第 {int(saved_callback_result.get('attempt_count') or 1)}"
+                                f"/{int(saved_callback_result.get('max_attempts') or 1)} 次）"
+                                if int(saved_callback_result.get("attempt_count") or 1) > 1
+                                else ""
+                            ),
+                            email=email,
+                            stage="checkout_probe",
+                            status=(
+                                "success" if checkout_type == "oaics" else "warning"
+                            ),
+                        )
+                except Exception as error:
+                    self._append_log(
+                        f"账号已保存，但同步到远程服务器失败：{error}",
+                        email=email,
+                        stage="sync",
+                        status="warning",
+                    )
             account_state["status"] = "success"
             account_state["stage"] = "completed"
             account_state["message"] = "协议注册完成（密码+2FA）"
+            completion_success = True
+            completion_message = account_state["message"]
             self._state["succeeded"] += 1
             self._append_log(
                 account_state["message"],
@@ -418,11 +556,13 @@ class ProtocolRegistrationManager:
         except asyncio.CancelledError:
             account_state["status"] = "cancelled"
             account_state["message"] = "任务已停止"
+            completion_message = account_state["message"]
             raise
         except Exception as error:
             account_state["status"] = "failed"
             account_state["stage"] = "failed"
             account_state["message"] = _sanitize_message(error)
+            completion_message = account_state["message"]
             self._state["failed"] += 1
             self._append_log(
                 f"失败：{error}", email=email, stage="failed", status="error"
@@ -430,18 +570,41 @@ class ProtocolRegistrationManager:
         finally:
             self._code_tokens.pop(token, None)
             self._state["completed"] += 1
+            if on_account_finished is not None:
+                try:
+                    await on_account_finished(
+                        email,
+                        completion_success,
+                        completion_message or "协议注册未完成",
+                    )
+                except Exception as error:
+                    self._append_log(
+                        f"协议注册结果写回库存失败：{error}",
+                        email=email,
+                        stage="inventory",
+                        status="warning",
+                    )
 
     async def _run_worker(
         self,
         payload: dict[str, Any],
         on_event: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
+        worker_env = os.environ.copy()
+        worker_env.update(
+            {
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
         process = await asyncio.create_subprocess_exec(
             str(self.python_executable),
             str(self.worker_script),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=worker_env,
         )
         self._active_processes.add(process)
         if process.stdin is None or process.stdout is None or process.stderr is None:

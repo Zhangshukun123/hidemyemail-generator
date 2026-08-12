@@ -12,6 +12,7 @@
   <svg class="icon-sprite" aria-hidden="true">
     <symbol id="i-dashboard" viewBox="0 0 24 24"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></symbol>
     <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m4 7 8 6 8-6"/></symbol>
+    <symbol id="i-network" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M5 12a7 7 0 0 1 14 0M8 12a4 4 0 0 1 8 0M12 14v7"/></symbol>
     <symbol id="i-protocol" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></symbol>
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
     <symbol id="i-paypal" viewBox="0 0 24 24"><path d="M7 20 9.3 4h6.2a4.8 4.8 0 0 1 0 9.6h-4.7"/><path d="m10.1 20 1.4-9.5h4.4a3.6 3.6 0 0 1 0 7.2h-3.4"/></symbol>
@@ -29,8 +30,8 @@
       </div>
       <nav class="nav-list">
         <button class="nav-item" type="button" data-route="overview"><svg><use href="#i-dashboard"/></svg><span>概览</span></button>
-        <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>邮箱账号</span><b id="accountNavCount">—</b></button>
-        <button class="nav-item" type="button" data-route="protocol-registration"><svg><use href="#i-protocol"/></svg><span>协议注册</span><b id="protocolNavState">—</b></button>
+        <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>账号设置</span><b id="accountNavCount">—</b></button>
+        <button class="nav-item" type="button" data-route="network"><svg><use href="#i-network"/></svg><span>代理与线路</span><b id="networkNavState">—</b></button>
         <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>直卡提链接</span><b id="cardLinkNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="pp-payment"><svg><use href="#i-paypal"/></svg><span>PP 支付</span><b id="paypalNavState">—</b></button>
         <button class="nav-item" type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span>验证记录</span></button>
@@ -60,36 +61,54 @@
         </div>
       </section>
 
-      <section class="view" id="accountsView" data-view="accounts" hidden>
-        <div class="view-actions">
+      <section class="view account-workspace-view" id="accountsView" data-view="accounts" data-layout="task-first" hidden>
+        <div class="view-actions registration-launch-shell">
           <div class="registration-command-deck" aria-label="注册命令栏">
-            <div class="command-block command-source">
+            <div class="registration-launch-head">
+              <div><span class="eyebrow">REGISTER</span><h2>启动注册</h2><p>选择注册方式、邮箱来源与网络后开始任务</p></div>
+              <span class="badge blue">Roxy 最多 5 个并发</span>
+            </div>
+            <div class="command-block command-source" id="registrationSourceBlock">
               <div class="command-heading"><span>REGISTER</span><strong>注册来源</strong></div>
               <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="gmail">Gmail · SMSBower</option></select></label>
               <div id="smsbowerControls" class="command-subcontrols" hidden><span id="smsbowerStatus" class="badge warning">SMSBower 未配置</span><label class="command-field smsbower-price-field" for="smsbowerMaxPrice"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="10" step="0.001" value="0.05"></label><button class="button" data-action="set-smsbower-key">SMSBower API</button></div>
               <button id="registerProviderButton" class="button primary command-primary" data-action="register-provider"><span aria-hidden="true">▶</span>开始注册</button>
             </div>
-            <div class="command-block command-network">
-              <div class="command-heading"><span>NETWORK</span><strong>浏览器出口</strong></div>
-              <label class="switch command-switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册代理</label>
+            <div class="command-block command-network" id="registrationNetworkBlock">
+              <div class="command-heading"><span>NETWORK</span><strong>注册网络</strong></div>
+              <label class="switch command-switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册使用代理</label>
               <span id="registrationNetworkMode" class="badge blue">本机 IP 直连 · 语言随出口</span>
-              <label class="command-field command-country" for="registrationProxyMode"><span>模式</span><select id="registrationProxyMode"><option value="dynamic">动态 SID</option><option value="clash">Clash 日本轮询</option></select></label>
-              <label class="command-field command-country" for="registrationProxyCountry"><span>出口</span><select id="registrationProxyCountry"><option value="NL">荷兰 NL</option><option value="US">美国 US</option><option value="JP">日本 JP</option><option value="DE">德国 DE</option><option value="GB">英国 GB</option><option value="FR">法国 FR</option><option value="CA">加拿大 CA</option><option value="AU">澳大利亚 AU</option><option value="SG">新加坡 SG</option><option value="HK">中国香港 HK</option><option value="TW">中国台湾 TW</option><option value="KR">韩国 KR</option><option value="BR">巴西 BR</option><option value="IN">印度 IN</option><option value="TR">土耳其 TR</option></select></label>
-              <button id="registrationProxySetupButton" class="button" data-action="set-registration-proxy-credential">代理连接</button>
+              <label class="command-field command-country" for="registrationProxyCountrySearch"><span>注册出口</span><input id="registrationProxyCountrySearch" type="search" list="registrationProxyCountryOptions" autocomplete="off" placeholder="输入国家或代码"><input id="registrationProxyCountry" type="hidden" value="NL"><datalist id="registrationProxyCountryOptions"></datalist></label>
+              <button id="registrationProxySetupButton" class="button" data-action="focus-registration-proxy">代理设置</button>
             </div>
             <div class="command-block command-utilities">
-              <div class="command-heading"><span>TOOLS</span><strong>运行选项</strong></div>
-              <label class="switch"><input id="headless" type="checkbox"><span></span>无头浏览器（关闭＝前台窗口）</label>
+              <div class="command-heading"><span>MODE</span><strong>注册方式</strong></div>
+              <div class="registration-mode-selector" role="radiogroup" aria-label="注册方式">
+                <label><input type="radio" name="registrationMode" value="headless"><span><b>无头浏览器</b><small>后台自动运行</small></span></label>
+                <label><input type="radio" name="registrationMode" value="headed" checked><span><b>有头浏览器</b><small>显示前台窗口</small></span></label>
+                <label><input type="radio" name="registrationMode" value="roxy"><span><b>Roxy 注册</b><small>随机指纹 · 本地机场</small></span></label>
+                <label><input type="radio" name="registrationMode" value="protocol"><span><b>协议注册</b><small>Mail Auth · 无浏览器</small></span></label>
+              </div>
+              <div id="roxyRegistrationControls" class="roxy-registration-controls" hidden>
+                <label class="command-field"><span>Roxy 工作区</span><select id="roxyWorkspace"></select></label>
+                <label class="command-field"><span>首个专用环境</span><select id="roxyProfile"></select></label>
+                <label class="command-field"><span>并发窗口</span><input id="roxyConcurrency" type="number" min="1" max="5" step="1" value="5"></label>
+                <label class="command-field"><span>目标账号数</span><input id="roxyTargetCount" type="number" min="1" max="100" step="1" value="5"></label>
+                <label class="command-field"><span>窗口方式</span><select id="roxyWindowMode"><option value="background">无头效果（后台隐藏）</option><option value="headed">有头窗口</option></select></label>
+                <button class="button" data-action="refresh-roxy">刷新 Roxy 环境</button>
+                <span id="roxyRegistrationStatus" class="badge warning">等待连接 Roxy</span>
+                <small id="roxyProfileAllocation">选择首个环境后，系统将使用最多 5 个互不重复的 Roxy 环境，按目标账号数自动分轮执行；每个账号重新生成随机指纹并写入独立代理。</small>
+              </div>
+              <input id="headless" type="checkbox" hidden>
               <input id="concurrency" type="hidden" value="1">
-              <button class="button" data-action="fetch-all">获取全部 Session</button>
             </div>
-            <div class="command-manual">
+            <div class="command-manual" id="registrationManualBlock">
               <div><span>自有邮箱</span><small>iCloud 自动扫描收件箱与垃圾邮件；其他邮箱在浏览器中手动输入</small></div>
               <label class="command-field registration-email-field" for="registrationEmail"><span>自有邮箱（iCloud 支持自动取码）</span><input id="registrationEmail" type="email" placeholder="name@example.com" autocomplete="email"></label>
               <button id="registerEmailButton" class="button" data-action="register">添加邮箱并注册</button>
             </div>
+            <button id="fetchAllButton" class="button registration-fetch-all" data-action="fetch-all">批量获取全部 Session</button>
           </div>
-          <div id="accountMetrics" class="metric-grid compact"></div>
         </div>
         <article id="taskPanel" class="panel task-panel" data-task-tone="idle" data-stage-group="prepare">
           <div class="task-panel-header">
@@ -124,6 +143,13 @@
                   <div><small>正在执行</small><strong id="taskCurrentAction">尚未开始</strong></div>
                   <span id="taskCurrentAccount">未选择账号</span>
                 </div>
+              </div>
+              <div class="task-recognition-detail" aria-label="注册页面识别结果">
+                <div><small>已经完成</small><strong id="taskCompletedSteps">等待识别注册进度</strong></div>
+                <div><small>下一步</small><strong id="taskNextAction">等待浏览器页面出现</strong><span id="taskRecognitionMeta">DOM / URL 实时识别</span></div>
+              </div>
+              <div id="taskStepLedger" class="task-step-ledger" aria-label="完整注册步骤状态">
+                <div class="task-step-ledger-empty">等待完整注册步骤开始</div>
               </div>
               <div id="taskAssistance" class="task-assistance" data-mode="automatic">
                 <span id="taskAssistanceBadge">自动化执行</span>
@@ -165,29 +191,21 @@
           </div>
         </article>
         <article class="panel table-panel">
-          <div class="panel-head account-list-head"><div><h2>邮箱账号</h2><p id="accountSummary">正在加载…</p></div><div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select></div></div>
+          <div class="panel-head account-list-head">
+            <div class="account-list-heading"><div><h2>邮箱账号</h2><p id="accountSummary">正在加载…</p></div><div id="accountMetrics" class="metric-grid compact account-inline-metrics"></div></div>
+            <div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select></div>
+          </div>
           <div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>注册状态</th><th>套餐</th><th>Session 状态</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
         </article>
-      </section>
-
-      <section class="view protocol-registration-view" id="protocolRegistrationView" data-view="protocol-registration" hidden>
+      <div class="protocol-registration-view account-protocol-panel" id="protocolRegistrationPanel" hidden>
         <article class="panel protocol-registration-toolbar">
           <div class="protocol-heading"><span class="protocol-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></svg></span><div><h2>Mail Auth 协议注册</h2><p>无浏览器完成邮箱验证、Session 获取、密码确认与 TOTP 2FA 激活</p></div></div>
           <div class="protocol-actions">
-            <span id="protocolRuntimeStatus" class="badge">检查运行环境</span>
-            <label class="protocol-concurrency" for="protocolConcurrency"><span>并发</span><input id="protocolConcurrency" type="number" min="1" max="5" value="1"></label>
-            <button id="startProtocolSelectedButton" class="button primary" type="button" data-action="start-protocol-selected">协议注册选中</button>
-            <button id="startProtocolAllButton" class="button" type="button" data-action="start-protocol-all">协议注册全部</button>
             <button id="stopProtocolButton" class="button danger" type="button" data-action="stop-protocol-registration" disabled>停止</button>
           </div>
         </article>
         <div id="protocolMetrics" class="metric-grid compact"></div>
         <div class="protocol-workspace-grid">
-          <article class="panel protocol-account-panel">
-            <div class="panel-head"><div><h2>待注册账号</h2><p id="protocolAccountSummary">选择需要通过 Mail Auth 处理的邮箱</p></div><label class="protocol-select-all"><input id="protocolSelectAll" type="checkbox">选择全部待处理</label></div>
-            <div class="filter-bar padded"><input id="protocolSearch" type="search" placeholder="搜索邮箱账号"><select id="protocolStatusFilter"><option value="all">状态：全部</option><option value="pending">待处理</option><option value="ready">已完成</option></select></div>
-            <div id="protocolAccountList" class="protocol-account-list"><div class="empty-state">正在加载账号…</div></div>
-          </article>
           <aside class="panel protocol-task-panel">
             <div class="panel-head"><div><h2>协议任务</h2><p id="protocolTaskMessage">等待开始</p></div><span id="protocolTaskBadge" class="badge">空闲</span></div>
             <div class="protocol-flow" aria-label="协议注册步骤">
@@ -200,12 +218,53 @@
             <div id="protocolTaskLog" class="inline-log protocol-task-log" role="log" aria-live="polite"><div class="task-log-empty">暂无协议任务日志</div></div>
           </aside>
         </div>
+      </div>
+      </section>
+
+      <section class="view network-routing-view" id="networkView" data-view="network" hidden>
+        <article class="panel network-overview-panel">
+          <div class="network-overview-copy"><span>INDEPENDENT NETWORK MODULE</span><h2>注册代理独立配置</h2><p>代理与注册方式互相独立。启用后，无头浏览器、有头浏览器、Roxy 和协议注册都会使用这里配置的线路；关闭后统一直连。</p></div>
+          <div class="network-overview-state"><small>应用范围</small><strong>所有注册方式</strong><span id="networkUsageState">当前使用本机 IP 直连</span></div>
+        </article>
+        <section id="registrationProxyPanel" class="panel registration-proxy-panel" aria-labelledby="registrationProxyTitle">
+          <div class="registration-proxy-head">
+            <div><span>NETWORK ROUTING</span><h2 id="registrationProxyTitle">代理与线路</h2><p>按所选国家生成独立代理 Session；凭据只保存在本地</p></div>
+            <span id="registrationProxyStatus" class="badge blue">本机 IP 直连</span>
+          </div>
+          <div class="registration-proxy-mode-row">
+            <label class="proxy-field proxy-mode-field" for="registrationProxyMode"><span>代理模式</span><select id="registrationProxyMode"><option value="kookeey">Kookeey 动态住宅</option><option value="dynamic">通用 region/SID</option><option value="clash">Clash 日本轮询</option></select></label>
+            <p id="registrationProxyModeHint">Kookeey 模式会自动把国家、8 位 Session 和 5m 写入连接密码</p>
+          </div>
+          <div id="registrationProxyCredentialFields" class="registration-proxy-credentials">
+            <label class="proxy-field" for="registrationProxyUsername"><span>用户名</span><input id="registrationProxyUsername" type="text" autocomplete="off" spellcheck="false" placeholder="线路连接用户名"></label>
+            <label class="proxy-field" for="registrationProxyPassword"><span>密码</span><input id="registrationProxyPassword" type="password" autocomplete="new-password" placeholder="代理基础密码"></label>
+            <label class="proxy-field proxy-endpoint-field" for="registrationProxyEndpoint"><span>主机:端口</span><input id="registrationProxyEndpoint" type="text" autocomplete="off" spellcheck="false" placeholder="gate.kookeey.info:1000"></label>
+            <button id="saveRegistrationProxyButton" class="button primary" type="button" data-action="save-registration-proxy">保存</button>
+          </div>
+          <div class="registration-proxy-route-row">
+            <div id="registrationProxyRoutePreview" class="registration-proxy-route-preview"><small>当前注册出口</small><strong>本机 IP 直连</strong><span>启用代理后，各注册方式都会使用这里配置的出口</span></div>
+            <div class="proxy-route-actions"><button id="testRegistrationProxyButton" class="button" type="button" data-action="test-registration-proxy">测试代理</button><button id="rotateRegistrationProxyButton" class="button" type="button" data-action="rotate-registration-proxy" hidden>检测并切换日本 IP</button></div>
+            <div id="registrationProxyTestResult" class="proxy-test-result"><small>代理测试</small><strong>尚未测试</strong><span>点击“测试代理”检查出口 IP、国家与 ChatGPT 连通性</span></div>
+          </div>
+        </section>
       </section>
 
       <section class="view" id="cardLinksView" data-view="card-links" hidden>
         <div class="split-workspace">
-          <article class="panel account-picker"><div id="cardMetrics" class="metric-grid compact three"></div><div class="panel-head"><div><h2>选择账号</h2><p id="cardLinkSummary">正在加载…</p></div></div><div class="filter-bar padded"><input id="cardSearch" type="search" placeholder="搜索邮箱账号"><select id="cardStatusFilter"><option value="all">链接：全部</option><option value="generated">已生成</option><option value="available">可提取</option><option value="unavailable">Session 不可用</option></select></div><div id="cardAccountList" class="select-list"></div></article>
-          <aside class="panel extraction-panel"><div class="panel-head"><div><h2>提取设置</h2><p>选择账号后生成严格 0 hosted 链接</p></div></div><div class="mode-label">gpt-link · PH / PHP hosted · 双代理严格 0</div><label class="field-label">建单代理<input id="cardLinkCreateProxy" type="password" placeholder="代理 1（留空则直连）" autocomplete="off"></label><label class="field-label">优惠代理<input id="cardLinkPromotionProxy" type="password" placeholder="代理 2（留空复用代理 1）" autocomplete="off"></label><div class="check-grid"><span>✓ Session 可用</span><span>✓ 地区 PH</span><span>✓ 币种 PHP</span><span>✓ 金额必须为 0</span></div><div class="button-row"><button id="generateCardLinkButton" class="button primary" data-action="generate-card-link">提取严格 0</button><button id="copyCardLinkButton" class="button" data-action="copy-card-link" disabled>复制链接</button><button id="openCardLinkButton" class="button" data-action="open-card-link" disabled>打开支付页</button></div><div class="operation-log"><h3>当前结果</h3><div id="cardOperationState" class="empty-state compact">请选择一个账号</div></div></aside>
+          <article class="panel account-picker"><div id="cardMetrics" class="metric-grid compact"></div><div class="panel-head"><div><h2>选择账号</h2><p id="cardLinkSummary">正在加载…</p></div></div><div class="filter-bar padded"><input id="cardSearch" type="search" placeholder="搜索邮箱账号"><select id="cardStatusFilter"><option value="all">链接：全部</option><option value="generated">已生成</option><option value="cs_live">cs_live 已标注</option><option value="available">可提取</option><option value="unavailable">Session 不可用</option></select></div><div id="cardAccountList" class="select-list"></div></article>
+          <aside class="panel extraction-panel">
+            <div class="panel-head"><div><h2>提取设置</h2><p id="cardLinkModeSummary">选择账号后生成严格 0 hosted 链接</p></div></div>
+            <label class="field-label">提链方式<select id="cardLinkMethod"><option value="ph_hosted">gpt-link / 菲律宾 · PHP hosted</option><option value="de_oaics_paypal">PayPal / 德国 · EUR</option></select></label>
+            <div id="cardLinkModeLabel" class="mode-label">gpt-link · PH / PHP hosted · 双代理严格 0</div>
+            <label class="field-label">提链代理模式<select id="cardLinkProxyMode" aria-label="提链代理模式"></select></label>
+            <label id="cardLinkCreateProxyLabel" class="field-label">建单代理国家<select id="cardLinkCreateProxyCountry" aria-label="建单代理国家"></select></label>
+            <label id="cardLinkPromotionProxyLabel" class="field-label">优惠代理国家<select id="cardLinkPromotionProxyCountry" aria-label="优惠代理国家"></select></label>
+            <div id="cardLinkProxyHint" class="mode-label">使用“代理与线路”中已保存的代理配置</div>
+            <div id="cardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 地区 PH</span><span>✓ 币种 PHP</span><span>✓ 金额必须为 0</span></div>
+            <div class="button-row"><button id="generateAllCardLinksButton" class="button primary" data-action="generate-all-card-links">一键提链</button><button id="generateCardLinkButton" class="button" data-action="generate-card-link">提取严格 0</button><button id="copyCardLinkButton" class="button" data-action="copy-card-link" disabled>复制链接</button><button id="openCardLinkButton" class="button" data-action="open-card-link" disabled>打开支付页</button></div>
+            <div id="cardLinkBatchState" class="empty-state compact">一键提链将处理当前模式下所有未处理账号</div>
+            <div class="operation-log"><h3>当前结果</h3><div id="cardOperationState" class="empty-state compact">请选择一个账号</div></div>
+          </aside>
         </div>
       </section>
 

@@ -9,8 +9,8 @@ import time
 from pathlib import Path
 
 
-REGISTRATION_CHATGPT_403_MAX_ATTEMPTS = 5
-REGISTRATION_CHATGPT_403_RETRY_DELAYS_SECONDS = (1.0, 2.0, 3.0, 5.0)
+REGISTRATION_PROXY_PROBE_MAX_ATTEMPTS = 5
+REGISTRATION_PROXY_PROBE_RETRY_DELAYS_SECONDS = (1.0, 2.0, 3.0, 5.0)
 
 
 def prepare_registration_proxy(
@@ -21,54 +21,39 @@ def prepare_registration_proxy(
     *,
     sleep=time.sleep,
 ):
-    """Retry a transient ChatGPT 403 before accepting or rejecting an exit."""
+    """Confirm the proxy exit and tolerate browser-verifiable ChatGPT 403."""
 
-    for attempt in range(1, REGISTRATION_CHATGPT_403_MAX_ATTEMPTS + 1):
+    for attempt in range(1, REGISTRATION_PROXY_PROBE_MAX_ATTEMPTS + 1):
         try:
             health = worker._prepare_fingerprint_for_proxy(
                 proxy, "注册", check_stripe=False
             )
         except Exception as error:
-            if attempt >= REGISTRATION_CHATGPT_403_MAX_ATTEMPTS:
+            if attempt >= REGISTRATION_PROXY_PROBE_MAX_ATTEMPTS:
                 raise
-            delay = REGISTRATION_CHATGPT_403_RETRY_DELAYS_SECONDS[attempt - 1]
+            delay = REGISTRATION_PROXY_PROBE_RETRY_DELAYS_SECONDS[attempt - 1]
             api.emit(
                 "log",
                 message=(
                     "[代理] ChatGPT 探测请求暂时失败"
-                    f"（{attempt}/{REGISTRATION_CHATGPT_403_MAX_ATTEMPTS}）："
+                    f"（{attempt}/{REGISTRATION_PROXY_PROBE_MAX_ATTEMPTS}）："
                     f"{str(error)[:240]}；{delay:g} 秒后使用同一粘性出口重新请求"
                 ),
             )
             sleep(delay)
             continue
-        try:
-            actual_country = api.require_registration_proxy_country(
-                health, expected_proxy_country
-            )
-        except RuntimeError:
-            chatgpt_status = int(getattr(health, "chatgpt_status", 0) or 0)
-            expected = str(expected_proxy_country or "").strip().upper()
-            actual = str(getattr(health, "country", "") or "").strip().upper()
-            retryable_403 = chatgpt_status == 403 and (
-                not expected or actual == expected
-            )
-            if (
-                not retryable_403
-                or attempt >= REGISTRATION_CHATGPT_403_MAX_ATTEMPTS
-            ):
-                raise
-            delay = REGISTRATION_CHATGPT_403_RETRY_DELAYS_SECONDS[attempt - 1]
+        actual_country = api.require_registration_proxy_country(
+            health, expected_proxy_country
+        )
+        chatgpt_status = int(getattr(health, "chatgpt_status", 0) or 0)
+        if chatgpt_status == 403:
             api.emit(
                 "log",
                 message=(
-                    "[代理] ChatGPT 探测暂时返回 HTTP 403"
-                    f"（{attempt}/{REGISTRATION_CHATGPT_403_MAX_ATTEMPTS}）；"
-                    f"{delay:g} 秒后使用同一粘性出口重新请求"
+                    "[代理] ChatGPT 探测返回 HTTP 403（浏览器验证页）；"
+                    "不再拦截，继续启动真实浏览器注册"
                 ),
             )
-            sleep(delay)
-            continue
         return health, actual_country
     raise RuntimeError("注册代理 ChatGPT 探测重试未返回结果")
 
@@ -106,6 +91,12 @@ def run(api) -> int:
     strict_gmail_credentials = gmail_account
     foreground_required = os.environ.get("HME_BROWSER_FOREGROUND_REQUIRED", "") == "1"
     browser_headless = bool(args.headless and not foreground_required)
+    browser_engine = str(
+        os.environ.get("HME_BROWSER_ENGINE") or "camoufox"
+    ).strip().lower()
+    if browser_engine not in {"camoufox", "roxy"}:
+        api.emit("error", error="不支持的注册浏览器引擎")
+        return 2
     saved_storage_state = api.load_saved_storage_state(
         os.environ.get("HME_BROWSER_DB_FILE", ""),
         args.email,
@@ -119,10 +110,15 @@ def run(api) -> int:
     except (json.JSONDecodeError, TypeError, ValueError):
         pending_2fa = {}
     account = None
+    roxy_session = None
     try:
         api.ensure_tkinter_importable()
         # Keep the temporary directory alive for the complete browser run.
-        _camoufox_runtime = api.prepare_writable_camoufox_fontconfig()
+        _camoufox_runtime = (
+            api.prepare_writable_camoufox_fontconfig()
+            if browser_engine == "camoufox"
+            else None
+        )
         if _camoufox_runtime is not None:
             api.emit(
                 "log", message="[运行环境] Camoufox fontconfig 已切换到可写临时目录"
@@ -133,7 +129,8 @@ def run(api) -> int:
         app_backend.HotmailOtpReader = api.ManualOtpReader
         if not manual_otp_entry:
             api.configure_registration_otp_reader(app_backend, args.email)
-        api.configure_windowed_camoufox(app_backend)
+        if browser_engine == "camoufox":
+            api.configure_windowed_camoufox(app_backend)
         app_backend.OpenAIRegisterPayLinkWorker._force_fill_locator = (
             api.resilient_force_fill_locator
         )
@@ -167,8 +164,36 @@ def run(api) -> int:
             proxy,
             proxy,
             log,
-            browser_engine="camoufox",
+            browser_engine=("camoufox" if browser_engine == "camoufox" else "chromium"),
         )
+        worker._hme_manual_otp_entry = manual_otp_entry
+        if browser_engine == "roxy":
+            roxy_session = api.RoxyRegistrationBrowser(
+                api_url=str(
+                    os.environ.get("HME_ROXY_API_URL")
+                    or "http://127.0.0.1:50000"
+                ),
+                api_token=str(os.environ.get("HME_ROXY_API_TOKEN") or ""),
+                workspace_id=int(os.environ.get("HME_ROXY_WORKSPACE_ID") or 0),
+                profile_id=str(os.environ.get("HME_ROXY_PROFILE_ID") or ""),
+                proxy_url=proxy_url,
+                background=browser_headless,
+                log=log,
+            )
+            worker._new_browser_context = roxy_session.new_browser_context
+            worker._log_browser_fingerprint = lambda: log(
+                "浏览器指纹: Roxy Chromium · 启动前清理专用环境并随机生成新指纹 · "
+                "语言/时区/地理位置跟随出口"
+            )
+            api.emit(
+                "log",
+                message=(
+                    "[Roxy] 已选择后台隐藏模式；Roxy 原生不提供真正 headless，"
+                    "启动后会隐藏本机窗口并继续 CDP 自动化"
+                    if browser_headless
+                    else "[Roxy] 已选择有头模式，将显示真实指纹浏览器窗口"
+                ),
+            )
         diagnostics_dir = str(
             os.environ.get("HME_BROWSER_DIAGNOSTICS_DIR")
             or (
@@ -241,10 +266,15 @@ def run(api) -> int:
                 "log",
                 message="当前流程已选择前台浏览器；交互前会自动激活窗口",
             )
-        else:
+        elif browser_engine == "camoufox":
             api.emit(
                 "log",
                 message="Camoufox 已启用后台加载与交互；窗口被遮挡时任务仍会继续",
+            )
+        else:
+            api.emit(
+                "log",
+                message="Roxy CDP 后台交互已启用；注册结束后自动关闭专用环境",
             )
         if api.configure_direct_registration_browser(
             worker,
@@ -301,6 +331,17 @@ def run(api) -> int:
             force_reset_password=force_reset_password,
             enable_2fa=enable_2fa,
             pending_two_factor=pending_2fa,
+        )
+        api.configure_request_driven_registration(
+            worker,
+            emit_state=lambda state: api.emit("registration_chain", state=state),
+            require_password=bool(ensure_password),
+            enable_two_factor=bool(enable_2fa),
+        )
+        api.configure_registration_state_recognition(
+            worker,
+            diagnostics_dir=diagnostics_dir,
+            emit_state=lambda state: api.emit("page_state", state=state),
         )
         result = worker.run()
         password_confirmed = api._password_confirmed_for_two_factor(
@@ -403,6 +444,14 @@ def run(api) -> int:
             raise RuntimeError(
                 "Gmail 注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
             )
+        api.finalize_registration_chain(
+            worker,
+            password_confirmed=password_confirmed,
+            two_factor_enabled=bool(
+                isinstance(two_factor_state, dict)
+                and two_factor_state.get("enabled")
+            ),
+        )
         api.emit(
             "result",
             result=result,
@@ -411,6 +460,8 @@ def run(api) -> int:
         )
         return 0
     except api.FreshFingerprintRequiredError as error:
+        if locals().get("worker") is not None:
+            api.fail_registration_chain(worker, error)
         api.emit(
             "fresh_fingerprint_required",
             reason=api.safe_log_message(str(error)),
@@ -421,6 +472,8 @@ def run(api) -> int:
         )
         return 75
     except KeyboardInterrupt:
+        if locals().get("worker") is not None:
+            api.fail_registration_chain(worker, "浏览器任务已停止")
         api.emit(
             "error",
             error="浏览器任务已停止",
@@ -429,6 +482,8 @@ def run(api) -> int:
         )
         return 130
     except Exception as error:
+        if locals().get("worker") is not None:
+            api.fail_registration_chain(worker, error)
         api.emit(
             "error",
             error=api.safe_log_message(str(error)),
@@ -438,3 +493,6 @@ def run(api) -> int:
             ),
         )
         return 1
+    finally:
+        if roxy_session is not None:
+            roxy_session.close()

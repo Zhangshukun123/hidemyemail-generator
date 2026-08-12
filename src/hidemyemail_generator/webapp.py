@@ -13,7 +13,8 @@ import webbrowser
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -26,10 +27,12 @@ from .account_verifier import AccountVerificationManager, removed_account_emails
 from .browser_tasks import (
     BrowserTaskManager,
     _save_account_record,
+    account_registration_proxy_url,
     account_saved_cookies,
     account_session,
     account_session_access_token,
     access_token_is_expired,
+    build_registration_environment,
     load_account_record,
     set_manual_account_type,
 )
@@ -63,12 +66,24 @@ from .registration_inventory import (
     lease_generated_inventory_email,
     registration_inventory_status as stored_registration_inventory_status,
 )
+from .registration_inventory_auth import (
+    InventoryCredentialStore,
+    access_token_digest,
+)
 from .registration_inventory_client import (
     INVENTORY_INTEGRATION_PATHS,
     INVENTORY_LEASE_PATH,
+    INVENTORY_LOGIN_PATH,
     INVENTORY_RESULT_PATH,
     INVENTORY_STATUS_PATH,
+    INVENTORY_SYNC_PATH,
     RemoteRegistrationInventoryClient,
+)
+from .registration_inventory_sync import (
+    SYNC_SCHEMA_VERSION,
+    export_inventory_record,
+    export_inventory_records,
+    import_inventory_records,
 )
 from .registration_tasks import (
     ConcurrentRegistrationTaskManager,
@@ -76,6 +91,7 @@ from .registration_tasks import (
     generate_openai_password,
 )
 from .registration_proxy import RegistrationProxyStore
+from .roxy_registration import RoxyRegistrationStore
 from .scheduled_generation import (
     DEFAULT_BATCH_SIZE as DEFAULT_INVENTORY_BATCH_SIZE,
     DEFAULT_INTERVAL_SECONDS as DEFAULT_INVENTORY_INTERVAL_SECONDS,
@@ -103,6 +119,7 @@ PUBLIC_PATHS = {
     "/api/code/latest",
     "/healthz",
     WORKBENCH_INVENTORY_IMPORT_PATH,
+    INVENTORY_LOGIN_PATH,
 }
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
@@ -113,6 +130,7 @@ ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS = 60 * 60
 OPENAI_CODE_INBOX_SYNC_LIMIT = 3
 OPENAI_CODE_INBOX_WAIT_SECONDS = 7.0
 DEACTIVATION_SCAN_INTERVAL_SECONDS = 5 * 60
+INVENTORY_SYNC_INTERVAL_SECONDS = 5 * 60
 REGISTRATION_PROCESS_FAILURE_PREFIX = "registration_process_failure:"
 CARD_LINK_REGIONS = {
     "US": {"label": "美国", "currency": "USD", "locale": "en-US"},
@@ -122,7 +140,7 @@ CARD_LINK_REGIONS = {
     "CA": {"label": "加拿大", "currency": "CAD", "locale": "en-CA"},
     "AU": {"label": "澳大利亚", "currency": "AUD", "locale": "en-AU"},
 }
-CARD_LINK_METHODS = {"standard", "ph_hosted"}
+CARD_LINK_METHODS = {"standard", "ph_hosted", "de_oaics_paypal"}
 
 
 class InboxSyncDeferredError(RuntimeError):
@@ -1453,6 +1471,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
     let selectedOperationEmail = "";
     const cardLinkExtractionModes = [
       ["ph_hosted", "gpt-link · PH / PHP hosted · 双代理严格 0"],
+      ["de_oaics_paypal", "PayPal / 德国 · EUR · OAICS 严格 0"],
       ["standard:US", "标准直卡 · 美国 · USD"],
       ["standard:JP", "标准直卡 · 日本 · JPY"],
       ["standard:DE", "标准直卡 · 德国 · EUR"],
@@ -1679,14 +1698,15 @@ GPT_INDEX_HTML = r"""<!doctype html>
 
     async function generateCardLink(item, extractionMode) {
       const hosted = extractionMode === "ph_hosted";
-      const country = hosted ? "PH" : extractionMode.split(":", 2)[1] || "US";
+      const deOaicsPayPal = extractionMode === "de_oaics_paypal";
+      const country = hosted ? "PH" : deOaicsPayPal ? "DE" : extractionMode.split(":", 2)[1] || "US";
       const data = await api("/api/account/card-link", {
         method: "POST",
         body: JSON.stringify({
           email: item.email,
-          method: hosted ? "ph_hosted" : "standard",
+          method: hosted ? "ph_hosted" : deOaicsPayPal ? "de_oaics_paypal" : "standard",
           country,
-          create_proxy: hosted ? $("cardLinkCreateProxy").value.trim() : "",
+          create_proxy: hosted || deOaicsPayPal ? $("cardLinkCreateProxy").value.trim() : "",
           promotion_proxy: hosted ? $("cardLinkPromotionProxy").value.trim() : "",
         }),
       });
@@ -2303,8 +2323,9 @@ GPT_INDEX_HTML = r"""<!doctype html>
         if (item.cardLink) {
           const linkBadge = document.createElement("span");
           linkBadge.className = "payment-link-badge";
-          linkBadge.textContent = item.cardLinkMethod === "ph_hosted"
-            ? "hosted 严格 0" : "已生成";
+          linkBadge.textContent = item.cardLinkMethod === "de_oaics_paypal"
+            ? "PayPal DE/EUR"
+            : item.cardLinkMethod === "ph_hosted" ? "hosted 严格 0" : "已生成";
           meta.append(linkBadge);
         }
         identityCopy.append(address, meta);
@@ -2316,7 +2337,11 @@ GPT_INDEX_HTML = r"""<!doctype html>
         const stateDetail = document.createElement("span");
         const generatedLabel = cardLinkDateLabel(item.cardLinkGeneratedAt);
         if (item.cardLink) {
-          if (item.cardLinkMethod === "ph_hosted") {
+          if (item.cardLinkMethod === "de_oaics_paypal") {
+            const zeroVerified = item.cardLinkAmount === "0";
+            stateTitle.textContent = "PayPal DE/EUR OAICS 严格 0 已提取";
+            stateDetail.textContent = `PayPal BA · ${zeroVerified ? "零金额已校验" : "严格零元流程"}${generatedLabel ? ` · ${generatedLabel} 生成` : ""} · 建议尽快使用`;
+          } else if (item.cardLinkMethod === "ph_hosted") {
             const zeroVerified = item.cardLinkAmount === "0";
             stateTitle.textContent = "PH/PHP hosted 严格 0 已提取";
             stateDetail.textContent = `oaics_ · ${zeroVerified ? "零金额已校验" : "严格零元流程"}${generatedLabel ? ` · ${generatedLabel} 生成` : ""} · 建议尽快使用`;
@@ -2345,8 +2370,8 @@ GPT_INDEX_HTML = r"""<!doctype html>
           modeSelect.append(option);
         }
         const storedStandardMode = `standard:${item.cardLinkCountry || "US"}`;
-        modeSelect.value = item.cardLink && item.cardLinkMethod === "ph_hosted"
-          ? "ph_hosted"
+        modeSelect.value = item.cardLink && ["ph_hosted", "de_oaics_paypal"].includes(item.cardLinkMethod)
+          ? item.cardLinkMethod
           : item.cardLink && cardLinkExtractionModes.some(([value]) => value === storedStandardMode)
           ? storedStandardMode
           : "ph_hosted";
@@ -2584,19 +2609,53 @@ def _workbench_import_token_valid(
     return bool(configured) and hmac.compare_digest(supplied, configured)
 
 
-def _session_valid(request: web.Request) -> bool:
-    if not request.app["web_password"]:
-        return True
+def _web_login_required(app: web.Application) -> bool:
+    return bool(app.get("inventory_auth_enabled") or app.get("web_password"))
+
+
+def _session_cookie_valid(request: web.Request) -> bool:
     supplied = request.cookies.get(SESSION_COOKIE_NAME, "")
     return bool(supplied) and hmac.compare_digest(
         supplied, request.app["session_token"]
     )
 
 
+def _session_valid(request: web.Request) -> bool:
+    return not _web_login_required(request.app) or _session_cookie_valid(request)
+
+
+def _inventory_access_valid(
+    request: web.Request, app: web.Application
+) -> bool:
+    if not app.get("inventory_auth_enabled"):
+        return _workbench_import_token_valid(request, app)
+    authorization = str(request.headers.get("Authorization") or "")
+    scheme, _, supplied = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not supplied:
+        return False
+    now = time.monotonic()
+    tokens: dict[str, float] = app["inventory_access_tokens"]
+    for digest, expires_at in list(tokens.items()):
+        if expires_at <= now:
+            tokens.pop(digest, None)
+    expires_at = tokens.get(access_token_digest(supplied))
+    return bool(expires_at and expires_at > now)
+
+
 @web.middleware
 async def auth_middleware(
     request: web.Request, handler
 ) -> web.StreamResponse:
+    if request.path in INVENTORY_INTEGRATION_PATHS:
+        if _inventory_access_valid(request, request.app) or _session_cookie_valid(
+            request
+        ):
+            return await handler(request)
+        return web.json_response(
+            {"ok": False, "error": "请先登录"},
+            status=401,
+            headers={"Cache-Control": "no-store"},
+        )
     if (
         request.path in PUBLIC_PATHS
         or (
@@ -2607,10 +2666,10 @@ async def auth_middleware(
             )
         )
         or (
-            request.path
-            in ({WORKBENCH_OPENAI_CODE_PATH} | INVENTORY_INTEGRATION_PATHS)
+            request.path == WORKBENCH_OPENAI_CODE_PATH
             and _workbench_import_token_valid(request, request.app)
         )
+        or _local_token_valid(request, request.app)
         or _session_valid(request)
     ):
         return await handler(request)
@@ -2905,18 +2964,31 @@ def _account_card_link(record: dict) -> dict:
     value = record.get("card_link")
     if not isinstance(value, dict):
         return {}
-    url = str(value.get("url") or "").strip()
-    if not _valid_card_link(url):
-        return {}
     method = str(value.get("method") or "standard").strip().lower()
     if method not in CARD_LINK_METHODS:
         method = "standard"
+    url = str(value.get("url") or "").strip()
+    status = str(value.get("status") or "").strip().lower()
+    if status == "cs_live" and method == "de_oaics_paypal":
+        return {
+            "url": "",
+            "status": "cs_live",
+            "method": method,
+            "country": str(value.get("country") or "DE").strip().upper(),
+            "currency": str(value.get("currency") or "EUR").strip().upper(),
+            "generated_at": "",
+            "checked_at": str(value.get("checked_at") or "").strip(),
+        }
+    if not _valid_card_link(url, method):
+        return {}
     return {
         "url": url,
+        "status": "generated",
         "method": method,
         "country": str(value.get("country") or "US").strip().upper(),
         "currency": str(value.get("currency") or "USD").strip().upper(),
         "generated_at": str(value.get("generated_at") or "").strip(),
+        "checked_at": str(value.get("checked_at") or "").strip(),
         "payment_link_type": str(value.get("payment_link_type") or "").strip(),
         "checkout_ui_mode": str(value.get("checkout_ui_mode") or "").strip(),
         "amount": str(value.get("amount") or "").strip(),
@@ -2929,12 +3001,35 @@ def _account_card_link(record: dict) -> dict:
     }
 
 
-def _valid_card_link(value: str) -> bool:
-    match = re.fullmatch(
+def _valid_card_link(value: str, method: str = "") -> bool:
+    text = str(value or "").strip()
+    normalized_method = str(method or "").strip().lower()
+    chatgpt_match = re.fullmatch(
         r"https://chatgpt\.com/checkout/[A-Za-z0-9_-]+/(?:cs_|oaics_)[A-Za-z0-9_-]+",
-        str(value or "").strip(),
+        text,
     )
-    return bool(match)
+    if normalized_method and normalized_method != "de_oaics_paypal":
+        return bool(chatgpt_match)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    paypal_approve = bool(
+        parsed.scheme.lower() == "https"
+        and (host == "paypal.com" or host.endswith(".paypal.com"))
+        and parsed.path.rstrip("/").lower() == "/agreements/approve"
+        and str(parse_qs(parsed.query).get("ba_token", [""])[0]).strip()
+    )
+    stripe_redirect = bool(
+        parsed.scheme.lower() == "https"
+        and host == "pm-redirects.stripe.com"
+        and parsed.path not in {"", "/"}
+    )
+    provider_link = paypal_approve or stripe_redirect
+    if normalized_method == "de_oaics_paypal":
+        return provider_link
+    return bool(chatgpt_match) or provider_link
 
 
 def _normalize_card_link_proxy_url(value: str) -> str:
@@ -2996,23 +3091,33 @@ def _save_account_card_link(
     amount_verification: str = "",
     promotion_applied: bool = False,
     promotion_strategy: str = "",
+    status: str = "generated",
 ) -> dict:
     target = str(email or "").strip().lower()
     record = load_account_record(db_file, target)
     if not record:
         raise RuntimeError("未找到账号记录")
-    if not _valid_card_link(url):
-        raise RuntimeError("直卡支付链接格式无效")
     normalized_method = str(method or "standard").strip().lower()
     if normalized_method not in CARD_LINK_METHODS:
         raise RuntimeError("不支持该直卡提取方式")
+    normalized_status = str(status or "generated").strip().lower()
+    if normalized_status not in {"generated", "cs_live"}:
+        raise RuntimeError("提链结果状态无效")
+    if normalized_status == "cs_live" and normalized_method != "de_oaics_paypal":
+        raise RuntimeError("cs_live 标记仅适用于 PayPal DE/EUR OAICS 模式")
+    if normalized_status == "generated" and not _valid_card_link(
+        url, normalized_method
+    ):
+        raise RuntimeError("支付链接格式无效")
     now = datetime.now(timezone.utc).isoformat()
     card_link = {
-        "url": str(url).strip(),
+        "url": str(url).strip() if normalized_status == "generated" else "",
+        "status": normalized_status,
         "method": normalized_method,
         "country": str(country or "US").strip().upper(),
         "currency": str(currency or "USD").strip().upper(),
-        "generated_at": now,
+        "generated_at": now if normalized_status == "generated" else "",
+        "checked_at": now,
         "payment_link_type": str(payment_link_type or "").strip(),
         "checkout_ui_mode": str(checkout_ui_mode or "").strip(),
         "amount": str(amount or "").strip(),
@@ -3038,6 +3143,91 @@ def _save_account_card_link(
     return card_link
 
 
+def _save_registration_checkout_probe(
+    db_file: Path,
+    email: str,
+    *,
+    registration_environment: dict[str, Any],
+    checkout_proxy: dict[str, Any],
+    classification: str = "",
+    error: str = "",
+    attempt_count: int = 1,
+    max_attempts: int = 1,
+    attempt_errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """Persist a comparison-safe Checkout classification without its ID."""
+
+    target = str(email or "").strip().lower()
+    record = load_account_record(db_file, target)
+    if not record:
+        raise RuntimeError("未找到账户记录")
+    normalized = str(classification or "").strip().lower()
+    if normalized not in {"oaics", "cs_live", "cs", "other"}:
+        normalized = ""
+    checked_at = datetime.now(timezone.utc).isoformat()
+    registration_snapshot = dict(registration_environment or {})
+    checkout_snapshot = dict(checkout_proxy or {})
+    differences = {
+        "proxy_mode_changed": str(registration_snapshot.get("proxy_mode") or "")
+        != str(checkout_snapshot.get("proxy_mode") or ""),
+        "proxy_country_changed": str(
+            registration_snapshot.get("proxy_country") or ""
+        ).upper()
+        != str(checkout_snapshot.get("proxy_country") or "").upper(),
+        "proxy_endpoint_changed": str(
+            registration_snapshot.get("proxy_endpoint") or ""
+        )
+        != str(checkout_snapshot.get("proxy_endpoint") or ""),
+        "exit_ip_changed": bool(
+            registration_snapshot.get("exit_ip")
+            and checkout_snapshot.get("exit_ip")
+            and registration_snapshot.get("exit_ip")
+            != checkout_snapshot.get("exit_ip")
+        ),
+    }
+    probe = {
+        "status": "verified" if normalized else "error",
+        "checkout_id_type": normalized or "error",
+        "is_oaics": normalized == "oaics",
+        "method": "oaics_probe",
+        "country": "DE",
+        "currency": "EUR",
+        "attempt_count": max(1, int(attempt_count or 1)),
+        "max_attempts": max(1, int(max_attempts or 1)),
+        "attempt_errors": [
+            str(item or "").strip()[:300]
+            for item in (attempt_errors or [])
+            if str(item or "").strip()
+        ],
+        "checked_at": checked_at,
+        "registration_marker": str(
+            registration_snapshot.get("captured_at")
+            or record.get("registration_completed_at")
+            or ""
+        ),
+        "registration_environment": registration_snapshot,
+        "checkout_proxy": checkout_snapshot,
+        "differences": differences,
+        "error": str(error or "").strip()[:500] if not normalized else "",
+    }
+    record["registration_environment"] = registration_snapshot
+    record["registration_checkout_probe"] = probe
+    record["updated_at"] = checked_at
+    conn = connect_db(str(db_file))
+    try:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"gpt_account:{target}", json.dumps(record, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return probe
+
+
 async def _run_card_link_bridge(
     *,
     target_project_dir: Path,
@@ -3048,6 +3238,7 @@ async def _run_card_link_bridge(
     country: str,
     currency: str,
     locale: str,
+    account_email: str = "",
     create_proxy_url: str = "",
     promotion_proxy_url: str = "",
 ) -> dict:
@@ -3077,6 +3268,8 @@ async def _run_card_link_bridge(
         currency,
         "--locale",
         locale,
+        "--account-email",
+        str(account_email or "").strip(),
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     process = await asyncio.create_subprocess_exec(
@@ -3089,7 +3282,13 @@ async def _run_card_link_bridge(
         limit=1024 * 1024,
     )
     try:
-        timeout = 150 if method == "ph_hosted" else 75
+        timeout = (
+            240
+            if method == "de_oaics_paypal"
+            else 150
+            if method == "ph_hosted"
+            else 75
+        )
         stdout, stderr = await asyncio.wait_for(
             process.communicate(), timeout=timeout
         )
@@ -3109,7 +3308,8 @@ async def _run_card_link_bridge(
             continue
         if isinstance(candidate, dict):
             event = candidate
-    if process.returncode != 0 or event.get("status") != "success":
+    event_status = str(event.get("status") or "")
+    if process.returncode != 0 or event_status not in {"success", "classified"}:
         detail = str(event.get("detail") or "").strip()
         if not detail:
             detail = stderr.decode("utf-8", errors="replace").strip()
@@ -3119,8 +3319,19 @@ async def _run_card_link_bridge(
             if proxy:
                 detail = detail.replace(proxy, "[REDACTED_PROXY]")
         raise RuntimeError((detail or "直卡支付链接生成失败")[:1000])
-    if not _valid_card_link(str(event.get("url") or "")):
-        raise RuntimeError("生成器没有返回有效的 ChatGPT 直卡支付链接")
+    if event_status == "classified":
+        if method == "oaics_probe" and str(
+            event.get("classification") or ""
+        ) in {"oaics", "cs_live", "cs", "other"}:
+            return event
+        if (
+            method == "de_oaics_paypal"
+            and event.get("classification") == "cs_live"
+        ):
+            return event
+        raise RuntimeError("生成器返回了不支持的 Checkout 分类")
+    if not _valid_card_link(str(event.get("url") or ""), method):
+        raise RuntimeError("生成器没有返回有效的支付链接")
     return event
 
 
@@ -3420,6 +3631,15 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         session = account_session(account)
         access_token = account_session_access_token(account)
         card_link = _account_card_link(account)
+        registration_environment = account.get("registration_environment")
+        if not isinstance(registration_environment, dict):
+            registration_environment = {}
+        checkout_probe = account.get("registration_checkout_probe")
+        if not isinstance(checkout_probe, dict):
+            checkout_probe = {}
+        checkout_proxy = checkout_probe.get("checkout_proxy")
+        if not isinstance(checkout_proxy, dict):
+            checkout_proxy = {}
         token_expired = bool(access_token) and (
             access_token_is_expired(access_token)
             or bool(account.get("session_invalid_at"))
@@ -3448,6 +3668,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 if isinstance(account.get("two_factor"), dict)
                 else "",
                 "hasSession": bool(session and access_token),
+                "registrationComplete": bool(session and access_token),
                 "protocolReady": bool(
                     _account_has_confirmed_password(account)
                     and isinstance(account.get("two_factor"), dict)
@@ -3458,6 +3679,56 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 ),
                 "sessionAcquisitionMethod": str(
                     account.get("session_acquisition_method") or ""
+                ),
+                "registrationMode": str(
+                    registration_environment.get("registration_mode") or ""
+                ),
+                "registrationEmailType": str(
+                    registration_environment.get("email_type") or ""
+                ),
+                "registrationProxyMode": str(
+                    registration_environment.get("proxy_mode") or ""
+                ),
+                "registrationProxyCountry": str(
+                    registration_environment.get("proxy_country") or ""
+                ),
+                "registrationProxyEndpoint": str(
+                    registration_environment.get("proxy_endpoint") or ""
+                ),
+                "registrationProxyNode": str(
+                    registration_environment.get("proxy_node") or ""
+                ),
+                "registrationExitIp": str(
+                    registration_environment.get("exit_ip") or ""
+                ),
+                "registrationExitCountry": str(
+                    registration_environment.get("exit_country") or ""
+                ),
+                "checkoutProbeStatus": str(checkout_probe.get("status") or ""),
+                "checkoutIdType": str(
+                    checkout_probe.get("checkout_id_type") or ""
+                ),
+                "checkoutIsOaics": bool(checkout_probe.get("is_oaics")),
+                "checkoutProbeCheckedAt": str(
+                    checkout_probe.get("checked_at") or ""
+                ),
+                "checkoutProbeError": str(checkout_probe.get("error") or ""),
+                "checkoutProbeAttemptCount": max(
+                    0, int(checkout_probe.get("attempt_count") or 0)
+                ),
+                "checkoutProbeMaxAttempts": max(
+                    0, int(checkout_probe.get("max_attempts") or 0)
+                ),
+                "checkoutProxyMode": str(checkout_proxy.get("proxy_mode") or ""),
+                "checkoutProxyCountry": str(
+                    checkout_proxy.get("proxy_country") or ""
+                ),
+                "checkoutProxyEndpoint": str(
+                    checkout_proxy.get("proxy_endpoint") or ""
+                ),
+                "checkoutExitIp": str(checkout_proxy.get("exit_ip") or ""),
+                "checkoutExitCountry": str(
+                    checkout_proxy.get("exit_country") or ""
                 ),
                 "hasCookies": bool(account_saved_cookies(account)),
                 "hasImportableSession": bool(
@@ -3475,10 +3746,15 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 "accountTypeSource": str(account.get("account_type_source") or ""),
                 "verifiedAt": str(account.get("verified_at") or ""),
                 "cardLink": str(card_link.get("url") or ""),
+                "cardLinkStatus": str(
+                    card_link.get("status")
+                    or ("generated" if card_link.get("url") else "")
+                ),
                 "cardLinkMethod": str(card_link.get("method") or ""),
                 "cardLinkCountry": str(card_link.get("country") or "US"),
                 "cardLinkCurrency": str(card_link.get("currency") or "USD"),
                 "cardLinkGeneratedAt": str(card_link.get("generated_at") or ""),
+                "cardLinkCheckedAt": str(card_link.get("checked_at") or ""),
                 "cardLinkPaymentType": str(
                     card_link.get("payment_link_type") or ""
                 ),
@@ -3511,6 +3787,94 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
     )
 
 
+def _chatgpt_proxy_status_reachable(status: int) -> bool:
+    return int(status or 0) in {200, 403}
+
+
+async def test_registration_proxy_connection(
+    proxy_url: str,
+    expected_country: str,
+) -> dict[str, Any]:
+    """Test the configured registration proxy without exposing its URL."""
+
+    started = time.perf_counter()
+    timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=12)
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+        async with session.get(
+            "https://www.cloudflare.com/cdn-cgi/trace",
+            proxy=proxy_url or None,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as response:
+            trace_text = await response.text()
+            if response.status != 200:
+                raise RuntimeError(f"出口检测 HTTP {response.status}")
+        trace = {}
+        for line in trace_text.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                trace[key.strip()] = value.strip()
+        exit_ip = str(trace.get("ip") or "").strip()
+        actual_country = str(trace.get("loc") or "").strip().upper()
+        if not exit_ip or not actual_country:
+            raise RuntimeError("出口检测未返回 IP 或国家")
+        try:
+            async with session.get(
+                "https://chatgpt.com/api/auth/csrf",
+                proxy=proxy_url or None,
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as response:
+                chatgpt_status = int(response.status)
+                await response.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            chatgpt_status = 0
+    latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+    expected = str(expected_country or "").strip().upper()
+    country_matches = not expected or actual_country == expected
+    # The real browser completes Cloudflare's JavaScript challenge.  This
+    # lightweight aiohttp probe cannot do that, so ChatGPT commonly answers
+    # 403 even when the proxy tunnel and destination are both reachable.  Keep
+    # this aligned with the payment project's established proxy-health check.
+    chatgpt_ok = _chatgpt_proxy_status_reachable(chatgpt_status)
+    parts = [f"出口 {exit_ip}", actual_country, f"延迟 {latency_ms} ms"]
+    if chatgpt_status == 200:
+        parts.append("ChatGPT 可达 (HTTP 200)")
+    elif chatgpt_status == 403:
+        parts.append("ChatGPT 可达 (HTTP 403，等待浏览器验证)")
+    else:
+        parts.append(
+            f"ChatGPT HTTP {chatgpt_status}" if chatgpt_status else "ChatGPT 连接失败"
+        )
+    if not country_matches:
+        parts.append(f"要求 {expected}，实际 {actual_country}")
+    return {
+        "ok": bool(country_matches and chatgpt_ok),
+        "exitIp": exit_ip,
+        "country": actual_country,
+        "expectedCountry": expected,
+        "countryMatches": country_matches,
+        "chatgptStatus": chatgpt_status,
+        "latencyMs": latency_ms,
+        "message": " · ".join(parts),
+        "testedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _registration_proxy_test_error(error: Exception) -> str:
+    """Return a useful proxy-test error without exposing proxy credentials."""
+
+    if isinstance(error, asyncio.TimeoutError):
+        return "代理连接超时"
+    if isinstance(error, aiohttp.ClientHttpProxyError):
+        return "代理网关拒绝 HTTPS 连接，请检查主机、端口或账号余额"
+    if isinstance(error, aiohttp.ClientProxyConnectionError):
+        return "无法连接代理网关，请检查主机和端口"
+    if isinstance(error, aiohttp.ClientError):
+        return f"代理连接异常 ({type(error).__name__})"
+    if isinstance(error, RuntimeError):
+        return str(error)
+    return type(error).__name__
+
+
 def create_app(
     *,
     base_dir: Path,
@@ -3519,6 +3883,7 @@ def create_app(
     db_file: str = DEFAULT_DB_FILE,
     inbox_config_file: str = DEFAULT_INBOX_CONFIG_FILE,
     region: str = "china",
+    web_username: str = "",
     web_password: str = "",
     target_project_dir: str = "",
     target_python: str = "",
@@ -3529,9 +3894,12 @@ def create_app(
     inventory_server_enabled: bool = False,
     inventory_service_url: str = "",
     inventory_service_token: str = "",
+    inventory_service_username: str = "",
+    inventory_service_password: str = "",
     inventory_lease_seconds: int = DEFAULT_LEASE_SECONDS,
     inventory_batch_size: int = DEFAULT_INVENTORY_BATCH_SIZE,
     inventory_interval_seconds: int = DEFAULT_INVENTORY_INTERVAL_SECONDS,
+    inventory_sync_interval_seconds: float = INVENTORY_SYNC_INTERVAL_SECONDS,
     smsbower_api_key: str = "",
     smsbower_service: str = DEFAULT_SMSBOWER_SERVICE,
     smsbower_max_price: float = DEFAULT_SMSBOWER_MAX_PRICE,
@@ -3540,17 +3908,27 @@ def create_app(
     paypal_python: str = "",
     paypal_port: int = 18097,
     deactivation_scan_interval_seconds: float = DEACTIVATION_SCAN_INTERVAL_SECONDS,
+    auto_oaics_probe: bool = True,
 ) -> web.Application:
     app = web.Application(
-        client_max_size=1024 * 1024, middlewares=[auth_middleware]
+        client_max_size=4 * 1024 * 1024, middlewares=[auth_middleware]
     )
     app["local_token"] = secrets.token_urlsafe(32)
-    app["web_password"] = web_password
     app["session_token"] = secrets.token_urlsafe(48)
     app["login_attempts"] = []
+    app["inventory_login_attempts"] = []
+    app["inventory_access_tokens"] = {}
     app["cookie_file"] = _resolve_data_path(base_dir, cookie_file)
     app["output_file"] = _resolve_data_path(base_dir, output_file)
     app["db_file"] = _resolve_data_path(base_dir, db_file)
+    credential_store = InventoryCredentialStore(app["db_file"])
+    if str(web_username or "").strip():
+        if not web_password:
+            raise ValueError("HIDEMYEMAIL_WEB_PASSWORD is required with WEB_USERNAME")
+        credential_store.configure(web_username, web_password)
+    app["inventory_credential_store"] = credential_store
+    app["inventory_auth_enabled"] = credential_store.configured
+    app["web_password"] = "" if app["inventory_auth_enabled"] else web_password
     app["inbox_config_file"] = _resolve_data_path(base_dir, inbox_config_file)
     app["region"] = region
     app["inbox_background_last_sync"] = ""
@@ -3573,6 +3951,8 @@ def create_app(
     app["inbox_sync_lock"] = asyncio.Lock()
     app["identity_lock"] = asyncio.Lock()
     app["card_link_lock"] = asyncio.Lock()
+    app["auto_oaics_probe"] = bool(auto_oaics_probe)
+    app["auto_oaics_probe_sleep"] = asyncio.sleep
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
     app["inventory_server_enabled"] = bool(inventory_server_enabled)
@@ -3580,12 +3960,70 @@ def create_app(
     app["inventory_client"] = RemoteRegistrationInventoryClient(
         service_url=inventory_service_url,
         token=inventory_service_token,
+        username=inventory_service_username,
+        password=inventory_service_password,
     )
+    app["inventory_sync_lock"] = asyncio.Lock()
+    app["inventory_sync_interval_seconds"] = max(
+        1.0, float(inventory_sync_interval_seconds)
+    )
+    app["inventory_initial_sync_complete"] = False
+    app["inventory_sync_state"] = {
+        "status": "waiting" if app["inventory_client"].configured else "disabled",
+        "lastAttemptAt": "",
+        "lastSuccessAt": "",
+        "lastError": "",
+        "records": 0,
+        "addresses": 0,
+        "accounts": 0,
+        "batches": 0,
+    }
+
+    async def sync_inventory_to_remote(
+        emails: list[str] | None = None,
+    ) -> dict[str, Any]:
+        client: RemoteRegistrationInventoryClient = app["inventory_client"]
+        if not client.configured:
+            return {"configured": False, "records": 0, "addresses": 0, "accounts": 0}
+        async with app["inventory_sync_lock"]:
+            state: dict[str, Any] = app["inventory_sync_state"]
+            state.update(
+                status="syncing",
+                lastAttemptAt=datetime.now(timezone.utc).isoformat(),
+                lastError="",
+            )
+            try:
+                records = await asyncio.to_thread(
+                    export_inventory_records,
+                    app["db_file"],
+                    emails=emails,
+                )
+                result = await client.sync_records(records)
+            except Exception as error:
+                state.update(status="error", lastError=str(error)[:1000])
+                raise
+            state.update(
+                status="ready",
+                lastSuccessAt=datetime.now(timezone.utc).isoformat(),
+                lastError="",
+                **result,
+            )
+            if emails is None:
+                app["inventory_initial_sync_complete"] = True
+            return {"configured": True, **result}
+
+    async def sync_saved_account_to_remote(email: str) -> None:
+        await sync_inventory_to_remote([str(email or "").strip().lower()])
+
+    app["sync_inventory_to_remote"] = sync_inventory_to_remote
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
+    app["roxy_registration_store"] = RoxyRegistrationStore(app["db_file"])
+    app["registration_proxy_tester"] = test_registration_proxy_connection
     app["protocol_registration_manager"] = ProtocolRegistrationManager(
         base_dir=base_dir,
         db_file=app["db_file"],
         proxy_store=app["registration_proxy_store"],
+        on_account_saved=sync_saved_account_to_remote,
     )
     app["smsbower_config_store"] = SMSBowerConfigStore(
         app["db_file"],
@@ -3620,10 +4058,184 @@ def create_app(
         python_executable=Path(target_python) if target_python else None,
         force_headless=force_browser_headless,
         registration_proxy_store=app["registration_proxy_store"],
+        roxy_registration_store=app["roxy_registration_store"],
+        on_account_saved=sync_saved_account_to_remote,
     )
     app["card_link_bridge_file"] = Path(__file__).with_name(
         "openai_card_link_bridge.py"
     ).resolve()
+
+    async def inspect_proxy_environment(
+        proxy_url: str, environment: dict[str, Any]
+    ) -> dict[str, Any]:
+        snapshot = dict(environment)
+        try:
+            tested = await app["registration_proxy_tester"](
+                proxy_url, str(snapshot.get("proxy_country") or "")
+            )
+        except Exception as error:
+            snapshot["exit_ip_status"] = "error"
+            snapshot["exit_ip_error"] = _registration_proxy_test_error(error)[:300]
+            return snapshot
+        snapshot.update(
+            exit_ip=str(tested.get("exitIp") or "").strip(),
+            exit_country=str(tested.get("country") or "").strip().upper(),
+            exit_ip_status="verified" if tested.get("exitIp") else "unknown",
+            proxy_test_latency_ms=max(0, int(tested.get("latencyMs") or 0)),
+        )
+        return snapshot
+
+    async def validate_saved_registration_checkout(
+        email: str,
+    ) -> dict[str, Any] | None:
+        target = str(email or "").strip().lower()
+        if not app["auto_oaics_probe"]:
+            await sync_saved_account_to_remote(target)
+            return None
+        record = await asyncio.to_thread(
+            load_account_record, app["db_file"], target
+        )
+        registration_environment = record.get("registration_environment")
+        if not isinstance(registration_environment, dict):
+            await sync_saved_account_to_remote(target)
+            return None
+        marker = str(
+            registration_environment.get("captured_at")
+            or record.get("registration_completed_at")
+            or ""
+        )
+        previous_probe = record.get("registration_checkout_probe")
+        if (
+            isinstance(previous_probe, dict)
+            and marker
+            and str(previous_probe.get("registration_marker") or "") == marker
+            and str(previous_probe.get("status") or "") == "verified"
+        ):
+            await sync_saved_account_to_remote(target)
+            return dict(previous_probe)
+
+        checkout_environment: dict[str, Any] = {
+            "registration_mode": "checkout_probe",
+            "email_type": str(registration_environment.get("email_type") or ""),
+            "proxy_enabled": True,
+            "proxy_mode": "kookeey",
+            "proxy_country": "BR",
+            "proxy_country_label": "巴西",
+            "proxy_endpoint": "",
+            "proxy_node": "",
+            "proxy_selector": "",
+            "proxy_latency_ms": 0,
+            "exit_ip": "",
+            "exit_country": "",
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+        access_token = account_session_access_token(record)
+        registration_proxy_url = account_registration_proxy_url(record)
+        max_probe_attempts = 3
+        probe_retry_delays = (2, 5)
+        attempt_count = 0
+        attempt_errors: list[str] = []
+        try:
+            if not access_token:
+                raise RuntimeError("账户没有可用 Access Token")
+            if access_token_is_expired(access_token):
+                raise RuntimeError("Access Token 已过期")
+            browser_manager: BrowserTaskManager = app["browser_manager"]
+            if not browser_manager.target_project_dir.is_dir():
+                raise RuntimeError("OpenAI 支付运行目录不存在")
+            if not browser_manager.python_executable.is_file():
+                raise RuntimeError("OpenAI 支付运行环境不可用")
+            registration_environment = await inspect_proxy_environment(
+                registration_proxy_url, registration_environment
+            )
+            result: dict[str, Any] = {}
+            for attempt in range(1, max_probe_attempts + 1):
+                attempt_count = attempt
+                checkout_proxy_url, checkout_proxy_state = await asyncio.to_thread(
+                    app["registration_proxy_store"].proxy_for_country,
+                    "BR",
+                    mode="kookeey",
+                )
+                if not checkout_proxy_url:
+                    raise RuntimeError("Kookeey 巴西代理尚未配置")
+                checkout_state = {
+                    **checkout_proxy_state,
+                    "mode": "kookeey",
+                    "country": "BR",
+                    "countryLabel": "巴西",
+                }
+                checkout_environment = build_registration_environment(
+                    target,
+                    registration_mode="checkout_probe",
+                    proxy_url=checkout_proxy_url,
+                    proxy_state=checkout_state,
+                    proxy_mode="kookeey",
+                    proxy_country="BR",
+                )
+                checkout_environment = await inspect_proxy_environment(
+                    checkout_proxy_url, checkout_environment
+                )
+                try:
+                    async with app["card_link_lock"]:
+                        result = await _run_card_link_bridge(
+                            target_project_dir=browser_manager.target_project_dir,
+                            python_executable=browser_manager.python_executable,
+                            bridge_file=app["card_link_bridge_file"],
+                            access_token=access_token,
+                            method="oaics_probe",
+                            country="DE",
+                            currency="EUR",
+                            locale="de-DE",
+                            account_email=target,
+                            create_proxy_url=checkout_proxy_url,
+                        )
+                    break
+                except Exception as error:
+                    attempt_errors.append(
+                        _registration_proxy_test_error(error)[:300]
+                    )
+                    if attempt >= max_probe_attempts:
+                        raise
+                    await app["auto_oaics_probe_sleep"](
+                        probe_retry_delays[attempt - 1]
+                    )
+            probe = await asyncio.to_thread(
+                _save_registration_checkout_probe,
+                app["db_file"],
+                target,
+                registration_environment=registration_environment,
+                checkout_proxy=checkout_environment,
+                classification=str(
+                    result.get("checkout_id_type")
+                    or result.get("classification")
+                    or ""
+                ),
+                attempt_count=attempt_count,
+                max_attempts=max_probe_attempts,
+                attempt_errors=attempt_errors,
+            )
+        except Exception as error:
+            probe = await asyncio.to_thread(
+                _save_registration_checkout_probe,
+                app["db_file"],
+                target,
+                registration_environment=registration_environment,
+                checkout_proxy=checkout_environment,
+                error=_registration_proxy_test_error(error),
+                attempt_count=max(1, attempt_count),
+                max_attempts=max_probe_attempts,
+                attempt_errors=attempt_errors,
+            )
+        await sync_saved_account_to_remote(target)
+        return probe
+
+    app["browser_manager"].on_account_saved = validate_saved_registration_checkout
+    app["protocol_registration_manager"].on_account_saved = (
+        validate_saved_registration_checkout
+    )
+    app["validate_saved_registration_checkout"] = (
+        validate_saved_registration_checkout
+    )
     gpt_code_identity_cache: list[dict] = []
     gpt_code_identity_cache_at = 0.0
 
@@ -3706,10 +4318,19 @@ def create_app(
         # The remote inventory database cannot see account records saved on
         # this workstation.  Consume only completed accounts; a password-only
         # record from a failed attempt stays retryable and reuses that password.
+        if not app["inventory_initial_sync_complete"]:
+            await sync_inventory_to_remote()
         for _attempt in range(100):
             email = await app["inventory_client"].acquire_email(label)
             if not email:
                 return ""
+            leased_record = app["inventory_client"].leased_record(email)
+            if leased_record is not None:
+                await asyncio.to_thread(
+                    import_inventory_records,
+                    app["db_file"],
+                    [leased_record],
+                )
             record = await asyncio.to_thread(
                 load_account_record, app["db_file"], email
             )
@@ -3730,7 +4351,16 @@ def create_app(
     async def complete_registration_inventory_email(
         email: str, success: bool, message: str
     ) -> None:
-        await app["inventory_client"].complete_email(email, success, message)
+        record = (
+            await asyncio.to_thread(
+                export_inventory_record, app["db_file"], email
+            )
+            if success
+            else None
+        )
+        await app["inventory_client"].complete_email(
+            email, success, message, record=record
+        )
 
     async def confirm_registration_email(email: str) -> None:
         if not str(email or "").strip().lower().endswith("@icloud.com"):
@@ -3841,6 +4471,8 @@ def create_app(
             bridge_file=primary_browser.bridge_file,
             force_headless=primary_browser.force_headless,
             registration_proxy_store=primary_browser.registration_proxy_store,
+            roxy_registration_store=primary_browser.roxy_registration_store,
+            on_account_saved=validate_saved_registration_checkout,
         )
         return RegistrationTaskManager(
             browser_manager=process_browser,
@@ -4158,6 +4790,28 @@ def create_app(
 
     app.cleanup_ctx.append(deactivation_scan_context)
 
+    if app["inventory_client"].configured:
+        async def remote_inventory_sync_context(_: web.Application):
+            async def sync_loop() -> None:
+                while True:
+                    try:
+                        await sync_inventory_to_remote()
+                    except Exception:
+                        # The status endpoint exposes the last error.  Keep the
+                        # local service usable and retry without losing data.
+                        pass
+                    await asyncio.sleep(app["inventory_sync_interval_seconds"])
+
+            task = asyncio.create_task(sync_loop())
+            try:
+                yield
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        app.cleanup_ctx.append(remote_inventory_sync_context)
+
     if app["inventory_server_enabled"]:
         async def scheduled_generation_context(_: web.Application):
             await app["scheduled_generation_manager"].start()
@@ -4184,7 +4838,7 @@ def create_app(
         app.cleanup_ctx.append(inventory_lease_cleanup_context)
 
     async def login_page(request: web.Request) -> web.Response:
-        if not app["web_password"] or _session_valid(request):
+        if not _web_login_required(app) or _session_valid(request):
             raise web.HTTPFound("/")
         return web.Response(
             text=DESIGNED_LOGIN_HTML,
@@ -4218,7 +4872,7 @@ def create_app(
         )
 
     async def login_api(request: web.Request) -> web.Response:
-        if not app["web_password"]:
+        if not _web_login_required(app):
             return web.json_response({"ok": True})
         now = time.monotonic()
         attempts = [
@@ -4239,11 +4893,20 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
-        supplied = str(payload.get("password") or "")
-        if not hmac.compare_digest(supplied, app["web_password"]):
+        supplied_username = str(payload.get("username") or "").strip()
+        supplied_password = str(payload.get("password") or "")
+        if app["inventory_auth_enabled"]:
+            valid = await asyncio.to_thread(
+                app["inventory_credential_store"].verify,
+                supplied_username,
+                supplied_password,
+            )
+        else:
+            valid = hmac.compare_digest(supplied_password, app["web_password"])
+        if not valid:
             attempts.append(now)
             return web.json_response(
-                {"ok": False, "error": "密码错误"},
+                {"ok": False, "error": "账号或密码错误"},
                 status=401,
                 headers={"Cache-Control": "no-store"},
             )
@@ -4261,6 +4924,62 @@ def create_app(
             path="/",
         )
         return response
+
+    async def inventory_login_api(request: web.Request) -> web.Response:
+        if not app["inventory_server_enabled"]:
+            raise web.HTTPNotFound()
+        if not app["inventory_auth_enabled"]:
+            return web.json_response(
+                {"ok": False, "error": "服务器登录账号尚未配置"},
+                status=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        now = time.monotonic()
+        attempts = [
+            timestamp
+            for timestamp in app["inventory_login_attempts"]
+            if now - timestamp < 60
+        ]
+        app["inventory_login_attempts"][:] = attempts
+        if len(attempts) >= 5:
+            return web.json_response(
+                {"ok": False, "error": "尝试次数过多，请一分钟后再试"},
+                status=429,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        valid = isinstance(payload, dict) and await asyncio.to_thread(
+            app["inventory_credential_store"].verify,
+            str(payload.get("username") or "").strip(),
+            str(payload.get("password") or ""),
+        )
+        if not valid:
+            attempts.append(now)
+            return web.json_response(
+                {"ok": False, "error": "账号或密码错误"},
+                status=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        app["inventory_login_attempts"].clear()
+        access_token = secrets.token_urlsafe(48)
+        app["inventory_access_tokens"][access_token_digest(access_token)] = (
+            now + SESSION_MAX_AGE
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "accessToken": access_token,
+                "expiresIn": SESSION_MAX_AGE,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def logout_api(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
@@ -4938,6 +5657,9 @@ def create_app(
         if method == "ph_hosted":
             country = "PH"
             region = {"currency": "PHP", "locale": "en-US"}
+        elif method == "de_oaics_paypal":
+            country = "DE"
+            region = {"currency": "EUR", "locale": "de-DE"}
         else:
             country = str(body.get("country") or "US").strip().upper()
             region = CARD_LINK_REGIONS.get(country)
@@ -4946,23 +5668,76 @@ def create_app(
                     {"ok": False, "error": "不支持该直卡支付地区"},
                     status=400,
                 )
-        try:
-            create_proxy = _normalize_card_link_proxy_url(
-                str(body.get("create_proxy") or "")
-            )
-            promotion_proxy = _normalize_card_link_proxy_url(
-                str(body.get("promotion_proxy") or "")
-            )
-        except RuntimeError as error:
-            return web.json_response(
-                {"ok": False, "error": str(error)}, status=400
-            )
-        if method == "standard":
-            create_proxy = ""
-            promotion_proxy = ""
         record = await asyncio.to_thread(
             load_account_record, app["db_file"], email
         )
+        existing_card_link = (
+            record.get("card_link") if isinstance(record, dict) else {}
+        )
+        if not isinstance(existing_card_link, dict):
+            existing_card_link = {}
+        if (
+            method == "de_oaics_paypal"
+            and existing_card_link.get("method") == method
+            and existing_card_link.get("status") == "cs_live"
+        ):
+            return web.json_response(
+                {
+                    "ok": True,
+                    "email": email,
+                    "skipped": True,
+                    "cardLinkStatus": "cs_live",
+                    **existing_card_link,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+        proxy_store = app["registration_proxy_store"]
+        create_proxy_country = str(
+            body.get("create_proxy_country") or ""
+        ).strip().upper()
+        promotion_proxy_country = str(
+            body.get("promotion_proxy_country") or ""
+        ).strip().upper()
+        proxy_mode = str(body.get("proxy_mode") or "").strip().lower()
+
+        async def configured_proxy_for_country(
+            selected_country: str, legacy_value: object
+        ) -> str:
+            if selected_country:
+                try:
+                    proxy_url, _ = await asyncio.to_thread(
+                        proxy_store.proxy_for_country,
+                        selected_country,
+                        mode=proxy_mode,
+                    )
+                except ValueError as error:
+                    raise RuntimeError(str(error)) from error
+                if not proxy_url:
+                    raise RuntimeError("请先在“代理与线路”中保存代理配置")
+                return proxy_url
+            return _normalize_card_link_proxy_url(str(legacy_value or ""))
+
+        if method == "standard":
+            create_proxy = ""
+            promotion_proxy = ""
+        else:
+            try:
+                create_proxy = await configured_proxy_for_country(
+                    create_proxy_country,
+                    body.get("create_proxy"),
+                )
+                promotion_proxy = (
+                    ""
+                    if method == "de_oaics_paypal"
+                    else await configured_proxy_for_country(
+                        promotion_proxy_country,
+                        body.get("promotion_proxy"),
+                    )
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=400
+                )
         session = account_session(record)
         access_token = account_session_access_token(record)
         if not session or not access_token:
@@ -4995,6 +5770,7 @@ def create_app(
                     country=country,
                     currency=str(region["currency"]),
                     locale=str(region["locale"]),
+                    account_email=email,
                     create_proxy_url=create_proxy,
                     promotion_proxy_url=promotion_proxy,
                 )
@@ -5025,6 +5801,11 @@ def create_app(
                     promotion_strategy=str(
                         result.get("promotion_strategy") or ""
                     ),
+                    status=(
+                        "cs_live"
+                        if result.get("classification") == "cs_live"
+                        else "generated"
+                    ),
                 )
         except RuntimeError as error:
             return web.json_response(
@@ -5032,8 +5813,44 @@ def create_app(
                 status=502,
             )
         return web.json_response(
-            {"ok": True, "email": email, **saved},
+            {
+                "ok": True,
+                "email": email,
+                "cardLinkStatus": saved["status"],
+                **saved,
+            },
             headers={"Cache-Control": "no-store"},
+        )
+
+    async def retry_registration_checkout_probe(
+        request: web.Request,
+    ) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(body.get("email") or "").strip().lower()
+        if not _valid_supported_account_email(email):
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        probe = await app["validate_saved_registration_checkout"](email)
+        if not isinstance(probe, dict):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "账号缺少注册环境记录，无法重新检测 Checkout",
+                },
+                status=409,
+            )
+        return web.json_response(
+            {"ok": True, **probe}, headers={"Cache-Control": "no-store"}
         )
 
     async def browser_status(_: web.Request) -> web.Response:
@@ -5132,6 +5949,43 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "不支持的注册邮箱来源"}, status=400
             )
+        browser_engine = str(
+            payload.get("browser_engine") or "camoufox"
+        ).strip().lower()
+        if browser_engine not in {"camoufox", "roxy"}:
+            return web.json_response(
+                {"ok": False, "error": "不支持的注册浏览器引擎"}, status=400
+            )
+        try:
+            concurrency = int(payload.get("concurrency", 1))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"ok": False, "error": "注册并发数必须是整数"}, status=400
+            )
+        concurrency_limit = 5 if browser_engine == "roxy" else 10
+        if concurrency < 1 or concurrency > concurrency_limit:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": f"{('Roxy ' if browser_engine == 'roxy' else '')}注册并发数必须是 1–{concurrency_limit}",
+                },
+                status=400,
+            )
+        try:
+            target_count = int(payload.get("target_count", concurrency))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"ok": False, "error": "目标账号数必须是整数"}, status=400
+            )
+        if target_count < 1 or target_count > 100:
+            return web.json_response(
+                {"ok": False, "error": "目标账号数必须是 1–100"}, status=400
+            )
+        if provider in {"manual", "smsbower"}:
+            concurrency = 1
+            target_count = 1
+        elif browser_engine != "roxy":
+            target_count = concurrency
         email = str(payload.get("email") or "").strip().lower()
         if provider == "manual" and (
             not email
@@ -5145,13 +5999,17 @@ def create_app(
                 status=400,
             )
         try:
-            task = app["registration_manager"].start(
+            registration_options = dict(
                 label=label,
                 headless=bool(payload.get("headless", False)),
-                concurrency=1,
+                concurrency=concurrency,
                 email=email,
                 provider=provider,
             )
+            if browser_engine != "camoufox":
+                registration_options["browser_engine"] = browser_engine
+                registration_options["target_count"] = target_count
+            task = app["registration_manager"].start(**registration_options)
         except (RuntimeError, ValueError) as error:
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
@@ -5231,6 +6089,21 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def protocol_registration_runtime_refresh(
+        request: web.Request,
+    ) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        runtime = await asyncio.to_thread(
+            app["protocol_registration_manager"].refresh_runtime
+        )
+        return web.json_response(
+            {"ok": True, "runtime": runtime},
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def protocol_registration_start(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
@@ -5255,6 +6128,38 @@ def create_app(
                 {"ok": False, "error": "协议注册并发必须是 1–5"}, status=400
             )
 
+        provider = str(payload.get("provider") or "").strip().lower()
+        if provider not in {"", "inventory"}:
+            return web.json_response(
+                {"ok": False, "error": "协议注册暂不支持该邮箱来源"}, status=400
+            )
+        inventory_email = ""
+        if provider == "inventory":
+            try:
+                inventory_email = await acquire_registration_inventory_email(
+                    "iCloud 邮箱协议注册"
+                )
+            except RuntimeError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            if not inventory_email:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "code": "inventory_empty",
+                        "error": "iCloud 未注册库存为空",
+                    },
+                    status=409,
+                )
+
+        async def release_inventory_email(message: str) -> None:
+            if not inventory_email:
+                return
+            await complete_registration_inventory_email(
+                inventory_email, False, message
+            )
+
         try:
             identities = await active_icloud_identities()
         except RuntimeError:
@@ -5268,7 +6173,9 @@ def create_app(
             if str(item.get("email") or "").strip()
         }
         run_all = bool(payload.get("all"))
-        if run_all:
+        if inventory_email:
+            requested = [inventory_email]
+        elif run_all:
             requested = list(accounts_by_email)
         else:
             raw_emails = payload.get("emails")
@@ -5286,6 +6193,7 @@ def create_app(
             or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
         ]
         if invalid:
+            await release_inventory_email("库存邮箱未能导入本地账号列表")
             return web.json_response(
                 {
                     "ok": False,
@@ -5296,12 +6204,13 @@ def create_app(
         pending = [
             email
             for email in requested
-            if not bool(accounts_by_email[email].get("protocolReady"))
+            if not bool(accounts_by_email[email].get("registrationComplete"))
         ]
         skipped = len(requested) - len(pending)
         if not pending:
+            await release_inventory_email("库存邮箱已有完成的 OpenAI 账号")
             message = (
-                "全部账号均已完成协议注册（密码+2FA）"
+                "全部账号均已注册，无需再次协议注册"
                 if requested
                 else "当前没有可协议注册的邮箱账号"
             )
@@ -5309,22 +6218,36 @@ def create_app(
                 {"ok": False, "error": message}, status=409
             )
         try:
-            task = app["protocol_registration_manager"].start(
-                emails=pending,
-                base_url=f"{request.scheme}://{request.host}",
-                concurrency=concurrency,
-            )
+            start_options: dict[str, Any] = {
+                "emails": pending,
+                "base_url": f"{request.scheme}://{request.host}",
+                "concurrency": concurrency,
+            }
+            if inventory_email:
+                start_options["on_account_finished"] = (
+                    complete_registration_inventory_email
+                )
+            task = app["protocol_registration_manager"].start(**start_options)
         except ValueError as error:
+            await release_inventory_email(str(error))
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=400
             )
         except RuntimeError as error:
+            await release_inventory_email(str(error))
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
             )
         task["skipped"] = skipped
         return web.json_response(
-            {"ok": True, "started": True, "skipped": skipped, "task": task}
+            {
+                "ok": True,
+                "started": True,
+                "skipped": skipped,
+                "provider": provider or "selected",
+                "email": inventory_email,
+                "task": task,
+            }
         )
 
     async def protocol_registration_stop(request: web.Request) -> web.Response:
@@ -5977,7 +6900,12 @@ def create_app(
                 headers={"Cache-Control": "no-store"},
             )
         return web.json_response(
-            {"configured": True, **state}, headers={"Cache-Control": "no-store"}
+            {
+                "configured": True,
+                **state,
+                "sync": dict(app["inventory_sync_state"]),
+            },
+            headers={"Cache-Control": "no-store"},
         )
 
     async def integration_inventory_status(_: web.Request) -> web.Response:
@@ -6034,6 +6962,35 @@ def create_app(
             {"ok": True, "lease": lease}, headers={"Cache-Control": "no-store"}
         )
 
+    async def integration_inventory_sync(request: web.Request) -> web.Response:
+        if not app["inventory_server_enabled"]:
+            raise web.HTTPNotFound()
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        if payload.get("schemaVersion") != SYNC_SCHEMA_VERSION:
+            return web.json_response(
+                {"ok": False, "error": "不支持的同步协议版本"}, status=400
+            )
+        records = payload.get("records")
+        if not isinstance(records, list) or len(records) > 50:
+            return web.json_response(
+                {"ok": False, "error": "records 必须是最多 50 项的数组"},
+                status=400,
+            )
+        try:
+            result = await asyncio.to_thread(
+                import_inventory_records, app["db_file"], records
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        return web.json_response(
+            {"ok": True, **result}, headers={"Cache-Control": "no-store"}
+        )
+
     async def integration_inventory_result(request: web.Request) -> web.Response:
         if not app["inventory_server_enabled"]:
             raise web.HTTPNotFound()
@@ -6047,6 +7004,11 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "success 必须是布尔值"}, status=400
             )
+        record = payload.get("record")
+        if record is not None and not isinstance(record, dict):
+            return web.json_response(
+                {"ok": False, "error": "record 必须是对象或 null"}, status=400
+            )
         try:
             result = await asyncio.to_thread(
                 complete_generated_inventory_lease,
@@ -6055,6 +7017,7 @@ def create_app(
                 email=str(payload.get("email") or ""),
                 success=payload["success"],
                 message=str(payload.get("message") or ""),
+                record=record,
             )
         except ValueError as error:
             return web.json_response({"ok": False, "error": str(error)}, status=400)
@@ -6062,6 +7025,58 @@ def create_app(
             status = 404 if result.get("status") == "not_found" else 409
             return web.json_response(result, status=status)
         return web.json_response(result, headers={"Cache-Control": "no-store"})
+
+    async def roxy_registration_status(_: web.Request) -> web.Response:
+        state = await asyncio.to_thread(
+            app["roxy_registration_store"].public_state
+        )
+        return web.json_response(
+            {"ok": True, **state}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def roxy_registration_config(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        fields = {
+            "apiUrl": payload.get("apiUrl") if "apiUrl" in payload else None,
+            "workspaceId": (
+                payload.get("workspaceId") if "workspaceId" in payload else None
+            ),
+            "profileId": (
+                payload.get("profileId") if "profileId" in payload else None
+            ),
+        }
+        if any(
+            value is not None
+            and (not isinstance(value, (str, int)) or isinstance(value, bool))
+            for value in fields.values()
+        ):
+            return web.json_response(
+                {"ok": False, "error": "Roxy 注册配置字段无效"}, status=400
+            )
+        try:
+            await asyncio.to_thread(
+                app["roxy_registration_store"].configure,
+                api_url=fields["apiUrl"],
+                workspace_id=fields["workspaceId"],
+                profile_id=fields["profileId"],
+            )
+            state = await asyncio.to_thread(
+                app["roxy_registration_store"].public_state
+            )
+        except ValueError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=400
+            )
+        return web.json_response({"ok": True, **state})
 
     async def registration_proxy_status(_: web.Request) -> web.Response:
         state = await asyncio.to_thread(
@@ -6086,6 +7101,15 @@ def create_app(
         mode = payload.get("mode") if "mode" in payload else None
         country = payload.get("country") if "country" in payload else None
         proxy_line = payload.get("proxyLine") if "proxyLine" in payload else None
+        proxy_endpoint = (
+            payload.get("proxyEndpoint") if "proxyEndpoint" in payload else None
+        )
+        proxy_username = (
+            payload.get("proxyUsername") if "proxyUsername" in payload else None
+        )
+        proxy_password = (
+            payload.get("proxyPassword") if "proxyPassword" in payload else None
+        )
         clash_controller = (
             payload.get("clashController") if "clashController" in payload else None
         )
@@ -6098,6 +7122,14 @@ def create_app(
         )
         max_latency_ms = (
             payload.get("maxLatencyMs") if "maxLatencyMs" in payload else None
+        )
+        card_link_countries = (
+            payload.get("cardLinkCountries")
+            if "cardLinkCountries" in payload
+            else None
+        )
+        card_link_modes = (
+            payload.get("cardLinkModes") if "cardLinkModes" in payload else None
         )
         if enabled is not None and not isinstance(enabled, bool):
             return web.json_response(
@@ -6116,6 +7148,19 @@ def create_app(
         ):
             return web.json_response(
                 {"ok": False, "error": "代理连接信息无效"}, status=400
+            )
+        proxy_fields = {
+            "proxyEndpoint": proxy_endpoint,
+            "proxyUsername": proxy_username,
+            "proxyPassword": proxy_password,
+        }
+        if any(
+            value is not None
+            and (not isinstance(value, str) or len(value) > 1000)
+            for value in proxy_fields.values()
+        ):
+            return web.json_response(
+                {"ok": False, "error": "代理配置字段无效"}, status=400
             )
         clash_strings = {
             "clashController": clash_controller,
@@ -6137,6 +7182,18 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "maxLatencyMs 必须是整数"}, status=400
             )
+        if card_link_countries is not None and not isinstance(
+            card_link_countries, dict
+        ):
+            return web.json_response(
+                {"ok": False, "error": "cardLinkCountries 必须是国家配置"},
+                status=400,
+            )
+        if card_link_modes is not None and not isinstance(card_link_modes, dict):
+            return web.json_response(
+                {"ok": False, "error": "cardLinkModes 必须是代理模式配置"},
+                status=400,
+            )
         try:
             state = await asyncio.to_thread(
                 app["registration_proxy_store"].configure,
@@ -6144,6 +7201,11 @@ def create_app(
                 mode=mode,
                 country=country,
                 proxy_line=proxy_line,
+                proxy_endpoint=proxy_endpoint,
+                proxy_username=proxy_username,
+                proxy_password=proxy_password,
+                card_link_countries=card_link_countries,
+                card_link_modes=card_link_modes,
                 clash_controller=clash_controller,
                 clash_secret=clash_secret,
                 clash_selector=clash_selector,
@@ -6176,6 +7238,35 @@ def create_app(
             )
         return web.json_response(
             {"ok": True, **state}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def registration_proxy_test(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        proxy_url, state = await asyncio.to_thread(
+            app["registration_proxy_store"].proxy_for_test
+        )
+        if not proxy_url:
+            return web.json_response(
+                {"ok": False, "error": "注册代理尚未配置"}, status=400
+            )
+        try:
+            result = await app["registration_proxy_tester"](
+                proxy_url, str(state.get("country") or "")
+            )
+        except Exception as error:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": f"代理测试失败：{_registration_proxy_test_error(error)}",
+                },
+                status=502,
+            )
+        return web.json_response(
+            {"ok": True, **state, "testResult": result},
+            headers={"Cache-Control": "no-store"},
         )
 
     async def inbox_status(_: web.Request) -> web.Response:
@@ -6425,6 +7516,7 @@ def create_app(
 
     app.router.add_get("/login", login_page)
     app.router.add_post("/api/login", login_api)
+    app.router.add_post(INVENTORY_LOGIN_PATH, inventory_login_api)
     app.router.add_get("/access", access_page)
     app.router.add_get("/code", code_page)
     app.router.add_post("/api/code/latest", latest_code)
@@ -6442,6 +7534,9 @@ def create_app(
         "/api/account/import-workbench", import_workbench_account
     )
     app.router.add_post("/api/account/card-link", create_card_link)
+    app.router.add_post(
+        "/api/account/checkout-probe", retry_registration_checkout_probe
+    )
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_post(WORKBENCH_OPENAI_CODE_PATH, workbench_openai_code)
@@ -6461,6 +7556,10 @@ def create_app(
         "/api/protocol-registration/status", protocol_registration_status
     )
     app.router.add_post(
+        "/api/protocol-registration/runtime/refresh",
+        protocol_registration_runtime_refresh,
+    )
+    app.router.add_post(
         "/api/protocol-registration/start", protocol_registration_start
     )
     app.router.add_post(
@@ -6476,6 +7575,7 @@ def create_app(
     )
     app.router.add_get(INVENTORY_STATUS_PATH, integration_inventory_status)
     app.router.add_post(INVENTORY_LEASE_PATH, integration_inventory_lease)
+    app.router.add_post(INVENTORY_SYNC_PATH, integration_inventory_sync)
     app.router.add_post(INVENTORY_RESULT_PATH, integration_inventory_result)
     app.router.add_get(
         "/api/scheduled-generation/status", scheduled_generation_status
@@ -6485,7 +7585,10 @@ def create_app(
     )
     app.router.add_get("/api/registration-proxy/status", registration_proxy_status)
     app.router.add_post("/api/registration-proxy/config", registration_proxy_config)
+    app.router.add_get("/api/roxy-registration/status", roxy_registration_status)
+    app.router.add_post("/api/roxy-registration/config", roxy_registration_config)
     app.router.add_post("/api/registration-proxy/rotate", registration_proxy_rotate)
+    app.router.add_post("/api/registration-proxy/test", registration_proxy_test)
     app.router.add_get("/api/account-verification/status", verification_status)
     app.router.add_post("/api/account-verification/start", verification_start)
     app.router.add_post("/api/account-verification/stop", verification_stop)
@@ -6508,6 +7611,7 @@ async def run_server(args: argparse.Namespace) -> None:
         db_file=args.db_file,
         inbox_config_file=args.inbox_config_file,
         region=args.region,
+        web_username=os.environ.get("HIDEMYEMAIL_WEB_USERNAME", ""),
         web_password=os.environ.get("HIDEMYEMAIL_WEB_PASSWORD", ""),
         target_project_dir=os.environ.get("OPENAI_REGISTER_PROJECT_DIR", ""),
         target_python=os.environ.get("OPENAI_REGISTER_PYTHON", ""),
@@ -6527,6 +7631,12 @@ async def run_server(args: argparse.Namespace) -> None:
         in {"1", "true", "yes", "on"},
         inventory_service_url=os.environ.get("HIDEMYEMAIL_INVENTORY_URL", ""),
         inventory_service_token=_configured_inventory_service_token(),
+        inventory_service_username=os.environ.get(
+            "HIDEMYEMAIL_INVENTORY_USERNAME", ""
+        ),
+        inventory_service_password=os.environ.get(
+            "HIDEMYEMAIL_INVENTORY_PASSWORD", ""
+        ),
         inventory_lease_seconds=int(
             os.environ.get(
                 "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
@@ -6545,6 +7655,12 @@ async def run_server(args: argparse.Namespace) -> None:
                 str(DEFAULT_INVENTORY_INTERVAL_SECONDS),
             )
         ),
+        inventory_sync_interval_seconds=float(
+            os.environ.get(
+                "HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS",
+                str(INVENTORY_SYNC_INTERVAL_SECONDS),
+            )
+        ),
         smsbower_api_key=os.environ.get("SMSBOWER_API_KEY", ""),
         smsbower_service=os.environ.get(
             "SMSBOWER_MAIL_SERVICE", DEFAULT_SMSBOWER_SERVICE
@@ -6558,6 +7674,10 @@ async def run_server(args: argparse.Namespace) -> None:
         paypal_project_dir=os.environ.get("PAYPAL_PROTOCOL_PROJECT_DIR", ""),
         paypal_python=os.environ.get("PAYPAL_PROTOCOL_PYTHON", ""),
         paypal_port=int(os.environ.get("PAYPAL_PROTOCOL_PORT", "18097")),
+        auto_oaics_probe=os.environ.get(
+            "HIDEMYEMAIL_AUTO_OAICS_PROBE", "1"
+        ).strip().lower()
+        in {"1", "true", "yes", "on"},
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -6595,13 +7715,17 @@ def _load_local_env_file(path: Path) -> None:
     allowed = {
         "ACCOUNT_WORKBENCH_URL",
         "ACCOUNT_WORKBENCH_IMPORT_TOKEN",
+        "HIDEMYEMAIL_WEB_USERNAME",
         "HIDEMYEMAIL_WEB_PASSWORD",
         "HIDEMYEMAIL_INVENTORY_SERVER",
         "HIDEMYEMAIL_INVENTORY_URL",
         "HIDEMYEMAIL_INVENTORY_TOKEN",
+        "HIDEMYEMAIL_INVENTORY_USERNAME",
+        "HIDEMYEMAIL_INVENTORY_PASSWORD",
         "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
         "HIDEMYEMAIL_INVENTORY_BATCH_SIZE",
         "HIDEMYEMAIL_INVENTORY_INTERVAL_SECONDS",
+        "HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS",
         "SMSBOWER_API_KEY",
         "SMSBOWER_MAIL_SERVICE",
         "SMSBOWER_MAX_PRICE",

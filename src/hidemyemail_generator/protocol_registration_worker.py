@@ -17,6 +17,14 @@ from urllib.request import Request, urlopen
 
 EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
 RESULT_PREFIX = "HME_PROTOCOL_RESULT:"
+INVALID_STATE_FULL_RETRY_LIMIT = 1
+
+
+def _configure_utf8_stdio(streams: tuple[Any, ...] | None = None) -> None:
+    for stream in streams or (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 
 def _emit_event(stage: str, message: str, status: str = "active") -> None:
@@ -35,11 +43,35 @@ def _emit_event(stage: str, message: str, status: str = "active") -> None:
     )
 
 
+def _is_invalid_state_failure(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("status") or "").strip().casefold() == "success":
+        return False
+    error = result.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code") or "").strip().casefold()
+        if code == "invalid_state":
+            return True
+        detail = " ".join(str(value or "") for value in error.values())
+    else:
+        detail = str(error or "")
+    normalized = detail.casefold()
+    return (
+        "invalid_state" in normalized
+        or "sign-in session is no longer valid" in normalized
+    )
+
+
 def _load_core(root: Path) -> ModuleType:
     core = root / "core"
     required = (
         core / "chatgpt_register.py",
         core / "sentinel_token.py",
+        core / "codex_oauth.py",
+        core / "gpt_trial_protocol" / "__init__.py",
+        core / "gpt_trial_protocol" / "models.py",
+        core / "gpt_trial_protocol" / "sentinel_http.py",
         core / "sentinel_vm" / "runtime_worker.js",
     )
     if not all(path.is_file() for path in required):
@@ -53,6 +85,11 @@ def _load_core(root: Path) -> ModuleType:
         raise RuntimeError(f"无法加载 Mail Auth 内核：{module_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    try:
+        provider = module._SentinelWithProxy()
+        provider._impl._browser_profile("runtime-check")
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(f"Mail Auth 动态协议模块加载失败：{error}") from error
     return module
 
 
@@ -157,6 +194,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     code_url = str(payload.get("code_url") or "").strip()
     proxy_url = str(payload.get("proxy_url") or "").strip()
     password = str(payload.get("existing_password") or "")
+    password_confirmed = bool(payload.get("existing_password_confirmed"))
     totp_secret = str(payload.get("existing_totp_secret") or "")
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         raise RuntimeError("协议注册邮箱无效")
@@ -192,20 +230,38 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             stage = "session"
         _emit_event(stage, text)
 
-    bot = register_class(
-        {
-            "email": email,
-            "password": password,
-            "client_id": "",
-            "refresh_token": code_url,
-        },
-        log_fn=log,
-        proxy=proxy_url,
-        otp_timeout=120,
-        impersonate="firefox144",
-        with_password=True,
-    )
-    raw = bot.register()
+    bot = None
+    raw: Any = None
+    for full_attempt in range(INVALID_STATE_FULL_RETRY_LIMIT + 1):
+        # Reconstructing the register object is intentional: register() creates
+        # a fresh OpenAIAuthClient, device id, cookie jar, OAuth state, and OTP
+        # request for every full attempt.
+        bot = register_class(
+            {
+                "email": email,
+                "password": password,
+                "client_id": "",
+                "refresh_token": code_url,
+            },
+            log_fn=log,
+            proxy=proxy_url,
+            otp_timeout=120,
+            impersonate="firefox144",
+            # Always finish the password after account creation through
+            # POST /api/accounts/password/add.  This keeps passwordless and
+            # password-page registrations on the same verified completion path.
+            with_password=False,
+        )
+        raw = bot.register()
+        if not _is_invalid_state_failure(raw):
+            break
+        if full_attempt >= INVALID_STATE_FULL_RETRY_LIMIT:
+            break
+        _emit_event(
+            "protocol_auth",
+            "OpenAI 在创建账号步骤返回会话失效；正在创建新会话并重新获取验证码（1/1）",
+            "warning",
+        )
     if not isinstance(raw, dict):
         raise RuntimeError("Mail Auth 返回格式无效")
     if str(raw.get("status") or "").strip().lower() != "success":
@@ -226,15 +282,17 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     device_id = str(raw.get("device_id") or "").strip()
     generated_password = str(
         password
-        if password and totp_secret
+        if password and password_confirmed
         else raw.get("password") or getattr(bot, "password", "") or password
     ).strip()
-    _emit_event("password", "正在确认协议账号密码")
+    _emit_event("password", "正在后置设置协议账号密码")
     credentials = complete_protocol_credentials(
         email=email,
         access_token=access_token,
         generated_password=generated_password,
-        password_set=bool(raw.get("password_set") or (password and totp_secret)),
+        password_set=bool(
+            raw.get("password_set") or (password and password_confirmed)
+        ),
         proxy_url=proxy_url,
         session_token=session_token,
         device_id=device_id,
@@ -274,10 +332,15 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "password_confirmed": True,
         "totp_secret": str(two_factor.get("secret") or ""),
         "two_factor": two_factor,
+        "registration_diagnostics": {
+            "full_attempts": full_attempt + 1,
+            "invalid_state_recovered": bool(full_attempt > 0),
+        },
     }
 
 
 def main() -> int:
+    _configure_utf8_stdio()
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):

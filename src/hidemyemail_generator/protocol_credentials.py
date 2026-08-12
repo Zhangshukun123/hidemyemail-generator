@@ -175,19 +175,19 @@ def complete_protocol_credentials(
     logger = log or (lambda _message: None)
 
     saved_totp = str(existing_totp_secret or "").strip()
-    if saved_totp:
-        secret = normalize_totp_secret(saved_totp)
+    saved_secret = normalize_totp_secret(saved_totp) if saved_totp else ""
+    if saved_secret and password_set:
         logger("已保留现有密码与 TOTP 2FA")
         return {
             "password": password,
             "password_set": True,
             "access_token": token,
-            "totp_secret": secret,
+            "totp_secret": saved_secret,
             "two_factor": {
                 "enabled": True,
                 "status": "enabled",
                 "type": "totp",
-                "secret": secret,
+                "secret": saved_secret,
                 "recovery_codes": [],
             },
         }
@@ -204,7 +204,7 @@ def complete_protocol_credentials(
                 _post_json(session, PASSWORD_ADD_URL, token, {"password": password}),
                 "添加密码",
             )
-            logger("密码已通过 accounts/password/add 添加")
+            logger("POST /api/accounts/password/add 已确认后置密码成功")
             if session_token:
                 refreshed = _refresh_access_token(session)
                 if refreshed:
@@ -212,6 +212,22 @@ def complete_protocol_credentials(
                     logger("添加密码后已刷新 Access Token")
         else:
             logger("Mail Auth 已确认密码")
+
+        if saved_secret:
+            logger("已保留现有 TOTP 2FA")
+            return {
+                "password": password,
+                "password_set": True,
+                "access_token": token,
+                "totp_secret": saved_secret,
+                "two_factor": {
+                    "enabled": True,
+                    "status": "enabled",
+                    "type": "totp",
+                    "secret": saved_secret,
+                    "recovery_codes": [],
+                },
+            }
 
         enrolled = _require_success(
             _post_json(

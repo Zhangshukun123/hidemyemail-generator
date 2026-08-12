@@ -39,7 +39,7 @@ icloud-code.8-208-13-52.sslip.io {
 	}
 	handle @registration_inventory {
 		request_body {
-			max_size 16KB
+			max_size 4MB
 		}
 		reverse_proxy 127.0.0.1:18767
 	}

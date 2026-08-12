@@ -7,8 +7,28 @@ from urllib.parse import urlparse
 
 try:
     from .browser_diagnostics import BrowserDiagnosticCode, emit_browser_diagnostic
+    from .registration_activity import (
+        CLICK_RESPONSE_SECONDS,
+        MAX_NO_RESPONSE_CLICK_ATTEMPTS,
+        begin_page_registration_step,
+        ensure_registration_activity_monitor,
+        mark_page_registration_milestone,
+        registration_activity_snapshot,
+        skip_page_registration_step,  # noqa: F401 - navigation compatibility export
+        wait_for_registration_activity,
+    )
 except ImportError:
     from browser_diagnostics import BrowserDiagnosticCode, emit_browser_diagnostic
+    from registration_activity import (
+        CLICK_RESPONSE_SECONDS,
+        MAX_NO_RESPONSE_CLICK_ATTEMPTS,
+        begin_page_registration_step,
+        ensure_registration_activity_monitor,
+        mark_page_registration_milestone,
+        registration_activity_snapshot,
+        skip_page_registration_step,  # noqa: F401 - navigation compatibility export
+        wait_for_registration_activity,
+    )
 
 
 CHATGPT_HOME_LOGIN_SELECTORS = (
@@ -419,6 +439,8 @@ def click_chatgpt_home_login(
         BrowserDiagnosticCode.AUTH_HOME_READY,
         f"ChatGPT 首页已完成加载，正在定位{entry_label}按钮",
     )
+    mark_page_registration_milestone(page, "site_loaded", "document.readyState=complete")
+    wait(page, int(CLICK_RESPONSE_SECONDS * 1000))
     semantic_match_logged = False
 
     def semantic_candidate(target_page):
@@ -474,108 +496,117 @@ def click_chatgpt_home_login(
             )
 
     before_url = str(getattr(page, "url", "") or "")
-    try:
-        if activate is not None:
-            activate(page)
-        _click_candidate(candidate)
-    except RuntimeError as error:
-        if _wait_for_transition(
-            page,
-            before_url,
-            timeout_seconds=3.0,
-            first_visible=first_visible,
-            wait=wait,
-        ):
-            emit_browser_diagnostic(
-                log,
-                BrowserDiagnosticCode.AUTH_HOME_TRANSITION,
-                f"{entry_label}点击等待超时，但页面已经发生变化，继续当前流程",
-                attempt=1,
-            )
-            return True
-        raise RuntimeError(
-            f"ChatGPT 首页{entry_label}按钮点击失败"
-        ) from error
-    emit_browser_diagnostic(
-        log,
-        BrowserDiagnosticCode.AUTH_HOME_LOGIN_CLICK,
-        f"ChatGPT 首页已第一次点击{entry_label}；正在等待页面变化",
-        attempt=1,
+    ensure_registration_activity_monitor(page)
+    response_window = min(
+        CLICK_RESPONSE_SECONDS,
+        max(0.05, float(transition_timeout_seconds)),
     )
-    if _wait_for_transition(
+    begin_page_registration_step(
         page,
-        before_url,
-        timeout_seconds=transition_timeout_seconds,
-        first_visible=first_visible,
-        wait=wait,
-    ):
+        "registration_clicked",
+        f"等待点击{entry_label}，最多 {MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次",
+    )
+    current_candidate = candidate
+    for attempt in range(1, MAX_NO_RESPONSE_CLICK_ATTEMPTS + 1):
+        before_activity = registration_activity_snapshot(page)
+        click_error: RuntimeError | None = None
+        try:
+            if activate is not None:
+                activate(page)
+            _click_candidate(current_candidate)
+        except RuntimeError as error:
+            click_error = error
+        mark_page_registration_milestone(
+            page,
+            "registration_clicked",
+            f"第 {attempt} 次点击{entry_label}",
+        )
+        begin_page_registration_step(
+            page,
+            "registration_entry_ready",
+            f"第 {attempt} 次点击后静默等待 {CLICK_RESPONSE_SECONDS:g} 秒",
+        )
         emit_browser_diagnostic(
             log,
-            BrowserDiagnosticCode.AUTH_HOME_TRANSITION,
-            f"第一次点击{entry_label}后页面已跳转",
-            attempt=1,
+            (
+                BrowserDiagnosticCode.AUTH_HOME_LOGIN_CLICK
+                if attempt == 1
+                else BrowserDiagnosticCode.AUTH_HOME_LOGIN_RETRY
+            ),
+            f"ChatGPT 首页第 {attempt} 次点击{entry_label}；"
+            f"正在保留 {CLICK_RESPONSE_SECONDS:g} 秒响应时间",
+            attempt=attempt,
         )
-        return True
-
-    retry_candidate = _wait_for_candidate(
-        page,
-        entry_selectors,
-        timeout_seconds=5.0,
-        first_visible=first_visible,
-        wait=wait,
-        semantic_candidate=semantic_candidate,
-    )
-    if retry_candidate is None or not is_chatgpt_homepage(
-        str(getattr(page, "url", "") or "")
-    ):
-        raise RuntimeError(
-            f"第一次点击{entry_label}后页面未变化，且按钮已不可再次操作"
-        )
-    emit_browser_diagnostic(
-        log,
-        BrowserDiagnosticCode.AUTH_HOME_LOGIN_RETRY,
-        f"第一次点击{entry_label}后页面仍停留在 ChatGPT 首页；"
-        f"已确认{entry_label}按钮可用，正在第二次点击",
-        attempt=2,
-    )
-    try:
-        if activate is not None:
-            activate(page)
-        _click_candidate(retry_candidate)
-    except RuntimeError as error:
-        if _wait_for_transition(
+        activity = wait_for_registration_activity(
             page,
-            before_url,
-            timeout_seconds=3.0,
+            before_activity,
+            timeout_seconds=response_window,
+            wait=wait,
+            transition=lambda: _transitioned(
+                page,
+                before_url,
+                first_visible=first_visible,
+            ),
+        )
+        if activity.get("changed"):
+            if activity.get("reason") != "transition":
+                log(
+                    f"[请求监测] 第 {attempt} 次点击{entry_label}后检测到"
+                    f"{activity.get('reason') or '网络'}活动；停止补点并等待页面完成"
+                )
+                transitioned = _wait_for_transition(
+                    page,
+                    before_url,
+                    timeout_seconds=transition_timeout_seconds,
+                    first_visible=first_visible,
+                    wait=wait,
+                )
+            else:
+                transitioned = True
+            if transitioned:
+                mark_page_registration_milestone(
+                    page,
+                    "registration_entry_ready",
+                    f"第 {attempt} 次点击后页面已有响应",
+                )
+                emit_browser_diagnostic(
+                    log,
+                    BrowserDiagnosticCode.AUTH_HOME_TRANSITION,
+                    f"第 {attempt} 次点击{entry_label}后页面已响应",
+                    attempt=attempt,
+                )
+                return True
+            raise RuntimeError(
+                f"ChatGPT 首页{entry_label}已有网络请求，"
+                "但页面未在限定时间内完成变化；为避免重复提交已停止补点"
+            )
+        if click_error is not None and attempt >= MAX_NO_RESPONSE_CLICK_ATTEMPTS:
+            raise RuntimeError(
+                f"ChatGPT 首页{entry_label}按钮点击失败"
+            ) from click_error
+        if attempt >= MAX_NO_RESPONSE_CLICK_ATTEMPTS:
+            break
+        current_candidate = _wait_for_candidate(
+            page,
+            entry_selectors,
+            timeout_seconds=response_window,
             first_visible=first_visible,
             wait=wait,
-        ):
-            emit_browser_diagnostic(
-                log,
-                BrowserDiagnosticCode.AUTH_HOME_TRANSITION,
-                f"第二次点击{entry_label}等待超时，但页面已经发生变化",
-                attempt=2,
-            )
-            return True
-        raise RuntimeError(
-            f"ChatGPT 首页{entry_label}按钮第二次点击失败"
-        ) from error
-    if _wait_for_transition(
-        page,
-        before_url,
-        timeout_seconds=transition_timeout_seconds,
-        first_visible=first_visible,
-        wait=wait,
-    ):
-        emit_browser_diagnostic(
-            log,
-            BrowserDiagnosticCode.AUTH_HOME_TRANSITION,
-            f"第二次点击{entry_label}后页面已跳转",
-            attempt=2,
+            semantic_candidate=semantic_candidate,
         )
-        return True
+        if current_candidate is None or not is_chatgpt_homepage(
+            str(getattr(page, "url", "") or "")
+        ):
+            raise RuntimeError(
+                f"第 {attempt} 次点击{entry_label}后无请求且按钮已不可再次操作"
+            )
+        log(
+            f"[请求监测] 第 {attempt} 次点击{entry_label}后 "
+            f"{CLICK_RESPONSE_SECONDS:g} 秒无请求、无响应且页面未变化；"
+            f"准备第 {attempt + 1}/{MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次点击"
+        )
     raise RuntimeError(
-        f"两次点击{entry_label}后页面仍未跳转；已停止继续点击"
+        f"最多点击 {MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次{entry_label}后仍无请求或页面响应"
     )
 
 
@@ -844,6 +875,11 @@ def paste_email_and_submit(
     allow_enter_submit: bool = True,
     submit_diagnostic_message: str = "已点击登录/继续；未直接跳转认证 URL",
 ) -> None:
+    begin_page_registration_step(
+        page,
+        "email_entered",
+        "正在输入邮箱并回读输入框",
+    )
     activate(page)
     emit_browser_diagnostic(
         log,
@@ -930,38 +966,133 @@ def paste_email_and_submit(
         BrowserDiagnosticCode.AUTH_EMAIL_PASTE,
         "邮箱已通过系统剪贴板粘贴并完成回读校验",
     )
+    mark_page_registration_milestone(
+        page,
+        "email_entered",
+        "邮箱输入框回读与目标邮箱一致",
+    )
+    wait(page, int(CLICK_RESPONSE_SECONDS * 1000))
     activate(page)
     submitted_with_enter = False
     before_url = str(getattr(page, "url", "") or "")
+    monitor = ensure_registration_activity_monitor(page)
+    begin_page_registration_step(
+        page,
+        "email_submitted",
+        "等待提交邮箱，提交后静默等待 2 秒",
+    )
     if allow_enter_submit:
+        before_activity = registration_activity_snapshot(page)
         try:
             try:
                 email_input.press("Enter", timeout=5000)
             except TypeError:
                 email_input.press("Enter")
-            for _ in range(3):
-                wait(page, 500)
-                current_url = str(getattr(page, "url", "") or "")
-                if current_url and current_url != before_url:
-                    submitted_with_enter = True
-                    break
-                if first_visible(
+            if monitor.available:
+                activity = wait_for_registration_activity(
                     page,
-                    OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
-                    timeout=300,
-                ) is None:
-                    submitted_with_enter = True
-                    break
+                    before_activity,
+                    timeout_seconds=CLICK_RESPONSE_SECONDS,
+                    wait=wait,
+                    transition=lambda: (
+                        str(getattr(page, "url", "") or "") != before_url
+                        or first_visible(
+                            page,
+                            OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
+                            timeout=300,
+                        )
+                        is None
+                    ),
+                )
+                submitted_with_enter = bool(activity.get("changed"))
+            else:
+                for _ in range(3):
+                    wait(page, 500)
+                    current_url = str(getattr(page, "url", "") or "")
+                    if current_url and current_url != before_url:
+                        submitted_with_enter = True
+                        break
+                    if first_visible(
+                        page,
+                        OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
+                        timeout=300,
+                    ) is None:
+                        submitted_with_enter = True
+                        break
         except Exception:
             submitted_with_enter = False
-    if not submitted_with_enter and not click_email_submit(
-        page,
-        first_visible=first_visible,
-        submit_selectors=submit_selectors,
-        allowed_labels=submit_allowed_labels,
-        anchor_input=email_input,
-        selection_log=log,
-    ):
+    submitted_with_click = False
+    if not submitted_with_enter:
+        max_attempts = MAX_NO_RESPONSE_CLICK_ATTEMPTS if monitor.available else 1
+        for attempt in range(1, max_attempts + 1):
+            current_value = input_value(email_input)
+            if current_value is not None and current_value.strip() != email.strip():
+                fill = getattr(email_input, "fill", None)
+                if not callable(fill):
+                    raise RuntimeError("邮箱提交前回读不一致，无法重新填写")
+                try:
+                    fill(email, timeout=5000)
+                except TypeError:
+                    fill(email)
+                if (input_value(email_input) or "").strip() != email.strip():
+                    raise RuntimeError("邮箱提交前重填一次后回读仍不一致")
+            before_activity = registration_activity_snapshot(page)
+            clicked = click_email_submit(
+                page,
+                first_visible=first_visible,
+                submit_selectors=submit_selectors,
+                allowed_labels=submit_allowed_labels,
+                anchor_input=email_input,
+                selection_log=log,
+            )
+            if not clicked:
+                break
+            mark_page_registration_milestone(
+                page,
+                "email_submitted",
+                f"第 {attempt} 次点击邮箱提交按钮",
+            )
+            begin_page_registration_step(
+                page,
+                "email_responded",
+                f"第 {attempt} 次点击后静默等待 {CLICK_RESPONSE_SECONDS:g} 秒",
+            )
+            if not monitor.available:
+                submitted_with_click = True
+                break
+            activity = wait_for_registration_activity(
+                page,
+                before_activity,
+                timeout_seconds=CLICK_RESPONSE_SECONDS,
+                wait=wait,
+                transition=lambda: (
+                    str(getattr(page, "url", "") or "") != before_url
+                    or first_visible(
+                        page,
+                        OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
+                        timeout=300,
+                    )
+                    is None
+                ),
+            )
+            if activity.get("changed"):
+                mark_page_registration_milestone(
+                    page,
+                    "email_responded",
+                    f"第 {attempt} 次点击后检测到请求或页面变化",
+                )
+                submitted_with_click = True
+                break
+            log(
+                f"[请求监测] 邮箱提交第 {attempt} 次点击后 "
+                f"{CLICK_RESPONSE_SECONDS:g} 秒无请求、无响应且页面未变化"
+            )
+        if not submitted_with_click and monitor.available and clicked:
+            raise RuntimeError(
+                f"邮箱提交最多点击 {MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次后"
+                "仍无请求或页面响应"
+            )
+    if not submitted_with_enter and not submitted_with_click:
         labels = visible_email_submit_labels(page)
         log(
             "[AUTH_EMAIL_SUBMIT_CANDIDATES] 当前可见按钮文字："
@@ -974,6 +1105,14 @@ def paste_email_and_submit(
         raise RuntimeError(
             "注册邮箱已粘贴，但未找到继续/创建账号按钮；未点击登录按钮"
         )
+    if submitted_with_enter:
+        mark_page_registration_milestone(page, "email_submitted", "按 Enter 提交邮箱")
+        begin_page_registration_step(
+            page,
+            "email_responded",
+            f"按 Enter 后静默等待 {CLICK_RESPONSE_SECONDS:g} 秒",
+        )
+        mark_page_registration_milestone(page, "email_responded", "邮箱提交已有响应")
     emit_browser_diagnostic(
         log,
         BrowserDiagnosticCode.AUTH_EMAIL_SUBMIT,

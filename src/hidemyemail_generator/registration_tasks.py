@@ -121,8 +121,10 @@ class RegistrationTaskManager:
         label: str,
         headless: bool,
         concurrency: int = 1,
+        target_count: int | None = None,
         email: str = "",
         provider: str = "",
+        browser_engine: str = "camoufox",
     ) -> dict[str, Any]:
         if self._task and not self._task.done():
             raise RuntimeError("一键注册任务正在运行")
@@ -139,10 +141,26 @@ class RegistrationTaskManager:
             raise ValueError("手动注册必须提供邮箱地址")
         if provider == "smsbower" and self.acquire_provider_email is None:
             raise RuntimeError("SMSBower Gmail 获取服务未配置")
+        selected_browser_engine = str(browser_engine or "camoufox").strip().lower()
+        if selected_browser_engine not in {"camoufox", "roxy"}:
+            raise ValueError("不支持的注册浏览器引擎")
         concurrency = (
             1
             if manual_email or provider == "smsbower"
-            else max(1, min(10, int(concurrency)))
+            else max(
+                1,
+                min(5 if selected_browser_engine == "roxy" else 10, int(concurrency)),
+            )
+        )
+        requested_target_count = (
+            concurrency if target_count is None else int(target_count)
+        )
+        target_count = (
+            1
+            if manual_email or provider == "smsbower"
+            else max(1, min(100, requested_target_count))
+            if selected_browser_engine == "roxy"
+            else concurrency
         )
         reset_browser_state = getattr(self.browser_manager, "reset", None)
         if callable(reset_browser_state):
@@ -165,11 +183,14 @@ class RegistrationTaskManager:
                 else "claiming_inventory"
             ),
             "provider": provider,
+            "browserEngine": selected_browser_engine,
             "email": manual_email,
             "emails": [manual_email] if manual_email else [],
             "awaitingCode": False,
             "awaitingCodeEmails": [],
-            "requested": concurrency,
+            "concurrency": concurrency,
+            "targetCount": target_count,
+            "requested": target_count,
             "effectiveConcurrency": 0,
             "claimed": 0,
             "message": (
@@ -177,7 +198,7 @@ class RegistrationTaskManager:
                 if provider == "smsbower"
                 else f"正在准备使用 {manual_email} 注册"
                 if manual_email
-                else f"正在从已生成邮箱库存领取 {concurrency} 个账号"
+                else f"正在从已生成邮箱库存领取 {target_count} 个账号"
             ),
             "logs": [],
             "currentStage": "prepare",
@@ -192,14 +213,21 @@ class RegistrationTaskManager:
         elif manual_email:
             self._append_log(f"已添加注册邮箱：{manual_email}")
         else:
-            self._append_log(f"开始并发注册：计划领取 {concurrency} 个库存邮箱")
+            self._append_log(
+                f"开始 Roxy 目标注册：并发 {concurrency} 个窗口，"
+                f"目标 {target_count} 个账号"
+                if selected_browser_engine == "roxy"
+                else f"开始并发注册：计划领取 {target_count} 个库存邮箱"
+            )
         self._task = asyncio.create_task(
             self._run(
                 label=label,
                 headless=bool(headless),
                 concurrency=concurrency,
+                target_count=target_count,
                 manual_email=manual_email,
                 provider=provider,
+                browser_engine=selected_browser_engine,
             )
         )
         return self.snapshot()
@@ -489,8 +517,10 @@ class RegistrationTaskManager:
         label: str,
         headless: bool,
         concurrency: int,
+        target_count: int,
         manual_email: str = "",
         provider: str = "inventory",
+        browser_engine: str = "camoufox",
     ) -> None:
         claimed_emails: list[str] = []
         successful_emails: set[str] = set()
@@ -516,7 +546,7 @@ class RegistrationTaskManager:
                     message=f"正在准备注册邮箱：{manual_email}",
                 )
             else:
-                for _index in range(concurrency):
+                for _index in range(target_count):
                     email = (await self.acquire_email(label)).strip().lower()
                     if not email:
                         break
@@ -526,25 +556,26 @@ class RegistrationTaskManager:
                         emails=list(claimed_emails),
                         claimed=len(claimed_emails),
                         message=(
-                            f"正在领取库存邮箱：{len(claimed_emails)}/{concurrency}"
+                            f"正在领取库存邮箱：{len(claimed_emails)}/{target_count}"
                         ),
                     )
                     self._append_log(
-                        f"已从生成库存领取邮箱（{len(claimed_emails)}/{concurrency}）：{email}"
+                        f"已从生成库存领取邮箱（{len(claimed_emails)}/{target_count}）：{email}"
                     )
             effective_concurrency = len(claimed_emails)
             if effective_concurrency == 0:
                 raise RuntimeError(
-                    f"邮箱库存不足：需要 {concurrency} 个，当前可领取 0 个；未启动浏览器"
+                    f"邮箱库存不足：目标 {target_count} 个，当前可领取 0 个；未启动浏览器"
                 )
-            self._state["effectiveConcurrency"] = effective_concurrency
-            if effective_concurrency < concurrency:
+            browser_concurrency = min(concurrency, effective_concurrency)
+            self._state["effectiveConcurrency"] = browser_concurrency
+            if effective_concurrency < target_count:
                 self._state["message"] = (
-                    f"邮箱库存不足：期望 {concurrency} 个，实际领取 "
+                    f"邮箱库存不足：目标 {target_count} 个，实际领取 "
                     f"{effective_concurrency} 个；自动按最小可用数量继续注册"
                 )
                 self._append_log(
-                    f"库存不足，已将本次并发从 {concurrency} 自动降为 "
+                    f"库存不足，已将本次目标账号数从 {target_count} 自动降为 "
                     f"{effective_concurrency}"
                 )
             self._state.update(
@@ -565,8 +596,8 @@ class RegistrationTaskManager:
                         )
                     )
                     + (
-                        f"（原计划 {concurrency} 个，已自动降并发）"
-                        if effective_concurrency < concurrency
+                        f"（原目标 {target_count} 个，已按库存自动调整）"
+                        if effective_concurrency < target_count
                         else ""
                     )
                 ),
@@ -618,7 +649,8 @@ class RegistrationTaskManager:
             self._state.update(
                 phase="registering_openai",
                 message=(
-                    f"正在启动 {effective_concurrency} 个 Camoufox 注册浏览器"
+                    f"正在启动 {effective_concurrency} 个 "
+                    f"{'Roxy' if browser_engine == 'roxy' else 'Camoufox'} 注册浏览器"
                     + (
                         (
                             "；验证码将自动扫描收件箱与垃圾邮件"
@@ -629,15 +661,16 @@ class RegistrationTaskManager:
                         else ""
                     )
                     + (
-                        f"（库存不足，已从 {concurrency} 降为 {effective_concurrency}）"
-                        if effective_concurrency < concurrency
+                        f"（库存不足，目标已从 {target_count} 降为 {effective_concurrency}）"
+                        if effective_concurrency < target_count
                         else ""
                     )
                 ),
             )
             self._append_log(
                 f"{effective_concurrency} 个邮箱已准备，按并发 "
-                f"{effective_concurrency} 启动 Camoufox"
+                f"{browser_concurrency} 启动 "
+                f"{'Roxy' if browser_engine == 'roxy' else 'Camoufox'}"
                 + (
                     (
                         "；iCloud 自有邮箱自动扫描 INBOX 与垃圾邮件取码"
@@ -648,12 +681,14 @@ class RegistrationTaskManager:
                     else ""
                 )
             )
-            self.browser_manager.start(
-                accounts,
-                headless=False if provider == "manual" else headless,
-                concurrency=effective_concurrency,
-                use_registration_proxy=True,
-            )
+            browser_start_options = {
+                "headless": False if provider == "manual" else headless,
+                "concurrency": browser_concurrency,
+                "use_registration_proxy": True,
+            }
+            if browser_engine != "camoufox":
+                browser_start_options["browser_engine"] = browser_engine
+            self.browser_manager.start(accounts, **browser_start_options)
             browser_result = await self._wait_for_browser_with_logs()
             succeeded = max(0, int(browser_result.get("succeeded") or 0))
             result_accounts = browser_result.get("accounts") or []
@@ -758,11 +793,15 @@ class RegistrationTaskManager:
                         ),
                     )
                     self._append_log(self._state["message"])
+                    retry_start_options = {
+                        "headless": headless,
+                        "concurrency": len(retry_accounts),
+                        "use_registration_proxy": True,
+                    }
+                    if browser_engine != "camoufox":
+                        retry_start_options["browser_engine"] = browser_engine
                     self.browser_manager.start(
-                        retry_accounts,
-                        headless=headless,
-                        concurrency=len(retry_accounts),
-                        use_registration_proxy=True,
+                        retry_accounts, **retry_start_options
                     )
                     retry_result = await self._wait_for_browser_with_logs()
                     retry_items = {
@@ -1093,8 +1132,10 @@ class ConcurrentRegistrationTaskManager:
         label: str,
         headless: bool,
         concurrency: int = 1,
+        target_count: int | None = None,
         email: str = "",
         provider: str = "",
+        browser_engine: str = "camoufox",
     ) -> dict[str, Any]:
         active = [
             state
@@ -1103,6 +1144,12 @@ class ConcurrentRegistrationTaskManager:
         ]
         if len(active) >= self.max_processes:
             raise RuntimeError(f"注册进程已达到上限 {self.max_processes}")
+        selected_browser_engine = str(browser_engine or "camoufox").strip().lower()
+        if selected_browser_engine == "roxy" and any(
+            str(state.get("browserEngine") or "").strip().lower() == "roxy"
+            for state in active
+        ):
+            raise RuntimeError("Roxy 专用指纹环境正在注册，请等待当前任务完成")
         target = str(email or "").strip().lower()
         if target and any(
             target
@@ -1120,13 +1167,18 @@ class ConcurrentRegistrationTaskManager:
             raise RuntimeError("浏览器任务正在运行，请等待完成后再注册")
 
         manager = self.process_factory()
-        task = manager.start(
+        process_start_options = dict(
             label=label,
             headless=headless,
             concurrency=concurrency,
             email=target,
             provider=provider,
         )
+        if selected_browser_engine != "camoufox":
+            process_start_options["browser_engine"] = selected_browser_engine
+            if target_count is not None:
+                process_start_options["target_count"] = target_count
+        task = manager.start(**process_start_options)
         process_id = str(task.get("id") or uuid.uuid4().hex)
         self._processes[process_id] = manager
         self._latest_process_id = process_id

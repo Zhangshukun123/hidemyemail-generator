@@ -56,6 +56,7 @@ from hidemyemail_generator.openai_browser_bridge import (
     configure_post_registration_password_setup,
     configure_registration_otp_reader,
     configure_registration_profile_capture,
+    configure_registration_state_recognition,
     configure_resilient_registration_navigation,
     configure_security_challenge_monitoring,
     configure_windowed_camoufox,
@@ -66,6 +67,10 @@ from hidemyemail_generator.openai_browser_bridge import (
     require_registration_proxy_country,
     resilient_force_fill_locator,
     safe_log_message,
+    recognize_registration_page,
+)
+from hidemyemail_generator.openai_account_security import (
+    add_password_via_account_api as add_password_via_account_api_impl,
 )
 from hidemyemail_generator.openai_browser_cli import prepare_registration_proxy
 from hidemyemail_generator.openai_mfa import MfaSetupError
@@ -81,6 +86,117 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_registration_page_recognition_reports_done_and_next_action(self):
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+        class Collection:
+            def __init__(self, items=(), text=""):
+                self.items = list(items)
+                self.text = text
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            url = "https://auth.openai.com/email-verification?secret=hidden"
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Collection(
+                        text="受信箱を確認してください パスワードで続行"
+                    )
+                if selector == 'input[autocomplete="one-time-code"]':
+                    return Collection([Candidate()])
+                return Collection()
+
+            def evaluate(self, _script):
+                return "complete"
+
+        worker = SimpleNamespace(
+            _password_step_submitted=False,
+            _hme_manual_otp_entry=False,
+        )
+        state = recognize_registration_page(worker, Page())
+
+        self.assertEqual(state["code"], "email_verification")
+        self.assertEqual(state["currentPage"], "邮箱验证码页")
+        self.assertIn("邮箱已提交", state["completedSteps"])
+        self.assertIn("使用密码继续", state["nextAction"])
+        self.assertEqual(state["source"], "dom")
+        self.assertNotIn("secret", state["route"])
+
+    def test_registration_state_monitor_warns_and_saves_screenshot_after_five_seconds(self):
+        class Collection:
+            def count(self):
+                return 0
+
+            def nth(self, _index):
+                raise IndexError
+
+            def inner_text(self, **_kwargs):
+                return "Check your inbox verification code"
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.screenshots = []
+
+            def locator(self, _selector):
+                return Collection()
+
+            def evaluate(self, _script):
+                return "complete"
+
+            def screenshot(self, *, path, **_kwargs):
+                self.screenshots.append(path)
+                Path(path).write_bytes(b"state-png")
+
+        class Worker:
+            _password_step_submitted = True
+            _hme_manual_otp_entry = False
+
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _has_otp_input(self, _page):
+                return True
+
+        ticks = iter((0.0, 5.1))
+        emitted = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = Worker()
+            page = Page()
+            self.assertTrue(
+                configure_registration_state_recognition(
+                    worker,
+                    emit_state=emitted.append,
+                    diagnostics_dir=temp_dir,
+                    monotonic=lambda: next(ticks),
+                )
+            )
+            worker._recognize_registration_state(page)
+            worker._recognize_registration_state(page)
+
+            self.assertEqual(len(emitted), 2)
+            self.assertFalse(emitted[0]["stalled"])
+            self.assertTrue(emitted[1]["stalled"])
+            self.assertEqual(emitted[1]["stalledSeconds"], 5)
+            self.assertTrue(Path(emitted[1]["diagnosticScreenshot"]).is_file())
+            self.assertEqual(len(page.screenshots), 1)
+            self.assertTrue(any("下一步=" in line for line in worker.logs))
+
     def test_post_registration_password_uses_account_api(self):
         calls = []
 
@@ -125,6 +241,90 @@ class BrowserTaskHelperTests(unittest.TestCase):
             "Bearer at-registration",
         )
         self.assertIn("POST /api/accounts/password/add", worker.logs[-1])
+
+    def test_post_registration_password_retries_pre_tls_disconnect(self):
+        calls = []
+        delays = []
+
+        class Response:
+            status = 200
+
+            @staticmethod
+            def json():
+                return {"success": True}
+
+        class Request:
+            @staticmethod
+            def post(url, **kwargs):
+                calls.append((url, kwargs))
+                if len(calls) < 3:
+                    raise RuntimeError(
+                        "Client network socket disconnected before secure TLS "
+                        "connection was established"
+                    )
+                return Response()
+
+        worker = SimpleNamespace(
+            _password_step_submitted=False,
+            logs=[],
+        )
+        worker.log = worker.logs.append
+
+        confirmed = add_password_via_account_api_impl(
+            worker,
+            SimpleNamespace(request=Request()),
+            "at-registration",
+            "Strong!Password123",
+            retry_delays=(2.0, 5.0),
+            sleep=delays.append,
+        )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(delays, [2.0, 5.0])
+        self.assertEqual(
+            [message for message in worker.logs if "重试" in message],
+            [
+                "[密码] POST /api/accounts/password/add 在 TLS 建连前断开；"
+                "2 秒后重试（2/3）",
+                "[密码] POST /api/accounts/password/add 在 TLS 建连前断开；"
+                "5 秒后重试（3/3）",
+            ],
+        )
+
+    def test_post_registration_password_does_not_retry_ambiguous_failure(self):
+        calls = []
+        delays = []
+        secret = "header.payload.signature-secret"
+
+        class Request:
+            @staticmethod
+            def post(_url, **_kwargs):
+                calls.append("post")
+                raise RuntimeError(
+                    "response body read failed\nAuthorization: Bearer " + secret
+                )
+
+        worker = SimpleNamespace(
+            _password_step_submitted=False,
+            logs=[],
+        )
+        worker.log = worker.logs.append
+
+        with self.assertRaisesRegex(RuntimeError, "网络连接失败") as raised:
+            add_password_via_account_api_impl(
+                worker,
+                SimpleNamespace(request=Request()),
+                "at-registration",
+                "Strong!Password123",
+                retry_delays=(2.0, 5.0),
+                sleep=delays.append,
+            )
+
+        self.assertEqual(calls, ["post"])
+        self.assertEqual(delays, [])
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn(secret, " ".join(worker.logs))
 
     def test_password_readiness_timeout_logs_dom_state_and_screenshot(self):
         class Candidate:
@@ -651,18 +851,18 @@ class BrowserTaskHelperTests(unittest.TestCase):
             [event for event in events if isinstance(event, tuple) and event[0] == "click"],
             [("click", 1, True), ("click", 2, True)],
         )
-        self.assertTrue(any("第一次点击登录后页面仍停留" in log for log in logs))
-        self.assertTrue(any("第二次点击登录后页面已跳转" in log for log in logs))
+        self.assertTrue(any("第 1 次点击登录后" in log for log in logs))
+        self.assertTrue(any("第 2 次点击登录后页面已响应" in log for log in logs))
 
         stuck_page = Page(transition_on_click=0)
-        with self.assertRaisesRegex(RuntimeError, "两次点击登录后页面仍未跳转"):
+        with self.assertRaisesRegex(RuntimeError, "最多点击 5 次登录"):
             _click_chatgpt_home_login(
                 stuck_page,
                 SimpleNamespace(log=lambda _message: None),
                 timeout_seconds=0.1,
                 transition_timeout_seconds=0.01,
             )
-        self.assertEqual(stuck_page.login.clicks, 2)
+        self.assertEqual(stuck_page.login.clicks, 5)
 
         timeout_page = Page(
             transition_on_click=1,
@@ -1175,7 +1375,10 @@ class BrowserTaskHelperTests(unittest.TestCase):
         url, payload = reader.session.calls[0]
         self.assertTrue(url.endswith("/api/gpt-code"))
         self.assertEqual(payload["email"], "relay@icloud.com")
-        self.assertIn("since", payload)
+        self.assertEqual(
+            payload["since"],
+            "1970-01-01T00:01:33+00:00",
+        )
 
     def test_smsbower_backend_code_fills_japanese_code_field(self):
         class Reader:
@@ -1821,28 +2024,26 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 SimpleNamespace(country="BR", chatgpt_status=200), "NL"
             )
 
-    def test_registration_proxy_rejects_chatgpt_403(self):
-        with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+    def test_registration_proxy_accepts_chatgpt_403_for_browser_verification(self):
+        self.assertEqual(
             require_registration_proxy_country(
                 SimpleNamespace(country="JP", chatgpt_status=403), "JP"
-            )
+            ),
+            "JP",
+        )
 
     def test_registration_proxy_rejects_unknown_chatgpt_status(self):
         with self.assertRaisesRegex(RuntimeError, "HTTP 未知"):
             require_registration_proxy_country(SimpleNamespace(country="JP"), "JP")
 
-    def test_registration_proxy_retries_403_until_200(self):
-        health_results = [
-            SimpleNamespace(country="JP", chatgpt_status=status)
-            for status in (403, 403, 200)
-        ]
+    def test_registration_proxy_accepts_403_without_retry(self):
         calls = []
         logs = []
         delays = []
 
         def prepare(*args, **kwargs):
             calls.append((args, kwargs))
-            return health_results.pop(0)
+            return SimpleNamespace(country="JP", chatgpt_status=403)
 
         health, country = prepare_registration_proxy(
             SimpleNamespace(_prepare_fingerprint_for_proxy=prepare),
@@ -1855,14 +2056,14 @@ class BrowserTaskHelperTests(unittest.TestCase):
             sleep=delays.append,
         )
 
-        self.assertEqual(health.chatgpt_status, 200)
+        self.assertEqual(health.chatgpt_status, 403)
         self.assertEqual(country, "JP")
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(delays, [1.0, 2.0])
-        self.assertEqual(len(logs), 2)
-        self.assertTrue(all("HTTP 403" in item[1]["message"] for item in logs))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(delays, [])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("不再拦截", logs[0][1]["message"])
 
-    def test_registration_proxy_stops_after_five_403_responses(self):
+    def test_registration_proxy_does_not_repeat_403_probe(self):
         calls = []
         delays = []
 
@@ -1870,20 +2071,21 @@ class BrowserTaskHelperTests(unittest.TestCase):
             calls.append((args, kwargs))
             return SimpleNamespace(country="JP", chatgpt_status=403)
 
-        with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
-            prepare_registration_proxy(
-                SimpleNamespace(_prepare_fingerprint_for_proxy=prepare),
-                SimpleNamespace(
-                    require_registration_proxy_country=require_registration_proxy_country,
-                    emit=lambda *_args, **_kwargs: None,
-                ),
-                "proxy",
-                "JP",
-                sleep=delays.append,
-            )
+        health, country = prepare_registration_proxy(
+            SimpleNamespace(_prepare_fingerprint_for_proxy=prepare),
+            SimpleNamespace(
+                require_registration_proxy_country=require_registration_proxy_country,
+                emit=lambda *_args, **_kwargs: None,
+            ),
+            "proxy",
+            "JP",
+            sleep=delays.append,
+        )
 
-        self.assertEqual(len(calls), 5)
-        self.assertEqual(delays, [1.0, 2.0, 3.0, 5.0])
+        self.assertEqual(health.chatgpt_status, 403)
+        self.assertEqual(country, "JP")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(delays, [])
 
     def test_registration_proxy_retries_probe_timeout_until_200(self):
         outcomes = iter(
@@ -1915,10 +2117,10 @@ class BrowserTaskHelperTests(unittest.TestCase):
             sleep=delays.append,
         )
 
-        self.assertEqual(health.chatgpt_status, 200)
+        self.assertEqual(health.chatgpt_status, 403)
         self.assertEqual(country, "JP")
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(delays, [1.0, 2.0])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(delays, [1.0])
         self.assertIn("探测请求暂时失败", logs[0][1]["message"])
         self.assertIn("HTTP 403", logs[1][1]["message"])
 
@@ -2726,6 +2928,104 @@ class BrowserTaskHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(worker.events, [("wait", 9)])
+
+    def test_chatgpt_home_about_you_is_completed_before_session_success(self):
+        class Worker:
+            def __init__(self):
+                self.events = []
+                self.logs = []
+                self.session_ready = False
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _has_visible_password(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                return False
+
+            def _has_chatgpt_session(self, _page):
+                return self.session_ready
+
+            def _has_about_you_form(self, _page):
+                return not self.session_ready
+
+            def _fill_about_you(self, _page):
+                self.events.append("fill-about-you")
+                self.session_ready = True
+
+            def _wait_after_otp_submit(self, _page, timeout=45):
+                self.events.append(("wait", timeout))
+                return "intermediate-page"
+
+        worker = Worker()
+        self.assertTrue(configure_email_verification_priority(worker))
+
+        with patch(
+            "hidemyemail_generator.openai_registration_flow._page_wait",
+            return_value=None,
+        ):
+            result = worker._wait_after_otp_submit(
+                SimpleNamespace(url="https://chatgpt.com/"),
+                timeout=12,
+            )
+
+        self.assertEqual(result, "intermediate-page")
+        self.assertEqual(worker.events, [("wait", 12), "fill-about-you"])
+        self.assertTrue(
+            any("确认 Access Token 后才会判定注册成功" in log for log in worker.logs)
+        )
+
+    def test_chatgpt_home_about_you_waits_again_for_real_session(self):
+        class Worker:
+            def __init__(self):
+                self.events = []
+                self.session_ready = False
+                self.about_you_ready = True
+
+            def log(self, _message):
+                return None
+
+            def _has_visible_password(self, _page):
+                return False
+
+            def _has_otp_input(self, _page):
+                return False
+
+            def _has_chatgpt_session(self, _page):
+                return self.session_ready
+
+            def _has_about_you_form(self, _page):
+                return self.about_you_ready
+
+            def _fill_about_you(self, _page):
+                self.events.append("fill-about-you")
+                self.about_you_ready = False
+
+            def _wait_after_otp_submit(self, _page, timeout=45):
+                self.events.append(("wait", timeout))
+                if self.events.count(("wait", timeout)) == 2:
+                    self.session_ready = True
+                return "session-wait"
+
+        worker = Worker()
+        self.assertTrue(configure_email_verification_priority(worker))
+
+        with patch(
+            "hidemyemail_generator.openai_registration_flow._page_wait",
+            return_value=None,
+        ):
+            result = worker._wait_after_otp_submit(
+                SimpleNamespace(url="https://chatgpt.com/"),
+                timeout=7,
+            )
+
+        self.assertEqual(result, "session-wait")
+        self.assertEqual(
+            worker.events,
+            [("wait", 7), "fill-about-you", ("wait", 7)],
+        )
 
     def test_chatgpt_home_waits_for_delayed_otp_control(self):
         class Page:
@@ -4628,6 +4928,16 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertNotIn("Secret123", message)
         self.assertIn("已安全保存", message)
 
+    def test_bearer_token_and_cookie_are_redacted_from_worker_log(self):
+        token = "header.payload.signature-secret"
+        message = safe_log_message(
+            "Authorization: Bearer " + token + "\nCookie: session=private-value"
+        )
+
+        self.assertNotIn(token, message)
+        self.assertNotIn("private-value", message)
+        self.assertGreaterEqual(message.count("[已隐藏]"), 2)
+
     def test_password_fill_falls_back_to_native_input_event(self):
         class Worker:
             def __init__(self):
@@ -4870,7 +5180,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 Page(), "Noah Scott", "1999-01-01", "1999", "27"
             )
 
-    def test_about_you_submit_retries_once_after_first_stalled_click(self):
+    def test_about_you_submit_does_not_repeat_a_stalled_click(self):
         class Page:
             def wait_for_load_state(self, _state, **_kwargs):
                 return None
@@ -4915,18 +5225,83 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
             def _submit_about_you(self, _page):
                 self.submit_calls += 1
-                if self.submit_calls == 1:
-                    raise RuntimeError(
-                        "基础资料按钮点击后 30 秒内页面未响应；未自动重新提交"
-                    )
+                raise RuntimeError(
+                    "基础资料按钮点击后 120 秒内页面未响应；未自动重新提交"
+                )
+
+        worker = Worker()
+        self.assertTrue(configure_resilient_about_you_input(worker))
+
+        with self.assertRaisesRegex(RuntimeError, "120 秒"):
+            worker._submit_about_you(Page())
+        self.assertEqual(worker.submit_calls, 1)
+
+    def test_about_you_finish_click_waits_for_stable_values_and_button(self):
+        events = []
+
+        class Candidate:
+            def is_visible(self, **_kwargs):
+                return True
+
+            def is_enabled(self, **_kwargs):
+                return True
+
+            def is_editable(self, **_kwargs):
+                return False
+
+        class Collection:
+            def count(self):
+                return 1
+
+            def nth(self, _index):
+                return Candidate()
+
+        class Page:
+            def wait_for_load_state(self, state, **_kwargs):
+                events.append(("load", state))
+
+            def wait_for_timeout(self, milliseconds):
+                events.append(("wait", milliseconds))
+
+            def locator(self, _selector):
+                return Collection()
+
+        class Worker:
+            headless = True
+
+            def __init__(self):
+                self.logs = []
+                self.value_checks = 0
+                self.clicks = 0
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _fill_visible_input_by_keyboard(self, *_args):
+                return None
+
+            def _fill_about_you_inputs(self, *_args):
+                return None
+
+            def _about_you_current_values_ok(self, _page):
+                self.value_checks += 1
+                return self.value_checks > 1
+
+            def _click_finish_creating_account(self, _page):
+                self.clicks += 1
+                events.append("click")
                 return True
 
         worker = Worker()
         self.assertTrue(configure_resilient_about_you_input(worker))
 
-        self.assertTrue(worker._submit_about_you(Page()))
-        self.assertEqual(worker.submit_calls, 2)
-        self.assertTrue(any("只重试一次" in message for message in worker.logs))
+        self.assertTrue(worker._click_finish_creating_account(Page()))
+
+        self.assertEqual(worker.clicks, 1)
+        self.assertEqual(worker.value_checks, 7)
+        self.assertEqual(events.count("click"), 1)
+        self.assertGreaterEqual(events.count(("wait", 400)), 6)
+        self.assertTrue(any("连续稳定约 2 秒" in line for line in worker.logs))
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -4984,6 +5359,67 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(state["accounts"][0]["status"], "running")
             self.assertEqual(state["accounts"][0]["logStatus"], "active")
+
+    async def test_worker_page_state_event_is_exposed_to_the_ui(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "state = {\n"
+                "  'code':'password','currentPage':'OpenAI 密码页',\n"
+                "  'stage':'password','completedSteps':['浏览器与网络已准备','邮箱已提交'],\n"
+                "  'nextAction':'填写唯一密码并提交','actionMode':'automatic',\n"
+                "  'confidence':97,'source':'dom','route':'auth.openai.com/password',\n"
+                "  'readyState':'complete','stalled':False,'stalledSeconds':0\n"
+                "}\n"
+                "chain = {\n"
+                "  'status':'running','currentCode':'verification_page',\n"
+                "  'currentStep':'已进入邮箱验证码界面','currentValue':'已识别验证码输入控件',\n"
+                "  'currentCompleted':True,'nextCode':'verification_requested','canAdvance':True,\n"
+                "  'steps':[{'index':8,'code':'verification_page','label':'已进入邮箱验证码界面','status':'completed','value':'已识别验证码输入控件','completed':True}],\n"
+                "  'completedSteps':['已进入邮箱验证码界面'],'nextAction':'请求本轮最新验证码',\n"
+                "  'registrationCreated':False,'sessionReady':False,'passwordConfirmed':False,'twoFactorEnabled':False,'fullRegistrationComplete':False,\n"
+                "  'requestActivity':{'requestCount':4,'responseCount':3,'failedCount':0,'loadCount':2,'lastMethod':'POST','lastRoute':'auth.openai.com/api/accounts/email-otp/send','lastStatus':200}\n"
+                "}\n"
+                "print(prefix + json.dumps({'type':'registration_chain','state':chain}, ensure_ascii=False), flush=True)\n"
+                "print(prefix + json.dumps({'type':'page_state','state':state}, ensure_ascii=False), flush=True)\n"
+                "print(prefix + json.dumps({'type':'result','result':{'access_token':'at-state'}}, ensure_ascii=False), flush=True)\n",
+                encoding="utf-8",
+            )
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(
+                [{"email": "state@icloud.com"}],
+                headless=True,
+                concurrency=1,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            page_state = snapshot["accounts"][0]["pageState"]
+            self.assertEqual(page_state["currentPage"], "OpenAI 密码页")
+            self.assertEqual(page_state["completedSteps"][-1], "邮箱已提交")
+            self.assertEqual(page_state["nextAction"], "填写唯一密码并提交")
+            self.assertEqual(snapshot["pageState"]["email"], "state@icloud.com")
+            chain = snapshot["registrationChain"]
+            self.assertEqual(chain["currentCode"], "verification_page")
+            self.assertTrue(chain["currentCompleted"])
+            self.assertEqual(chain["nextCode"], "verification_requested")
+            self.assertEqual(chain["requestActivity"]["requestCount"], 4)
+            self.assertEqual(chain["steps"][0]["status"], "completed")
 
     async def test_google_login_restarts_worker_with_fresh_fingerprint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5099,6 +5535,189 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 snapshot["accounts"][0]["message"],
             )
             self.assertIn("已放弃该 Gmail", snapshot["accounts"][0]["message"])
+
+    async def test_roxy_registration_opens_five_distinct_profiles_with_clash_ports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json, os, sys\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "message = ';'.join([\n"
+                "    'engine=' + os.environ.get('HME_BROWSER_ENGINE', ''),\n"
+                "    'workspace=' + os.environ.get('HME_ROXY_WORKSPACE_ID', ''),\n"
+                "    'profile=' + os.environ.get('HME_ROXY_PROFILE_ID', ''),\n"
+                "    'proxy=' + os.environ.get('HME_REGISTRATION_PROXY_URL', ''),\n"
+                "    'headless=' + str('--headless' in sys.argv),\n"
+                "])\n"
+                "print(prefix + json.dumps({'type':'log','message':message}), flush=True)\n"
+                "print(prefix + json.dumps({'type':'result','result':{'access_token':'at-roxy'}}), flush=True)\n",
+                encoding="utf-8",
+            )
+
+            class RoxyStore:
+                def runtime_config(self, profile_count=1):
+                    profile_ids = [
+                        f"dedicated-{index}" for index in range(1, 6)
+                    ][:profile_count]
+                    return {
+                        "apiUrl": "http://127.0.0.1:50000",
+                        "workspaceId": "136502",
+                        "profileId": profile_ids[0],
+                        "profileIds": profile_ids,
+                    }
+
+                def load(self):
+                    return self.runtime_config()
+
+            class ProxyStore:
+                def __init__(self):
+                    self.index = 0
+
+                def public_state(self):
+                    return {
+                        "enabled": True,
+                        "configured": True,
+                        "mode": "clash",
+                        "country": "JP",
+                        "fixedPortsEnabled": True,
+                        "fixedPortCount": 21,
+                        "maxLatencyMs": 900,
+                    }
+
+                def next_proxy(self):
+                    self.index += 1
+                    port = 18000 + self.index
+                    return f"http://127.0.0.1:{port}", {
+                        **self.public_state(),
+                        "endpoint": f"127.0.0.1:{port}",
+                        "currentNode": f"JP-{self.index}",
+                        "lastLatencyMs": 50 + self.index,
+                    }
+
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                registration_proxy_store=ProxyStore(),
+                roxy_registration_store=RoxyStore(),
+            )
+            accounts = [
+                {"email": f"roxy-{index}@icloud.com"}
+                for index in range(1, 6)
+            ]
+            state = manager.start(
+                accounts,
+                headless=True,
+                concurrency=5,
+                use_registration_proxy=True,
+                browser_engine="roxy",
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            messages = [entry["message"] for entry in manager.snapshot()["logs"]]
+            self.assertEqual(state["browserEngine"], "roxy")
+            self.assertEqual(state["concurrency"], 5)
+            self.assertEqual(
+                state["roxyProfileIds"],
+                [f"dedicated-{index}" for index in range(1, 6)],
+            )
+            self.assertEqual(
+                {item["roxyProfileId"] for item in state["accounts"]},
+                {f"dedicated-{index}" for index in range(1, 6)},
+            )
+            for index in range(1, 6):
+                self.assertTrue(
+                    any(
+                        f"profile=dedicated-{index}" in message
+                        and "proxy=http://127.0.0.1:18" in message
+                        and "headless=True" in message
+                        for message in messages
+                    )
+                )
+
+    async def test_roxy_target_accounts_reuse_each_profile_serially(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text("# replaced by test coroutine\n", encoding="utf-8")
+
+            class RoxyStore:
+                def runtime_config(self, profile_count=1):
+                    profile_ids = [
+                        f"dedicated-{index}" for index in range(1, 6)
+                    ][:profile_count]
+                    return {
+                        "apiUrl": "http://127.0.0.1:50000",
+                        "workspaceId": "136502",
+                        "profileId": profile_ids[0],
+                        "profileIds": profile_ids,
+                    }
+
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                roxy_registration_store=RoxyStore(),
+            )
+            active_profiles = set()
+            overlaps = []
+            profile_loops = {}
+
+            async def fake_run_account(item, *, semaphore, headless):
+                del headless
+                async with semaphore:
+                    profile_id = item["_roxy_profile_id"]
+                    if profile_id in active_profiles:
+                        overlaps.append(profile_id)
+                    active_profiles.add(profile_id)
+                    profile_loops.setdefault(profile_id, []).append(item["loopIndex"])
+                    await asyncio.sleep(
+                        0.08
+                        if profile_id == "dedicated-1" and item["loopIndex"] == 1
+                        else 0.005
+                    )
+                    active_profiles.remove(profile_id)
+                    item["status"] = "success"
+                    manager._state["succeeded"] += 1
+                    manager._state["completed"] += 1
+
+            manager._run_account = fake_run_account
+            state = manager.start(
+                [
+                    {"email": f"target-{index}@icloud.com"}
+                    for index in range(1, 13)
+                ],
+                headless=True,
+                concurrency=5,
+                browser_engine="roxy",
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=5)
+
+            self.assertEqual(state["targetCount"], 12)
+            self.assertEqual(state["loopCount"], 3)
+            self.assertEqual(overlaps, [])
+            self.assertEqual(profile_loops["dedicated-1"], [1, 2, 3])
+            self.assertEqual(profile_loops["dedicated-2"], [1, 2, 3])
+            self.assertEqual(profile_loops["dedicated-3"], [1, 2])
+            self.assertEqual(profile_loops["dedicated-4"], [1, 2])
+            self.assertEqual(profile_loops["dedicated-5"], [1, 2])
 
     async def test_manual_otp_entry_forces_visible_browser_without_password_first(self):
         with tempfile.TemporaryDirectory() as temp_dir:

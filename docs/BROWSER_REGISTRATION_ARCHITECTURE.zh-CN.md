@@ -11,6 +11,8 @@
 | `openai_bridge_runtime.py` | Session 状态读取、日志脱敏、Camoufox 运行目录、输入回读 |
 | `openai_browser_dom.py` | 通用 DOM 查找、点击、菜单、密码行和页面等待 |
 | `openai_registration_flow.py` | 注册 Worker 补丁、安全挑战、基础资料、邮箱密码路径 |
+| `openai_registration_state.py` | 注册页面实时识别、已完成步骤、下一步动作和停留预警 |
+| `registration_activity.py` | 轻量网络活动监测、2 秒静默响应窗口、五次补点上限和严格步骤账本 |
 | `openai_registration_navigation.py` | 首页入口、认证页资源检查、直连和容错导航 |
 | `openai_registration_otp.py` | 自动取码、本地验证码接口、浏览器手动验证码 |
 | `openai_account_security.py` | 注册后 Session、密码设置、账号安全页和 TOTP 2FA |
@@ -29,6 +31,8 @@
 | 基础资料填写、回读或提交异常 | `openai_registration_flow.py` |
 | 密码设置、账号菜单或安全页异常 | `openai_account_security.py`、`openai_browser_dom.py` |
 | 自动取码或手动验证码卡住 | `openai_registration_otp.py` |
+| 当前页面无法识别、进度不更新或停留预警不准确 | `openai_registration_state.py` |
+| 点击无响应、请求未变化、步骤跨越或完整注册链路状态异常 | `registration_activity.py` |
 | Session、日志脱敏或 Camoufox 运行目录异常 | `openai_bridge_runtime.py` |
 
 ## 修改边界

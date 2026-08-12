@@ -31,9 +31,11 @@ https://icloud-code.8-208-13-52.sslip.io/code
 
 本机需要：
 
-- 已配置可用的 SSH 主机别名 `cac`；
+- 已配置可用的 SSH 主机别名 `aliyun-ecs`；
 - 当前 Windows 用户环境中已设置至少 32 位的
   `HIDEMYEMAIL_REMOTE_TOKEN`；
+- 当前 Windows 用户环境中已设置 `HIDEMYEMAIL_INVENTORY_USERNAME` 和
+  `HIDEMYEMAIL_INVENTORY_PASSWORD`；
 - 项目根目录已有可用的 `inbox_config.json`、`cookies.txt` 和（可选）
   `hidemyemail.db`；
 - 服务器已安装 Docker 和 Docker Compose。
@@ -46,7 +48,9 @@ https://icloud-code.8-208-13-52.sslip.io/code
 
 脚本将源码和运行数据上传到 `/opt/icloud-code-server`，生成仅服务器使用的 `.env`，
 构建 `icloud-code-server` 容器，并检查 `/healthz`。密码、Cookie 和共享令牌不会输出
-到控制台。若服务器已有最新运行数据，可加 `-SkipLocalData`，避免覆盖它们。
+到控制台。首次启动把账号和密码转换成 SQLite 中的 `scrypt` 加盐哈希后，脚本会从
+服务器 `.env` 删除明文登录凭据并重新创建容器。若服务器已有最新运行数据，可加
+`-SkipLocalData`，避免覆盖它们。
 
 ## HTTPS 取码接口
 
@@ -71,28 +75,46 @@ https://icloud-code.8-208-13-52.sslip.io
 注册程序不再自行定时生成；每次注册都通过 HTTPS 领取一个邮箱租约。租约默认锁定
 10 分钟，同一邮箱不会同时分配给两个注册任务。
 
-三个接口均使用请求头：
+先使用账号密码登录：
 
 ```text
-X-HME-Import-Token: <共享令牌>
+POST /api/integrations/registration-inventory/login
+{"username":"<账号>","password":"<密码>"}
 ```
 
-接口：
+登录成功返回 12 小时临时 `accessToken`。其余接口使用请求头
+`Authorization: Bearer <accessToken>`；服务重启或令牌过期后客户端会自动重新登录。
+服务器 SQLite 只保存 `scrypt` 加盐密码哈希，不保存明文密码。
+
+库存接口：
 
 ```text
 GET  /api/integrations/registration-inventory/status
 POST /api/integrations/registration-inventory/lease
+POST /api/integrations/registration-inventory/sync
 POST /api/integrations/registration-inventory/result
 ```
 
-领取成功返回 `leaseId`、`email` 和 `expiresAt`。注册结束后必须提交结果：
+本地服务启动后会通过 `sync` 分批上传现有邮箱，包含 `addresses` 表的全部字段
+（邮箱、标签、状态、来源、备注、启用状态、批次和创建/更新时间），以及
+`gpt_account:<email>` 中的完整账号对象。之后默认每 5 分钟补偿同步一次；浏览器注册和
+协议注册保存账号后还会立即同步一次。同步只新增或合并记录，不会因为某台客户端缺少
+记录而删除服务器已有数据。
+
+领取成功返回 `leaseId`、`email`、`expiresAt` 和完整 `record`。本地会先把 `record`
+写入 SQLite，再开始注册。注册结束后必须提交结果；成功回执同时携带最新完整账号记录：
 
 ```json
 {
   "leaseId": "领取时返回的 ID",
   "email": "alias@icloud.com",
   "success": true,
-  "message": "OpenAI 注册成功"
+  "message": "OpenAI 注册成功",
+  "record": {
+    "email": "alias@icloud.com",
+    "address": {"email": "alias@icloud.com", "state": "used"},
+    "account": {"email": "alias@icloud.com", "session": {}}
+  }
 }
 ```
 
@@ -107,13 +129,21 @@ POST /api/integrations/registration-inventory/result
 
 ```text
 HIDEMYEMAIL_INVENTORY_URL=https://icloud-code.8-208-13-52.sslip.io
-HIDEMYEMAIL_INVENTORY_TOKEN=<共享令牌>
+HIDEMYEMAIL_INVENTORY_USERNAME=<登录账号>
+HIDEMYEMAIL_INVENTORY_PASSWORD=<登录密码>
+HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS=300
 ```
 
+正式远端地址统一使用 HTTPS：如果省略协议会自动补上 `https://`，公网
+`http://` 地址也会自动升级为 `https://`；只有 `localhost`、`127.0.0.1` 和 `::1`
+测试地址保留 HTTP。HTTPS 在 DNS、TCP 或 TLS 建连阶段失败时会有限重试，已可能
+送达服务器的请求不会自动重发。同步请求使用登录后得到的 Bearer 令牌，单批最多
+50 条，并受 Caddy 请求体大小限制保护。
+
 `HIDEMYEMAIL_REMOTE_TOKEN` 只供部署和手动访问远端验证码服务使用；
-`HIDEMYEMAIL_INVENTORY_TOKEN` 只供本地注册程序访问远端库存使用。它们当前
-可以使用同一个值，但不得再使用全局 `HME_IMPORT_TOKEN`，以免覆盖本地
-工作台导入令牌。
+`HIDEMYEMAIL_INVENTORY_TOKEN` 只用于尚未配置账号密码的旧版服务器兼容模式。
+配置 `HIDEMYEMAIL_INVENTORY_USERNAME` 和 `HIDEMYEMAIL_INVENTORY_PASSWORD` 后，
+库存接口不再接受旧共享令牌；全局 `HME_IMPORT_TOKEN` 也不会作为库存认证使用。
 
 ## SSH 隧道（仅用于维护）
 

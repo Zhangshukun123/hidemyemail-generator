@@ -37,6 +37,19 @@ if ($listener) {
     exit 0
 }
 
+$protocolCoreDir = Join-Path $projectDir "src\hidemyemail_generator\vendor\gptfree_register\core"
+$protocolJsdom = Join-Path $protocolCoreDir "node_modules\jsdom\package.json"
+if (-not (Test-Path -LiteralPath $protocolJsdom -PathType Leaf)) {
+    $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npmCommand) {
+        throw "Node.js npm runtime not found; cannot prepare the bundled Mail Auth module"
+    }
+    & $npmCommand.Source ci --omit=dev --prefix $protocolCoreDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install bundled Mail Auth Node dependencies"
+    }
+}
+
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $env:OPENAI_REGISTER_PROJECT_DIR = $registerProjectDir
 $env:OPENAI_REGISTER_PYTHON = $registerPythonPath
@@ -44,9 +57,14 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUNBUFFERED = "1"
 foreach ($name in @(
+    "HIDEMYEMAIL_WEB_USERNAME",
+    "HIDEMYEMAIL_WEB_PASSWORD",
     "HIDEMYEMAIL_INVENTORY_URL",
     "HIDEMYEMAIL_INVENTORY_TOKEN",
-    "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS"
+    "HIDEMYEMAIL_INVENTORY_USERNAME",
+    "HIDEMYEMAIL_INVENTORY_PASSWORD",
+    "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
+    "HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS"
 )) {
     if (-not [Environment]::GetEnvironmentVariable($name, "Process")) {
         $userValue = [Environment]::GetEnvironmentVariable($name, "User")

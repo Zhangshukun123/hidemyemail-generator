@@ -79,6 +79,25 @@ except ImportError:
 
 ICloudOtpReader = None
 PASSWORD_ADD_URL = "https://chatgpt.com/api/accounts/password/add"
+PASSWORD_ADD_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+
+
+def _password_add_preconnect_error(error: Exception) -> bool:
+    """Return whether the account request failed before HTTP could be sent."""
+
+    message = str(error or "").casefold()
+    return any(
+        marker in message
+        for marker in (
+            "before secure tls connection was established",
+            "tls handshake",
+            "ssl handshake",
+            "getaddrinfo",
+            "enotfound",
+            "eai_again",
+            "connection refused",
+        )
+    )
 
 
 def _api_response_status(response) -> int:
@@ -118,6 +137,8 @@ def add_password_via_account_api(
     password: str,
     *,
     timeout_seconds: int = 60,
+    retry_delays: tuple[float, ...] = PASSWORD_ADD_RETRY_DELAYS_SECONDS,
+    sleep=time.sleep,
 ) -> bool:
     """Add a password after registration with the authenticated account API."""
 
@@ -131,18 +152,48 @@ def add_password_via_account_api(
     if request is None or not callable(getattr(request, "post", None)):
         raise RuntimeError("当前浏览器上下文不支持账号密码接口")
 
-    response = request.post(
-        PASSWORD_ADD_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Origin": "https://chatgpt.com",
-            "Referer": "https://chatgpt.com/",
-        },
-        data=json.dumps({"password": target_password}),
-        timeout=max(15, int(timeout_seconds)) * 1000,
-    )
+    delays = tuple(max(0.0, float(value)) for value in retry_delays)
+    total_attempts = len(delays) + 1
+    response = None
+    for attempt in range(total_attempts):
+        try:
+            response = request.post(
+                PASSWORD_ADD_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Origin": "https://chatgpt.com",
+                    "Referer": "https://chatgpt.com/",
+                },
+                data=json.dumps({"password": target_password}),
+                timeout=max(15, int(timeout_seconds)) * 1000,
+            )
+            break
+        except Exception as error:
+            retryable = _password_add_preconnect_error(error)
+            if not retryable or attempt >= len(delays):
+                detail = (
+                    f"；TLS 建连重试 {len(delays)} 次后仍失败"
+                    if retryable and delays
+                    else ""
+                )
+                worker.log(
+                    "[密码] POST /api/accounts/password/add 网络连接失败"
+                    + detail
+                )
+                raise RuntimeError(
+                    "POST /api/accounts/password/add 网络连接失败" + detail
+                ) from error
+            delay = delays[attempt]
+            worker.log(
+                "[密码] POST /api/accounts/password/add 在 TLS 建连前断开；"
+                f"{delay:g} 秒后重试（{attempt + 2}/{total_attempts}）"
+            )
+            sleep(delay)
+
+    if response is None:
+        raise RuntimeError("POST /api/accounts/password/add 未返回响应")
     status = _api_response_status(response)
     if not 200 <= status < 300:
         detail = _api_response_detail(response)

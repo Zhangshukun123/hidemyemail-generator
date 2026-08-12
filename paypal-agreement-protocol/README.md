@@ -27,6 +27,7 @@
 ## 功能概览
 
 - 输入 PayPal BA 链接或 `BA Token` 创建独立协议任务。
+- 可选开启 DE/EUR OAICS 来源验证；提交 `oaics_` Checkout ID/URL 后才启动 PP 任务，`cs_live_`/`cs_` hosted Checkout 会在占用代理前直接拒绝。
 - 每个任务可选择 `身份提升流程` 或 `原版流程`；默认使用身份提升流程。两者均为纯协议，原版保持现有行为，身份提升版强制校验 EC Checkout、Signup Context，并在最终授权前重建 Guest → Member 上下文。
 - 支持 BR、GB、US、JP、TH、ID、PH、TW、MX 国家资料与地址结构。
 - 支持 HTTP、HTTPS、SOCKS5 代理池；带认证的 SOCKS5 可通过任务级代理桥交给 Chromium 使用。

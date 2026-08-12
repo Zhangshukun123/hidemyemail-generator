@@ -17,7 +17,6 @@ class StructuredWebUiTests(unittest.TestCase):
         for view in (
             "overviewView",
             "accountsView",
-            "protocolRegistrationView",
             "cardLinksView",
             "ppPaymentView",
             "verificationView",
@@ -27,7 +26,6 @@ class StructuredWebUiTests(unittest.TestCase):
         for route in (
             "overview",
             "accounts",
-            "protocol-registration",
             "card-links",
             "pp-payment",
             "verification",
@@ -35,6 +33,18 @@ class StructuredWebUiTests(unittest.TestCase):
         ):
             self.assertIn(f'data-route="{route}"', page)
         self.assertIn("gpt-link · PH / PHP hosted · 双代理严格 0", page)
+        self.assertIn('id="cardLinkMethod"', page)
+        self.assertIn('value="de_oaics_paypal">PayPal / 德国 · EUR', page)
+        self.assertIn("generate_opll_de_oaics_paypal_link", (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "hidemyemail_generator"
+            / "openai_card_link_bridge.py"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("cardLinkExtractionModes", page)
+        self.assertIn('method, country: config.country', page)
+        self.assertIn('config.singleProxy ? ""', page)
+        self.assertIn('.field-label[hidden] { display: none; }', page)
         self.assertIn('id="verificationAccountSelect"', page)
         self.assertIn('id="verificationConcurrency"', page)
         self.assertIn('data-action="previous-verification"', page)
@@ -49,17 +59,171 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("/api/paypal/status", page)
         self.assertIn("renderPayPal", page)
         self.assertIn("协议注册", page)
+        self.assertIn('id="protocolRegistrationPanel"', page)
+        self.assertNotIn('data-route="protocol-registration"', page)
         self.assertIn("Mail Auth 协议注册", page)
-        self.assertIn("协议注册选中", page)
-        self.assertIn("协议注册全部", page)
+        self.assertNotIn("协议注册选中", page)
+        self.assertNotIn("协议注册全部", page)
+        self.assertNotIn("协议注册账号", page)
         self.assertIn("/api/protocol-registration/start", page)
         self.assertIn("/api/protocol-registration/status", page)
         self.assertIn("renderProtocolRegistration", page)
         self.assertIn("添加密码", page)
         self.assertIn("激活 2FA", page)
+        self.assertIn('item.checkoutIdType === "oaics"', page)
+        self.assertIn('"OAICS"', page)
+        self.assertIn('"重新检测 Checkout"', page)
+        self.assertIn('this.commands.register("retry-checkout-probe"', page)
+        self.assertIn('/api/account/checkout-probe', page)
+        self.assertIn("注册出口", page)
+        self.assertIn("item.checkoutExitIp", page)
         self.assertIn('id="registrationProxyMode"', page)
         self.assertIn("Clash 日本轮询", page)
         self.assertIn("/api/registration-proxy/rotate", page)
+
+    def test_account_settings_selects_browser_or_protocol_registration(self):
+        page = build_app_page()
+
+        self.assertIn("账号设置", page)
+        self.assertIn('role="radiogroup" aria-label="注册方式"', page)
+        self.assertIn('name="registrationMode" value="headless"', page)
+        self.assertIn('name="registrationMode" value="headed"', page)
+        self.assertIn('name="registrationMode" value="roxy"', page)
+        self.assertIn('name="registrationMode" value="protocol"', page)
+        self.assertIn("无头浏览器", page)
+        self.assertIn("有头浏览器", page)
+        self.assertIn("Mail Auth · 无浏览器", page)
+        self.assertIn('$("protocolRegistrationPanel").hidden = !protocolMode', page)
+        self.assertIn('$("taskPanel").hidden = protocolMode', page)
+        self.assertIn('browser_engine: mode === "roxy" ? "roxy" : "camoufox"', page)
+        self.assertIn('id="roxyWindowMode"', page)
+        self.assertIn('id="roxyProfile"', page)
+        self.assertIn("/api/roxy-registration/status", page)
+        self.assertIn('localStorage.setItem("hme_registration_mode", mode)', page)
+
+    def test_protocol_registration_uses_inventory_entry_without_account_picker(self):
+        page = build_app_page()
+
+        self.assertNotIn('id="protocolRuntimeStatus"', page)
+        self.assertNotIn("Mail Auth 环境可用", page)
+        self.assertNotIn('this.commands.register("refresh-protocol-runtime"', page)
+        self.assertNotIn('id="protocolAccountList"', page)
+        self.assertNotIn('id="protocolSearch"', page)
+        self.assertNotIn('id="protocolStatusFilter"', page)
+        self.assertNotIn('id="protocolSelectAll"', page)
+        self.assertNotIn('id="startProtocolSelectedButton"', page)
+        self.assertNotIn('id="startProtocolAllButton"', page)
+        self.assertNotIn('this.commands.register("start-protocol-selected"', page)
+        self.assertNotIn('this.commands.register("start-protocol-all"', page)
+        self.assertIn('class="panel protocol-task-panel"', page)
+        self.assertIn('this.assertProtocolRuntime()', page)
+        self.assertIn('provider: "inventory"', page)
+        self.assertIn('const options = this.browserOptions();', page)
+
+    def test_account_workbench_configures_country_registration_proxy(self):
+        page = build_app_page()
+
+        self.assertIn('data-route="network"', page)
+        self.assertIn('id="networkView" data-view="network"', page)
+        self.assertIn('id="registrationProxyPanel"', page)
+        self.assertIn("代理与线路", page)
+        self.assertIn("代理与注册方式互相独立", page)
+        self.assertIn("无头浏览器、有头浏览器、Roxy 和协议注册都会使用该出口", page)
+        self.assertIn('value="kookeey">Kookeey 动态住宅', page)
+        self.assertIn("国家、8 位 Session 和 5m", page)
+        self.assertIn('id="registrationProxyUsername"', page)
+        self.assertIn('id="registrationProxyPassword"', page)
+        self.assertIn('id="registrationProxyEndpoint"', page)
+        self.assertIn('id="registrationProxyCountry"', page)
+        self.assertIn('id="registrationProxyCountrySearch"', page)
+        self.assertIn('list="registrationProxyCountryOptions"', page)
+        self.assertIn("注册出口", page)
+        self.assertIn('data-action="save-registration-proxy"', page)
+        self.assertIn('data-action="test-registration-proxy"', page)
+        self.assertIn('/api/registration-proxy/test', page)
+        self.assertIn('payload.proxyEndpoint = endpoint', page)
+        self.assertIn('payload.proxyUsername = username', page)
+        self.assertIn('payload.proxyPassword = password', page)
+        self.assertIn('country: $("registrationProxyCountry").value || "NL"', page)
+        self.assertIn("proxy.dynamicEndpoint", page)
+        self.assertIn("matchProxyCountry", page)
+        self.assertIn('addEventListener("input", (event) =>', page)
+        self.assertIn("void commitProxyCountry(event)", page)
+        self.assertIn("未找到唯一国家", page)
+        self.assertIn("注册出口已切换为", page)
+
+    def test_card_link_uses_saved_proxy_country_selectors(self):
+        page = build_app_page()
+
+        self.assertIn('id="cardLinkCreateProxyCountry"', page)
+        self.assertIn('id="cardLinkPromotionProxyCountry"', page)
+        self.assertIn("提链代理国家", page)
+        self.assertIn("建单代理国家", page)
+        self.assertIn("优惠代理国家", page)
+        self.assertIn("cardLinkCountries", page)
+        self.assertIn("create_proxy_country", page)
+        self.assertIn("promotion_proxy_country", page)
+        self.assertNotIn('id="cardLinkCreateProxy" type="password"', page)
+        self.assertNotIn('id="cardLinkPromotionProxy" type="password"', page)
+
+    def test_card_link_supports_saved_proxy_mode_and_one_click_extraction(self):
+        page = build_app_page()
+
+        self.assertIn('id="cardLinkProxyMode"', page)
+        self.assertIn("提链代理模式", page)
+        self.assertIn("cardLinkModes", page)
+        self.assertIn("proxy_mode", page)
+        self.assertIn('id="generateAllCardLinksButton"', page)
+        self.assertIn('data-action="generate-all-card-links"', page)
+        self.assertIn('this.commands.register("generate-all-card-links"', page)
+        self.assertIn("cardLinkMarkedForMethod", page)
+        self.assertIn('item?.cardLinkMethod === method', page)
+        self.assertIn("cs_live 已标注", page)
+        self.assertIn("当前模式不再提链", page)
+
+    def test_proxy_module_is_not_disabled_by_registration_mode(self):
+        page = build_app_page()
+
+        self.assertIn(
+            '$("registrationSourceBlock").classList.remove("mode-disabled")', page
+        )
+        self.assertIn(
+            '$("registrationManualBlock").classList.toggle("mode-disabled", protocolMode)',
+            page,
+        )
+        self.assertNotIn(
+            '["registrationSourceBlock", "registrationNetworkBlock", "registrationManualBlock"]',
+            page,
+        )
+        self.assertIn('$("registrationProxyEnabled").disabled = !proxy.configured', page)
+        self.assertNotIn('$("registrationProxyEnabled").disabled = protocolMode', page)
+        self.assertNotIn('$("registrationProxyMode").disabled = protocolMode', page)
+        self.assertNotIn('$("registrationProxySetupButton").disabled = protocolMode', page)
+        self.assertNotIn('$("rotateRegistrationProxyButton").disabled = protocolMode', page)
+        self.assertIn('.registration-proxy-credentials[hidden] { display: none; }', page)
+
+    def test_icloud_inventory_can_start_protocol_registration(self):
+        page = build_app_page()
+        command_start = page.index('this.commands.register("register-provider"')
+        command_end = page.index(
+            'this.commands.register("stop-protocol-registration"', command_start
+        )
+        command = page[command_start:command_end]
+
+        self.assertIn('$("registrationEmailProvider").disabled = false', page)
+        self.assertIn('"开始 iCloud 协议注册"', page)
+        self.assertIn('registrationProvider !== "icloud"', page)
+        self.assertIn('this.store.state.registrationMode === "protocol"', page)
+        self.assertIn('this.api.post("/api/protocol-registration/start"', command)
+        self.assertIn('provider: "inventory"', command)
+        self.assertIn("已从库存领取 iCloud 邮箱并启动协议注册", command)
+        self.assertLess(
+            command.index("if (protocolMode)"),
+            command.index("const options = this.browserOptions();"),
+        )
+        self.assertIn(
+            "已切换为协议注册，点击上方按钮即可自动领取 iCloud 邮箱", page
+        )
 
     def test_app_page_uses_frontend_design_patterns(self):
         page = build_app_page()
@@ -119,6 +283,18 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("浏览器执行轨迹", page)
         self.assertIn("data-task-tone", page)
 
+    def test_account_workspace_uses_task_first_two_level_layout(self):
+        page = build_app_page()
+
+        self.assertIn('data-layout="task-first"', page)
+        self.assertIn("registration-launch-shell", page)
+        self.assertIn("registration-launch-head", page)
+        self.assertIn("account-inline-metrics", page)
+        self.assertIn("发起注册任务、跟踪执行状态并维护账号资产", page)
+        self.assertIn("批量获取全部 Session", page)
+        self.assertIn("grid-template-columns: minmax(390px, 5fr) minmax(620px, 7fr)", page)
+        self.assertIn("#accountsView > .table-panel { min-width: 0; grid-column: 1 / -1; }", page)
+
     def test_running_registration_keeps_start_next_process_available(self):
         page = build_app_page()
 
@@ -130,6 +306,51 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn(
             '$("registerEmailButton").disabled = Boolean(state.registrationTask.running)',
             page,
+        )
+
+    def test_roxy_missing_profile_keeps_registration_button_clickable(self):
+        page = build_app_page()
+
+        self.assertNotIn(
+            '(roxyMode && !state.roxyRegistration?.configured)',
+            page,
+        )
+        self.assertIn('profile.classList.toggle("needs-selection"', page)
+        self.assertIn('profile.scrollIntoView({ behavior: "smooth"', page)
+        self.assertIn(
+            '请先在上方“专用指纹环境”中选择一个 Roxy 环境，再点击注册',
+            page,
+        )
+
+    def test_roxy_registration_exposes_five_window_concurrency(self):
+        page = build_app_page()
+
+        self.assertIn('id="roxyConcurrency"', page)
+        self.assertIn('max="5"', page)
+        self.assertIn('id="roxyTargetCount"', page)
+        self.assertIn('max="100"', page)
+        self.assertIn('localStorage.getItem("hme_roxy_concurrency") || 5', page)
+        self.assertIn('localStorage.getItem("hme_roxy_target_count") || 5', page)
+        self.assertIn('concurrency: mode === "roxy" ? roxyConcurrency', page)
+        self.assertIn('target_count: mode === "roxy" ? roxyTargetCount', page)
+        self.assertIn("同一环境不会并行执行两个账号", page)
+
+    def test_registration_task_exposes_structured_page_recognition(self):
+        page = build_app_page()
+
+        self.assertIn('id="taskCompletedSteps"', page)
+        self.assertIn('id="taskNextAction"', page)
+        self.assertIn('id="taskRecognitionMeta"', page)
+        self.assertIn('id="taskStepLedger"', page)
+        self.assertIn("task.pageState", page)
+        self.assertIn("task.registrationChain", page)
+        self.assertIn("pageRecognition?.completedSteps", page)
+        self.assertIn("registrationChain.currentCompleted", page)
+        self.assertIn("registrationChain.nextCode", page)
+        self.assertIn("task-ledger-step", page)
+        self.assertIn("当前界面停留 ", page)
+        self.assertIn(
+            'this.schedule("browser", () => this.loadBrowserTask(), 500)', page
         )
 
     def test_hourly_inventory_generation_is_removed_from_local_workspace(self):
@@ -171,7 +392,10 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="registerProviderButton"', page)
         self.assertIn("开始 Gmail 注册", page)
         self.assertIn("开始 iCloud 注册", page)
-        self.assertIn("无头浏览器（关闭＝前台窗口）", page)
+        self.assertIn('name="registrationMode" value="headless"', page)
+        self.assertIn('name="registrationMode" value="headed"', page)
+        self.assertIn('name="registrationMode" value="roxy"', page)
+        self.assertIn('name="registrationMode" value="protocol"', page)
         self.assertNotIn("options.headless = true", page)
         self.assertIn("本机取码保留 ", page)
         self.assertIn("smsBower.retentionHours || 24", page)
@@ -218,6 +442,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("本地数据存储", page)
         self.assertIn("SSH 安全隧道", page)
         self.assertIn('id="loginForm"', page)
+        self.assertIn('id="username"', page)
+        self.assertIn("username: username.value", page)
 
 class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -254,6 +480,36 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("统一管理邮箱与账号", page)
         self.assertIn("登录工作台", page)
 
+    async def test_username_and_password_login_unlocks_the_workspace(self):
+        await self.client.close()
+        self.app = create_app(
+            base_dir=Path(self.temp_dir.name),
+            web_username="inventory-user",
+            web_password="strong-test-password",
+        )
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+        locked = await self.client.get("/", allow_redirects=False)
+        wrong = await self.client.post(
+            "/api/login",
+            json={"username": "inventory-user", "password": "wrong-password"},
+        )
+        logged_in = await self.client.post(
+            "/api/login",
+            json={
+                "username": "inventory-user",
+                "password": "strong-test-password",
+            },
+        )
+        workspace = await self.client.get("/")
+
+        self.assertEqual(locked.status, 302)
+        self.assertEqual(locked.headers["Location"], "/login")
+        self.assertEqual(wrong.status, 401)
+        self.assertEqual(logged_in.status, 200)
+        self.assertEqual(workspace.status, 200)
+
     async def test_paypal_status_reports_missing_vendored_service(self):
         response = await self.client.get("/api/paypal/status")
         payload = await response.json()
@@ -274,6 +530,21 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("available", payload["runtime"])
         self.assertIn("projectRoot", payload["runtime"])
 
+    async def test_protocol_registration_runtime_can_be_rechecked(self):
+        manager = self.app["protocol_registration_manager"]
+        manager._runtime_cache = {"available": True, "stale": True}
+        response = await self.client.post(
+            "/api/protocol-registration/runtime/refresh",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("stale", payload["runtime"])
+        self.assertIn("available", payload["runtime"])
+
     async def test_protocol_registration_start_rejects_empty_account_pool(self):
         response = await self.client.post(
             "/api/protocol-registration/start",
@@ -285,6 +556,97 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 409)
         self.assertFalse(payload["ok"])
         self.assertIn("没有可协议注册", payload["error"])
+
+    async def test_protocol_registration_can_claim_one_icloud_inventory_email(self):
+        email = "inventory-protocol@icloud.com"
+
+        class InventoryClientStub:
+            def __init__(self):
+                self.completed = []
+
+            async def acquire_email(self, label):
+                self.label = label
+                return email
+
+            def leased_record(self, leased_email):
+                self.asserted_email = leased_email
+                return {
+                    "email": leased_email,
+                    "address": {
+                        "email": leased_email,
+                        "state": "unused",
+                        "source": "generated",
+                    },
+                    "account": {"email": leased_email},
+                }
+
+            async def complete_email(
+                self, completed_email, success, message, *, record=None
+            ):
+                self.completed.append(
+                    (completed_email, success, message, record)
+                )
+
+        class ProtocolManagerStub:
+            def __init__(self):
+                self.options = None
+
+            def start(self, **options):
+                self.options = options
+                return {"status": "running", "running": True}
+
+            async def close(self):
+                return None
+
+        inventory = InventoryClientStub()
+        manager = ProtocolManagerStub()
+        self.app["inventory_client"] = inventory
+        self.app["inventory_initial_sync_complete"] = True
+        self.app["protocol_registration_manager"] = manager
+
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"provider": "inventory", "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["provider"], "inventory")
+        self.assertEqual(payload["email"], email)
+        self.assertEqual(manager.options["emails"], [email])
+        self.assertTrue(callable(manager.options["on_account_finished"]))
+        await manager.options["on_account_finished"](email, True, "registered")
+        self.assertEqual(inventory.completed[0][:3], (email, True, "registered"))
+        self.assertIsNotNone(inventory.completed[0][3])
+
+    async def test_protocol_registration_skips_account_with_saved_session(self):
+        _save_account_record(
+            self.app["db_file"],
+            "registered@icloud.com",
+            result={
+                "access_token": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                "session_json": json.dumps(
+                    {
+                        "accessToken": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                        "sessionToken": "saved-session-token",
+                    }
+                ),
+            },
+            password="GeneratedPassword!1",
+            password_confirmed=False,
+        )
+
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"all": True, "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 409)
+        self.assertFalse(payload["ok"])
+        self.assertIn("均已注册", payload["error"])
 
     async def test_protocol_registration_api_persists_complete_credentials(self):
         email = "api-protocol@icloud.com"

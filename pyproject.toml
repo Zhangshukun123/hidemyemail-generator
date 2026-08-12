@@ -12,6 +12,7 @@ dependencies = [
     "httpx[http2,socks]>=0.27,<1",
     "loguru>=0.7,<1",
     "pproxy>=2.7,<3",
+    "curl-cffi>=0.13.0",
 ]
 
 authors = [

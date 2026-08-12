@@ -1,18 +1,25 @@
 {
   "manifest_version": 3,
   "name": "Apple Hide My Email Navigator",
-  "version": "1.0.0",
-  "description": "Automatically opens Privacy and then Hide My Email on the Apple Account page.",
-  "host_permissions": [
-    "https://account.apple.com/*"
+  "version": "1.2.0",
+  "description": "Batch-creates Apple Hide My Email addresses and adds them to the server's unregistered inventory.",
+  "permissions": [
+    "storage"
   ],
+  "host_permissions": [
+    "https://account.apple.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": [
-        "https://account.apple.com/account/manage/*"
+        "https://account.apple.com/*"
       ],
       "js": [
-        "MODIFIED_FILE.js"
+        "inventory-workflow.js"
       ],
       "run_at": "document_idle"
     }

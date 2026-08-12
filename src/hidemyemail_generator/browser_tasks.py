@@ -9,20 +9,90 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from .browser_diagnostics import browser_diagnostic_context
 from .inbox import connect_db, mark_address
 from .registration_proxy import RegistrationProxyStore
+from .roxy_registration import RoxyRegistrationStore
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
 MAX_LOG_ITEMS = 300
 MAX_GOOGLE_FINGERPRINT_RETRIES = 1
+AccountSaved = Callable[[str], Awaitable[dict[str, Any] | None]]
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def registration_email_type(email: str) -> str:
+    """Return a stable provider label suitable for registration comparisons."""
+
+    target = str(email or "").strip().lower()
+    if target.endswith("@icloud.com"):
+        return "icloud_hide_my_email"
+    if target.endswith("@gmail.com"):
+        return "gmail_smsbower"
+    if target.endswith(("@outlook.com", "@hotmail.com", "@live.com")):
+        return "microsoft_mail"
+    domain = target.rsplit("@", 1)[-1] if "@" in target else ""
+    return f"other:{domain}" if domain else "other"
+
+
+def _masked_proxy_endpoint(proxy_url: str, fallback: str = "") -> str:
+    value = str(proxy_url or "").strip()
+    if value:
+        try:
+            parsed = urlsplit(value if "://" in value else f"http://{value}")
+            host = str(parsed.hostname or "").strip()
+            port = parsed.port
+            if host:
+                host_text = f"[{host}]" if ":" in host else host
+                return f"{host_text}:{port}" if port else host_text
+        except ValueError:
+            pass
+    safe_fallback = str(fallback or "").strip()
+    if "@" in safe_fallback:
+        safe_fallback = safe_fallback.rsplit("@", 1)[-1]
+    return safe_fallback[:255]
+
+
+def build_registration_environment(
+    email: str,
+    *,
+    registration_mode: str,
+    proxy_url: str = "",
+    proxy_state: dict[str, Any] | None = None,
+    proxy_mode: str = "",
+    proxy_country: str = "",
+) -> dict[str, Any]:
+    """Build a credential-free snapshot of one registration network."""
+
+    state = proxy_state if isinstance(proxy_state, dict) else {}
+    enabled = bool(str(proxy_url or "").strip())
+    selected_proxy_mode = str(proxy_mode or state.get("mode") or "").strip()
+    return {
+        "registration_mode": str(registration_mode or "").strip(),
+        "email_type": registration_email_type(email),
+        "proxy_enabled": enabled,
+        "proxy_mode": selected_proxy_mode if enabled else "direct",
+        "proxy_country": str(
+            proxy_country or state.get("country") or ""
+        ).strip().upper(),
+        "proxy_country_label": str(state.get("countryLabel") or "").strip(),
+        "proxy_endpoint": _masked_proxy_endpoint(
+            proxy_url, str(state.get("endpoint") or "")
+        ),
+        "proxy_node": str(state.get("currentNode") or "").strip(),
+        "proxy_selector": str(state.get("selector") or "").strip(),
+        "proxy_latency_ms": max(0, int(state.get("lastLatencyMs") or 0)),
+        "exit_ip": str(state.get("exitIp") or "").strip(),
+        "exit_country": str(state.get("exitCountry") or "").strip().upper(),
+        "captured_at": utc_now(),
+    }
 
 
 def browser_log_context(message: str) -> dict[str, str]:
@@ -381,6 +451,8 @@ def _save_account_record(
             result.get("registration_proxy_url") or ""
         ).strip()
         registration_proxy = result.get("registration_proxy")
+        registration_environment = result.get("registration_environment")
+        registration_diagnostics = result.get("registration_diagnostics")
         if access_token or session_json:
             current.pop("session_invalid_at", None)
         if access_token:
@@ -416,6 +488,13 @@ def _save_account_record(
             current["registration_proxy_url"] = registration_proxy_url
         if isinstance(registration_proxy, dict) and registration_proxy:
             current["registration_proxy"] = dict(registration_proxy)
+        if isinstance(registration_environment, dict) and registration_environment:
+            current["registration_environment"] = dict(registration_environment)
+            current["registration_completed_at"] = str(
+                registration_environment.get("captured_at") or utc_now()
+            )
+        if isinstance(registration_diagnostics, dict) and registration_diagnostics:
+            current["registration_diagnostics"] = dict(registration_diagnostics)
         result_two_factor = result.get("two_factor")
         if isinstance(result_two_factor, dict) and result_two_factor.get("secret"):
             current["two_factor"] = dict(result_two_factor)
@@ -500,6 +579,8 @@ class BrowserTaskManager:
         bridge_file: Path | None = None,
         force_headless: bool = False,
         registration_proxy_store: RegistrationProxyStore | None = None,
+        roxy_registration_store: RoxyRegistrationStore | None = None,
+        on_account_saved: AccountSaved | None = None,
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.python_executable = (
@@ -514,6 +595,8 @@ class BrowserTaskManager:
         self.db_file = db_file.resolve()
         self.force_headless = bool(force_headless)
         self.registration_proxy_store = registration_proxy_store
+        self.roxy_registration_store = roxy_registration_store
+        self.on_account_saved = on_account_saved
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._state: dict[str, Any] = self._idle_state()
@@ -589,6 +672,7 @@ class BrowserTaskManager:
         concurrency: int,
         skipped: int = 0,
         use_registration_proxy: bool = False,
+        browser_engine: str = "camoufox",
     ) -> dict[str, Any]:
         if self._batch_task and not self._batch_task.done():
             raise RuntimeError("浏览器获取任务正在运行")
@@ -641,7 +725,14 @@ class BrowserTaskManager:
         if not deduplicated:
             raise RuntimeError("没有需要获取 Session 的 iCloud 邮箱")
 
-        concurrency = max(1, min(10, int(concurrency)))
+        selected_browser_engine = str(browser_engine or "camoufox").strip().lower()
+        if selected_browser_engine not in {"camoufox", "roxy"}:
+            raise ValueError("不支持的注册浏览器引擎")
+        if selected_browser_engine == "roxy":
+            if self.roxy_registration_store is None:
+                raise RuntimeError("Roxy 注册配置不可用")
+        concurrency_limit = 5 if selected_browser_engine == "roxy" else 10
+        concurrency = max(1, min(concurrency_limit, int(concurrency)))
         foreground_required = any(
             item["foreground_required"] for item in deduplicated
         )
@@ -662,7 +753,37 @@ class BrowserTaskManager:
             proxy_active and proxy_state.get("mode") == "clash"
         )
         if clash_proxy_active:
-            concurrency = 1
+            if selected_browser_engine == "roxy" and proxy_state.get(
+                "fixedPortsEnabled"
+            ):
+                concurrency = min(
+                    concurrency,
+                    max(1, int(proxy_state.get("fixedPortCount") or 1)),
+                )
+            else:
+                concurrency = 1
+        roxy_config: dict[str, Any] = {}
+        roxy_profile_ids: list[str] = []
+        if selected_browser_engine == "roxy":
+            required_profiles = min(concurrency, len(deduplicated))
+            if required_profiles > 1:
+                roxy_config = self.roxy_registration_store.runtime_config(
+                    profile_count=required_profiles
+                )
+            else:
+                roxy_config = self.roxy_registration_store.runtime_config()
+            roxy_profile_ids = [
+                str(profile_id).strip()
+                for profile_id in roxy_config.get("profileIds", [])
+                if str(profile_id).strip()
+            ]
+            if not roxy_profile_ids and roxy_config.get("profileId"):
+                roxy_profile_ids = [str(roxy_config["profileId"]).strip()]
+            if len(roxy_profile_ids) < required_profiles:
+                raise RuntimeError(
+                    f"Roxy 可用环境不足：需要 {required_profiles} 个，"
+                    f"当前仅分配到 {len(roxy_profile_ids)} 个"
+                )
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -671,6 +792,8 @@ class BrowserTaskManager:
             "foregroundRequired": foreground_required,
             "concurrency": concurrency,
             "total": len(deduplicated),
+            "targetCount": len(deduplicated),
+            "loopCount": (len(deduplicated) + concurrency - 1) // concurrency,
             "completed": 0,
             "succeeded": 0,
             "failed": 0,
@@ -697,8 +820,23 @@ class BrowserTaskManager:
                     "fingerprintRetries": 0,
                     "phase": "queued",
                     "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
+                    "roxyProfileId": (
+                        roxy_profile_ids[
+                            slot_index % len(roxy_profile_ids)
+                        ]
+                        if roxy_profile_ids
+                        else ""
+                    ),
+                    "_roxy_profile_id": (
+                        roxy_profile_ids[
+                            slot_index % len(roxy_profile_ids)
+                        ]
+                        if roxy_profile_ids
+                        else ""
+                    ),
                     "_window_slot": slot_index % min(concurrency, len(deduplicated)),
                     "_window_slots": min(concurrency, len(deduplicated)),
+                    "loopIndex": slot_index // min(concurrency, len(deduplicated)) + 1,
                 }
                 for slot_index, item in enumerate(deduplicated)
             ],
@@ -711,12 +849,23 @@ class BrowserTaskManager:
             "finishedAt": "",
             "useRegistrationProxy": proxy_active,
             "registrationProxy": proxy_state,
+            "browserEngine": selected_browser_engine,
+            "roxyProfileId": str(roxy_config.get("profileId") or ""),
+            "roxyProfileIds": list(roxy_profile_ids),
+            "roxyApiUrl": str(roxy_config.get("apiUrl") or ""),
+            "roxyWorkspaceId": str(roxy_config.get("workspaceId") or ""),
         }
         self._append_log(
             f"浏览器取全部已启动：待处理 {len(deduplicated)}，"
             f"跳过 {skipped}，并发 {concurrency}，"
-            f"{'无头' if headless else '显示浏览器'}"
+            f"{'后台隐藏' if headless and selected_browser_engine == 'roxy' else '无头' if headless else '显示浏览器'}"
         )
+        if selected_browser_engine == "roxy":
+            self._append_log(
+                f"Roxy 注册已启用：已为 {len(roxy_profile_ids)} 个并发窗口分配"
+                "互不重复的专用环境；每个环境将在启动前清空缓存并生成全新随机指纹；"
+                + ("窗口将后台隐藏" if headless else "窗口将在前台显示")
+            )
         if foreground_required:
             if any(item["manual_otp_entry"] for item in deduplicated):
                 self._append_log(
@@ -736,9 +885,13 @@ class BrowserTaskManager:
             if clash_proxy_active:
                 if proxy_state.get("fixedPortsEnabled"):
                     self._append_log(
-                        "Clash 日本固定端口已启用：当前进程内保持单账号；"
-                        "可同时启动其他注册进程，每个进程使用独立固定端口；"
-                        f"高于 {proxy_state.get('maxLatencyMs') or 900} ms 的出口会被跳过"
+                        (
+                            "Clash 日本固定端口已启用：每个 Roxy 并发窗口分配独立固定端口；"
+                            if selected_browser_engine == "roxy"
+                            else "Clash 日本固定端口已启用：当前进程内保持单账号；"
+                            "可同时启动其他注册进程，每个进程使用独立固定端口；"
+                        )
+                        + f"高于 {proxy_state.get('maxLatencyMs') or 900} ms 的出口会被跳过"
                     )
                 else:
                     self._append_log(
@@ -798,12 +951,35 @@ class BrowserTaskManager:
     async def _run_batch(self, *, headless: bool, concurrency: int) -> None:
         semaphore = asyncio.Semaphore(concurrency)
         try:
-            await asyncio.gather(
-                *(
-                    self._run_account(item, semaphore=semaphore, headless=headless)
-                    for item in self._state["accounts"]
+            accounts = self._state["accounts"]
+            if (
+                self._state.get("browserEngine") == "roxy"
+                and len(accounts) > concurrency
+            ):
+                async def run_roxy_slot(slot: int) -> None:
+                    for item in accounts:
+                        if int(item.get("_window_slot") or 0) != slot:
+                            continue
+                        await self._run_account(
+                            item,
+                            semaphore=semaphore,
+                            headless=headless,
+                        )
+
+                await asyncio.gather(
+                    *(run_roxy_slot(slot) for slot in range(concurrency))
                 )
-            )
+            else:
+                await asyncio.gather(
+                    *(
+                        self._run_account(
+                            item,
+                            semaphore=semaphore,
+                            headless=headless,
+                        )
+                        for item in accounts
+                    )
+                )
             if self._state["status"] == "cancelling":
                 self._state["status"] = "cancelled"
                 self._append_log("浏览器获取任务已停止")
@@ -831,6 +1007,15 @@ class BrowserTaskManager:
     ) -> None:
         email = str(item["email"])
         async with semaphore:
+            existing_record = await asyncio.to_thread(
+                load_account_record, self.db_file, email
+            )
+            is_new_registration = bool(
+                not item.get("_cookie_refresh_only")
+                and not account_session_access_token(existing_record)
+                and not account_session(existing_record)
+                and not account_saved_cookies(existing_record)
+            )
             if self._state.get("status") == "cancelling":
                 item["status"] = "cancelled"
                 item["message"] = "任务已停止"
@@ -940,6 +1125,18 @@ class BrowserTaskManager:
                     "HME_BROWSER_WINDOW_SLOTS": str(
                         max(1, int(item.get("_window_slots") or 1))
                     ),
+                    "HME_BROWSER_ENGINE": str(
+                        self._state.get("browserEngine") or "camoufox"
+                    ),
+                    "HME_ROXY_API_URL": str(
+                        self._state.get("roxyApiUrl") or ""
+                    ),
+                    "HME_ROXY_WORKSPACE_ID": str(
+                        self._state.get("roxyWorkspaceId") or ""
+                    ),
+                    "HME_ROXY_PROFILE_ID": str(
+                        item.get("_roxy_profile_id") or ""
+                    ),
                 }
             )
             command = [
@@ -1046,6 +1243,29 @@ class BrowserTaskManager:
                     session_saved = False
             if session_saved:
                 result_to_save = dict(result)
+                if is_new_registration:
+                    result_to_save["registration_environment"] = (
+                        build_registration_environment(
+                            email,
+                            registration_mode=(
+                                "roxy_background"
+                                if self._state.get("browserEngine") == "roxy"
+                                and headless
+                                else "roxy_headed"
+                                if self._state.get("browserEngine") == "roxy"
+                                else "browser_headless"
+                                if headless
+                                else "browser_headed"
+                            ),
+                            proxy_url=proxy_url,
+                            proxy_state=proxy_state,
+                        )
+                    )
+                    result_to_save["registration_diagnostics"] = {
+                        "fingerprint_retries": max(
+                            0, int(item.get("_fingerprint_retry_count") or 0)
+                        ),
+                    }
                 if proxy_url:
                     result_to_save["registration_proxy_url"] = proxy_url
                     result_to_save["registration_proxy"] = {
@@ -1067,6 +1287,40 @@ class BrowserTaskManager:
                         else None
                     ),
                 )
+                if self.on_account_saved is not None:
+                    try:
+                        saved_callback_result = await self.on_account_saved(email)
+                        if isinstance(saved_callback_result, dict):
+                            checkout_type = str(
+                                saved_callback_result.get("checkout_id_type") or ""
+                            ).strip().lower()
+                            item["checkoutIdType"] = checkout_type
+                            item["checkoutProbeStatus"] = str(
+                                saved_callback_result.get("status") or ""
+                            )
+                            checkout_labels = {
+                                "oaics": "OAICS",
+                                "cs_live": "CS LIVE",
+                                "cs": "CS",
+                                "other": "OTHER",
+                                "error": "检测失败",
+                            }
+                            self._append_log(
+                                "Checkout 自动验证："
+                                + checkout_labels.get(checkout_type, "待检测")
+                                + (
+                                    f"（第 {int(saved_callback_result.get('attempt_count') or 1)}"
+                                    f"/{int(saved_callback_result.get('max_attempts') or 1)} 次）"
+                                    if int(saved_callback_result.get("attempt_count") or 1) > 1
+                                    else ""
+                                ),
+                                email=email,
+                            )
+                    except Exception as error:
+                        self._append_log(
+                            f"账号已保存，但同步到远程服务器失败：{str(error)[:300]}",
+                            email=email,
+                        )
                 item["status"] = "success"
                 item["phase"] = "completed"
                 saved_parts = ["Session / AT / Cookie 已保存"]
@@ -1221,6 +1475,141 @@ class BrowserTaskManager:
                 item["twoFactorEnabled"] = True
                 item["message"] = "2FA 已开启，正在保存账号"
                 self._append_log("TOTP 2FA 已成功开启", email=email)
+            elif kind == "registration_chain":
+                chain_state = event.get("state")
+                if isinstance(chain_state, dict):
+                    completed_steps = chain_state.get("completedSteps")
+                    step_ledger = chain_state.get("steps")
+                    request_activity = chain_state.get("requestActivity")
+                    if not isinstance(request_activity, dict):
+                        request_activity = {}
+                    chain = {
+                        "status": str(chain_state.get("status") or "running")[:40],
+                        "currentStep": str(
+                            chain_state.get("currentStep") or "准备注册请求"
+                        )[:180],
+                        "currentCode": str(
+                            chain_state.get("currentCode") or ""
+                        )[:80],
+                        "currentValue": str(
+                            chain_state.get("currentValue") or ""
+                        )[:240],
+                        "currentCompleted": bool(
+                            chain_state.get("currentCompleted", False)
+                        ),
+                        "nextCode": str(chain_state.get("nextCode") or "")[:80],
+                        "canAdvance": bool(chain_state.get("canAdvance", False)),
+                        "steps": [
+                            {
+                                "index": max(0, int(step.get("index") or 0)),
+                                "code": str(step.get("code") or "")[:80],
+                                "label": str(step.get("label") or "")[:180],
+                                "status": str(step.get("status") or "pending")[:20],
+                                "value": str(step.get("value") or "")[:240],
+                                "completed": bool(step.get("completed", False)),
+                                "updatedAt": str(step.get("updatedAt") or "")[:80],
+                            }
+                            for step in step_ledger
+                            if isinstance(step, dict)
+                        ][:24]
+                        if isinstance(step_ledger, list)
+                        else [],
+                        "completedSteps": [
+                            str(step)[:180]
+                            for step in completed_steps
+                            if str(step).strip()
+                        ][:24]
+                        if isinstance(completed_steps, list)
+                        else [],
+                        "nextAction": str(
+                            chain_state.get("nextAction") or "继续监测完整注册链路"
+                        )[:300],
+                        "registrationCreated": bool(
+                            chain_state.get("registrationCreated", False)
+                        ),
+                        "sessionReady": bool(chain_state.get("sessionReady", False)),
+                        "passwordConfirmed": bool(
+                            chain_state.get("passwordConfirmed", False)
+                        ),
+                        "twoFactorEnabled": bool(
+                            chain_state.get("twoFactorEnabled", False)
+                        ),
+                        "fullRegistrationComplete": bool(
+                            chain_state.get("fullRegistrationComplete", False)
+                        ),
+                        "requestActivity": {
+                            "requestCount": max(
+                                0, int(request_activity.get("requestCount") or 0)
+                            ),
+                            "responseCount": max(
+                                0, int(request_activity.get("responseCount") or 0)
+                            ),
+                            "failedCount": max(
+                                0, int(request_activity.get("failedCount") or 0)
+                            ),
+                            "loadCount": max(
+                                0, int(request_activity.get("loadCount") or 0)
+                            ),
+                            "lastMethod": str(
+                                request_activity.get("lastMethod") or ""
+                            )[:12],
+                            "lastRoute": str(
+                                request_activity.get("lastRoute") or ""
+                            )[:220],
+                            "lastStatus": max(
+                                0, int(request_activity.get("lastStatus") or 0)
+                            ),
+                        },
+                        "startedAt": str(chain_state.get("startedAt") or "")[:80],
+                        "updatedAt": utc_now(),
+                    }
+                    item["registrationChain"] = chain
+                    item["message"] = chain["nextAction"]
+                    self._state["registrationChain"] = {**chain, "email": email}
+            elif kind == "page_state":
+                page_state = event.get("state")
+                if isinstance(page_state, dict):
+                    completed_steps = page_state.get("completedSteps")
+                    state = {
+                        "code": str(page_state.get("code") or "unknown")[:80],
+                        "currentPage": str(
+                            page_state.get("currentPage") or "未识别页面"
+                        )[:160],
+                        "stage": str(page_state.get("stage") or "running")[:80],
+                        "completedSteps": [
+                            str(step)[:160]
+                            for step in completed_steps
+                            if str(step).strip()
+                        ][:12]
+                        if isinstance(completed_steps, list)
+                        else [],
+                        "nextAction": str(
+                            page_state.get("nextAction") or "继续监测页面变化"
+                        )[:300],
+                        "actionMode": str(
+                            page_state.get("actionMode") or "automatic"
+                        )[:40],
+                        "confidence": max(
+                            0, min(100, int(page_state.get("confidence") or 0))
+                        ),
+                        "source": str(page_state.get("source") or "dom")[:40],
+                        "route": str(page_state.get("route") or "")[:240],
+                        "readyState": str(
+                            page_state.get("readyState") or "unknown"
+                        )[:40],
+                        "stalled": bool(page_state.get("stalled", False)),
+                        "stalledSeconds": max(
+                            0, int(page_state.get("stalledSeconds") or 0)
+                        ),
+                        "diagnosticScreenshot": str(
+                            page_state.get("diagnosticScreenshot") or ""
+                        )[:500],
+                        "updatedAt": utc_now(),
+                    }
+                    item["pageState"] = state
+                    item["phase"] = state["stage"]
+                    item["message"] = state["nextAction"]
+                    self._state["pageState"] = {**state, "email": email}
             elif kind == "error":
                 item["_error"] = str(event.get("error") or "浏览器任务失败")
                 password = str(event.get("password") or "")
@@ -1310,5 +1699,7 @@ __all__ = [
     "decode_jwt_payload",
     "jwt_account_type",
     "load_account_record",
+    "build_registration_environment",
+    "registration_email_type",
     "set_manual_account_type",
 ]
