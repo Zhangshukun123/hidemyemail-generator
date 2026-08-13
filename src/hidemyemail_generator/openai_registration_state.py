@@ -18,6 +18,60 @@ from urllib.parse import urlparse
 STATE_HEARTBEAT_SECONDS = 1.0
 STATE_STALL_SCREENSHOT_SECONDS = 5.0
 
+# These methods either inspect the page or change the registration form.  The
+# state observer wraps them after all other registration patches are installed,
+# so every browser operation gets a fresh DOM snapshot immediately before it
+# runs.  Mutating operations are additionally guarded by the page types on
+# which the action is valid.
+_MONITORED_METHODS = (
+    "_register",
+    "_continue_chatgpt_registration_complete",
+    "_fill_email_if_visible",
+    "_has_visible_password",
+    "_has_otp_input",
+    "_has_about_you_form",
+    "_fill_password_step",
+    "_submit_email_code",
+    "_validate_email_code_api",
+    "_fill_about_you",
+    "_wait_for_auth_page_ready",
+    "_wait_after_otp_submit",
+    "_has_chatgpt_session",
+)
+
+_OPERATION_LABELS = {
+    "_register": "执行注册状态机",
+    "_continue_chatgpt_registration_complete": "检查注册完成或安全验证界面",
+    "_fill_email_if_visible": "填写邮箱并提交",
+    "_has_visible_password": "检测密码输入框",
+    "_has_otp_input": "检测邮箱验证码输入框",
+    "_has_about_you_form": "检测姓名与出生信息表单",
+    "_fill_password_step": "填写密码并提交",
+    "_submit_email_code": "填写邮箱验证码并提交",
+    "_validate_email_code_api": "提交已回读确认的邮箱验证码",
+    "_fill_about_you": "填写姓名与出生信息并提交",
+    "_wait_for_auth_page_ready": "等待当前认证界面可操作",
+    "_wait_after_otp_submit": "等待验证码提交后的界面变化",
+    "_has_chatgpt_session": "检测 ChatGPT Session",
+}
+
+# ``False`` means that a stale call is skipped and reported to the surrounding
+# state machine as "not handled yet".  ``raise`` is used for OTP submission,
+# where returning normally could be mistaken for a successful verification.
+_ACTION_GUARDS = {
+    "_fill_email_if_visible": ({"email"}, "emailInput", "false"),
+    "_fill_password_step": ({"password"}, "passwordInput", "false"),
+    "_submit_email_code": ({"email_verification"}, "otpInput", "raise"),
+    "_validate_email_code_api": ({"email_verification"}, "otpInput", "raise"),
+    "_fill_about_you": ({"profile"}, "profileInput", "false"),
+}
+
+_TRANSIENT_PAGE_CODES = {"loading", "unknown"}
+
+
+class RegistrationDomStateMismatch(RuntimeError):
+    """A mutating browser operation did not match the current DOM page."""
+
 _SECURITY_MARKERS = (
     "security verification",
     "verify you are human",
@@ -212,6 +266,24 @@ def recognize_registration_page(
     otp_visible = _selector_visible(page, _OTP_SELECTORS)
     profile_visible = _selector_visible(page, _PROFILE_SELECTORS)
     email_visible = _selector_visible(page, _EMAIL_SELECTORS)
+    dom_signals = {
+        "bodyText": bool(body_text),
+        "emailInput": email_visible,
+        "passwordInput": password_visible,
+        "otpInput": otp_visible,
+        "profileInput": profile_visible,
+    }
+    dom_evidence = [
+        label
+        for key, label in (
+            ("bodyText", "body-text"),
+            ("emailInput", "email-input"),
+            ("passwordInput", "password-input"),
+            ("otpInput", "otp-input"),
+            ("profileInput", "profile-input"),
+        )
+        if dom_signals[key]
+    ]
 
     if session_ready:
         code, label, stage = "session", "Session 已建立", "session"
@@ -278,10 +350,31 @@ def recognize_registration_page(
         "actionMode": mode,
         "confidence": confidence,
         "source": source,
+        "domSignals": dom_signals,
+        "domEvidence": dom_evidence,
         "route": route,
         "readyState": ready_state,
         "updatedAt": _utc_now(),
     }
+
+
+def _operation_label(method_name: str) -> str:
+    return _OPERATION_LABELS.get(method_name, method_name.lstrip("_") or "页面操作")
+
+
+def _dom_evidence_summary(state: dict[str, Any]) -> str:
+    evidence = state.get("domEvidence")
+    if not isinstance(evidence, list):
+        return "无"
+    values = [str(item) for item in evidence if str(item).strip()]
+    return ",".join(values) if values else "无"
+
+
+def _wait_for_transient_dom(page, milliseconds: int = 250) -> None:
+    try:
+        page.wait_for_timeout(milliseconds)
+    except Exception:
+        time.sleep(max(0, milliseconds) / 1000)
 
 
 def _save_state_screenshot(page, diagnostics_dir: Path | str, code: str) -> str:
@@ -317,20 +410,9 @@ def configure_registration_state_recognition(
 
     if getattr(worker, "_hme_state_recognition_configured", False):
         return True
-    method_names = (
-        "_continue_chatgpt_registration_complete",
-        "_fill_email_if_visible",
-        "_has_visible_password",
-        "_has_otp_input",
-        "_has_about_you_form",
-        "_fill_password_step",
-        "_submit_email_code",
-        "_fill_about_you",
-        "_wait_for_auth_page_ready",
-        "_wait_after_otp_submit",
-        "_has_chatgpt_session",
-    )
-    available = [name for name in method_names if callable(getattr(worker, name, None))]
+    available = [
+        name for name in _MONITORED_METHODS if callable(getattr(worker, name, None))
+    ]
     if not available:
         return False
 
@@ -338,6 +420,7 @@ def configure_registration_state_recognition(
     worker._hme_state_first_seen_at = 0.0
     worker._hme_state_last_emitted_at = 0.0
     worker._hme_state_screenshot_key = ""
+    worker._hme_dom_operation_sequence = 0
 
     def observe(self, page, *, session_ready: bool = False, force: bool = False):
         state = recognize_registration_page(
@@ -399,23 +482,131 @@ def configure_registration_state_recognition(
             _original=original,
             **kwargs,
         ):
-            self._recognize_registration_state(page)
-            result = _original(page, *args, **kwargs)
-            self._recognize_registration_state(
+            operation = _operation_label(_method_name)
+            self._hme_dom_operation_sequence = int(
+                getattr(self, "_hme_dom_operation_sequence", 0) or 0
+            ) + 1
+            operation_number = self._hme_dom_operation_sequence
+            state = self._recognize_registration_state(page)
+            guard = _ACTION_GUARDS.get(_method_name)
+
+            # A loading or empty DOM gets a short bounded stabilization window.
+            # A recognized but different form is never clicked or submitted.
+            if guard is not None:
+                expected_codes, required_signal, _mismatch_policy = guard
+                signal_ready = bool(
+                    (state.get("domSignals") or {}).get(required_signal)
+                )
+            else:
+                expected_codes, required_signal, signal_ready = set(), "", True
+            if guard is not None and (
+                state["code"] in _TRANSIENT_PAGE_CODES
+                or (state["code"] in expected_codes and not signal_ready)
+            ):
+                self.log(
+                    f"[DOM检测] #{operation_number} 执行前={operation}；"
+                    f"当前={state['currentPage']}；判定=暂不可执行；"
+                    f"必要DOM={required_signal}；响应=等待 DOM 稳定后重新检测"
+                )
+                for _attempt in range(8):
+                    _wait_for_transient_dom(page)
+                    state = self._recognize_registration_state(page)
+                    signal_ready = bool(
+                        (state.get("domSignals") or {}).get(required_signal)
+                    )
+                    if state["code"] in expected_codes and signal_ready:
+                        break
+                    if (
+                        state["code"] not in _TRANSIENT_PAGE_CODES
+                        and state["code"] not in expected_codes
+                    ):
+                        break
+
+            expected_text = "只读检测"
+            decision = "执行页面检查"
+            matched = True
+            if guard is not None:
+                expected_codes, required_signal, mismatch_policy = guard
+                expected_text = "/".join(sorted(expected_codes))
+                signal_ready = bool(
+                    (state.get("domSignals") or {}).get(required_signal)
+                )
+                matched = state["code"] in expected_codes and signal_ready
+                if matched:
+                    decision = f"执行{operation}"
+                elif state["code"] == "security":
+                    decision = "保持当前页面并等待手动完成安全验证"
+                else:
+                    decision = f"跳过{operation}，交回状态机重新判断"
+            verdict = "符合" if matched else "不符合"
+            self.log(
+                f"[DOM检测] #{operation_number} 执行前={operation}；"
+                f"当前={state['currentPage']}；阶段={state['stage']}；"
+                f"路由={state['route']}；readyState={state['readyState']}；"
+                f"来源={state['source']}；DOM证据={_dom_evidence_summary(state)}；"
+                f"置信度={state['confidence']}%；期望={expected_text}；"
+                f"必要DOM={required_signal or '无'}；"
+                f"判定={verdict}；响应={decision}"
+            )
+
+            if guard is not None and not matched:
+                _expected_codes, _required_signal, mismatch_policy = guard
+                if mismatch_policy == "false":
+                    return False
+                raise RegistrationDomStateMismatch(
+                    f"DOM 检测阻止错误操作：当前为{state['currentPage']}，"
+                    f"不能执行{operation}；期望页面={expected_text}"
+                )
+
+            try:
+                result = _original(page, *args, **kwargs)
+            except Exception as error:
+                failed_state = self._recognize_registration_state(page)
+                self.log(
+                    f"[DOM检测] #{operation_number} 执行后={operation}；"
+                    f"结果=异常({type(error).__name__})；"
+                    f"当前={failed_state['currentPage']}；"
+                    f"下一步={failed_state['nextAction']}"
+                )
+                raise
+
+            result_state = self._recognize_registration_state(
                 page,
                 session_ready=bool(
                     _method_name == "_has_chatgpt_session" and result
                 ),
+            )
+            changed = (
+                "未变化"
+                if result_state["code"] == state["code"]
+                else f"{state['code']}→{result_state['code']}"
+            )
+            if isinstance(result, bool):
+                result_summary = f"布尔值={str(result).lower()}"
+            elif result is None:
+                result_summary = "无返回值"
+            else:
+                result_summary = f"类型={type(result).__name__}"
+            self.log(
+                f"[DOM检测] #{operation_number} 执行后={operation}；"
+                f"结果=已返回({result_summary})；"
+                f"界面变化={changed}；当前={result_state['currentPage']}；"
+                f"下一步={result_state['nextAction']}"
             )
             return result
 
         setattr(worker, method_name, types.MethodType(observed_method, worker))
 
     worker._hme_state_recognition_configured = True
+    worker.log(
+        "[DOM检测] 已启用执行前界面校验：每次浏览器操作先识别当前 DOM、"
+        "核对期望页面，再执行、等待或跳过；执行后再次记录界面变化与下一步"
+    )
     return True
 
 
 __all__ = [
+    "RegistrationDomStateMismatch",
     "configure_registration_state_recognition",
     "recognize_registration_page",
 ]

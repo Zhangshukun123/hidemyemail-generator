@@ -82,6 +82,7 @@ class RoxyRegistrationTests(unittest.TestCase):
         self.assertEqual(payload["workspaceId"], 136502)
         self.assertEqual(payload["dirId"], "profile-id")
         self.assertTrue(payload["headless"])
+        self.assertIn("--disable-save-password-bubble", payload["args"])
         self.assertEqual(roxy_cdp_endpoint(result), result["ws"])
 
     def test_store_saves_only_selected_dedicated_profile(self):
@@ -168,7 +169,7 @@ class RoxyRegistrationTests(unittest.TestCase):
                 events.append(("clear", workspace_id, profile_id))
 
             def modify_profile(self, payload):
-                events.append(("modify", payload["proxyInfo"]["host"]))
+                events.append(("modify", payload))
 
             def randomize_profile(self, workspace_id, profile_id):
                 events.append(("random", workspace_id, profile_id))
@@ -183,9 +184,13 @@ class RoxyRegistrationTests(unittest.TestCase):
         class Context:
             def __init__(self):
                 self.cookies = []
+                self.routes = []
 
             def add_cookies(self, cookies):
                 self.cookies.extend(cookies)
+
+            def route(self, pattern, handler):
+                self.routes.append((pattern, handler))
 
         context = Context()
         browser = mock.Mock(contexts=[context])
@@ -213,9 +218,35 @@ class RoxyRegistrationTests(unittest.TestCase):
         self.assertIs(returned_browser, browser)
         self.assertIs(returned_context, context)
         self.assertEqual(context.cookies[0]["name"], "session")
+        self.assertEqual(context.routes[0][0], "**/*")
+
+        route_events = []
+
+        class Route:
+            def abort(self, **kwargs):
+                route_events.append(("abort", kwargs.get("error_code")))
+
+            def fallback(self):
+                route_events.append(("fallback", None))
+
+        context.routes[0][1](Route(), mock.Mock(resource_type="image"))
+        context.routes[0][1](Route(), mock.Mock(resource_type="script"))
+        self.assertEqual(
+            route_events,
+            [("abort", "blockedbyclient"), ("fallback", None)],
+        )
         self.assertEqual(events[0][0], "log")
+        modified_profile = next(item[1] for item in events if item[0] == "modify")
+        self.assertFalse(modified_profile["fingerInfo"]["syncPassword"])
+        self.assertTrue(modified_profile["fingerInfo"]["forbidSavePassword"])
         self.assertIn(("random", 136502, "dedicated"), events)
         self.assertIn(("open", 136502, "dedicated", False), events)
+        self.assertTrue(
+            any(item[0] == "log" and "已关闭图片加载" in item[1] for item in events)
+        )
+        self.assertTrue(
+            any(item[0] == "log" and "已禁用 Google 密码保存" in item[1] for item in events)
+        )
         self.assertEqual(events[-1], ("close", "dedicated"))
 
 

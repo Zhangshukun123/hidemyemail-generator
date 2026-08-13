@@ -482,6 +482,36 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exported[0]["address"]["state"], "used")
             self.assertTrue(exported[0]["account"]["password_confirmed"])
 
+    async def test_static_token_exchanges_session_when_account_login_is_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token = "static-token-at-least-32-characters-long"
+            app = create_app(
+                base_dir=Path(temp_dir),
+                inventory_server_enabled=True,
+                web_username="inventory-user",
+                web_password="strong-test-password",
+                workbench_import_token=token,
+            )
+            server = TestServer(app)
+            http = TestClient(server)
+            await http.start_server()
+            remote = RemoteRegistrationInventoryClient(
+                service_url=str(server.make_url("/")).rstrip("/"),
+                token=token,
+            )
+            try:
+                initial = await remote.status()
+                first_session = remote._session_cookie
+                app["session_token"] = "rotated-after-service-restart"
+                after_restart = await remote.status()
+            finally:
+                await http.close()
+
+            self.assertTrue(initial["ok"])
+            self.assertTrue(first_session)
+            self.assertTrue(after_restart["ok"])
+            self.assertNotEqual(remote._session_cookie, first_session)
+
     async def test_sync_api_and_lease_round_trip_complete_records(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             token = "test-token-at-least-32-characters-long"
@@ -653,6 +683,44 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
                 saved_account["two_factor"]["secret"], "REGISTERED-TOTP"
             )
 
+    async def test_webapp_registration_falls_back_to_local_generated_inventory(self):
+        with tempfile.TemporaryDirectory() as local_dir:
+            app = create_app(
+                base_dir=Path(local_dir),
+                inventory_service_url="https://inventory.example.com",
+                inventory_service_token="expired-token-at-least-32-characters",
+            )
+            conn = connect_db(str(app["db_file"]))
+            try:
+                upsert_address(
+                    conn,
+                    "local-fallback@icloud.com",
+                    state="unused",
+                    source="generated",
+                )
+            finally:
+                conn.close()
+
+            async def rejected_sync(_records):
+                raise RuntimeError("请先登录")
+
+            app["inventory_client"].sync_records = rejected_sync
+            email = await app["registration_manager"].acquire_email("fallback test")
+            await app["registration_manager"].complete_email(
+                email, False, "retry later"
+            )
+
+            self.assertEqual(email, "local-fallback@icloud.com")
+            self.assertTrue(app["inventory_fallback_active"])
+            conn = connect_db(str(app["db_file"]))
+            try:
+                state = conn.execute(
+                    "SELECT state FROM addresses WHERE email = ?", (email,)
+                ).fetchone()["state"]
+            finally:
+                conn.close()
+            self.assertEqual(state, "unused")
+
     async def test_completed_local_account_is_removed_from_remote_inventory(self):
         with tempfile.TemporaryDirectory() as remote_dir, tempfile.TemporaryDirectory() as local_dir:
             token = "test-token-at-least-32-characters-long"
@@ -812,6 +880,52 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["task"]["requested"], 1)
         self.assertEqual(manager.starts[0]["concurrency"], 1)
         self.assertEqual(manager.starts[0]["email"], "352121354@qq.com")
+
+    async def test_registration_endpoint_defaults_missing_provider_to_inventory(self):
+        class RegistrationManagerStub:
+            def __init__(self):
+                self.starts = []
+
+            def snapshot(self):
+                return {"status": "idle", "running": False}
+
+            def start(self, **options):
+                self.starts.append(options)
+                return {"status": "running", "running": True}
+
+            async def stop(self):
+                return self.snapshot()
+
+            async def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            manager = RegistrationManagerStub()
+            app["registration_manager"] = manager
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                page = await client.get("/")
+                html = await page.text()
+                response = await client.post(
+                    "/api/registration/start",
+                    json={
+                        "label": "OpenAI 一键注册",
+                        "headless": False,
+                        "concurrency": 3,
+                    },
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["started"])
+        self.assertIn('provider: "inventory"', html)
+        self.assertEqual(manager.starts[0]["provider"], "inventory")
+        self.assertEqual(manager.starts[0]["concurrency"], 3)
 
     async def test_manual_registration_code_submit_and_worker_poll_endpoints(self):
         class RegistrationManagerStub:

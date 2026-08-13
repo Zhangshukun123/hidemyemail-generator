@@ -14,12 +14,78 @@ from hidemyemail_generator.registration_auth import (
     click_email_submit,
     click_chatgpt_home_login,
     click_chatgpt_home_signup,
+    is_auth_problem_page,
     is_chatgpt_auth_entry_url,
     paste_email_and_submit,
+    wait_for_auth_email_entry,
 )
 
 
 class RegistrationAuthTests(unittest.TestCase):
+    def test_japanese_problem_page_clicks_back_once_and_recognizes_second_screen(self):
+        events = []
+
+        class EmailInput:
+            pass
+
+        email_input = EmailInput()
+
+        class Body:
+            def inner_text(self, **_kwargs):
+                if page.state == "problem":
+                    return (
+                        "問題が発生しました。\n"
+                        "サインイン中に問題が発生しました。少し待ってから、"
+                        "もう一度お試しください。"
+                    )
+                return "ログインまたは新規登録 Email address 続行"
+
+        class BackButton:
+            def is_enabled(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                events.append("戻る-click")
+                page.state = "email"
+
+        class Page:
+            state = "problem"
+            url = "https://auth.openai.com/error"
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Body()
+                raise AssertionError(f"unexpected semantic lookup: {selector}")
+
+        page = Page()
+        back_button = BackButton()
+
+        def first_visible(_page, selectors, **_kwargs):
+            if page.state == "email" and selectors == OPENAI_EMAIL_LOGIN_INPUT_SELECTORS:
+                return email_input
+            if page.state == "problem" and any("戻る" in item for item in selectors):
+                return back_button
+            return None
+
+        logs = []
+        result = wait_for_auth_email_entry(
+            page,
+            logs.append,
+            first_visible=first_visible,
+            wait=lambda _page, milliseconds: events.append(("wait", milliseconds)),
+            activate=lambda _page: events.append("activate"),
+            timeout_seconds=1,
+        )
+
+        self.assertIs(result, email_input)
+        self.assertTrue(is_auth_problem_page(type("Problem", (), {"locator": lambda _self, _selector: type("Body", (), {"inner_text": lambda _self, **_kwargs: "問題が発生しました。もう一度お試しください。"})()})()))
+        self.assertEqual(events.count("戻る-click"), 1)
+        self.assertIn("activate", events)
+        self.assertTrue(any("第二界面" in line for line in logs))
+
     def test_chatgpt_direct_auth_entry_url_is_recognized(self):
         self.assertTrue(
             is_chatgpt_auth_entry_url("https://chatgpt.com/auth/login")
@@ -353,7 +419,7 @@ class RegistrationAuthTests(unittest.TestCase):
                 "Control+V",
                 ("wait", 250),
                 ("clipboard", ""),
-                ("wait", 2000),
+                ("wait", 1000),
                 "activate",
                 "Enter",
                 ("wait", 500),

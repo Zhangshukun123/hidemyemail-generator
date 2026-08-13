@@ -1294,6 +1294,71 @@ class FreshFingerprintRequiredError(RuntimeError):
     """Stop the current browser so the outer task can retry with a new fingerprint."""
 
 
+REGISTRATION_BLOCKED_RESOURCE_TYPES = frozenset({"font", "image", "media"})
+
+
+def _playwright_request_value(request, name: str) -> str:
+    value = getattr(request, name, "")
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            return ""
+    return str(value or "")
+
+
+def configure_lightweight_registration_resources(worker) -> bool:
+    """Skip nonessential visual resources while preserving scripts and CSS."""
+
+    original_new_context = getattr(worker, "_new_browser_context", None)
+    if not callable(original_new_context):
+        return False
+    if getattr(worker, "_hme_lightweight_registration_resources", False):
+        return True
+
+    def new_lightweight_context(self, *args, **kwargs):
+        browser, context = original_new_context(*args, **kwargs)
+        route_method = getattr(context, "route", None)
+        if not callable(route_method):
+            return browser, context
+
+        def filter_resource(route, request=None):
+            target_request = request or getattr(route, "request", None)
+            resource_type = _playwright_request_value(
+                target_request, "resource_type"
+            ).casefold()
+            if resource_type in REGISTRATION_BLOCKED_RESOURCE_TYPES:
+                abort = getattr(route, "abort", None)
+                if callable(abort):
+                    try:
+                        abort(error_code="blockedbyclient")
+                    except TypeError:
+                        abort()
+                    return
+            fallback = getattr(route, "fallback", None)
+            if callable(fallback):
+                fallback()
+                return
+            continue_request = getattr(route, "continue_", None)
+            if callable(continue_request):
+                continue_request()
+
+        try:
+            route_method("**/*", filter_resource)
+        except Exception as error:
+            self.log(f"[加速] 注册资源过滤未启用：{str(error)[:160]}")
+            return browser, context
+        self.log("[加速] 已停止加载图片、媒体和网页字体；脚本、CSS 与验证请求保持正常")
+        return browser, context
+
+    worker._new_browser_context = types.MethodType(
+        new_lightweight_context,
+        worker,
+    )
+    worker._hme_lightweight_registration_resources = True
+    return True
+
+
 def configure_email_password_only_registration(
     worker,
     *,
@@ -1324,6 +1389,7 @@ def configure_email_password_only_registration(
         return False
     if getattr(worker, "_hme_email_password_only_configured", False):
         return True
+    configure_lightweight_registration_resources(worker)
 
     def register_without_google_oauth(self, page, context, *args, **kwargs):
         self._hme_openai_registration_context = context

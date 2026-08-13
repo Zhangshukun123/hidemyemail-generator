@@ -13,6 +13,18 @@ REGISTRATION_PROXY_PROBE_MAX_ATTEMPTS = 5
 REGISTRATION_PROXY_PROBE_RETRY_DELAYS_SECONDS = (1.0, 2.0, 3.0, 5.0)
 
 
+def password_registration_flow_options(
+    *, ensure_password: bool, password_first_required: bool
+) -> dict[str, bool]:
+    """Map registration requirements to the password-first browser hook."""
+
+    enabled = bool(ensure_password)
+    return {
+        "enabled": enabled,
+        "required": bool(enabled and password_first_required),
+    }
+
+
 def prepare_registration_proxy(
     worker,
     api,
@@ -110,6 +122,7 @@ def run(api) -> int:
     except (json.JSONDecodeError, TypeError, ValueError):
         pending_2fa = {}
     account = None
+    worker = None
     roxy_session = None
     try:
         api.ensure_tkinter_importable()
@@ -155,6 +168,12 @@ def run(api) -> int:
         )
 
         def log(message: str) -> None:
+            if (
+                message == "已通过接口提交邮箱验证码"
+                and worker is not None
+                and getattr(worker, "_hme_otp_visible_submit", False)
+            ):
+                message = "已点击验证码页面继续按钮"
             api.emit("log", message=api.safe_log_message(message))
 
         worker = app_backend.OpenAIRegisterPayLinkWorker(
@@ -240,8 +259,10 @@ def run(api) -> int:
             direct_location = api.detect_direct_registration_location(app_backend, log)
         api.configure_password_first_login(
             worker,
-            enabled=False,
-            required=False,
+            **password_registration_flow_options(
+                ensure_password=ensure_password,
+                password_first_required=password_first_required,
+            ),
         )
         api.configure_email_verification_priority(worker)
         api.configure_email_password_only_registration(
@@ -371,6 +392,19 @@ def run(api) -> int:
                 )
             if getattr(worker, "_hme_two_factor_completed", False):
                 two_factor = result.get("two_factor")
+                if api.reset_incomplete_two_factor_completion(worker, two_factor):
+                    # Login may have consumed a TOTP from a locally enrolled
+                    # factor without completing its activation. Keep that
+                    # pending state and finish activation below instead of
+                    # treating the login-code submission as 2FA enrollment.
+                    two_factor = {}
+                    api.emit(
+                        "log",
+                        message=(
+                            "[2FA] 登录动态码已通过，但本地 TOTP 仍为待激活；"
+                            "正在继续调用激活接口并等待 enabled 确认"
+                        ),
+                    )
             else:
                 two_factor = api.reusable_enabled_two_factor(pending_2fa)
             if not getattr(worker, "_hme_two_factor_completed", False) and two_factor:

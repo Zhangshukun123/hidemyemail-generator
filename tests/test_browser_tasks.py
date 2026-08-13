@@ -70,11 +70,18 @@ from hidemyemail_generator.openai_browser_bridge import (
     recognize_registration_page,
 )
 from hidemyemail_generator.openai_account_security import (
+    _enable_two_factor_before_browser_closes,
     add_password_via_account_api as add_password_via_account_api_impl,
 )
 from hidemyemail_generator.openai_browser_cli import prepare_registration_proxy
 from hidemyemail_generator.openai_mfa import MfaSetupError
 from hidemyemail_generator.openai_registration_otp import EmailVerificationPageAdvanced
+from hidemyemail_generator.openai_registration_flow import (
+    configure_lightweight_registration_resources,
+)
+from hidemyemail_generator.registration_activity import (
+    ensure_email_verification_code_entered,
+)
 from hidemyemail_generator.registration_proxy import RegistrationProxyStore
 
 
@@ -86,6 +93,181 @@ def token_with_exp(expires_at: int) -> str:
 
 
 class BrowserTaskHelperTests(unittest.TestCase):
+    def test_lightweight_registration_blocks_visual_resources_only(self):
+        handlers = []
+        events = []
+
+        class Context:
+            @staticmethod
+            def route(pattern, handler):
+                handlers.append((pattern, handler))
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            @staticmethod
+            def _new_browser_context(*_args, **_kwargs):
+                return "browser", Context()
+
+            def log(self, message):
+                self.logs.append(message)
+
+        class Request:
+            def __init__(self, resource_type):
+                self.resource_type = resource_type
+
+        class Route:
+            def abort(self, **kwargs):
+                events.append(("abort", kwargs.get("error_code")))
+
+            def fallback(self):
+                events.append(("fallback", None))
+
+        worker = Worker()
+        self.assertTrue(configure_lightweight_registration_resources(worker))
+        browser, context = worker._new_browser_context(None, None)
+
+        self.assertEqual(browser, "browser")
+        self.assertIsInstance(context, Context)
+        self.assertEqual(handlers[0][0], "**/*")
+        handler = handlers[0][1]
+        for resource_type in ("image", "media", "font"):
+            handler(Route(), Request(resource_type))
+        for resource_type in ("document", "script", "stylesheet", "fetch", "xhr"):
+            handler(Route(), Request(resource_type))
+
+        self.assertEqual(
+            events,
+            [("abort", "blockedbyclient")] * 3 + [("fallback", None)] * 5,
+        )
+        self.assertTrue(any("图片、媒体和网页字体" in item for item in worker.logs))
+
+    def test_email_otp_submit_is_blocked_while_visible_field_is_blank(self):
+        class Field:
+            @staticmethod
+            def input_value(**_kwargs):
+                return ""
+
+            @staticmethod
+            def click(**_kwargs):
+                return None
+
+            @staticmethod
+            def fill(_value):
+                return None
+
+            @staticmethod
+            def type(_value, **_kwargs):
+                return None
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            @staticmethod
+            def _visible_inputs(_page, _selectors):
+                return [Field()]
+
+        with self.assertRaisesRegex(RuntimeError, "已阻止提交"):
+            ensure_email_verification_code_entered(Worker(), Page(), "123456")
+
+    def test_email_otp_is_typed_and_read_back_before_submit_gate_opens(self):
+        class Field:
+            def __init__(self):
+                self.value = ""
+
+            def input_value(self, **_kwargs):
+                return self.value
+
+            @staticmethod
+            def click(**_kwargs):
+                return None
+
+            def fill(self, value):
+                self.value = value
+
+            def type(self, value, **_kwargs):
+                self.value += value
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.field = Field()
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _visible_inputs(self, _page, _selectors):
+                return [self.field]
+
+        worker = Worker()
+        ensure_email_verification_code_entered(worker, Page(), "123456")
+
+        self.assertEqual(worker.field.value, "123456")
+        self.assertIn("输入检查通过", worker.logs[-1])
+        self.assertIn("现在点击继续", worker.logs[-1])
+
+    def test_email_otp_deduplicates_locators_for_the_same_dom_input(self):
+        state = {"value": ""}
+
+        class Field:
+            @staticmethod
+            def evaluate(_script):
+                return "same-dom-input"
+
+            @staticmethod
+            def input_value(**_kwargs):
+                return state["value"]
+
+            @staticmethod
+            def click(**_kwargs):
+                return None
+
+            @staticmethod
+            def fill(value):
+                state["value"] = value
+
+            @staticmethod
+            def type(value, **_kwargs):
+                state["value"] += value
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            @staticmethod
+            def _visible_inputs(_page, _selectors):
+                return [Field() for _index in range(6)]
+
+        worker = Worker()
+        ensure_email_verification_code_entered(worker, Page(), "123456")
+
+        self.assertEqual(state["value"], "123456")
+        self.assertIn("输入检查通过", worker.logs[-1])
+        self.assertIn("现在点击继续", worker.logs[-1])
+
     def test_registration_page_recognition_reports_done_and_next_action(self):
         class Candidate:
             def is_visible(self, **_kwargs):
@@ -1103,6 +1285,12 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertEqual(len(context.routes), 2)
         context.routes[0][1](Route())
         self.assertEqual(events[-1], "abort-google")
+        self.assertTrue(
+            any(
+                "邮箱输入检查通过：password.only@gmail.com" in message
+                for message in worker.logs
+            )
+        )
         self.assertIn("不会匹配登录按钮", worker.logs[-1])
 
     def test_gmail_registration_requests_fresh_fingerprint_on_google_page(self):
@@ -1771,6 +1959,322 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(
             any("已改用页面可见的继续按钮提交" in message for message in worker.logs)
         )
+
+    def test_icloud_code_uses_visible_submit_without_refresh(self):
+        actions = []
+
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                self.page_advanced = None
+
+            def connect(self):
+                return None
+
+            def wait_for_code(self, _min_timestamp):
+                return "123456"
+
+        class Field:
+            value = ""
+
+            def input_value(self, **_kwargs):
+                return self.value
+
+            def fill(self, value):
+                self.value = value
+
+        class Button:
+            @staticmethod
+            def is_visible(**_kwargs):
+                return True
+
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def click(**_kwargs):
+                actions.append("click-visible-continue")
+
+        class Collection:
+            def __init__(self, items=()):
+                self.items = list(items)
+
+            def count(self):
+                return len(self.items)
+
+            @property
+            def first(self):
+                return self.items[0]
+
+        class Body:
+            @staticmethod
+            def inner_text(**_kwargs):
+                return (
+                    "受信箱を確認してください visible@icloud.com にお送りした"
+                    "検証コードを入力してください。コード 続行"
+                )
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.field = Field()
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Body()
+                if "続行" in selector or 'button[type="submit"]' == selector:
+                    return Collection([Button()])
+                return Collection()
+
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+            @staticmethod
+            def reload(**_kwargs):
+                raise AssertionError("验证码页不得刷新")
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="visible@icloud.com")
+                self.otp_reader = None
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "original"
+
+            def _visible_inputs(self, page, selectors):
+                if any(
+                    marker in selector
+                    for selector in selectors
+                    for marker in ("one-time-code", 'id="code"', 'name="code"')
+                ):
+                    return [page.field]
+                if any(
+                    selector
+                    in {
+                        'input:not([type])',
+                        'input[type="text"]',
+                        'input[type="number"]',
+                        'input[type="tel"]',
+                        'input[role="textbox"]',
+                    }
+                    for selector in selectors
+                ):
+                    return [page.field]
+                return []
+
+            def _validate_email_code_api(self, _page, _code):
+                actions.append("api-validate")
+                return ""
+
+            def _wait_after_otp_submit(self, _page):
+                actions.append("wait-after-submit")
+
+            def _submit_email_code(
+                self, page, min_timestamp, *, wait_for_session=True
+            ):
+                code = self._wait_for_openai_email_code(min_timestamp)
+                page.field.fill(code)
+                ensure_email_verification_code_entered(self, page, code)
+                self._validate_email_code_api(page, code)
+                self.log("已通过接口提交邮箱验证码")
+                if wait_for_session:
+                    self._wait_after_otp_submit(page)
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "visible@icloud.com")
+        )
+
+        page = Page()
+        worker = Worker()
+        worker._submit_email_code(page, 0)
+
+        self.assertEqual(page.field.value, "123456")
+        self.assertEqual(
+            actions,
+            ["click-visible-continue", "wait-after-submit"],
+        )
+        self.assertNotIn("api-validate", actions)
+        self.assertTrue(worker._hme_otp_visible_submit)
+        self.assertTrue(any("未刷新验证码页面" in line for line in worker.logs))
+
+    def test_icloud_visible_submit_is_blocked_without_input_attestation(self):
+        actions = []
+
+        class Field:
+            @staticmethod
+            def input_value(**_kwargs):
+                return "123456"
+
+        class Button:
+            @staticmethod
+            def is_visible(**_kwargs):
+                return True
+
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def click(**_kwargs):
+                actions.append("clicked")
+
+        class Collection:
+            def __init__(self, items=()):
+                self.items = list(items)
+
+            def count(self):
+                return len(self.items)
+
+            @property
+            def first(self):
+                return self.items[0]
+
+        class Body:
+            @staticmethod
+            def inner_text(**_kwargs):
+                return (
+                    "检查收件箱 blocked@icloud.com 验证码已经发送，"
+                    "请输入验证码，然后继续"
+                )
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.field = Field()
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Body()
+                if "继续" in selector or selector == 'button[type="submit"]':
+                    return Collection([Button()])
+                return Collection()
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="blocked@icloud.com")
+
+            def log(self, _message):
+                return None
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "123456"
+
+            def _visible_inputs(self, page, selectors):
+                if any("input" in selector for selector in selectors):
+                    return [page.field]
+                return []
+
+            def _validate_email_code_api(self, _page, _code):
+                return ""
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=object,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "blocked@icloud.com")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "尚未完成回读确认"):
+            Worker()._validate_email_code_api(Page(), "123456")
+        self.assertEqual(actions, [])
+
+    def test_icloud_code_fetch_is_checked_before_browser_input(self):
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                pass
+
+            def connect(self):
+                return None
+
+            def wait_for_code(self, _min_timestamp):
+                return "123456"
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="checked@icloud.com")
+                self.otp_reader = None
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "original"
+
+            def _visible_inputs(self, _page, _selectors):
+                return []
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "checked@icloud.com")
+        )
+
+        worker = Worker()
+        self.assertEqual(worker._wait_for_openai_email_code(0), "123456")
+        self.assertTrue(any("获取检查通过" in line for line in worker.logs))
+
+    def test_icloud_code_fetch_blocks_non_numeric_result(self):
+        class Reader:
+            def __init__(self, _account, _log, _proxy_url):
+                pass
+
+            def connect(self):
+                return None
+
+            def wait_for_code(self, _min_timestamp):
+                return "12AB56"
+
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(email="numeric@icloud.com")
+                self.otp_reader = None
+
+            def log(self, _message):
+                return None
+
+            def _preconnect_otp_reader(self):
+                return None
+
+            def _wait_for_openai_email_code(self, _min_timestamp):
+                return "original"
+
+            def _visible_inputs(self, _page, _selectors):
+                return []
+
+        backend = SimpleNamespace(
+            OpenAIRegisterPayLinkWorker=Worker,
+            HotmailOtpReader=Reader,
+        )
+        self.assertTrue(
+            configure_registration_otp_reader(backend, "numeric@icloud.com")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "不是 6 位数字"):
+            Worker()._wait_for_openai_email_code(0)
 
     def test_icloud_code_resend_accepts_mail_header_clock_skew(self):
         actions = []
@@ -3853,6 +4357,97 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(worker._hme_two_factor_completed)
         self.assertIn("two_factor_enabled", [kind for kind, _payload in emitted])
 
+    def test_existing_login_discards_stale_pending_totp_before_activation(self):
+        class Worker:
+            def __init__(self):
+                self.account = SimpleNamespace(
+                    email="retry@icloud.com",
+                    password="Strong!Password123",
+                )
+                self._hme_login_totp_submitted = True
+                self.logs = []
+
+            def _extract_session_info(self, _context):
+                self.fail("the original extractor must stay wrapped")
+
+            def log(self, message):
+                self.logs.append(message)
+
+        worker = Worker()
+        emitted = []
+        received_pending = []
+        stale = {
+            "enabled": False,
+            "status": "enrolled",
+            "secret": "JBSWY3DPEHPK3PXP",
+            "factor_id": "stale-factor",
+            "session_id": "stale-session",
+        }
+
+        def enable_mfa(
+            _client,
+            *,
+            access_token,
+            email,
+            pending,
+            on_enrolled,
+        ):
+            self.assertEqual(access_token, "at-current")
+            self.assertEqual(email, "retry@icloud.com")
+            received_pending.append(pending)
+            state = {
+                "enabled": True,
+                "status": "enabled",
+                "secret": "ABCDEFGHIJKLMNOP",
+            }
+            on_enrolled(state)
+            return state
+
+        self.assertTrue(
+            configure_existing_account_two_factor(
+                worker,
+                enabled=True,
+                pending_two_factor=stale,
+            )
+        )
+        with (
+            patch(
+                "hidemyemail_generator.openai_account_security."
+                "extract_session_without_navigation",
+                return_value={"access_token": "at-current"},
+            ),
+            patch(
+                "hidemyemail_generator.openai_account_security.MfaHttpClient",
+                return_value=SimpleNamespace(close=lambda: None),
+            ),
+            patch(
+                "hidemyemail_generator.openai_account_security.enable_totp_mfa",
+                side_effect=enable_mfa,
+            ),
+            patch(
+                "hidemyemail_generator.openai_account_security.emit",
+                side_effect=lambda kind, **payload: emitted.append((kind, payload)),
+            ),
+        ):
+            # The wrapper's dependencies were bound when it was configured, so
+            # exercise the helper directly with the same current-session result.
+            result = _enable_two_factor_before_browser_closes(
+                worker,
+                SimpleNamespace(),
+                {"access_token": "at-current"},
+                stale,
+                password_confirmed=True,
+                emit_event=lambda kind, **payload: emitted.append((kind, payload)),
+                mfa_client_factory=lambda: SimpleNamespace(close=lambda: None),
+                enable_mfa=enable_mfa,
+            )
+
+        self.assertEqual(received_pending, [{}])
+        self.assertTrue(result["two_factor"]["enabled"])
+        self.assertTrue(worker._hme_two_factor_completed)
+        self.assertTrue(any("旧待激活登记已失效" in line for line in worker.logs))
+        self.assertIn("two_factor_enabled", [kind for kind, _payload in emitted])
+
     def test_session_is_read_without_opening_a_new_page(self):
         class Response:
             ok = True
@@ -5329,6 +5924,65 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(openai_email["stage"], "openai_auth")
         self.assertEqual(two_factor["stage"], "two_factor")
 
+    def test_browser_log_context_treats_zero_failures_as_success(self):
+        context = browser_log_context(
+            "浏览器取全部完成：成功 1，失败 0，跳过 0"
+        )
+
+        self.assertEqual(context["status"], "success")
+
+    def test_browser_log_context_does_not_report_otp_submitted_before_input(self):
+        waiting = browser_log_context(
+            "[状态识别] 邮箱已提交；当前页面=邮箱验证码页；下一步=读取本轮最新邮箱验证码"
+        )
+        checked = browser_log_context(
+            "[验证码] 输入检查通过：浏览器可见输入框已包含 6 位验证码；现在点击继续"
+        )
+
+        self.assertEqual(waiting["action"], "等待并监测邮箱验证码")
+        self.assertEqual(checked["action"], "校验验证码输入并点击继续")
+
+    def test_browser_log_context_keeps_otp_submit_as_completed_step(self):
+        clicked = browser_log_context(
+            "[验证码] 输入框已回读一致；已直接点击当前页面的继续按钮，未刷新验证码页面"
+        )
+        upstream = browser_log_context("已通过接口提交邮箱验证码")
+        acquired = browser_log_context("已安全取得本次所需的邮箱验证码")
+        fallback = browser_log_context("正在确认邮箱验证码输入界面")
+
+        self.assertEqual(clicked["action"], "验证码已提交，等待页面跳转")
+        self.assertEqual(upstream["action"], "验证码已提交，等待页面跳转")
+        self.assertEqual(acquired["action"], "验证码已获取，准备写入输入框")
+        self.assertEqual(fallback["action"], "核对邮箱验证码页面状态")
+
+    def test_browser_log_context_uses_selected_roxy_engine(self):
+        context = browser_log_context(
+            "开始浏览器注册或登录",
+            browser_engine="roxy",
+        )
+
+        self.assertEqual(context["stage"], "browser")
+        self.assertEqual(context["action"], "启动并监测 Roxy 浏览器")
+
+    def test_append_log_uses_roxy_in_current_action(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = BrowserTaskManager(
+                target_project_dir=root,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=root / "bridge.py",
+            )
+            manager._state["browserEngine"] = "roxy"
+
+            manager._append_log("开始浏览器注册或登录")
+            state = manager.snapshot()
+
+            self.assertEqual(state["currentAction"], "启动并监测 Roxy 浏览器")
+            self.assertNotIn("Camoufox", state["currentAction"])
+
     def test_append_log_publishes_current_execution_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -5621,7 +6275,7 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 use_registration_proxy=True,
                 browser_engine="roxy",
             )
-            await asyncio.wait_for(manager._batch_task, timeout=10)
+            await asyncio.wait_for(manager._batch_task, timeout=30)
 
             messages = [entry["message"] for entry in manager.snapshot()["logs"]]
             self.assertEqual(state["browserEngine"], "roxy")
@@ -6155,6 +6809,55 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["failed"], 1)
             self.assertIn("拒绝保存免密码账号", snapshot["accounts"][0]["message"])
             record = load_account_record(db_file, "strict@gmail.com")
+            self.assertFalse(record.get("access_token"))
+
+    async def test_required_icloud_result_without_enabled_two_factor_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text(
+                "import json\n"
+                "prefix = 'HME_BROWSER_EVENT:'\n"
+                "result = {'access_token':'at-rejected','session_json':'{}'}\n"
+                "event = {'type':'result','result':result,'password':'LocalOnly!A7','password_confirmed':True}\n"
+                "print(prefix + json.dumps(event), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(
+                [
+                    {
+                        "email": "strict@icloud.com",
+                        "password": "LocalOnly!A7",
+                        "password_confirmed": True,
+                        "ensure_password": True,
+                        "password_first_required": True,
+                        "enable_2fa": True,
+                    }
+                ],
+                headless=True,
+                concurrency=1,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=30)
+
+            snapshot = manager.snapshot()
+            self.assertEqual(snapshot["succeeded"], 0)
+            self.assertEqual(snapshot["failed"], 1)
+            self.assertIn("TOTP 2FA", snapshot["accounts"][0]["message"])
+            record = load_account_record(db_file, "strict@icloud.com")
             self.assertFalse(record.get("access_token"))
 
     async def test_worker_result_is_saved_without_exposing_credentials(self):

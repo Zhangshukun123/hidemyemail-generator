@@ -634,16 +634,36 @@ def _enable_two_factor_before_browser_closes(
         worker.log("[2FA] 密码尚未设置成功，已跳过开启 2FA")
         return result
 
-    two_factor = reusable_enabled_two_factor(pending_two_factor)
+    pending_state = (
+        dict(pending_two_factor)
+        if isinstance(pending_two_factor, dict)
+        else {}
+    )
+    two_factor = reusable_enabled_two_factor(pending_state)
     if two_factor:
         worker.log("账号已有 TOTP 2FA，已保留现有启用状态")
     else:
         emit_event("two_factor_start")
         mfa_client = mfa_client_factory()
         try:
-            mfa_pending = (
-                dict(pending_two_factor) if isinstance(pending_two_factor, dict) else {}
-            )
+            mfa_pending = pending_state
+
+            # A stored enrollment belongs to the token/session that created it.
+            # After the normal login flow consumes that TOTP and issues a new
+            # authenticated token, OpenAI may silently invalidate the old pending
+            # enrollment.  Reusing its factor/session IDs then leaves the account
+            # logged in but never confirms MFA.  Start one fresh enrollment for
+            # the new token; the callback persists its new secret before activation.
+            if (
+                mfa_pending
+                and not mfa_pending.get("enabled")
+                and getattr(worker, "_hme_login_totp_submitted", False)
+            ):
+                worker.log(
+                    "[2FA] 已用保存的动态码完成登录；旧待激活登记已失效，"
+                    "正在使用当前会话重新创建并激活 TOTP"
+                )
+                mfa_pending = {}
 
             def remember_enrolled(state):
                 nonlocal mfa_pending

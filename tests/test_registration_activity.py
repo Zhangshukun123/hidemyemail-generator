@@ -16,7 +16,7 @@ from hidemyemail_generator.registration_activity import (
 
 
 class RegistrationActivityTests(unittest.TestCase):
-    def test_activity_wait_is_silent_for_two_seconds_then_checks_once(self):
+    def test_activity_wait_is_silent_for_one_second_then_checks_once(self):
         handlers = {}
         waits = []
 
@@ -57,8 +57,8 @@ class RegistrationActivityTests(unittest.TestCase):
             wait=wait,
         )
 
-        self.assertEqual(CLICK_RESPONSE_SECONDS, 2.0)
-        self.assertEqual(waits, [2000])
+        self.assertEqual(CLICK_RESPONSE_SECONDS, 1.0)
+        self.assertEqual(waits, [1000])
         self.assertTrue(result["changed"])
         self.assertEqual(result["reason"], "request")
 

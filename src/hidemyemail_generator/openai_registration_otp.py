@@ -48,6 +48,18 @@ EMAIL_VERIFICATION_RESEND_SELECTORS = (
     'button:has-text("重新发送邮件")',
     'button:has-text("重新傳送電子郵件")',
 )
+EMAIL_VERIFICATION_SUBMIT_SELECTORS = (
+    'button[data-dd-action-name="Continue"][type="submit"]',
+    'button[type="submit"]:has-text("Continue")',
+    'button[type="submit"]:has-text("続行")',
+    'button[type="submit"]:has-text("继续")',
+    'button[type="submit"]:has-text("繼續")',
+    'button:has-text("Continue")',
+    'button:has-text("続行")',
+    'button:has-text("继续")',
+    'button:has-text("繼續")',
+    'button[type="submit"]',
+)
 EMAIL_VERIFICATION_UI_MARKERS = {
     "日文": (
         "受信箱を確認",
@@ -252,6 +264,9 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
     original_preconnect = worker_type._preconnect_otp_reader
     original_wait_for_code = worker_type._wait_for_openai_email_code
     original_submit_email_code = getattr(worker_type, "_submit_email_code", None)
+    original_validate_email_code = getattr(
+        worker_type, "_validate_email_code_api", None
+    )
     original_visible_inputs = getattr(worker_type, "_visible_inputs", None)
     reader_type = app_backend.HotmailOtpReader
 
@@ -283,7 +298,15 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
             if icloud_inbox
             else "正在等待 SMSBower 返回 Gmail 验证码"
         )
-        return worker.otp_reader.wait_for_code(min_timestamp)
+        code = worker.otp_reader.wait_for_code(min_timestamp)
+        normalized = re.sub(r"\D", "", str(code or ""))
+        if not re.fullmatch(r"\d{6}", normalized):
+            raise RuntimeError("验证码获取结果不是 6 位数字，已阻止输入和提交")
+        worker.log(
+            "[验证码] 获取检查通过：已取得本轮 6 位验证码；"
+            "内容不输出，下一步写入浏览器并回读"
+        )
+        return normalized
 
     def visible_inputs_with_localized_email_code(worker, page, selectors):
         inputs = original_visible_inputs(worker, page, selectors)
@@ -371,6 +394,92 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                     worker.log("[验证码] 已按邮箱验证页面的唯一文本框定位 Code 输入框")
                     return text_inputs
         return inputs
+
+    def validate_email_code_by_visible_submit(worker, page, code: str) -> str:
+        """Submit only after a fresh, successful OTP-input attestation."""
+
+        if not is_supported_worker(worker):
+            return original_validate_email_code(worker, page, code)
+        ui_state = _email_verification_ui_state(
+            page,
+            target_email,
+            original_visible_inputs.__get__(worker, type(worker)),
+        )
+        if not ui_state["recognized"]:
+            raise RuntimeError("当前页面未严格识别为邮箱验证码页，已阻止提交")
+
+        expected = re.sub(r"\D", "", str(code or ""))
+        attestation = getattr(worker, "_hme_otp_input_attestation", None)
+        if (
+            not isinstance(attestation, dict)
+            or not attestation.get("verified")
+            or str(attestation.get("code") or "") != expected
+            or str(attestation.get("pageUrl") or "")
+            != str(getattr(page, "url", "") or "")
+            or time.monotonic() - float(attestation.get("verifiedAt") or 0.0) > 5.0
+        ):
+            raise RuntimeError("验证码输入尚未完成回读确认，已阻止点击继续")
+        inputs = visible_inputs_with_localized_email_code(
+            worker,
+            page,
+            list(LOCALIZED_EMAIL_OTP_INPUT_SELECTORS),
+        )
+        values: list[str] = []
+        for candidate in inputs:
+            try:
+                value = str(candidate.input_value(timeout=1000) or "")
+            except TypeError:
+                try:
+                    value = str(candidate.input_value() or "")
+                except Exception:
+                    value = ""
+            except Exception:
+                value = ""
+            normalized = re.sub(r"\D", "", value)
+            if normalized:
+                values.append(normalized)
+        actual = ""
+        if expected in values:
+            actual = expected
+        elif len(values) >= len(expected) and all(
+            len(value) == 1 for value in values
+        ):
+            actual = "".join(values[: len(expected)])
+        elif values:
+            actual = values[0]
+        if not re.fullmatch(r"\d{6}", expected) or actual != expected:
+            raise RuntimeError("验证码输入框回读不一致，已阻止点击继续")
+
+        # Consume the one-shot attestation before clicking. Any retry must fill
+        # and read the OTP again instead of reusing a stale successful check.
+        worker._hme_otp_input_attestation = None
+        for _attempt in range(20):
+            for selector in EMAIL_VERIFICATION_SUBMIT_SELECTORS:
+                try:
+                    locator = page.locator(selector)
+                    if int(locator.count()) < 1:
+                        continue
+                    candidate = locator.first
+                    if not candidate.is_visible(timeout=300):
+                        continue
+                    enabled = getattr(candidate, "is_enabled", None)
+                    if callable(enabled) and not enabled(timeout=300):
+                        continue
+                    candidate.click(timeout=5000, no_wait_after=True)
+                    worker._hme_otp_visible_submit = True
+                    worker.log(
+                        "[验证码] 输入框已回读一致；已直接点击当前页面的继续按钮，"
+                        "未刷新验证码页面"
+                    )
+                    return ""
+                except Exception:
+                    continue
+            wait = getattr(page, "wait_for_timeout", None)
+            if callable(wait):
+                wait(200)
+            else:
+                time.sleep(0.2)
+        raise RuntimeError("验证码已输入，但未找到可点击的继续按钮；未刷新页面")
 
     def submit_email_code_with_stable_input(
         worker,
@@ -517,6 +626,8 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
     worker_type._wait_for_openai_email_code = wait_for_openai_email_code
     if callable(original_submit_email_code):
         worker_type._submit_email_code = submit_email_code_with_stable_input
+    if callable(original_validate_email_code):
+        worker_type._validate_email_code_api = validate_email_code_by_visible_submit
     if callable(original_visible_inputs):
         worker_type._visible_inputs = visible_inputs_with_localized_email_code
     return True

@@ -483,6 +483,86 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(browser.start_options["concurrency"], 1)
         self.assertEqual(browser.reset_count, 1)
 
+    async def test_partial_batch_success_keeps_successful_inventory_consumed(self):
+        class PartialBrowserManager(FakeBrowserManager):
+            async def wait(self):
+                await asyncio.sleep(0)
+                self.state.update(
+                    status="completed",
+                    running=False,
+                    succeeded=1,
+                    accounts=[
+                        {
+                            "email": self.started_accounts[0]["email"],
+                            "status": "success",
+                            "passwordConfirmed": True,
+                            "twoFactorEnabled": True,
+                        },
+                        {
+                            "email": self.started_accounts[1]["email"],
+                            "status": "failed",
+                            "message": "验证码校验失败",
+                        },
+                    ],
+                )
+                return self.snapshot()
+
+        emails = iter(["success@icloud.com", "failed@icloud.com"])
+        completions = []
+
+        async def acquire(_label):
+            return next(emails)
+
+        async def noop(*_args):
+            return None
+
+        async def complete(email, success, _message):
+            completions.append((email, success))
+
+        manager = RegistrationTaskManager(
+            browser_manager=PartialBrowserManager(),
+            acquire_email=acquire,
+            confirm_email=noop,
+            save_password=noop,
+            complete_email=complete,
+        )
+        manager.start(label="partial", headless=True, concurrency=2)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        self.assertEqual(manager.snapshot()["status"], "failed")
+        self.assertEqual(
+            completions,
+            [("success@icloud.com", True), ("failed@icloud.com", False)],
+        )
+
+    async def test_browser_log_relay_tracks_rolling_buffer_by_entry(self):
+        manager = RegistrationTaskManager(
+            browser_manager=FakeBrowserManager(),
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+        )
+        first_logs = [
+            {"at": f"2026-08-13T00:00:0{index}Z", "message": f"line-{index}"}
+            for index in range(3)
+        ]
+        task_id, cursor = manager._relay_browser_logs(
+            {"id": "rolling", "logs": first_logs},
+            task_id="",
+            cursor=0,
+        )
+        rolling_logs = first_logs[1:] + [
+            {"at": "2026-08-13T00:00:03Z", "message": "line-3"}
+        ]
+
+        _, next_cursor = manager._relay_browser_logs(
+            {"id": "rolling", "logs": rolling_logs},
+            task_id=task_id,
+            cursor=cursor,
+        )
+
+        self.assertEqual(next_cursor, 3)
+        self.assertEqual(manager.snapshot()["logs"][-1]["message"], "line-3")
+
     async def test_manual_email_skips_inventory_and_starts_single_registration(self):
         browser = FakeBrowserManager()
         events = []
@@ -554,6 +634,13 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_reuses_first_saved_password_without_overwriting_it(self):
         browser = FakeBrowserManager()
         saved_password = "FirstAttempt!A7Password"
+        saved_two_factor = {
+            "enabled": False,
+            "status": "enrolled",
+            "secret": "JBSWY3DPEHPK3PXP",
+            "factor_id": "factor-1",
+            "session_id": "session-1",
+        }
         events = []
 
         async def load_account(email):
@@ -562,6 +649,7 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 "email": email,
                 "password": saved_password,
                 "password_confirmed": False,
+                "two_factor": saved_two_factor,
             }
 
         async def save_password(email, password):
@@ -585,7 +673,15 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account["email"], "retry.alias@icloud.com")
         self.assertEqual(account["password"], saved_password)
         self.assertFalse(account["password_confirmed"])
+        self.assertEqual(account["two_factor"], saved_two_factor)
         self.assertEqual(events, [("load", "retry.alias@icloud.com")])
+        self.assertTrue(
+            any(
+                "登录遇到动态码页面时将自动生成并提交当前验证码"
+                in item["message"]
+                for item in manager.snapshot()["logs"]
+            )
+        )
         self.assertTrue(
             any(
                 "本次继续使用原密码，不生成或覆盖新密码" in item["message"]

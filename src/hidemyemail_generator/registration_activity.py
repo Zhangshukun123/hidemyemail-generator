@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import types
 from datetime import datetime, timezone
@@ -9,8 +10,17 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 
-CLICK_RESPONSE_SECONDS = 2.0
+CLICK_RESPONSE_SECONDS = 1.0
 MAX_NO_RESPONSE_CLICK_ATTEMPTS = 5
+
+EMAIL_VERIFICATION_INPUT_SELECTORS = (
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    'input[type="tel"]',
+    'input[name="code"]',
+    'input[aria-label*="コード" i]',
+    'input[placeholder*="コード" i]',
+)
 
 _CHAIN_STEPS = (
     ("site_requested", "已请求 ChatGPT 网站", "等待网站加载完成"),
@@ -335,6 +345,140 @@ def quiet_registration_delay(
         except Exception:
             pass
     time.sleep(timeout_value)
+
+
+def _unique_visible_inputs(inputs: list[Any]) -> list[Any]:
+    """Keep one locator per DOM element when selectors overlap."""
+
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for candidate in inputs:
+        key = ""
+        evaluator = getattr(candidate, "evaluate", None)
+        if callable(evaluator):
+            try:
+                key = str(
+                    evaluator(
+                        """element => {
+                            if (!element.dataset.hmeOtpLocatorId) {
+                                element.dataset.hmeOtpLocatorId =
+                                    'hme-otp-' + Math.random().toString(36).slice(2);
+                            }
+                            return element.dataset.hmeOtpLocatorId;
+                        }"""
+                    )
+                    or ""
+                )
+            except Exception:
+                key = ""
+        if not key:
+            key = f"object:{id(candidate)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _read_email_verification_code(inputs: list[Any], expected: str) -> str:
+    values: list[str] = []
+    for candidate in inputs:
+        reader = getattr(candidate, "input_value", None)
+        if not callable(reader):
+            continue
+        try:
+            value = str(reader(timeout=1000) or "")
+        except TypeError:
+            try:
+                value = str(reader() or "")
+            except Exception:
+                value = ""
+        except Exception:
+            value = ""
+        normalized = re.sub(r"[^A-Za-z0-9]", "", value)
+        if normalized:
+            values.append(normalized)
+    if expected in values:
+        return expected
+    if len(values) >= len(expected) and all(len(value) == 1 for value in values):
+        return "".join(values[: len(expected)])
+    return values[0] if values else ""
+
+
+def _fill_email_verification_code(inputs: list[Any], expected: str) -> None:
+    if len(inputs) >= len(expected):
+        for index, character in enumerate(expected):
+            inputs[index].fill(character)
+        return
+    if not inputs:
+        return
+    candidate = inputs[0]
+    try:
+        candidate.click(timeout=2000, force=True)
+    except Exception:
+        pass
+    try:
+        candidate.fill("")
+        typer = getattr(candidate, "type", None)
+        if callable(typer):
+            try:
+                typer(expected, delay=80, timeout=5000)
+            except TypeError:
+                typer(expected, delay=80)
+        else:
+            candidate.fill(expected)
+    except Exception:
+        candidate.fill(expected)
+
+
+def ensure_email_verification_code_entered(worker: Any, page: Any, code: str) -> None:
+    """Fail closed unless the current visible OTP fields contain this code."""
+
+    worker._hme_otp_input_attestation = None
+    expected = re.sub(r"\D", "", str(code or ""))
+    if not re.fullmatch(r"\d{6}", expected):
+        raise RuntimeError("验证码不是 6 位数字，已阻止提交")
+    last_actual = ""
+    for attempt in range(2):
+        inputs = _unique_visible_inputs(
+            list(worker._visible_inputs(page, list(EMAIL_VERIFICATION_INPUT_SELECTORS)))
+        )
+        last_actual = _read_email_verification_code(inputs, expected)
+        if last_actual == expected:
+            worker._hme_otp_input_attestation = {
+                "verified": True,
+                "code": expected,
+                "pageUrl": str(getattr(page, "url", "") or ""),
+                "verifiedAt": time.monotonic(),
+            }
+            worker.log(
+                "[验证码] 输入检查通过：浏览器可见输入框已包含 6 位验证码，"
+                "逐位回读与本轮获取结果一致；现在点击继续"
+            )
+            return
+        if not inputs:
+            if attempt == 0:
+                quiet_registration_delay(page, seconds=0.35)
+                continue
+            break
+        _fill_email_verification_code(inputs, expected)
+        quiet_registration_delay(page, seconds=0.4)
+    inputs = _unique_visible_inputs(
+        list(worker._visible_inputs(page, list(EMAIL_VERIFICATION_INPUT_SELECTORS)))
+    )
+    if _read_email_verification_code(inputs, expected) == expected:
+        worker._hme_otp_input_attestation = {
+            "verified": True,
+            "code": expected,
+            "pageUrl": str(getattr(page, "url", "") or ""),
+            "verifiedAt": time.monotonic(),
+        }
+        worker.log(
+            "[验证码] 输入检查通过：浏览器可见输入框已包含 6 位验证码，"
+            "逐位回读与本轮获取结果一致；现在点击继续"
+        )
+        return
+    raise RuntimeError("验证码未写入当前可见输入框，已阻止提交")
 
 
 def _chain_state(worker: Any) -> dict[str, Any]:
@@ -782,7 +926,8 @@ def configure_request_driven_registration(
                     )
                     return True
                 self.log(
-                    f"[请求监测] 基础资料第 {attempt} 次点击后 2 秒无请求、"
+                    f"[请求监测] 基础资料第 {attempt} 次点击后 "
+                    f"{CLICK_RESPONSE_SECONDS:g} 秒无请求、"
                     "无响应且页面未变化"
                 )
             raise RuntimeError("基础资料提交最多点击 5 次后仍无请求或页面响应")
@@ -826,49 +971,13 @@ def configure_request_driven_registration(
     original_validate_code = getattr(worker, "_validate_email_code_api", None)
     if callable(original_validate_code):
         def validate_code_with_chain(self, page, code, *args, **kwargs):
-            selectors = [
-                'input[autocomplete="one-time-code"]',
-                'input[inputmode="numeric"]',
-                'input[type="tel"]',
-                'input[name="code"]',
-                'input[aria-label*="コード" i]',
-                'input[placeholder*="コード" i]',
-            ]
-            inputs = self._visible_inputs(page, selectors)
-
-            def read_code() -> str:
-                values = []
-                for candidate in inputs:
-                    reader = getattr(candidate, "input_value", None)
-                    if not callable(reader):
-                        continue
-                    try:
-                        values.append(str(reader(timeout=1000) or ""))
-                    except TypeError:
-                        values.append(str(reader() or ""))
-                    except Exception:
-                        values.append("")
-                if len(values) >= 6:
-                    return "".join(value[:1] for value in values[:6])
-                return values[0] if values else ""
-
             begin_registration_step(
                 self,
                 "verification_code_entered",
                 page=page,
                 value="正在输入验证码并回读 6 位输入框",
             )
-            expected = str(code or "")[:6]
-            actual = read_code()[:6]
-            if expected and actual != expected:
-                if len(inputs) >= 6:
-                    for index, char in enumerate(expected):
-                        inputs[index].fill(char)
-                elif inputs:
-                    inputs[0].fill(expected)
-                actual = read_code()[:6]
-            if expected and actual != expected:
-                raise RuntimeError("验证码输入回读不一致，重填一次后仍未生效")
+            ensure_email_verification_code_entered(self, page, code)
             mark_registration_chain(
                 self,
                 "verification_code_entered",

@@ -89,6 +89,7 @@ class RegistrationTaskManager:
         self._provider_code_cache: dict[tuple[str, str], str] = {}
         self._provider_code_started_at: dict[tuple[str, str], float] = {}
         self._provider_cancelled_emails: set[str] = set()
+        self._last_relayed_browser_log_key: tuple[str, str, str] | None = None
 
     @staticmethod
     def _idle_state() -> dict[str, Any]:
@@ -259,11 +260,28 @@ class RegistrationTaskManager:
         if current_task_id and current_task_id != task_id:
             task_id = current_task_id
             cursor = 0
+            self._last_relayed_browser_log_key = None
         logs = snapshot.get("logs")
         if not isinstance(logs, list):
             return task_id, cursor
         if cursor > len(logs):
             cursor = 0
+        elif cursor == len(logs) and logs and self._last_relayed_browser_log_key:
+            previous_index = next(
+                (
+                    index
+                    for index in range(len(logs) - 1, -1, -1)
+                    if isinstance(logs[index], dict)
+                    and (
+                        str(logs[index].get("at") or ""),
+                        str(logs[index].get("email") or ""),
+                        str(logs[index].get("message") or ""),
+                    )
+                    == self._last_relayed_browser_log_key
+                ),
+                -1,
+            )
+            cursor = previous_index + 1 if previous_index >= 0 else 0
         for entry in logs[cursor:]:
             if not isinstance(entry, dict):
                 continue
@@ -272,6 +290,11 @@ class RegistrationTaskManager:
                 continue
             context = browser_log_context(message)
             self._append_log(message)
+            self._last_relayed_browser_log_key = (
+                str(entry.get("at") or ""),
+                str(entry.get("email") or ""),
+                message,
+            )
             self._state.update(
                 phase=context["stage"],
                 message=message[:500],
@@ -507,6 +530,7 @@ class RegistrationTaskManager:
         self._provider_code_cache.clear()
         self._provider_code_started_at.clear()
         self._provider_cancelled_emails.clear()
+        self._last_relayed_browser_log_key = None
         self._sync_code_state()
         if not self._state.get("finishedAt"):
             self._state["finishedAt"] = utc_now()
@@ -621,6 +645,11 @@ class RegistrationTaskManager:
                     password = generate_openai_password()
                     if self.save_password is not None:
                         await self.save_password(email, password)
+                saved_two_factor = (
+                    dict(saved_account.get("two_factor"))
+                    if isinstance(saved_account.get("two_factor"), dict)
+                    else {}
+                )
                 accounts.append(
                     {
                         "email": email,
@@ -634,8 +663,15 @@ class RegistrationTaskManager:
                         "manual_otp_entry": manual_browser_code,
                         "password_first_required": True,
                         "foreground_required": manual_browser_code,
+                        "two_factor": saved_two_factor,
                     }
                 )
+                if str(saved_two_factor.get("secret") or "").strip():
+                    self._append_log(
+                        f"[2FA] 已载入该账号本地保存的 TOTP 密钥（{index}/"
+                        f"{effective_concurrency}）：{email}；"
+                        "登录遇到动态码页面时将自动生成并提交当前验证码"
+                    )
                 if reused_password:
                     self._append_log(
                         "检测到该邮箱已有首次注册保存的密码"
@@ -697,6 +733,8 @@ class RegistrationTaskManager:
                 for item in result_accounts
                 if item.get("status") == "success" and item.get("email")
             }
+            if provider == "inventory":
+                successful_emails.update(registered_emails)
             if (
                 succeeded == effective_concurrency
                 and len(registered_emails) != effective_concurrency

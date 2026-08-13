@@ -1949,6 +1949,7 @@ GPT_INDEX_HTML = r"""<!doctype html>
         method: "POST",
         body: JSON.stringify({
           label: "OpenAI 一键注册",
+          provider: "inventory",
           ...options,
         }),
       });
@@ -3963,6 +3964,8 @@ def create_app(
         username=inventory_service_username,
         password=inventory_service_password,
     )
+    app["local_registration_leases"] = {}
+    app["inventory_fallback_active"] = False
     app["inventory_sync_lock"] = asyncio.Lock()
     app["inventory_sync_interval_seconds"] = max(
         1.0, float(inventory_sync_interval_seconds)
@@ -4013,7 +4016,11 @@ def create_app(
             return {"configured": True, **result}
 
     async def sync_saved_account_to_remote(email: str) -> None:
-        await sync_inventory_to_remote([str(email or "").strip().lower()])
+        try:
+            await sync_inventory_to_remote([str(email or "").strip().lower()])
+        except RuntimeError:
+            if not app["inventory_fallback_active"]:
+                raise
 
     app["sync_inventory_to_remote"] = sync_inventory_to_remote
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
@@ -4318,39 +4325,61 @@ def create_app(
         # The remote inventory database cannot see account records saved on
         # this workstation.  Consume only completed accounts; a password-only
         # record from a failed attempt stays retryable and reuses that password.
-        if not app["inventory_initial_sync_complete"]:
-            await sync_inventory_to_remote()
-        for _attempt in range(100):
-            email = await app["inventory_client"].acquire_email(label)
-            if not email:
-                return ""
-            leased_record = app["inventory_client"].leased_record(email)
-            if leased_record is not None:
-                await asyncio.to_thread(
-                    import_inventory_records,
-                    app["db_file"],
-                    [leased_record],
+        remote_error: RuntimeError | None = None
+        try:
+            if not app["inventory_initial_sync_complete"]:
+                await sync_inventory_to_remote()
+            for _attempt in range(100):
+                email = await app["inventory_client"].acquire_email(label)
+                if not email:
+                    break
+                leased_record = app["inventory_client"].leased_record(email)
+                if leased_record is not None:
+                    await asyncio.to_thread(
+                        import_inventory_records,
+                        app["db_file"],
+                        [leased_record],
+                    )
+                record = await asyncio.to_thread(
+                    load_account_record, app["db_file"], email
                 )
-            record = await asyncio.to_thread(
-                load_account_record, app["db_file"], email
-            )
-            completed_locally = bool(
-                account_session_access_token(record)
-                or account_saved_cookies(record)
-                or account_session(record)
-            )
-            if not completed_locally:
-                return email
-            await app["inventory_client"].complete_email(
-                email,
-                True,
-                "本地已有已完成的 OpenAI 账号，已从远端库存标记使用",
-            )
-        raise RuntimeError("远端邮箱库存连续返回已有账号，已停止领取")
+                completed_locally = bool(
+                    account_session_access_token(record)
+                    or account_saved_cookies(record)
+                    or account_session(record)
+                )
+                if not completed_locally:
+                    return email
+                await app["inventory_client"].complete_email(
+                    email,
+                    True,
+                    "本地已有已完成的 OpenAI 账号，已从远端库存标记使用",
+                )
+            else:
+                raise RuntimeError("远端邮箱库存连续返回已有账号，已停止领取")
+        except RuntimeError as error:
+            remote_error = error
+
+        local_lease = await asyncio.to_thread(
+            lease_generated_inventory_email,
+            app["db_file"],
+            client_id="local-registration-fallback",
+            label=label,
+            lease_seconds=app["inventory_lease_seconds"],
+        )
+        if local_lease:
+            email = str(local_lease["email"]).strip().lower()
+            app["local_registration_leases"][email] = local_lease
+            app["inventory_fallback_active"] = True
+            return email
+        if remote_error is not None:
+            raise RuntimeError(f"{remote_error}；本地生成库存为空") from remote_error
+        return ""
 
     async def complete_registration_inventory_email(
         email: str, success: bool, message: str
     ) -> None:
+        target = str(email or "").strip().lower()
         record = (
             await asyncio.to_thread(
                 export_inventory_record, app["db_file"], email
@@ -4358,6 +4387,21 @@ def create_app(
             if success
             else None
         )
+        local_lease = app["local_registration_leases"].get(target)
+        if local_lease is not None:
+            result = await asyncio.to_thread(
+                complete_generated_inventory_lease,
+                app["db_file"],
+                lease_id=local_lease["leaseId"],
+                email=target,
+                success=success,
+                message=message,
+                record=record,
+            )
+            if not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "本地库存回执失败"))
+            app["local_registration_leases"].pop(target, None)
+            return
         await app["inventory_client"].complete_email(
             email, success, message, record=record
         )
@@ -5944,7 +5988,10 @@ def create_app(
                 {"ok": False, "error": "邮箱标签长度必须是 1–100 个字符"},
                 status=400,
             )
-        provider = str(payload.get("provider") or "manual").strip().lower()
+        provider = str(
+            payload.get("provider")
+            or ("manual" if str(payload.get("email") or "").strip() else "inventory")
+        ).strip().lower()
         if provider not in {"manual", "inventory", "smsbower"}:
             return web.json_response(
                 {"ok": False, "error": "不支持的注册邮箱来源"}, status=400
@@ -6890,12 +6937,21 @@ def create_app(
         try:
             state = await client.status()
         except RuntimeError as error:
+            local_state = await asyncio.to_thread(
+                stored_registration_inventory_status, app["db_file"]
+            )
+            local_available = max(0, int(local_state.get("available") or 0))
             return web.json_response(
                 {
                     "ok": True,
                     "configured": True,
-                    "available": 0,
-                    "error": str(error),
+                    "available": local_available,
+                    "fallback": local_available > 0,
+                    "error": (
+                        "远端库存暂不可用，已切换本地生成库存"
+                        if local_available > 0
+                        else str(error)
+                    ),
                 },
                 headers={"Cache-Control": "no-store"},
             )

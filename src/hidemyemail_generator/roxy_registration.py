@@ -186,6 +186,8 @@ class RoxyOpenApiClient:
                 "dirId": str(dir_id),
                 "forceOpen": False,
                 "headless": bool(background),
+                # Keep the Chromium-side fallback in addition to Roxy's native
+                # forbidSavePassword profile setting configured before launch.
                 "args": ["--disable-save-password-bubble"],
             },
         )
@@ -491,6 +493,8 @@ class RoxyRegistrationBrowser:
                     "clearHistory": True,
                     "syncTab": False,
                     "syncCookie": False,
+                    "syncPassword": False,
+                    "forbidSavePassword": True,
                     "isLanguageBaseIp": True,
                     "isDisplayLanguageBaseIp": True,
                     "isTimeZone": True,
@@ -498,6 +502,7 @@ class RoxyRegistrationBrowser:
                 },
             }
         )
+        self.log("[Roxy] 已禁用 Google 密码保存提示与已保存密码同步")
         self.client.randomize_profile(self.workspace_id, self.profile_id)
         self.connection = self.client.open_profile(
             self.workspace_id,
@@ -534,6 +539,35 @@ class RoxyRegistrationBrowser:
         cookies = (storage_state or {}).get("cookies") or []
         if cookies:
             context.add_cookies(cookies)
+        route_method = getattr(context, "route", None)
+        if callable(route_method):
+
+            def block_images(route, request=None):
+                target_request = request or getattr(route, "request", None)
+                resource_type = getattr(target_request, "resource_type", "")
+                if callable(resource_type):
+                    try:
+                        resource_type = resource_type()
+                    except Exception:
+                        resource_type = ""
+                if str(resource_type or "").casefold() == "image":
+                    abort = getattr(route, "abort", None)
+                    if callable(abort):
+                        try:
+                            abort(error_code="blockedbyclient")
+                        except TypeError:
+                            abort()
+                        return
+                fallback = getattr(route, "fallback", None)
+                if callable(fallback):
+                    fallback()
+                    return
+                continue_request = getattr(route, "continue_", None)
+                if callable(continue_request):
+                    continue_request()
+
+            route_method("**/*", block_images)
+            self.log("[Roxy] 已关闭图片加载；页面脚本、样式和接口请求保持正常")
         return browser, context
 
     def close(self) -> None:

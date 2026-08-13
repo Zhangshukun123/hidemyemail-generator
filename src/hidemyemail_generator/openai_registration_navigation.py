@@ -461,12 +461,30 @@ def configure_chatgpt_home_login_entry(
                     OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
                     timeout=700,
                 )
+                recovered_problem_page = False
+                if email_input is None and _registration_auth.is_auth_problem_page(page):
+                    email_input = _registration_auth.wait_for_auth_email_entry(
+                        page,
+                        self.log,
+                        first_visible=_first_visible,
+                        wait=_page_wait,
+                        activate=lambda target_page: activate_page(self, target_page),
+                    )
+                    if email_input is None:
+                        raise RuntimeError(
+                            "已从登录错误页点击一次返回，但持续监听后仍未识别第二个邮箱界面"
+                        )
+                    recovered_problem_page = True
+                    current_url = str(getattr(page, "url", "") or "")
+                    direct_auth_entry = _is_chatgpt_auth_entry_url(current_url)
                 preopened_home_modal = bool(
                     _is_chatgpt_homepage(current_url)
                     and email_input is not None
                 )
                 if (
-                    direct_auth_entry or preopened_home_modal
+                    direct_auth_entry
+                    or preopened_home_modal
+                    or recovered_problem_page
                 ) and email_input is not None:
                     clicked_home_login = True
                     _registration_auth.skip_page_registration_step(
@@ -484,7 +502,12 @@ def configure_chatgpt_home_login_entry(
                         "registration_entry_ready",
                         "页面已直接显示邮箱输入框",
                     )
-                    if direct_auth_entry:
+                    if recovered_problem_page:
+                        self.log(
+                            "[认证] 登录错误页已点击一次返回；"
+                            "已重新识别登录或新注册第二界面的邮箱输入框"
+                        )
+                    elif direct_auth_entry:
                         self.log(
                             "[认证] ChatGPT 首页直接跳入登录或新注册页；"
                             "已识别邮箱输入框，跳过首页注册按钮"
@@ -527,26 +550,37 @@ def configure_chatgpt_home_login_entry(
                             activate_page=activate_page,
                         )
                     clicked_home_login = True
-                if (
-                    not direct_auth_entry
-                    and not preopened_home_modal
-                    and _is_chatgpt_homepage(
-                        str(getattr(page, "url", "") or "")
+                    if not callable(getattr(page, "locator", None)):
+                        # Lightweight adapters expose only URL transitions and
+                        # cannot inspect the newly opened second screen.
+                        return result
+                    email_input = _registration_auth.wait_for_auth_email_entry(
+                        page,
+                        self.log,
+                        first_visible=_first_visible,
+                        wait=_page_wait,
+                        activate=lambda target_page: activate_page(self, target_page),
                     )
-                    and _first_visible(
-                        page, OPENAI_EMAIL_LOGIN_INPUT_SELECTORS, timeout=700
-                    )
-                    is not None
-                ):
-                    self.log(
-                        "[认证] 检测到 ChatGPT 首页邮箱登录弹窗；"
-                        "正在当前弹窗输入邮箱，不刷新页面"
-                    )
+                    if email_input is None:
+                        raise RuntimeError(
+                            "点击注册入口后持续监听 30 秒，仍未识别登录或新注册第二界面"
+                        )
+                    current_url = str(getattr(page, "url", "") or "")
+                    if _is_chatgpt_homepage(current_url):
+                        self.log(
+                            "[认证] 检测到 ChatGPT 首页邮箱登录弹窗；"
+                            "正在当前弹窗输入邮箱，不刷新页面"
+                        )
+                    else:
+                        self.log(
+                            "[认证] 已持续监听并识别登录或新注册第二界面；"
+                            "正在输入邮箱并点击继续"
+                        )
                     activate_page(self, page)
-                    email_entry_url = str(getattr(page, "url", "") or "")
+                    email_entry_url = current_url
                     if not self._fill_email_if_visible(page):
                         raise RuntimeError(
-                            "ChatGPT 首页邮箱弹窗已出现，但未能输入并提交邮箱"
+                            "登录或新注册第二界面已出现，但未能输入邮箱并点击继续"
                         )
                     _wait_for_home_email_modal_transition(
                         page,

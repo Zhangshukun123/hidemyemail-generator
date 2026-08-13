@@ -152,6 +152,11 @@ def configure_worker_login_totp(worker, two_factor: dict | None) -> bool:
     )
 
 
+reset_incomplete_two_factor_completion = (
+    _runtime.reset_incomplete_two_factor_completion
+)
+
+
 # DOM compatibility exports. Wrappers inject patchable bridge dependencies.
 _visible_locators = _dom._visible_locators
 _first_visible = _dom._first_visible

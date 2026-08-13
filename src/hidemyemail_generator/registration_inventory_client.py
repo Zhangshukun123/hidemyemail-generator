@@ -14,6 +14,8 @@ INVENTORY_LOGIN_PATH = "/api/integrations/registration-inventory/login"
 INVENTORY_LEASE_PATH = "/api/integrations/registration-inventory/lease"
 INVENTORY_RESULT_PATH = "/api/integrations/registration-inventory/result"
 INVENTORY_SYNC_PATH = "/api/integrations/registration-inventory/sync"
+STATIC_TOKEN_ACCESS_PATH = "/access"
+SESSION_COOKIE_NAME = "hme_session"
 INVENTORY_INTEGRATION_PATHS = {
     INVENTORY_STATUS_PATH,
     INVENTORY_LEASE_PATH,
@@ -79,6 +81,7 @@ class RemoteRegistrationInventoryClient:
         self.username = str(username or "").strip()
         self.password = str(password or "")
         self._access_token = ""
+        self._session_cookie = ""
         self.client_id = str(client_id or socket.gethostname() or "local-client")[:200]
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.connect_retry_delays = tuple(
@@ -183,6 +186,41 @@ class RemoteRegistrationInventoryClient:
             )
         self._access_token = access_token
 
+    async def _exchange_static_token(self) -> None:
+        """Exchange a configured integration token for a restart-safe web session."""
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{self.service_url}{STATIC_TOKEN_ACCESS_PATH}",
+                    params={"token": self.token},
+                    allow_redirects=False,
+                ) as response:
+                    session_cookie = response.cookies.get(SESSION_COOKIE_NAME)
+                    cookie_value = str(session_cookie.value if session_cookie else "")
+                    if response.status not in {302, 303} or not cookie_value:
+                        raise RuntimeError(
+                            "远端邮箱库存令牌已失效，请更新库存访问令牌"
+                        )
+                    self._session_cookie = cookie_value
+        except RuntimeError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as error:
+            retryable = self._is_retryable_connect_error(error)
+            raise RuntimeError(
+                self._connection_error_message(
+                    error,
+                    attempts=1,
+                    retryable=retryable,
+                )
+            ) from error
+
+    def _static_token_headers(self) -> dict[str, str]:
+        if self._session_cookie:
+            return {"Cookie": f"{SESSION_COOKIE_NAME}={self._session_cookie}"}
+        return {"X-HME-Import-Token": self.token}
+
     async def _request(
         self, method: str, path: str, *, payload: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
@@ -196,7 +234,7 @@ class RemoteRegistrationInventoryClient:
         headers = (
             {"Authorization": f"Bearer {self._access_token}"}
             if use_login
-            else {"X-HME-Import-Token": self.token}
+            else self._static_token_headers()
         )
         status, data = await self._send(
             method, path, payload=payload, headers=headers
@@ -209,6 +247,15 @@ class RemoteRegistrationInventoryClient:
                 path,
                 payload=payload,
                 headers={"Authorization": f"Bearer {self._access_token}"},
+            )
+        elif not use_login and status == 401:
+            self._session_cookie = ""
+            await self._exchange_static_token()
+            status, data = await self._send(
+                method,
+                path,
+                payload=payload,
+                headers=self._static_token_headers(),
             )
         return status, data
 

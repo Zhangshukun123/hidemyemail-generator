@@ -14,6 +14,7 @@ from hidemyemail_generator.openai_mfa import (
 from hidemyemail_generator.openai_browser_bridge import (
     configure_worker_login_totp,
     load_saved_storage_state,
+    reset_incomplete_two_factor_completion,
     reusable_enabled_two_factor,
 )
 
@@ -107,6 +108,7 @@ class OpenAiMfaTests(unittest.TestCase):
 
         self.assertTrue(configured)
         self.assertEqual(code, "123456")
+        self.assertTrue(worker._hme_login_totp_submitted)
         generator.assert_called_once_with("JBSWY3DPEHPK3PXP")
 
     def test_enabled_two_factor_is_reused_without_reactivation(self):
@@ -120,6 +122,34 @@ class OpenAiMfaTests(unittest.TestCase):
         self.assertEqual(
             reusable_enabled_two_factor({**state, "enabled": False}), {}
         )
+
+    def test_enrolled_login_totp_does_not_count_as_activation(self):
+        worker = type("Worker", (), {"_hme_two_factor_completed": True})()
+        enrolled = {
+            "enabled": False,
+            "status": "enrolled",
+            "secret": "JBSWY3DPEHPK3PXP",
+            "factor_id": "factor-1",
+            "session_id": "session-1",
+        }
+
+        self.assertTrue(
+            reset_incomplete_two_factor_completion(worker, enrolled)
+        )
+        self.assertFalse(worker._hme_two_factor_completed)
+
+    def test_enabled_totp_keeps_completion_marker(self):
+        worker = type("Worker", (), {"_hme_two_factor_completed": True})()
+        enabled = {
+            "enabled": True,
+            "status": "enabled",
+            "secret": "JBSWY3DPEHPK3PXP",
+        }
+
+        self.assertFalse(
+            reset_incomplete_two_factor_completion(worker, enabled)
+        )
+        self.assertTrue(worker._hme_two_factor_completed)
 
     def test_rfc_totp_vector_uses_six_digits(self):
         secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"

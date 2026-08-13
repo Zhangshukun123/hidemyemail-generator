@@ -79,10 +79,22 @@ def configure_worker_login_totp(
         return False
 
     def current_code() -> str:
+        worker._hme_login_totp_submitted = True
         return generate_code(secret)
 
     worker.login_totp_provider = current_code
     return True
+
+
+def reset_incomplete_two_factor_completion(worker, two_factor: dict | None) -> bool:
+    """Clear a false completion marker left by login with an enrolled TOTP."""
+
+    completed = bool(getattr(worker, "_hme_two_factor_completed", False))
+    enabled = bool(reusable_enabled_two_factor(two_factor))
+    if completed and not enabled:
+        worker._hme_two_factor_completed = False
+        return True
+    return False
 
 
 def configure_registration_profile_capture(app_backend, worker) -> bool:

@@ -172,6 +172,31 @@ OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS = (
 # must explicitly use OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS.
 OPENAI_EMAIL_SUBMIT_SELECTORS = OPENAI_EMAIL_LOGIN_SUBMIT_SELECTORS
 
+AUTH_PROBLEM_PAGE_MARKERS = (
+    "問題が発生しました",
+    "サインイン中に問題が発生しました",
+    "もう一度お試しください",
+    "something went wrong",
+    "problem signing in",
+    "problem while signing in",
+    "登录时出现问题",
+    "登入時發生問題",
+)
+AUTH_PROBLEM_BACK_LABELS = (
+    "戻る",
+    "Back",
+    "返回",
+    "返回上一页",
+    "返回上一頁",
+)
+AUTH_PROBLEM_BACK_SELECTORS = tuple(
+    f'{control}:text-is("{label}")'
+    for label in AUTH_PROBLEM_BACK_LABELS
+    for control in ("button", '[role="button"]', "a", '[role="link"]')
+)
+AUTH_EMAIL_ENTRY_MONITOR_TIMEOUT_SECONDS = 30.0
+AUTH_EMAIL_ENTRY_MONITOR_LOG_INTERVAL_SECONDS = 5.0
+
 
 def is_chatgpt_homepage(url: str) -> bool:
     try:
@@ -400,6 +425,149 @@ def _click_candidate(candidate) -> None:
                 raise RuntimeError(
                     "ChatGPT 首页入口按钮强制点击失败"
                 ) from error
+
+
+def _page_body_text(page) -> str:
+    try:
+        return str(page.locator("body").inner_text(timeout=700) or "")
+    except TypeError:
+        try:
+            return str(page.locator("body").inner_text() or "")
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+
+def is_auth_problem_page(page) -> bool:
+    """Recognize the localized sign-in error page shown before email entry."""
+
+    body_text = " ".join(_page_body_text(page).split())
+    folded = body_text.casefold()
+    return any(
+        marker.casefold() in folded for marker in AUTH_PROBLEM_PAGE_MARKERS
+    )
+
+
+def _semantic_auth_problem_back(page):
+    try:
+        controls = page.locator('button, a, [role="button"], [role="link"]')
+        count = min(int(controls.count()), 40)
+    except Exception:
+        return None
+    labels = tuple(label.casefold() for label in AUTH_PROBLEM_BACK_LABELS)
+    for index in range(count):
+        try:
+            candidate = controls.nth(index)
+            is_visible = getattr(candidate, "is_visible", None)
+            if callable(is_visible):
+                try:
+                    if not is_visible(timeout=500):
+                        continue
+                except TypeError:
+                    if not is_visible():
+                        continue
+            identity = _candidate_identity(candidate)
+            if identity and any(label in identity for label in labels):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _auth_problem_back_candidate(page, *, first_visible: Callable):
+    candidate = first_visible(
+        page,
+        AUTH_PROBLEM_BACK_SELECTORS,
+        timeout=700,
+    )
+    if candidate is not None and locator_is_enabled(candidate):
+        return candidate
+    candidate = _semantic_auth_problem_back(page)
+    if candidate is not None and locator_is_enabled(candidate):
+        return candidate
+    return None
+
+
+def wait_for_auth_email_entry(
+    page,
+    log: Callable[[str], object],
+    *,
+    first_visible: Callable,
+    wait: Callable,
+    activate: Callable | None = None,
+    timeout_seconds: float = AUTH_EMAIL_ENTRY_MONITOR_TIMEOUT_SECONDS,
+):
+    """Monitor the auth surface, recover one error page, and return its email input."""
+
+    started = time.monotonic()
+    deadline = started + max(0.25, float(timeout_seconds))
+    next_notice_at = started + AUTH_EMAIL_ENTRY_MONITOR_LOG_INTERVAL_SECONDS
+    problem_back_clicked = False
+    problem_back_clicked_at = 0.0
+    while time.monotonic() < deadline:
+        email_input = first_visible(
+            page,
+            OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
+            timeout=500,
+        )
+        if email_input is not None:
+            if problem_back_clicked:
+                log(
+                    "[界面监听] 点击一次「戻る」后已识别登录或新注册第二界面；"
+                    "邮箱输入框可操作"
+                )
+            else:
+                log("[界面监听] 已识别登录或新注册第二界面；邮箱输入框可操作")
+            mark_page_registration_milestone(
+                page,
+                "registration_entry_ready",
+                "已持续监听并识别邮箱输入界面",
+            )
+            return email_input
+
+        now = time.monotonic()
+        if is_auth_problem_page(page):
+            if problem_back_clicked:
+                if now - problem_back_clicked_at >= CLICK_RESPONSE_SECONDS:
+                    raise RuntimeError(
+                        "日文登录错误页的「戻る」已点击一次，"
+                        "但页面仍未返回登录或新注册第二界面"
+                    )
+            else:
+                candidate = _auth_problem_back_candidate(
+                    page,
+                    first_visible=first_visible,
+                )
+                if candidate is None:
+                    raise RuntimeError(
+                        "已识别日文登录错误页，但未找到可操作的「戻る」按钮"
+                    )
+                if activate is not None:
+                    activate(page)
+                try:
+                    _click_candidate(candidate)
+                except RuntimeError as error:
+                    raise RuntimeError("日文登录错误页的「戻る」按钮点击失败") from error
+                problem_back_clicked = True
+                problem_back_clicked_at = time.monotonic()
+                log(
+                    "[界面监听] 已识别日文登录错误页并点击一次「戻る」；"
+                    "正在持续等待登录或新注册第二界面"
+                )
+                begin_page_registration_step(
+                    page,
+                    "registration_entry_ready",
+                    "错误页已返回，正在监听第二个邮箱界面",
+                )
+        elif now >= next_notice_at:
+            waited = int(now - started)
+            log(
+                f"[界面监听] 正在等待登录或新注册第二界面，已监听 {waited} 秒"
+            )
+            next_notice_at = now + AUTH_EMAIL_ENTRY_MONITOR_LOG_INTERVAL_SECONDS
+        wait(page, 250)
+    return None
 
 
 def click_chatgpt_home_login(
@@ -948,7 +1116,9 @@ def paste_email_and_submit(
                 except Exception:
                     pass
     pasted_value = input_value(email_input)
-    if pasted_value is not None and pasted_value.strip() != email.strip():
+    if pasted_value is None:
+        raise RuntimeError("无法回读邮箱输入框内容，已停止提交")
+    if pasted_value.strip() != email.strip():
         fill = getattr(email_input, "fill", None)
         if not callable(fill):
             raise RuntimeError("Ctrl+V 后邮箱输入框内容校验失败")
@@ -958,13 +1128,16 @@ def paste_email_and_submit(
             fill(email)
         wait(page, 250)
         pasted_value = input_value(email_input)
-        if pasted_value is not None and pasted_value.strip() != email.strip():
+        if pasted_value is None:
+            raise RuntimeError("后台 DOM 填写后无法回读邮箱输入框内容")
+        if pasted_value.strip() != email.strip():
             raise RuntimeError("后台 DOM 填写后邮箱输入框内容校验失败")
         log("[认证] 无头/后台剪贴板未生效，已改用输入框 DOM 填写并校验")
+    verified_email = pasted_value.strip()
     emit_browser_diagnostic(
         log,
         BrowserDiagnosticCode.AUTH_EMAIL_PASTE,
-        "邮箱已通过系统剪贴板粘贴并完成回读校验",
+        f"邮箱输入检查通过：{verified_email}；浏览器输入框回读与目标邮箱一致",
     )
     mark_page_registration_milestone(
         page,
@@ -979,7 +1152,7 @@ def paste_email_and_submit(
     begin_page_registration_step(
         page,
         "email_submitted",
-        "等待提交邮箱，提交后静默等待 2 秒",
+        f"等待提交邮箱，提交后静默等待 {CLICK_RESPONSE_SECONDS:g} 秒",
     )
     if allow_enter_submit:
         before_activity = registration_activity_snapshot(page)

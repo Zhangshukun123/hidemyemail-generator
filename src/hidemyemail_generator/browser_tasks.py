@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -95,21 +96,42 @@ def build_registration_environment(
     }
 
 
-def browser_log_context(message: str) -> dict[str, str]:
+def browser_log_context(
+    message: str, *, browser_engine: str = ""
+) -> dict[str, str]:
     """Turn a worker message into a concise, UI-friendly execution context."""
 
     text = str(message or "").strip()
+    normalized = text.casefold()
+    selected_browser_engine = str(browser_engine or "").strip().lower()
+    browser_name = (
+        "Roxy"
+        if selected_browser_engine == "roxy" or "roxy" in normalized
+        else "Camoufox"
+    )
     structured = browser_diagnostic_context(text)
     if structured is not None:
+        if browser_name == "Roxy" and structured.get("stage") == "browser":
+            structured = dict(structured)
+            structured["location"] = str(structured.get("location") or "").replace(
+                "Camoufox", "Roxy"
+            )
+            structured["action"] = str(structured.get("action") or "").replace(
+                "Camoufox", "Roxy"
+            )
         return structured
-    normalized = text.casefold()
     detail = text
     if text.startswith("[") and "]" in text:
         detail = text.split("]", 1)[1].strip()
     detail = (detail.split("；", 1)[0] or text)[:120]
 
+    completed_counts = re.search(
+        r"成功\s*(\d+).*?失败\s*(\d+).*?跳过\s*(\d+)", normalized
+    )
     status = "active"
-    if any(marker in normalized for marker in ("失败", "错误", "异常", "http 401", "超时")):
+    if completed_counts and int(completed_counts.group(2)) == 0:
+        status = "success"
+    elif any(marker in normalized for marker in ("失败", "错误", "异常", "http 401", "超时")):
         status = "error"
     elif any(marker in normalized for marker in ("停止", "取消", "仍是", "未完成", "跳过")):
         status = "warning"
@@ -170,12 +192,52 @@ def browser_log_context(message: str) -> dict[str, str]:
     elif "验证码" in text or "verification" in normalized or "otp" in normalized:
         stage = "email_verification"
         location = "邮箱验证码页"
-        if any(marker in text for marker in ("等待", "请在", "轮询")):
+        if any(
+            marker in text
+            for marker in (
+                "已点击验证码页面继续按钮",
+                "已直接点击当前页面的继续按钮",
+                "已通过接口提交邮箱验证码",
+                "验证码提交请求已执行",
+                "验证码提交步骤已返回成功",
+                "已检测到你提交验证码",
+            )
+        ):
+            action = "验证码已提交，等待页面跳转"
+        elif any(
+            marker in text
+            for marker in (
+                "输入检查通过",
+                "输入框已回读一致",
+                "验证码已输入并回读验证",
+            )
+        ):
+            action = "校验验证码输入并点击继续"
+        elif any(
+            marker in text
+            for marker in (
+                "获取检查通过",
+                "已安全取得本次所需的邮箱验证码",
+                "已获取邮箱验证码",
+                "已收到邮箱验证码",
+                "自动取得 Gmail 验证码",
+            )
+        ):
+            action = "验证码已获取，准备写入输入框"
+        elif "下一步=读取本轮最新邮箱验证码" in text:
             action = "等待并监测邮箱验证码"
-        elif any(marker in text for marker in ("已提交", "已收到", "自动取得", "交给")):
-            action = "提交邮箱验证码并继续"
+        elif any(
+            marker in text
+            for marker in ("等待", "请在", "轮询", "扫描", "重新发送邮件")
+        ):
+            action = "等待并监测邮箱验证码"
+        elif any(
+            marker in text
+            for marker in ("Code 输入框", "验证码输入控件", "准备自动填写")
+        ):
+            action = "定位验证码输入框并准备写入"
         else:
-            action = "识别并处理邮箱验证码"
+            action = "核对邮箱验证码页面状态"
     elif any(
         marker in text
         for marker in (
@@ -201,10 +263,13 @@ def browser_log_context(message: str) -> dict[str, str]:
         stage = "network"
         location = "网络与代理检查"
         action = "确认注册出口与浏览器语言"
-    elif any(marker in normalized for marker in ("camoufox", "浏览器", "fontconfig", "窗口")):
+    elif any(
+        marker in normalized
+        for marker in ("camoufox", "roxy", "浏览器", "fontconfig", "窗口")
+    ):
         stage = "browser"
         location = "浏览器运行环境"
-        action = "启动并监测 Camoufox 浏览器"
+        action = f"启动并监测 {browser_name} 浏览器"
     elif any(marker in text for marker in ("库存", "领取邮箱", "邮箱已添加", "准备注册邮箱")):
         stage = "prepare"
         location = "注册准备"
@@ -878,9 +943,16 @@ class BrowserTaskManager:
                     "禁用无头并避免并发窗口抢焦点"
                 )
         else:
-            self._append_log(
-                "Camoufox 后台交互已启用：窗口被其他应用遮挡时仍继续加载和执行"
-            )
+            if selected_browser_engine == "roxy":
+                self._append_log(
+                    "Roxy CDP 后台交互已启用：窗口被其他应用遮挡时仍继续加载和执行"
+                    if headless
+                    else "Roxy CDP 自动化已启用：窗口将在前台显示并持续执行"
+                )
+            else:
+                self._append_log(
+                    "Camoufox 后台交互已启用：窗口被其他应用遮挡时仍继续加载和执行"
+                )
         if proxy_active:
             if clash_proxy_active:
                 if proxy_state.get("fixedPortsEnabled"):
@@ -913,7 +985,10 @@ class BrowserTaskManager:
         text = str(message or "").strip()
         if not text:
             return
-        context = browser_log_context(text)
+        context = browser_log_context(
+            text,
+            browser_engine=str(self._state.get("browserEngine") or ""),
+        )
         entry = {
             "at": utc_now(),
             "email": email,
@@ -1022,7 +1097,12 @@ class BrowserTaskManager:
                 return
             item["status"] = "running"
             item["phase"] = "registering_openai"
-            item["message"] = "正在启动 Camoufox"
+            browser_name = (
+                "Roxy"
+                if self._state.get("browserEngine") == "roxy"
+                else "Camoufox"
+            )
+            item["message"] = f"正在启动 {browser_name}"
             self._append_log("开始浏览器注册或登录", email=email)
 
             proxy_url = ""
@@ -1234,13 +1314,26 @@ class BrowserTaskManager:
                 isinstance(result, dict)
                 and str(result.get("access_token") or "").strip()
             )
+            requested_two_factor = bool(item.get("_enable_2fa"))
+            strict_two_factor_credentials = bool(
+                strict_password_credentials
+                or (
+                    item.get("_ensure_password")
+                    and item.get("_password_first_required")
+                    and requested_two_factor
+                )
+            )
             if session_saved and strict_password_credentials:
                 if not password_confirmed:
                     item["_error"] = "注册未确认密码；已拒绝保存免密码账号"
                     session_saved = False
-                elif not item.get("twoFactorEnabled"):
-                    item["_error"] = "注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
-                    session_saved = False
+            if (
+                session_saved
+                and strict_two_factor_credentials
+                and not item.get("twoFactorEnabled")
+            ):
+                item["_error"] = "注册未确认 TOTP 2FA 已开启；已拒绝保存该账号"
+                session_saved = False
             if session_saved:
                 result_to_save = dict(result)
                 if is_new_registration:
