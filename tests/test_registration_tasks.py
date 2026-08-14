@@ -326,6 +326,45 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 provider="manual",
             )
 
+    async def test_concurrent_manager_stops_only_requested_process(self):
+        processes = []
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            max_processes=3,
+        )
+        first = coordinator.start(
+            label="first",
+            headless=True,
+            concurrency=1,
+            email="first@icloud.com",
+            provider="manual",
+        )
+        second = coordinator.start(
+            label="second",
+            headless=True,
+            concurrency=1,
+            email="second@icloud.com",
+            provider="manual",
+        )
+        first_id = first["tasks"][0]["processId"]
+        second_id = second["tasks"][1]["processId"]
+
+        state = await coordinator.stop(process_id=first_id)
+
+        self.assertEqual(processes[0].snapshot()["status"], "cancelled")
+        self.assertTrue(processes[1].snapshot()["running"])
+        self.assertEqual(state["runningCount"], 1)
+        self.assertEqual(state["tasks"][1]["processId"], second_id)
+        with self.assertRaisesRegex(ValueError, "不存在或已归档"):
+            await coordinator.stop(process_id="missing-process")
+        await coordinator.stop()
+
     async def test_failed_email_is_recorded_and_can_be_registered_again(self):
         processes = []
         recorded = []

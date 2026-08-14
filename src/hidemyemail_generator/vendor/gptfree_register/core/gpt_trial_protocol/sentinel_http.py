@@ -255,6 +255,7 @@ class SentinelSdkExecutor:
                 "pixelDepth": 24,
             },
             "historyLength": 3,
+            "timezone": profile.timezone,
         }
 
     def proof(

@@ -25,6 +25,7 @@ from .inbox import connect_db
 
 
 REGISTRATION_PROXY_SETTING_KEY = "registration_proxy_config_v1"
+CARD_LINK_PROXY_SETTING_KEY = "card_link_proxy_config_v1"
 DEFAULT_PROXY_COUNTRY = "NL"
 DEFAULT_PROXY_DURATION_MINUTES = 5
 DEFAULT_PROXY_MODE = "dynamic"
@@ -202,9 +203,13 @@ class RegistrationProxyStore:
         db_file: Path,
         *,
         clash_client_factory=None,
+        setting_key: str = REGISTRATION_PROXY_SETTING_KEY,
     ) -> None:
         self.db_file = Path(db_file)
         self.clash_client_factory = clash_client_factory or ClashController
+        self.setting_key = str(setting_key or REGISTRATION_PROXY_SETTING_KEY).strip()
+        if not self.setting_key:
+            raise ValueError("代理配置存储键不能为空")
         self._rotation_lock = threading.RLock()
 
     @property
@@ -250,7 +255,7 @@ class RegistrationProxyStore:
         try:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = ?",
-                (REGISTRATION_PROXY_SETTING_KEY,),
+                (self.setting_key,),
             ).fetchone()
         finally:
             conn.close()
@@ -310,7 +315,7 @@ class RegistrationProxyStore:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
                 (
-                    REGISTRATION_PROXY_SETTING_KEY,
+                    self.setting_key,
                     json.dumps(state, ensure_ascii=False, separators=(",", ":")),
                 ),
             )
@@ -668,6 +673,7 @@ class RegistrationProxyStore:
 
 
 __all__ = [
+    "CARD_LINK_PROXY_SETTING_KEY",
     "CARD_LINK_PROXY_MODE_KEYS",
     "CARD_LINK_PROXY_COUNTRY_DEFAULTS",
     "DEFAULT_PROXY_COUNTRY",

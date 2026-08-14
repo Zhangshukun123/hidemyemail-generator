@@ -367,6 +367,16 @@ class RegistrationInventoryTests(unittest.TestCase):
 
 
 class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inventory_client_sessions_follow_host_proxy_environment(self):
+        client = RemoteRegistrationInventoryClient(
+            service_url="https://inventory.example.com",
+            username="inventory-user",
+            password="strong-test-password",
+        )
+
+        async with client._http_session() as session:
+            self.assertTrue(session.trust_env)
+
     async def test_non_loopback_inventory_client_is_automatically_upgraded_to_https(self):
         client = RemoteRegistrationInventoryClient(
             service_url="http://inventory.example.com",

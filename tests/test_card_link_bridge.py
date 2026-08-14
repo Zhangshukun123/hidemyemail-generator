@@ -181,14 +181,14 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["amount"], "0")
         self.assertTrue(event["promotion_applied"])
 
-    def test_builds_de_oaics_paypal_zero_link_with_first_proxy(self):
+    def test_builds_de_oaics_paypal_zero_link_with_selected_promotion_proxy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir)
             (target / "app_backend.py").write_text(
                 "def generate_opll_de_oaics_paypal_link(token, create_proxy, promo_proxy, amount, **options):\n"
                 "    assert token == 'at-test'\n"
                 "    assert create_proxy == 'http://create.example:8000'\n"
-                "    assert promo_proxy == ''\n"
+                "    assert promo_proxy == 'socks5://promo.example:9000'\n"
                 "    assert amount == '0'\n"
                 "    assert options['account_email'] == 'member@icloud.com'\n"
                 "    return {'cs_id':'oaics_test_de','billing_country':'DE','currency':'EUR','paypal_ba_approve_url':'https://www.paypal.com/agreements/approve?ba_token=de_test','payment_link_type':'paypal_approve','checkout_ui_mode':'custom','stripe_amount':'0','amount_currency':'EUR','amount_verification':'checkout_create','promotion_applied':True,'promotion_strategy':'de_oaics_checkout_create_native'}\n"
@@ -207,7 +207,7 @@ class CardLinkBridgeTests(unittest.TestCase):
                 {
                     "HME_OPENAI_ACCESS_TOKEN": "at-test",
                     "HME_CARD_LINK_CREATE_PROXY_URL": "http://create.example:8000",
-                    "HME_CARD_LINK_PROMO_PROXY_URL": "socks5://ignored.example:9000",
+                    "HME_CARD_LINK_PROMO_PROXY_URL": "socks5://promo.example:9000",
                 }
             )
             process = subprocess.run(

@@ -7,6 +7,7 @@ from urllib.parse import unquote, urlsplit
 from aiohttp.test_utils import TestClient, TestServer
 
 from hidemyemail_generator.registration_proxy import (
+    CARD_LINK_PROXY_SETTING_KEY,
     RegistrationProxyStore,
     parse_proxy_credential,
 )
@@ -20,6 +21,37 @@ from aiohttp import ClientHttpProxyError
 
 
 class RegistrationProxyStoreTests(unittest.TestCase):
+    def test_registration_and_card_link_proxy_stores_are_independent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            registration = RegistrationProxyStore(db_file)
+            card_link = RegistrationProxyStore(
+                db_file, setting_key=CARD_LINK_PROXY_SETTING_KEY
+            )
+            registration.configure(
+                enabled=True,
+                country="NL",
+                proxy_line="register.example:3010:register-user:register-secret",
+            )
+            card_link.configure(
+                enabled=True,
+                country="DE",
+                proxy_line="extract.example:3020:extract-user:extract-secret",
+                card_link_modes={"de_oaics_paypal": "dynamic"},
+            )
+
+            registration_state = registration.public_state()
+            card_link_state = card_link.public_state()
+
+        self.assertEqual(registration_state["endpoint"], "register.example:3010")
+        self.assertEqual(registration_state["country"], "NL")
+        self.assertEqual(card_link_state["endpoint"], "extract.example:3020")
+        self.assertEqual(card_link_state["country"], "DE")
+        self.assertEqual(
+            card_link_state["cardLinkModes"]["de_oaics_paypal"], "dynamic"
+        )
+        self.assertEqual(registration_state["cardLinkModes"]["de_oaics_paypal"], "")
+
     def test_chatgpt_403_still_proves_proxy_destination_is_reachable(self):
         self.assertTrue(_chatgpt_proxy_status_reachable(200))
         self.assertTrue(_chatgpt_proxy_status_reachable(403))
@@ -350,25 +382,30 @@ class RegistrationProxyRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_card_link_country_choices_are_saved_through_proxy_config(self):
         response = await self.client.post(
-            "/api/registration-proxy/config",
+            "/api/card-link-proxy/config",
             json={"cardLinkCountries": {"de": "GB", "phPromotion": "TR"}},
             headers={"X-Local-Token": self.app["local_token"]},
         )
-        status = await self.client.get("/api/registration-proxy/status")
+        status = await self.client.get("/api/card-link-proxy/status")
+        registration_status = await self.client.get("/api/registration-proxy/status")
 
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["cardLinkCountries"]["de"], "GB")
         self.assertEqual(
             (await status.json())["cardLinkCountries"]["phPromotion"], "TR"
         )
+        self.assertEqual(
+            (await registration_status.json())["cardLinkCountries"]["de"], "DE"
+        )
 
     async def test_card_link_proxy_mode_is_saved_through_proxy_config(self):
         response = await self.client.post(
-            "/api/registration-proxy/config",
+            "/api/card-link-proxy/config",
             json={"cardLinkModes": {"de_oaics_paypal": "clash"}},
             headers={"X-Local-Token": self.app["local_token"]},
         )
-        status = await self.client.get("/api/registration-proxy/status")
+        status = await self.client.get("/api/card-link-proxy/status")
+        registration_status = await self.client.get("/api/registration-proxy/status")
 
         self.assertEqual(response.status, 200)
         self.assertEqual(
@@ -378,6 +415,10 @@ class RegistrationProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await status.json())["cardLinkModes"]["de_oaics_paypal"],
             "clash",
+        )
+        self.assertEqual(
+            (await registration_status.json())["cardLinkModes"]["de_oaics_paypal"],
+            "",
         )
 
     async def test_clash_config_does_not_return_controller_secret(self):

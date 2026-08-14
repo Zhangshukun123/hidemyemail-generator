@@ -17,6 +17,9 @@ from urllib.parse import quote
 
 from .browser_tasks import (
     _save_account_record,
+    account_saved_cookies,
+    account_session,
+    account_session_access_token,
     build_registration_environment,
     load_account_record,
 )
@@ -435,6 +438,22 @@ class ProtocolRegistrationManager:
             if isinstance(existing_two_factor, dict)
             else ""
         )
+        existing_session = account_session(record)
+        existing_cookies = account_saved_cookies(record)
+        existing_device_id = next(
+            (
+                str(cookie.get("value") or "")
+                for cookie in existing_cookies
+                if str(cookie.get("name") or "") == "oai-did"
+            ),
+            "",
+        )
+        existing_diagnostics = record.get("registration_diagnostics")
+        existing_impersonate = (
+            str(existing_diagnostics.get("impersonate") or "")
+            if isinstance(existing_diagnostics, dict)
+            else ""
+        )
         proxy_url = ""
         proxy_state: dict[str, Any] = {}
         if self.proxy_store is not None:
@@ -451,16 +470,34 @@ class ProtocolRegistrationManager:
             "email": email,
             "code_url": f"{base_url}{PROTOCOL_CODE_PREFIX}{quote(token)}",
             "proxy_url": proxy_url,
+            "proxy_country": str(
+                proxy_state.get("lastExitCountry")
+                or proxy_state.get("country")
+                or ""
+            ).strip().upper(),
             "existing_password": str(record.get("password") or ""),
             "existing_password_confirmed": bool(
                 record.get("password") and record.get("password_confirmed")
             ),
             "existing_totp_secret": existing_totp,
+            "existing_access_token": account_session_access_token(record),
+            "existing_session_token": str(
+                existing_session.get("sessionToken")
+                or existing_session.get("session_token")
+                or ""
+            ),
+            "existing_session_json": existing_session,
+            "existing_session_cookies": existing_cookies,
+            "existing_device_id": existing_device_id,
+            "existing_impersonate": existing_impersonate,
             "project_root": str(self.gptfree_root),
             "source_root": str(Path(__file__).resolve().parents[1]),
         }
+        password_candidate_saved = False
+        session_checkpoint_saved = False
 
         def on_event(event: dict[str, Any]) -> None:
+            nonlocal password_candidate_saved, session_checkpoint_saved
             stage = str(event.get("stage") or "protocol_auth")
             status = str(event.get("status") or "active")
             self._state["phase"] = stage
@@ -468,6 +505,36 @@ class ProtocolRegistrationManager:
             self._append_log(
                 event.get("message"), email=email, stage=stage, status=status
             )
+            checkpoint = event.get("password_checkpoint")
+            if not isinstance(checkpoint, dict):
+                return
+            checkpoint_password = str(checkpoint.get("password") or "").strip()
+            checkpoint_result = checkpoint.get("result")
+            checkpoint_confirmed = bool(checkpoint.get("password_confirmed"))
+            if len(checkpoint_password) < 12 or not isinstance(
+                checkpoint_result, dict
+            ):
+                return
+            try:
+                _save_account_record(
+                    self.db_file,
+                    email,
+                    result=checkpoint_result,
+                    password=checkpoint_password,
+                    password_confirmed=checkpoint_confirmed,
+                )
+                password_candidate_saved = True
+                session_checkpoint_saved = session_checkpoint_saved or bool(
+                    checkpoint_confirmed
+                    and str(checkpoint_result.get("access_token") or "").strip()
+                )
+            except Exception as error:
+                self._append_log(
+                    f"账号密码检查点保存失败：{error}",
+                    email=email,
+                    stage="password_checkpoint",
+                    status="warning",
+                )
 
         try:
             runner = self.worker_runner or self._run_worker
@@ -560,12 +627,45 @@ class ProtocolRegistrationManager:
             raise
         except Exception as error:
             account_state["status"] = "failed"
-            account_state["stage"] = "failed"
-            account_state["message"] = _sanitize_message(error)
+            account_state["stage"] = (
+                "two_factor"
+                if session_checkpoint_saved
+                else "password" if password_candidate_saved else "failed"
+            )
+            account_state["message"] = (
+                "账号注册和密码已保存；TOTP 2FA 待补跑："
+                + _sanitize_message(error)
+                if session_checkpoint_saved
+                else (
+                    "已保留同一注册密码；下次将复用，不会重新生成："
+                    + _sanitize_message(error)
+                    if password_candidate_saved
+                    else _sanitize_message(error)
+                )
+            )
             completion_message = account_state["message"]
             self._state["failed"] += 1
             self._append_log(
-                f"失败：{error}", email=email, stage="failed", status="error"
+                (
+                    f"账号注册和密码已保存；TOTP 2FA 待补跑：{error}"
+                    if session_checkpoint_saved
+                    else (
+                        f"已保留同一注册密码；下次将复用，不会重新生成：{error}"
+                        if password_candidate_saved
+                        else f"失败：{error}"
+                    )
+                ),
+                email=email,
+                stage=(
+                    "two_factor"
+                    if session_checkpoint_saved
+                    else "password" if password_candidate_saved else "failed"
+                ),
+                status=(
+                    "warning"
+                    if session_checkpoint_saved or password_candidate_saved
+                    else "error"
+                ),
             )
         finally:
             self._code_tokens.pop(token, None)
@@ -647,7 +747,194 @@ class ProtocolRegistrationManager:
                 stderr_task.cancel()
 
 
+class ConcurrentProtocolRegistrationManager:
+    """Expose independent Mail Auth registration processes through one API."""
+
+    def __init__(
+        self,
+        *,
+        process_factory: Callable[[], ProtocolRegistrationManager],
+        on_account_saved: AccountSaved | None = None,
+        max_processes: int = 5,
+        history_limit: int = 20,
+    ) -> None:
+        self.process_factory = process_factory
+        self.on_account_saved = on_account_saved
+        # Keep the single-manager test/integration hooks available while each
+        # started flow receives its own isolated manager instance.
+        self.worker_runner: WorkerRunner | None = None
+        self._runtime_cache: dict[str, Any] | None = None
+        self.max_processes = max(2, min(10, int(max_processes)))
+        self.history_limit = max(self.max_processes, int(history_limit))
+        self._processes: dict[str, ProtocolRegistrationManager] = {}
+        self._latest_process_id = ""
+        self._runtime_probe: ProtocolRegistrationManager | None = None
+
+    def _new_process(self) -> ProtocolRegistrationManager:
+        manager = self.process_factory()
+        manager.on_account_saved = self.on_account_saved
+        manager.worker_runner = self.worker_runner
+        manager._runtime_cache = deepcopy(self._runtime_cache)
+        return manager
+
+    def _probe(self) -> ProtocolRegistrationManager:
+        if self._runtime_probe is None:
+            self._runtime_probe = self._new_process()
+        return self._runtime_probe
+
+    def _process_snapshots(self) -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (process_id, manager.snapshot())
+            for process_id, manager in self._processes.items()
+        ]
+
+    def _trim_history(self) -> None:
+        completed = [
+            process_id
+            for process_id, state in self._process_snapshots()
+            if not state.get("running")
+        ]
+        while len(self._processes) > self.history_limit and completed:
+            self._processes.pop(completed.pop(0), None)
+
+    def snapshot(self) -> dict[str, Any]:
+        snapshots = self._process_snapshots()
+        if not snapshots:
+            state = self._probe().snapshot()
+            state.update(
+                runningCount=0,
+                processCount=0,
+                maxProcesses=self.max_processes,
+                canStartNext=True,
+                tasks=[],
+            )
+            return state
+
+        active = [item for item in snapshots if item[1].get("running")]
+        latest = next(
+            (
+                item
+                for item in reversed(snapshots)
+                if item[0] == self._latest_process_id
+            ),
+            snapshots[-1],
+        )
+        display = active[-1] if active else latest
+        display_state = deepcopy(display[1])
+        public_tasks: list[dict[str, Any]] = []
+        combined_logs: list[dict[str, Any]] = []
+        for process_index, (process_id, state) in enumerate(snapshots, start=1):
+            accounts = state.get("accounts") if isinstance(state.get("accounts"), list) else []
+            first_email = str(
+                (accounts[0].get("email") if accounts and isinstance(accounts[0], dict) else "")
+                or state.get("currentEmail")
+                or ""
+            ).strip().lower()
+            label = f"协议流程 {process_index}"
+            if first_email:
+                label += f" · {first_email}"
+            public_tasks.append(
+                {
+                    **deepcopy(state),
+                    "processId": process_id,
+                    "processIndex": process_index,
+                    "processLabel": label,
+                }
+            )
+            for log in state.get("logs", []):
+                if not isinstance(log, dict):
+                    continue
+                entry = dict(log)
+                entry["processId"] = process_id
+                entry["processIndex"] = process_index
+                entry["message"] = f"[{label}] {entry.get('message', '')}"
+                combined_logs.append(entry)
+        combined_logs.sort(key=lambda item: str(item.get("at") or ""))
+        active_count = len(active)
+        display_state.update(
+            id=display[0],
+            running=bool(active),
+            status="running" if active else display_state.get("status", "idle"),
+            message=(
+                f"{active_count} 个协议注册流程正在运行；最新流程："
+                f"{display_state.get('message', '')}"
+                if active_count
+                else display_state.get("message", "")
+            ),
+            logs=combined_logs[-250:],
+            runningCount=active_count,
+            processCount=len(snapshots),
+            maxProcesses=self.max_processes,
+            canStartNext=active_count < self.max_processes,
+            tasks=public_tasks,
+        )
+        return display_state
+
+    def refresh_runtime(self) -> dict[str, Any]:
+        self._runtime_cache = None
+        probe = self._probe()
+        probe._runtime_cache = None
+        return probe.refresh_runtime()
+
+    def token_record(self, token: str) -> dict[str, str] | None:
+        for manager in reversed(list(self._processes.values())):
+            record = manager.token_record(token)
+            if record:
+                return record
+        return self._probe().token_record(token)
+
+    def valid_code_token(self, token: str) -> bool:
+        return self.token_record(token) is not None
+
+    def start(self, **kwargs: Any) -> dict[str, Any]:
+        active_count = sum(
+            bool(state.get("running")) for _, state in self._process_snapshots()
+        )
+        if active_count >= self.max_processes:
+            raise RuntimeError(f"协议注册流程已达到上限 {self.max_processes}")
+        manager = self._new_process()
+        task = manager.start(**kwargs)
+        process_id = str(task.get("id") or secrets.token_hex(8))
+        self._processes[process_id] = manager
+        self._latest_process_id = process_id
+        self._trim_history()
+        return self.snapshot()
+
+    async def stop(self, process_id: str = "") -> dict[str, Any]:
+        target_process_id = str(process_id or "").strip()
+        if target_process_id:
+            manager = self._processes.get(target_process_id)
+            if manager is None:
+                raise ValueError("协议注册流程不存在或已归档")
+            managers = [manager] if manager.snapshot().get("running") else []
+        else:
+            managers = [
+                manager
+                for manager in self._processes.values()
+                if manager.snapshot().get("running")
+            ]
+        if managers:
+            await asyncio.gather(*(manager.stop() for manager in managers))
+        return self.snapshot()
+
+    async def wait(self) -> dict[str, Any]:
+        managers = list(self._processes.values())
+        if managers:
+            await asyncio.gather(*(manager.wait() for manager in managers))
+        return self.snapshot()
+
+    async def close(self) -> None:
+        managers = [
+            manager
+            for manager in self._processes.values()
+            if manager.snapshot().get("running")
+        ]
+        if managers:
+            await asyncio.gather(*(manager.stop() for manager in managers))
+
+
 __all__ = [
+    "ConcurrentProtocolRegistrationManager",
     "EVENT_PREFIX",
     "PROTOCOL_CODE_PREFIX",
     "ProtocolRegistrationManager",

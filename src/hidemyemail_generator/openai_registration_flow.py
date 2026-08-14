@@ -71,7 +71,45 @@ PASSWORD_OTP_RESEND_SELECTORS = (
     '[role="button"]:has-text("メールを再送信する")',
     'button:has-text("重新发送邮件")',
     'button:has-text("重新傳送電子郵件")',
+    'button:has-text("Reenviar e-mail")',
+    '[role="button"]:has-text("Reenviar e-mail")',
+    'button:has-text("ส่งอีเมลซ้ำ")',
+    '[role="button"]:has-text("ส่งอีเมลซ้ำ")',
 )
+
+
+def _detect_verification_language(body_text: str) -> str:
+    """Identify supported localized verification pages from official labels."""
+    normalized = re.sub(r"\s+", " ", str(body_text or "")).strip()
+    folded = normalized.casefold()
+    if any(marker in normalized for marker in ("受信箱", "パスワードで続行", "コード")):
+        return "日文"
+    if any(marker in normalized for marker in ("收件箱", "使用密码继续", "验证码")):
+        return "中文"
+    if any(
+        marker in normalized
+        for marker in (
+            "ตรวจสอบกล่องข้อความของคุณ",
+            "ดำเนินการต่อด้วยรหัสผ่าน",
+            "ส่งอีเมลซ้ำ",
+        )
+    ):
+        return "泰文（泰国）"
+    if any(
+        marker in folded
+        for marker in (
+            "confira sua caixa de entrada",
+            "continuar com uma senha",
+            "reenviar e-mail",
+        )
+    ):
+        return "葡萄牙文（巴西）"
+    if any(
+        marker in folded
+        for marker in ("check your inbox", "continue with password", "code")
+    ):
+        return "英文"
+    return "未确认"
 
 
 def _locator_state(candidate, method: str, *, default: bool) -> bool:
@@ -389,17 +427,7 @@ def configure_password_first_login(
                 body_text = ""
         normalized = re.sub(r"\s+", " ", body_text).strip()
         folded = normalized.casefold()
-        if any(marker in normalized for marker in ("受信箱", "パスワードで続行", "コード")):
-            language = "日文"
-        elif any(marker in normalized for marker in ("收件箱", "使用密码继续", "验证码")):
-            language = "中文"
-        elif any(
-            marker in folded
-            for marker in ("check your inbox", "continue with password", "code")
-        ):
-            language = "英文"
-        else:
-            language = "未确认"
+        language = _detect_verification_language(normalized)
         account = getattr(self, "account", None)
         target_email = str(getattr(account, "email", "") or "").strip().casefold()
         if not target_email:

@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 CLICK_RESPONSE_SECONDS = 1.0
 MAX_NO_RESPONSE_CLICK_ATTEMPTS = 5
+OTP_STABLE_READ_COUNT = 2
+OTP_STABLE_READ_DELAY_SECONDS = 0.12
 
 EMAIL_VERIFICATION_INPUT_SELECTORS = (
     'input[autocomplete="one-time-code"]',
@@ -412,23 +414,33 @@ def _fill_email_verification_code(inputs: list[Any], expected: str) -> None:
         return
     if not inputs:
         return
-    candidate = inputs[0]
-    try:
-        candidate.click(timeout=2000, force=True)
-    except Exception:
-        pass
-    try:
-        candidate.fill("")
-        typer = getattr(candidate, "type", None)
-        if callable(typer):
-            try:
-                typer(expected, delay=80, timeout=5000)
-            except TypeError:
-                typer(expected, delay=80)
-        else:
-            candidate.fill(expected)
-    except Exception:
-        candidate.fill(expected)
+    # Locator.fill() dispatches the required input/change events atomically and
+    # does not depend on the OS window retaining keyboard focus while six
+    # delayed key presses are in flight.
+    inputs[0].fill(expected)
+
+
+def _email_verification_code_is_stable(
+    worker: Any,
+    page: Any,
+    expected: str,
+) -> tuple[bool, str]:
+    """Require two fresh DOM reads before the submit gate can open."""
+
+    actual = ""
+    for read_index in range(OTP_STABLE_READ_COUNT):
+        inputs = _unique_visible_inputs(
+            list(worker._visible_inputs(page, list(EMAIL_VERIFICATION_INPUT_SELECTORS)))
+        )
+        actual = _read_email_verification_code(inputs, expected)
+        if actual != expected:
+            return False, actual
+        if read_index + 1 < OTP_STABLE_READ_COUNT:
+            quiet_registration_delay(
+                page,
+                seconds=OTP_STABLE_READ_DELAY_SECONDS,
+            )
+    return True, actual
 
 
 def ensure_email_verification_code_entered(worker: Any, page: Any, code: str) -> None:
@@ -439,45 +451,50 @@ def ensure_email_verification_code_entered(worker: Any, page: Any, code: str) ->
     if not re.fullmatch(r"\d{6}", expected):
         raise RuntimeError("验证码不是 6 位数字，已阻止提交")
     last_actual = ""
-    for attempt in range(2):
+    for attempt in range(3):
         inputs = _unique_visible_inputs(
             list(worker._visible_inputs(page, list(EMAIL_VERIFICATION_INPUT_SELECTORS)))
         )
         last_actual = _read_email_verification_code(inputs, expected)
-        if last_actual == expected:
+        if last_actual != expected and inputs:
+            _fill_email_verification_code(inputs, expected)
+        if inputs:
+            stable, last_actual = _email_verification_code_is_stable(
+                worker,
+                page,
+                expected,
+            )
+        else:
+            stable = False
+        if stable:
             worker._hme_otp_input_attestation = {
                 "verified": True,
                 "code": expected,
                 "pageUrl": str(getattr(page, "url", "") or ""),
                 "verifiedAt": time.monotonic(),
+                "stableReads": OTP_STABLE_READ_COUNT,
             }
             worker.log(
-                "[验证码] 输入检查通过：浏览器可见输入框已包含 6 位验证码，"
-                "逐位回读与本轮获取结果一致；现在点击继续"
+                "[验证码] 输入检查通过：已原子写入并连续两次回读 6 位验证码，"
+                "无需保持窗口键盘焦点；现在立即点击继续"
             )
             return
         if not inputs:
-            if attempt == 0:
-                quiet_registration_delay(page, seconds=0.35)
+            if attempt < 2:
+                quiet_registration_delay(
+                    page,
+                    seconds=OTP_STABLE_READ_DELAY_SECONDS,
+                )
                 continue
             break
-        _fill_email_verification_code(inputs, expected)
-        quiet_registration_delay(page, seconds=0.4)
-    inputs = _unique_visible_inputs(
-        list(worker._visible_inputs(page, list(EMAIL_VERIFICATION_INPUT_SELECTORS)))
-    )
-    if _read_email_verification_code(inputs, expected) == expected:
-        worker._hme_otp_input_attestation = {
-            "verified": True,
-            "code": expected,
-            "pageUrl": str(getattr(page, "url", "") or ""),
-            "verifiedAt": time.monotonic(),
-        }
         worker.log(
-            "[验证码] 输入检查通过：浏览器可见输入框已包含 6 位验证码，"
-            "逐位回读与本轮获取结果一致；现在点击继续"
+            "[验证码] 输入框在提交前发生重渲染或值变化；"
+            "已重新定位并再次原子填写"
         )
-        return
+        quiet_registration_delay(
+            page,
+            seconds=OTP_STABLE_READ_DELAY_SECONDS,
+        )
     raise RuntimeError("验证码未写入当前可见输入框，已阻止提交")
 
 
@@ -982,9 +999,8 @@ def configure_request_driven_registration(
                 self,
                 "verification_code_entered",
                 page=page,
-                detail="验证码 6 位输入回读一致",
+                detail="验证码已原子写入并连续两次回读一致",
             )
-            quiet_registration_delay(page)
             before = registration_activity_snapshot(page)
             begin_registration_step(
                 self,

@@ -6,6 +6,7 @@
   const pageDetails = {
     overview: ["DASHBOARD", "概览", "集中查看账号、任务与服务状态"],
     accounts: ["ACCOUNT SETTINGS", "账号设置", "发起注册任务、跟踪执行状态并维护账号资产"],
+    "quick-flow": ["ONE-CLICK PIPELINE", "一键注册并提链", "注册后仅为不带 OAICS 的账号补齐 PayPal 严格 0 · DE/EUR 链接"],
     network: ["NETWORK ROUTING", "代理与线路", "独立管理所有注册方式共用的代理出口"],
     "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "提取 gpt-link 严格 0 链接或 PayPal DE/EUR OAICS 授权链接"],
     "pp-payment": ["PAYPAL WORKSPACE", "PP 支付", "PayPal BA 协议授权与支付任务"],
@@ -29,8 +30,8 @@
     de_oaics_paypal: {
       country: "DE",
       summary: "创建 DE/EUR oaics_ Checkout 并提取 PayPal BA 授权链接",
-      label: "PayPal / 德国 · EUR · OAICS 严格 0",
-      checks: ["✓ Session 可用", "✓ oaics_ Checkout", "✓ 德国 / EUR", "✓ 优惠后金额 0"],
+      label: "PayPal / 严格 0 · DE / EUR",
+      checks: ["✓ Session 可用", "✓ 无 OAICS 才创建", "✓ DE / EUR", "✓ 优惠后金额 0"],
       button: "提取 PayPal 链接",
       success: "PayPal DE/EUR 链接已提取并复制",
       singleProxy: true,
@@ -199,8 +200,7 @@
     return Boolean(
       item?.email?.toLowerCase().endsWith("@icloud.com") &&
       item.sessionStatus === "ready" &&
-      !item.cardLink &&
-      !cardLinkMarkedForMethod(item, method)
+      !item.cardLink
     );
   }
 
@@ -318,6 +318,25 @@
   class WorkspaceRenderer {
     constructor(store) { this.store = store; }
 
+    paypalPaymentAction(item, state) {
+      if (!item?.email || !item?.url) return "";
+      const account = (state.accounts || []).find((candidate) =>
+        String(candidate.email || "").toLowerCase() === String(item.email || "").toLowerCase()
+      );
+      const country = String(item.country || account?.cardLinkCountry || "").toUpperCase();
+      if (!country) return "";
+      const countries = state.registrationProxy?.countries || [];
+      const countryItem = countries.find((candidate) => candidate.code === country) || {
+        code: country, label: country,
+      };
+      return '<div class="quick-flow-result-actions paypal-payment-action">' +
+        '<div class="paypal-payment-auto-country"><span>支付地址</span><strong>自动匹配 · ' +
+        escapeHtml(countryOptionLabel(countryItem)) + '</strong></div>' +
+        '<button class="button primary small" data-action="one-click-paypal-payment" ' +
+        'data-email="' + escapeHtml(item.email) + '">一键支付</button>' +
+        '<small>根据提链记录自动使用国家、当前账号 Cookie、通用代理与 SMSBower</small></div>';
+    }
+
     renderShell(state) {
       $("accountNavCount").textContent = state.accounts.length || "—";
       $("networkNavState").textContent = state.registrationProxy?.enabled ? "已启用" : "直连";
@@ -399,7 +418,9 @@
       const session = $("accountSessionFilter")?.value || "all";
       return state.accounts.filter((item) =>
         (!query || item.email.toLowerCase().includes(query)) &&
-        (plan === "all" || item.accountType === plan) &&
+        (plan === "all" ||
+          (plan === "oai" && (item.checkoutIsOaics || item.checkoutIdType === "oaics")) ||
+          item.accountType === plan) &&
         (session === "all" || item.sessionStatus === session)
       );
     }
@@ -443,11 +464,13 @@
       const canStartNextRegistration = registration.canStartNext !== false;
       const activeRegistrationProcesses = Number(registration.runningCount || 0);
       const protocolRegistration = state.protocolRegistrationTask || {};
+      const protocolBusy = Boolean(protocolRegistration.running || protocolRegistration.starting);
       const registrationProvider = $("registrationEmailProvider").value || "icloud";
       $("registrationEmailProvider").disabled = false;
       $("smsbowerControls").hidden = protocolMode || registrationProvider !== "gmail";
       $("registerProviderButton").textContent = protocolMode && registrationProvider === "icloud"
-        ? (protocolRegistration.running ? "iCloud 协议注册运行中" : "开始 iCloud 协议注册")
+        ? (protocolRegistration.starting ? "正在领取 iCloud 库存邮箱…"
+          : protocolRegistration.running ? "iCloud 协议注册运行中" : "开始 iCloud 协议注册")
         : registrationProvider === "gmail"
         ? (activeRegistrationProcesses ? "启动下一个 Gmail 注册进程" : "开始 Gmail 注册")
         : (activeRegistrationProcesses ? "启动下一个 iCloud 注册进程" : "开始 iCloud 注册");
@@ -460,7 +483,7 @@
             roxyTargetCount + " 个）";
       }
       $("registerProviderButton").disabled = protocolMode
-        ? registrationProvider !== "icloud" || Boolean(protocolRegistration.running)
+        ? registrationProvider !== "icloud" || protocolBusy
         : !canStartNextRegistration ||
           (roxyMode && activeRegistrationProcesses > 0) ||
           (registrationProvider === "gmail" && !smsBower.configured);
@@ -754,9 +777,12 @@
       $("registrationProxyStatus").textContent = proxy.enabled
         ? "已启用 · " + (proxy.countryLabel || proxy.country || "")
         : "本机 IP 直连";
-      $("networkUsageState").textContent = proxy.enabled
-        ? "无头、有头、Roxy 和协议注册共用 " + (proxy.countryLabel || proxy.country || "") + " 出口"
-        : "当前所有注册方式使用本机 IP 直连";
+      const extractionProxy = state.cardLinkProxy || {};
+      $("networkUsageState").textContent =
+        "注册：" + (proxy.enabled ? (proxy.countryLabel || proxy.country || "已启用") : "本机直连") +
+        "；提链：" + (extractionProxy.configured
+          ? (extractionProxy.countryLabel || extractionProxy.country || "已配置")
+          : "尚未配置");
       $("registrationProxyModeHint").textContent = clashMode
         ? "Clash 模式固定为日本出口；每个账号开始前选择新的可用节点"
         : kookeeyMode
@@ -790,6 +816,60 @@
           '</strong><span>' + escapeHtml(testResult.message || "") + '</span>'
         : '<small>代理测试</small><strong>尚未测试</strong><span>点击“测试代理”检查出口 IP、国家与 ChatGPT 连通性</span>';
       $("testRegistrationProxyButton").disabled = !proxy.configured;
+      this.renderCardLinkRouting(state);
+    }
+
+    renderCardLinkRouting(state) {
+      const proxy = state.cardLinkProxy || {};
+      const clashMode = proxy.mode === "clash";
+      const kookeeyMode = proxy.mode === "kookeey";
+      const modes = proxy.modes || [];
+      const countries = proxy.countries || [];
+      const modeSelect = $("cardLinkRoutingMode");
+      modeSelect.innerHTML = modes.length ? modes.map((item) =>
+        '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(item.label) + "</option>"
+      ).join("") : '<option value="kookeey">Kookeey 动态住宅</option><option value="dynamic">通用 region/SID</option><option value="clash">Clash 日本轮询</option>';
+      modeSelect.value = proxy.mode || "kookeey";
+      const countrySelect = $("cardLinkRoutingCountry");
+      countrySelect.innerHTML = countries.map((item) =>
+        '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(countryOptionLabel(item)) + "</option>"
+      ).join("");
+      countrySelect.value = clashMode ? "JP" : (proxy.country || "DE");
+      countrySelect.disabled = clashMode;
+      $("cardLinkRoutingStatus").className = "badge " + (proxy.configured ? "success" : "blue");
+      $("cardLinkRoutingStatus").textContent = proxy.configured
+        ? "已独立配置 · " + (proxy.countryLabel || proxy.country || "")
+        : "尚未配置";
+      $("cardLinkRoutingModeHint").textContent = clashMode
+        ? "提链 Clash 固定为日本出口；该节点状态不会覆盖注册代理"
+        : kookeeyMode
+          ? "提链 Kookeey 会按每次提链所选国家生成独立 Session"
+          : "提链通用代理会按所选国家生成独立 region/SID";
+      $("cardLinkRoutingCredentialFields").hidden = clashMode;
+      $("rotateCardLinkRoutingButton").hidden = !clashMode;
+      const endpoint = $("cardLinkRoutingEndpoint");
+      if (!endpoint.dataset.dirty && document.activeElement !== endpoint) {
+        endpoint.value = proxy.dynamicEndpoint || (clashMode ? "" : (proxy.endpoint || ""));
+      }
+      $("cardLinkRoutingUsername").placeholder = proxy.usernameConfigured
+        ? "已保存，留空保持提链用户名" : "提链代理用户名";
+      $("cardLinkRoutingPassword").placeholder = proxy.passwordConfigured
+        ? "已保存，留空保持提链密码" : "提链代理基础密码";
+      ["cardLinkRoutingUsername", "cardLinkRoutingPassword", "cardLinkRoutingEndpoint", "saveCardLinkRoutingButton"].forEach((id) => {
+        $(id).disabled = clashMode;
+      });
+      $("cardLinkRoutingPreview").innerHTML = proxy.configured
+        ? '<small>当前提链出口</small><strong>' + escapeHtml(proxy.countryLabel || proxy.country || "已配置") +
+          '</strong><span>OAICS / 支付链接只读取提链代理专用配置</span>'
+        : '<small>当前提链出口</small><strong>尚未配置</strong><span>提链不会回退读取注册代理凭据</span>';
+      const testResult = proxy.testResult || {};
+      $("cardLinkRoutingTestResult").className = "proxy-test-result" +
+        (testResult.ok === true ? " success" : testResult.ok === false ? " error" : "");
+      $("cardLinkRoutingTestResult").innerHTML = testResult.testedAt
+        ? '<small>提链代理测试</small><strong>' + escapeHtml(testResult.ok ? "测试通过" : "测试失败") +
+          '</strong><span>' + escapeHtml(testResult.message || "") + "</span>"
+        : '<small>提链代理测试</small><strong>尚未测试</strong><span>点击测试检查提链出口 IP、国家与 ChatGPT 连通性</span>';
+      $("testCardLinkRoutingButton").disabled = !proxy.configured;
     }
 
     renderRoxyRegistration(state, selected) {
@@ -900,6 +980,9 @@
         (item.checkoutProbeStatus === "error"
           ? this.credentialButton("重新检测 Checkout", "retry-checkout-probe", item, "", !item.hasSession)
           : "") +
+        (item.cardLinkStatus === "cs_live" && item.cardLinkMethod === "de_oaics_paypal"
+          ? this.credentialButton("重新提链", "retry-quick-card-link", item, "", item.sessionStatus !== "ready")
+          : "") +
         this.credentialButton("一键导入工作台", "import-workbench", item, "", !item.hasImportableSession) +
         this.credentialButton("复制账号", "copy-account", item, "", !item.hasPassword) +
         this.credentialButton("删除邮箱", "delete-email", item, "", false, "danger") +
@@ -914,24 +997,25 @@
 
     renderProtocolRegistration(state) {
       const task = state.protocolRegistrationTask || {};
-      const pending = state.accounts.filter((item) => !item.registrationComplete);
-      const registered = state.accounts.filter((item) => item.registrationComplete);
+      const protocolBusy = Boolean(task.running || task.starting);
+      const pending = state.accounts.filter((item) => !item.protocolReady);
+      const registered = state.accounts.filter((item) => item.protocolReady);
       const passwordReady = state.accounts.filter((item) => item.hasPassword);
       const twoFactorReady = state.accounts.filter((item) => item.hasTwoFactor);
       $("protocolMetrics").innerHTML = [
-        metricCard("待协议注册", pending.length, "尚未保存注册 Session", "amber", "◷"),
-        metricCard("已注册", registered.length, "已保存 Session 与 Access Token", "green", "✓"),
+        metricCard("待协议补全", pending.length, "密码、Session 或 TOTP 仍待完成", "amber", "◷"),
+        metricCard("协议就绪", registered.length, "密码、Session 与 TOTP 均已完成", "green", "✓"),
         metricCard("密码已确认", passwordReady.length, "至少 12 位并已保存", "green", "K"),
         metricCard("TOTP 2FA", twoFactorReady.length, "验证器已激活", "purple", "2"),
       ].join("");
 
       $("stopProtocolButton").disabled = !task.running;
 
-      const meta = taskStatusMeta(task.status || "idle");
-      $("protocolTaskBadge").className = "badge " + (task.status === "failed" ? "error" : task.status === "completed" ? "success" : task.running ? "blue" : "");
+      const meta = task.starting ? ["启动中", "running", "•"] : taskStatusMeta(task.status || "idle");
+      $("protocolTaskBadge").className = "badge " + (task.status === "failed" ? "error" : task.status === "completed" ? "success" : protocolBusy ? "blue" : "");
       $("protocolTaskBadge").textContent = meta[0];
       $("protocolTaskMessage").textContent = task.message || "等待开始";
-      $("protocolCurrentEmail").textContent = task.currentEmail || "尚未开始";
+      $("protocolCurrentEmail").textContent = task.currentEmail || (task.starting ? "正在领取库存邮箱" : "尚未开始");
       $("protocolCurrentStage").textContent = taskStageLabel(task.phase || "idle");
       const total = Number(task.total || 0);
       const completed = Number(task.completed || 0);
@@ -942,9 +1026,9 @@
       $("protocolTaskFailed").textContent = Number(task.failed || 0);
       $("protocolTaskElapsed").textContent = formatElapsed(task.startedAt, task.finishedAt);
 
-      const stageOrder = ["protocol_auth", "email_verification", "password", "two_factor", "completed"];
+      const stageOrder = ["password", "email_verification", "session", "two_factor", "completed"];
       let activeStage = task.phase || "";
-      if (activeStage === "session") activeStage = "completed";
+      if (activeStage === "protocol_auth") activeStage = "password";
       const activeIndex = stageOrder.indexOf(activeStage);
       document.querySelectorAll("[data-protocol-stage]").forEach((element) => {
         const index = stageOrder.indexOf(element.dataset.protocolStage);
@@ -960,6 +1044,278 @@
         escapeHtml(abbreviateEmail(item.email)) + '</b><span>' + escapeHtml(item.message || "") + '</span></div>'
       ).join("") : '<div class="task-log-empty">暂无协议任务日志</div>';
       $("protocolTaskLog").scrollTop = $("protocolTaskLog").scrollHeight;
+    }
+
+    renderQuickFlow(state) {
+      const flows = Array.isArray(state.quickFlows) ? state.quickFlows : [];
+      const activeFlowId = String(state.activeQuickFlowId || "");
+      const flow = flows.find((item) => item.runId === activeFlowId) || flows.at(-1) || state.quickFlow || {};
+      const running = flow.status === "running";
+      const methodSelect = $("quickCardLinkMethod");
+      const method = "de_oaics_paypal";
+      methodSelect.value = method;
+      const config = cardLinkExtractionModes[method];
+      const registrationProxy = state.registrationProxy || {};
+      const extractionProxy = state.cardLinkProxy || {};
+      const registrationProxyModeSelect = $("quickRegistrationProxyMode");
+      const registrationProxyCountrySelect = $("quickRegistrationProxyCountry");
+      const registrationProxyModes = registrationProxy.modes || [];
+      const savedRegistrationProxyMode = localStorage.getItem("hme_quick_registration_proxy_mode");
+      const selectedRegistrationProxyMode = registrationProxyModeSelect.dataset.ready === "1"
+        ? registrationProxyModeSelect.value
+        : (registrationProxy.enabled
+          ? (registrationProxy.mode || "direct")
+          : (registrationProxyModes.some((item) => item.code === savedRegistrationProxyMode)
+            ? savedRegistrationProxyMode : "direct"));
+      registrationProxyModeSelect.innerHTML = '<option value="direct">本机 IP 直连</option>' +
+        registrationProxyModes.map((item) =>
+          '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(item.label) +
+          (item.configured === false ? "（未配置）" : "") + "</option>"
+        ).join("");
+      registrationProxyModeSelect.value = registrationProxyModes.some((item) => item.code === selectedRegistrationProxyMode)
+        ? selectedRegistrationProxyMode : "direct";
+      registrationProxyModeSelect.dataset.ready = "1";
+      const selectedRegistrationProxy = registrationProxyModes.find(
+        (item) => item.code === registrationProxyModeSelect.value
+      );
+      const registrationProxyReady = registrationProxyModeSelect.value === "direct" ||
+        Boolean(selectedRegistrationProxy?.configured);
+      const registrationCountries = (registrationProxy.countries || []).filter((item) =>
+        registrationProxyModeSelect.value !== "clash" || item.code === "JP"
+      );
+      const selectedRegistrationCountry = registrationProxyCountrySelect.value ||
+        registrationProxy.country || "NL";
+      registrationProxyCountrySelect.innerHTML = registrationCountries.map((item) =>
+        '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(countryOptionLabel(item)) + "</option>"
+      ).join("");
+      registrationProxyCountrySelect.value = registrationCountries.some(
+        (item) => item.code === selectedRegistrationCountry
+      ) ? selectedRegistrationCountry : (registrationCountries[0]?.code || "");
+      const extractionProxyModeSelect = $("quickExtractionProxyMode");
+      const extractionFirstCountrySelect = $("quickExtractionFirstProxyCountry");
+      const extractionSecondCountrySelect = $("quickExtractionSecondProxyCountry");
+      const extractionProxyModes = extractionProxy.modes || [];
+      const savedExtractionMode = localStorage.getItem("hme_quick_extraction_proxy_mode");
+      const selectedExtractionMode = extractionProxyModeSelect.dataset.ready === "1"
+        ? extractionProxyModeSelect.value
+        : (extractionProxyModes.some((item) => item.code === savedExtractionMode)
+          ? savedExtractionMode
+          : (extractionProxy.cardLinkModes?.de_oaics_paypal || extractionProxy.mode || "dynamic"));
+      extractionProxyModeSelect.innerHTML = extractionProxyModes.map((item) =>
+        '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(item.label) +
+        (item.configured === false ? "（未配置）" : "") + "</option>"
+      ).join("");
+      extractionProxyModeSelect.value = extractionProxyModes.some(
+        (item) => item.code === selectedExtractionMode
+      ) ? selectedExtractionMode : (extractionProxyModes[0]?.code || "");
+      extractionProxyModeSelect.dataset.ready = "1";
+      const selectedExtractionProxy = extractionProxyModes.find(
+        (item) => item.code === extractionProxyModeSelect.value
+      );
+      const extractionProxyReady = Boolean(selectedExtractionProxy?.configured);
+      const extractionCountries = (extractionProxy.countries || []).filter((item) =>
+        extractionProxyModeSelect.value !== "clash" || item.code === "JP"
+      );
+      const fillExtractionCountry = (select, storageKey, fallback) => {
+        const selected = select.value || localStorage.getItem(storageKey) || fallback;
+        select.innerHTML = extractionCountries.map((item) =>
+          '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(countryOptionLabel(item)) + "</option>"
+        ).join("");
+        select.value = extractionCountries.some((item) => item.code === selected)
+          ? selected : (extractionCountries[0]?.code || "");
+      };
+      const defaultExtractionCountry = extractionProxy.cardLinkCountries?.de ||
+        extractionProxy.cardLinkCountries?.de_oaics_paypal || "DE";
+      fillExtractionCountry(
+        extractionFirstCountrySelect, "hme_quick_extraction_first_country", defaultExtractionCountry
+      );
+      fillExtractionCountry(
+        extractionSecondCountrySelect, "hme_quick_extraction_second_country", defaultExtractionCountry
+      );
+      const promotionChoice = $("quickPromotionProxyChoice");
+      if (promotionChoice.dataset.ready !== "1") {
+        promotionChoice.value = localStorage.getItem("hme_quick_promotion_proxy_choice") === "second"
+          ? "second" : "first";
+        promotionChoice.dataset.ready = "1";
+      }
+      $("quickCardLinkChecks").innerHTML = config.checks.map((item) =>
+        "<span>" + escapeHtml(item) + "</span>"
+      ).join("");
+      $("quickCardLinkHint").textContent = extractionProxyReady
+        ? "提链代理与注册代理独立。首次提链使用第一代理出口；链接失败后重新提链使用第二代理出口。优惠更新当前使用" +
+          (promotionChoice.value === "second" ? "第二 IP" : "第一 IP") +
+          "。每次启动都会固定本次流程的代理与提链次数；可继续创建新的独立流程。"
+        : "所选提链代理尚未配置，请先到“提链代理独立配置”保存凭据。";
+      $("quickRegistrationProxySummary").textContent = "注册代理：" +
+        (registrationProxyModeSelect.value === "direct"
+          ? "本机 IP 直连"
+          : registrationProxyReady
+            ? (registrationProxyModeSelect.selectedOptions[0]?.textContent || "已配置") + " · " +
+              (registrationProxyCountrySelect.selectedOptions[0]?.textContent || "")
+            : (registrationProxyModeSelect.selectedOptions[0]?.textContent || "所选模式") +
+              "；请先到注册代理独立配置保存凭据");
+      $("quickExtractionProxySummary").textContent = "提链代理：" +
+        (extractionProxyModeSelect.selectedOptions[0]?.textContent || "未选择") +
+        "；第一出口：" + (extractionFirstCountrySelect.selectedOptions[0]?.textContent || "—") +
+        "；第二出口：" + (extractionSecondCountrySelect.selectedOptions[0]?.textContent || "—") +
+        "；优惠更新：" + (promotionChoice.value === "second" ? "第二 IP" : "第一 IP");
+
+      const registrationMode = $("quickRegistrationMode").value || "headless";
+      const protocolMode = registrationMode === "protocol";
+      const roxyMode = registrationMode === "roxy";
+      $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
+      $("quickRegistrationTargetCount").disabled = !roxyMode;
+      if (!roxyMode) {
+        $("quickRegistrationTargetCount").value = protocolMode
+          ? "1" : $("quickRegistrationConcurrency").value;
+      }
+      const targetCount = Number($("quickRegistrationTargetCount").value || 1);
+      const extractionCount = $("quickExtractionCount");
+      extractionCount.max = "100";
+      if (Number(extractionCount.value) > 100) {
+        extractionCount.value = "100";
+      }
+      $("quickRegistrationHint").textContent = protocolMode
+        ? "Mail Auth 协议将领取 1 个 iCloud 库存邮箱，无需启动浏览器。"
+        : roxyMode
+          ? "Roxy 使用账号设置中已保存的专用环境，最多 5 个并发窗口并按目标数分轮。"
+          : registrationMode === "headed"
+            ? "有头浏览器会显示注册窗口；验证码自动从 iCloud 收件箱读取。"
+            : "无头浏览器将在后台完成注册；验证码自动从 iCloud 收件箱读取。";
+
+      methodSelect.disabled = true;
+      if (!roxyMode) $("quickRegistrationTargetCount").disabled = true;
+      registrationProxyCountrySelect.disabled = registrationProxyModeSelect.value === "direct" ||
+        registrationProxyModeSelect.value === "clash";
+      extractionFirstCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
+      extractionSecondCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
+      promotionChoice.disabled = false;
+      const taskState = protocolMode ? state.protocolRegistrationTask : state.registrationTask;
+      const canStartNext = taskState?.canStartNext !== false;
+      const roxyBusy = roxyMode && (state.registrationTask?.tasks || []).some((item) =>
+        item.running && item.browserEngine === "roxy"
+      );
+      $("startQuickFlowButton").disabled = !canStartNext || roxyBusy || !registrationProxyReady || !extractionProxyReady ||
+        (registrationProxyModeSelect.value !== "direct" && !registrationCountries.length) ||
+        !extractionCountries.length;
+
+      const runStatus = {
+        idle: ["空闲", ""],
+        running: ["运行中", "blue"],
+        completed: ["已完成", "success"],
+        failed: ["失败", "error"],
+        cancelled: ["已停止", "warning"],
+      };
+      const activeRunId = flow.runId || "";
+      const activeRunCount = flows.filter((item) => item.status === "running").length;
+      $("quickFlowRunCount").textContent = flows.length
+        ? activeRunCount + " 运行 / " + flows.length + " 条"
+        : "暂无流程";
+      $("quickFlowRunList").innerHTML = flows.length ? flows.map((item, index) => {
+        const meta = runStatus[item.status || "idle"] || runStatus.idle;
+        const selected = item.runId === activeRunId;
+        const current = item.currentEmail || item.message || "等待任务";
+        const action = item.status === "running"
+          ? '<button class="button danger small" data-action="stop-quick-flow-run" data-run-id="' +
+            escapeHtml(item.runId) + '">停止流程</button>'
+          : '<button class="button small" data-action="dismiss-quick-flow-run" data-run-id="' +
+            escapeHtml(item.runId) + '">关闭记录</button>';
+        return '<article class="quick-flow-run ' + (selected ? "selected" : "") + '">' +
+          '<button class="quick-flow-run-select" data-action="select-quick-flow" data-run-id="' +
+          escapeHtml(item.runId) + '"><span>流程 ' + String(index + 1).padStart(2, "0") +
+          '</span><strong>' + escapeHtml(item.manager === "protocol" ? "Mail Auth 协议注册" : "浏览器注册") +
+          '</strong><small>' + escapeHtml(current) + '</small></button>' +
+          '<div class="quick-flow-run-meta"><b class="badge ' + meta[1] + '">' + meta[0] +
+          '</b><small>' + Math.round(Number(item.progress || 0)) + '% · ' +
+          escapeHtml(String(item.taskId || "等待分配").slice(0, 12)) + '</small>' + action + '</div></article>';
+      }).join("") : '<div class="task-log-empty">点击“启动自动流水线”可创建第一个独立注册流程；运行中的流程可继续新建。</div>';
+
+      const stageOrder = ["prepare", "register", "session", "extract", "complete"];
+      const activeStage = stageOrder.includes(flow.phase) ? flow.phase : "prepare";
+      const activeIndex = stageOrder.indexOf(activeStage);
+      document.querySelectorAll("[data-quick-stage]").forEach((element) => {
+        const index = stageOrder.indexOf(element.dataset.quickStage);
+        element.classList.toggle("active", running && index === activeIndex);
+        element.classList.toggle("done", flow.status === "completed" || index < activeIndex);
+        element.classList.toggle("failed", flow.status === "failed" && index === activeIndex);
+      });
+      const progress = Math.max(0, Math.min(100, Number(flow.progress || 0)));
+      $("quickFlowProgress").value = progress;
+      $("quickFlowProgressValue").textContent = progress + "%";
+      $("quickFlowRegisteredCount").textContent = Number(flow.registered || 0);
+      $("quickFlowGeneratedCount").textContent = Number(flow.generated || 0);
+      $("quickFlowSkippedCount").textContent = Number(flow.skipped || 0);
+      $("quickFlowFailedCount").textContent = Number(flow.failed || 0);
+      $("quickFlowMessage").textContent = flow.message || "尚未启动流水线";
+      $("quickFlowCurrentAccount").textContent = flow.currentEmail || "等待任务";
+      $("quickFlowCurrentAction").textContent = flow.currentAction || "点击上方按钮开始";
+      const results = flow.results || [];
+      const visibleAccountCount = Math.max(1, Math.min(
+        100,
+        Number(flow.targetCount || flow.registered || (flow.emails || []).length || 1),
+      ));
+      const knownEmails = [...new Set([
+        ...(flow.emails || []),
+        ...results.map((item) => item.email),
+      ].map((email) => String(email || "").trim()).filter(Boolean))];
+      const resultByEmail = new Map(results.map((item) => [
+        String(item.email || "").trim().toLowerCase(), item,
+      ]));
+      const currentEmailKey = String(flow.currentEmail || "").trim().toLowerCase();
+      $("quickFlowAccountCount").textContent = visibleAccountCount + " 个";
+      $("quickFlowAccountQueue").innerHTML = Array.from(
+        { length: visibleAccountCount },
+        (_, index) => {
+          const email = knownEmails[index] || "";
+          const emailKey = email.toLowerCase();
+          const result = resultByEmail.get(emailKey);
+          const active = Boolean(email && currentEmailKey === emailKey && running);
+          const state = result
+            ? (result.ok ? (result.skipped ? "skipped" : "done") : "failed")
+            : active ? "running" : email ? "queued" : "idle";
+          const label = result
+            ? (result.ok ? (result.skipped ? "已跳过" : "PayPal 链接已完成") : result.retryable ? "提链失败 · 可重新提链" : "提链失败")
+            : active ? "正在提取 PayPal 链接" : email ? "等待提链" : "启动后自动分配账号";
+          const code = result?.retryable ? "RETRY" : { done: "DONE", skipped: "SKIP", failed: "FAIL", running: "LIVE", queued: "QUEUE", idle: "WAIT" }[state];
+          return '<div class="quick-flow-account-card ' + state + '"><i>' +
+            String(index + 1).padStart(2, "0") + '</i><div><strong>' +
+            escapeHtml(email || "等待分配账号") + '</strong><span>' + escapeHtml(label) +
+            '</span></div><b>' + code + "</b></div>";
+        },
+      ).join("");
+      const statusMeta = {
+        idle: ["空闲", "", "等待启动"],
+        running: ["运行中", "blue", "自动执行中"],
+        completed: ["已完成", "success", "流水线完成"],
+        failed: ["失败", "error", "需要处理"],
+        cancelled: ["已停止", "warning", "流水线已停止"],
+      }[flow.status || "idle"];
+      $("quickFlowStatusBadge").className = "badge " + statusMeta[1];
+      $("quickFlowStatusBadge").textContent = statusMeta[0];
+      $("quickFlowHeroStatus").textContent = statusMeta[2];
+      $("quickFlowHeroMeta").textContent = flow.status === "completed"
+        ? "注册 " + Number(flow.registered || 0) + " · 补 OAICS " + Number(flow.generated || 0) +
+          "/" + Number(flow.registered || 0) + " · 单账号最多 " +
+          Number(flow.extractionCount || 1) + " 次 · 已跳过 " + Number(flow.skipped || 0)
+        : flow.currentAction || "注册 → Session → 提链";
+      $("quickFlowNavState").textContent = running ? progress + "%" : flow.status === "completed" ? "DONE" : flow.status === "failed" ? "!" : "NEW";
+
+      const logs = flow.logs || [];
+      $("quickFlowLogCount").textContent = logs.length + " 条";
+      $("quickFlowLog").innerHTML = logs.length ? logs.map((item) =>
+        '<div class="task-log-row"><time>' + formatClock(item.at) + "</time><span>" +
+        escapeHtml(item.message || "") + "</span></div>"
+      ).join("") : '<div class="task-log-empty">尚无流水线日志</div>';
+      $("quickFlowLog").scrollTop = $("quickFlowLog").scrollHeight;
+      $("quickFlowResults").innerHTML = results.length ? results.map((item) =>
+        '<div class="quick-flow-result ' + (item.ok ? (item.skipped ? "skipped" : "") : "failed") + '"><strong>' +
+        escapeHtml(item.email) + "</strong><span>" + (item.skipped ? (item.skipLabel || "已有 OAICS · 已跳过") : item.ok ? "提取链接成功" : item.retrying ? "正在重新提链" : "提链未完成 · 可重试") +
+        "</span><code>" + escapeHtml(item.url || item.error || "—") + "</code>" +
+        (item.ok && !item.skipped ? this.paypalPaymentAction(item, state) : "") +
+        (item.retryable ? '<div class="quick-flow-result-actions"><button class="button small" data-action="retry-quick-card-link" data-email="' +
+          escapeHtml(item.email) + '" data-run-id="' + escapeHtml(flow.runId || "") + '"' + (running ? " disabled" : "") + '>重新提链</button></div>' : "") +
+        "</div>"
+      ).join("") : '<div class="empty-state compact">完成后在这里显示账号与支付链接</div>';
     }
 
     filteredCardAccounts(state) {
@@ -988,11 +1344,11 @@
         metricCard("全部", state.accounts.length, "账号总数", "", "◎"),
         metricCard("可提取", payable, "当前模式待处理", "green", "✓"),
         metricCard("已生成", generated, "支付链接", "purple", "↗"),
-        metricCard("cs_live", classified, "当前模式不再提链", "amber", "!"),
+        metricCard("cs_live", classified, "可对原账号重新提链", "amber", "!"),
       ].join("");
       const items = this.filteredCardAccounts(state);
       $("cardLinkSummary").textContent = "显示 " + items.length + " 个账号，待提链 " + payable +
-        " 个，cs_live 已标注 " + classified + " 个";
+        " 个，cs_live 可重试 " + classified + " 个";
       $("cardAccountList").innerHTML = items.length ? items.map((item) => {
         const selected = state.selectedCardEmail === item.email;
         return '<button class="select-row ' + (selected ? "selected" : "") +
@@ -1000,7 +1356,7 @@
           '"><span class="select-indicator"></span><span class="identity-cell"><span class="avatar">' +
           initials(item.email) + '</span><span class="identity-copy"><strong>' + escapeHtml(item.email) +
           '</strong><small>' + (item.cardLink ? "已生成链接" : item.cardLinkStatus === "cs_live"
-            ? "DE OAICS · cs_live 已标注" : "未生成") + '</small></span></span><span>' +
+            ? "DE OAICS · cs_live 可重新提链" : "未生成") + '</small></span></span><span>' +
           badge(planName(item.accountType), item.accountType === "plus" ? "plus" : "") + '</span><span>' +
           badge(sessionName(item.sessionStatus), item.sessionStatus === "ready" ? "success" : "warning") +
           "</span></button>";
@@ -1011,7 +1367,7 @@
     renderCardLinkMethod() {
       const method = $("cardLinkMethod").value;
       const config = cardLinkExtractionModes[method] || cardLinkExtractionModes.ph_hosted;
-      const proxy = this.store.state.registrationProxy || {};
+      const proxy = this.store.state.cardLinkProxy || {};
       const savedCountries = proxy.cardLinkCountries || {};
       const savedModes = proxy.cardLinkModes || {};
       const proxyModeSelect = $("cardLinkProxyMode");
@@ -1069,10 +1425,10 @@
       $("cardLinkCreateProxyLabel").firstChild.textContent = config.singleProxy
         ? "提链代理国家" : "建单代理国家";
       $("cardLinkProxyHint").textContent = modeConfigured
-        ? "使用“代理与线路”中已保存的" +
+        ? "使用“提链代理独立配置”中已保存的" +
           (proxyModeSelect.selectedOptions[0]?.textContent || "代理") +
           "；代理模式与国家都会自动保存"
-        : "当前提链代理模式尚未配置，请先到“代理与线路”保存对应配置";
+        : "当前提链代理模式尚未配置，请先到“提链代理独立配置”保存对应配置";
     }
 
     renderCardSelection(state) {
@@ -1084,7 +1440,7 @@
       const method = $("cardLinkMethod").value;
       const selectedMode = $("cardLinkProxyMode").value;
       const modeConfigured = Boolean(
-        state.registrationProxy?.modes?.find((candidate) => candidate.code === selectedMode)?.configured
+        state.cardLinkProxy?.modes?.find((candidate) => candidate.code === selectedMode)?.configured
       );
       const proxyReady = Boolean(
         modeConfigured &&
@@ -1092,9 +1448,10 @@
         (config.singleProxy || $("cardLinkPromotionProxyCountry").value)
       );
       const markedForCurrentMode = cardLinkMarkedForMethod(item, method);
-      generate.disabled = !item || item.sessionStatus !== "ready" || !proxyReady || markedForCurrentMode;
+      generate.textContent = markedForCurrentMode ? "重新提链当前账号" : config.button;
+      generate.disabled = !item || item.sessionStatus !== "ready" || !proxyReady;
       generate.title = markedForCurrentMode
-        ? "该账号在当前模式返回 cs_live，已设置为不再提链"
+        ? "该账号上次返回 cs_live，点击后将强制重新提链"
         : proxyReady ? "" : "请先在代理与线路中保存所选代理模式";
       const batch = $("generateAllCardLinksButton");
       const batchCandidates = state.accounts.filter((candidate) =>
@@ -1114,17 +1471,20 @@
       }
       $("cardOperationState").className = "operation-result";
       const generatedMode = item.cardLinkMethod === "de_oaics_paypal"
-        ? "已生成 PayPal / 德国 · EUR OAICS 严格 0 链接"
+        ? "提取链接成功 · PayPal / 德国 · EUR OAICS 严格 0"
         : item.cardLinkMethod === "ph_hosted"
-          ? "已生成 PH / PHP hosted 严格 0 链接"
-          : "已生成支付链接";
+          ? "提取链接成功 · PH / PHP hosted 严格 0"
+          : "提取链接成功";
       const operationMessage = markedForCurrentMode
-        ? "当前模式返回 cs_live，已标注且以后不再提链"
+        ? "当前模式上次返回 cs_live，可点击“重新提链当前账号”再次处理"
         : item.cardLink ? generatedMode : "等待提取支付链接";
       $("cardOperationState").innerHTML = '<strong>' + escapeHtml(item.email) + '</strong><span>' +
         operationMessage +
         '</span><code>' + escapeHtml(item.cardLink || "尚无链接") + '</code><span>Session：' +
-        sessionName(item.sessionStatus) + "</span>";
+        sessionName(item.sessionStatus) + "</span>" +
+        (item.cardLink ? this.paypalPaymentAction({
+          email: item.email, url: item.cardLink, country: item.cardLinkCountry,
+        }, state) : "");
     }
 
     renderPayPal(state) {
@@ -1343,7 +1703,7 @@
         '<label><input type="radio" name="settingsRegistrationMode" value="headless" ' + (mode === "headless" ? "checked" : "") + '><span><b>无头浏览器</b><small>后台运行 Camoufox</small></span></label>' +
         '<label><input type="radio" name="settingsRegistrationMode" value="headed" ' + (mode === "headed" ? "checked" : "") + (runtime.forceHeadless ? " disabled" : "") + '><span><b>有头浏览器</b><small>显示前台浏览器窗口</small></span></label>' +
         '<label><input type="radio" name="settingsRegistrationMode" value="roxy" ' + (mode === "roxy" ? "checked" : "") + '><span><b>Roxy 注册</b><small>专用环境 · 随机指纹</small></span></label>' +
-        '<label><input type="radio" name="settingsRegistrationMode" value="protocol" ' + (mode === "protocol" ? "checked" : "") + '><span><b>协议注册</b><small>Mail Auth · 无浏览器</small></span></label></div>' +
+        '<label><input type="radio" name="settingsRegistrationMode" value="protocol" ' + (mode === "protocol" ? "checked" : "") + '><span><b>协议注册</b><small>Mail Auth · 无浏览器 · 先设置密码</small></span></label></div>' +
         '<label class="field-label" style="margin-top:14px">验证并发<input id="settingsConcurrency" type="number" min="1" max="10" value="' +
         escapeHtml($("concurrency").value) + '"></label></section><section class="form-section"><h3>运行环境</h3><div class="connection-card"><strong>' +
         (runtime.available ? "✓ Camoufox 运行环境已连接" : "× Camoufox 运行环境不可用") +
@@ -1389,6 +1749,7 @@
         registrationTask: { status: "idle", phase: "idle" },
         protocolRegistrationTask: { status: "idle", phase: "idle", runtime: {} },
         registrationProxy: { enabled: false, configured: false, country: "NL", countries: [] },
+        cardLinkProxy: { enabled: false, configured: false, country: "DE", countries: [], modes: [] },
         roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         verificationTask: { status: "idle", runtime: {} },
@@ -1396,6 +1757,13 @@
         inbox: { configured: false, codeCount: 0 },
         selectedAccountEmail: "",
         registrationMode: "headed",
+        quickFlow: {
+          status: "idle", phase: "prepare", progress: 0, taskId: "", manager: "browser",
+          registered: 0, generated: 0, failed: 0, emails: [], results: [], logs: [],
+          message: "尚未启动流水线", currentEmail: "", currentAction: "",
+        },
+        quickFlows: [],
+        activeQuickFlowId: "",
         selectedCardEmail: "",
         selectedVerificationEmail: "",
         verificationFilter: "all",
@@ -1405,6 +1773,7 @@
       this.router = new HashRouter({
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
+        "quick-flow": () => this.renderer.renderQuickFlow(this.store.state),
         network: () => this.renderer.renderNetwork(this.store.state),
         "card-links": () => this.renderer.renderCardLinks(this.store.state),
         "pp-payment": () => this.renderer.renderPayPal(this.store.state),
@@ -1422,6 +1791,7 @@
       this.renderer.renderNetwork(state);
       this.renderer.renderAccounts(state);
       this.renderer.renderProtocolRegistration(state);
+      this.renderer.renderQuickFlow(state);
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
       if (this.router.current === "pp-payment") this.renderer.renderPayPal(state);
@@ -1542,6 +1912,11 @@
     async loadRegistrationProxy() {
       const data = await this.api.get("/api/registration-proxy/status");
       this.store.patch({ registrationProxy: data });
+    }
+
+    async loadCardLinkProxy() {
+      const data = await this.api.get("/api/card-link-proxy/status");
+      this.store.patch({ cardLinkProxy: data });
     }
 
     async loadRoxyRegistration() {
@@ -1666,6 +2041,355 @@
       }
     }
 
+    quickFlowList(state = this.store.state) {
+      return Array.isArray(state.quickFlows) ? state.quickFlows : [];
+    }
+
+    activeQuickFlow(state = this.store.state) {
+      const flows = this.quickFlowList(state);
+      const activeId = String(state.activeQuickFlowId || "");
+      return flows.find((item) => item.runId === activeId) || flows.at(-1) || state.quickFlow || {};
+    }
+
+    quickFlowById(runId) {
+      const target = String(runId || "");
+      return this.quickFlowList().find((item) => item.runId === target) || null;
+    }
+
+    createQuickFlowId() {
+      if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+      return "quick-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    }
+
+    selectQuickFlow(runId) {
+      const flow = this.quickFlowById(runId);
+      if (!flow) throw new Error("该流水线已不在当前列表中");
+      this.store.patch({ activeQuickFlowId: flow.runId, quickFlow: flow });
+      return flow;
+    }
+
+    patchQuickFlow(runId, changes, logMessage = "") {
+      const target = String(runId || "");
+      const flows = this.quickFlowList();
+      const index = flows.findIndex((item) => item.runId === target);
+      if (index < 0) return null;
+      const current = flows[index];
+      const logs = [...(current.logs || [])];
+      if (logMessage) {
+        logs.push({ at: new Date().toISOString(), message: logMessage });
+      }
+      const next = { ...current, ...changes, logs: logs.slice(-120) };
+      const nextFlows = [...flows];
+      nextFlows[index] = next;
+      const activeId = this.store.state.activeQuickFlowId || target;
+      const active = nextFlows.find((item) => item.runId === activeId) || next;
+      this.store.patch({
+        quickFlows: nextFlows,
+        activeQuickFlowId: active.runId,
+        quickFlow: active,
+      });
+      return next;
+    }
+
+    quickCardLinkPayload(email, forceRetry = false, flow = null) {
+      const method = "de_oaics_paypal";
+      const config = cardLinkExtractionModes[method];
+      const snapshot = flow || this.activeQuickFlow();
+      return {
+        email,
+        method,
+        country: config.country,
+        proxy_mode: snapshot.extractionProxyMode || $("quickExtractionProxyMode").value,
+        create_proxy_country: snapshot.extractionFirstProxyCountry || $("quickExtractionFirstProxyCountry").value,
+        secondary_proxy_country: snapshot.extractionSecondProxyCountry || $("quickExtractionSecondProxyCountry").value,
+        reuse_registration_proxy: false,
+        independent_proxy_pair: true,
+        use_secondary_proxy: Boolean(forceRetry),
+        promotion_proxy_choice: snapshot.promotionProxyChoice || $("quickPromotionProxyChoice").value || "first",
+        force_retry: Boolean(forceRetry),
+        attempt_limit: Math.max(1, Math.min(
+          100, Number(snapshot.extractionCount || $("quickExtractionCount").value || 1),
+        )),
+      };
+    }
+
+    async retryQuickCardLink(email, runId = "") {
+      const target = String(email || "").trim().toLowerCase();
+      if (!target) throw new Error("缺少需要重新提链的账号");
+      const flow = this.quickFlowById(runId) || this.activeQuickFlow();
+      if (!flow?.runId) throw new Error("未找到该账号对应的流水线");
+      if (flow.status === "running") throw new Error("该流水线正在运行，请完成后再重试");
+      await this.loadAccounts();
+      const account = this.selectedAccount(target);
+      if (!account) throw new Error("账号不存在，请刷新后重试");
+      if (account.sessionStatus !== "ready") throw new Error("该账号 Session / AT 尚未就绪");
+      const previousResults = [...(flow.results || [])];
+      const existingIndex = previousResults.findIndex((item) =>
+        String(item.email || "").trim().toLowerCase() === target
+      );
+      const retrying = {
+        ...(existingIndex >= 0 ? previousResults[existingIndex] : {}),
+        ok: false,
+        skipped: false,
+        retryable: true,
+        retrying: true,
+        email: target,
+        error: "正在强制重新提链",
+      };
+      if (existingIndex >= 0) previousResults[existingIndex] = retrying;
+      else previousResults.push(retrying);
+      this.patchQuickFlow(flow.runId, {
+        status: "running", phase: "extract", progress: 92,
+        currentEmail: target, currentAction: "正在重新提取 OAICS 支付链接",
+        message: "正在对失败账号重新提链", results: previousResults,
+      }, "重新提链已启动：" + target);
+      try {
+        const data = await this.api.post(
+          "/api/account/card-link", this.quickCardLinkPayload(target, true, flow),
+        );
+        const classified = data.cardLinkStatus === "cs_live";
+        const attemptCount = Number(data.attemptCount || 1);
+        const attemptLimit = Number(data.attemptLimit || flow.extractionCount || 1);
+        const nextResult = classified
+          ? {
+              ok: false, skipped: false, retryable: true, retrying: false,
+              email: target, error: "连续 " + attemptCount + "/" + attemptLimit +
+                " 次返回 cs_live，尚未获得 OAICS 支付链接",
+            }
+          : {
+              ok: true, skipped: false, retryable: false, retrying: false,
+              email: target, url: data.url,
+              country: data.country || account.cardLinkCountry,
+            };
+        const nextResults = previousResults.map((item) =>
+          String(item.email || "").trim().toLowerCase() === target ? nextResult : item
+        );
+        const generated = nextResults.filter((item) => item.ok && !item.skipped).length;
+        const skipped = nextResults.filter((item) => item.skipped).length;
+        const failed = nextResults.filter((item) => !item.ok).length;
+        this.patchQuickFlow(flow.runId, {
+          status: failed ? "failed" : "completed",
+          phase: failed ? "extract" : "complete",
+          progress: 100, results: nextResults, generated, skipped, failed,
+          currentEmail: "",
+          currentAction: classified ? "提链次数已用完，仍未获得 OAICS" : "重新提链成功",
+          message: classified
+            ? "已连续尝试 " + attemptCount + " 次，均返回 cs_live"
+            : "第 " + attemptCount + " 次提链成功：已生成 OAICS 支付链接",
+        }, classified ? "cs_live 重试次数已用完：" + target : "重新提链成功：" + target);
+        await this.loadAccounts();
+        return classified
+          ? "已用完 " + attemptCount + " 次提链，结果仍为 cs_live"
+          : "第 " + attemptCount + " 次提链成功：" + target;
+      } catch (error) {
+        const nextResult = {
+          ok: false, skipped: false, retryable: true, retrying: false,
+          email: target, error: error.message || "重新提链失败",
+        };
+        const nextResults = previousResults.map((item) =>
+          String(item.email || "").trim().toLowerCase() === target ? nextResult : item
+        );
+        this.patchQuickFlow(flow.runId, {
+          status: "failed", phase: "extract", progress: 100, results: nextResults,
+          failed: nextResults.filter((item) => !item.ok).length,
+          currentEmail: "", currentAction: "重新提链失败",
+          message: "重新提链失败，可再次点击重试",
+        }, "重新提链失败：" + target + " · " + error.message);
+        throw error;
+      }
+    }
+
+    async extractQuickFlowAccounts(runId, emails) {
+      await this.loadAccounts();
+      const uniqueEmails = [...new Set((emails || []).map((email) =>
+        String(email || "").trim().toLowerCase()
+      ).filter(Boolean))];
+      const accountMap = new Map(this.store.state.accounts.map((item) => [
+        String(item.email || "").trim().toLowerCase(), item,
+      ]));
+      const results = [];
+      let generated = 0;
+      let skipped = 0;
+      let failed = 0;
+      let attempted = 0;
+      const startedFlow = this.quickFlowById(runId);
+      if (!startedFlow) return;
+      const extractionCount = Math.max(
+        1, Math.min(100, Number(startedFlow.extractionCount || 1)),
+      );
+      for (let index = 0; index < uniqueEmails.length; index += 1) {
+        const activeFlow = this.quickFlowById(runId);
+        if (!activeFlow || activeFlow.status !== "running") return;
+        const email = uniqueEmails[index];
+        const account = accountMap.get(email);
+        this.patchQuickFlow(runId, {
+          phase: "extract",
+          progress: 65 + Math.round(index / Math.max(1, uniqueEmails.length) * 30),
+          currentEmail: email,
+          currentAction: "正在提取严格 0 支付链接（" + (index + 1) + "/" + uniqueEmails.length + "）",
+          results: [...results], generated, skipped, failed,
+        }, "检查 OAICS：" + email);
+        if (account && (account.checkoutIsOaics || account.checkoutIdType === "oaics")) {
+          skipped += 1;
+          results.push({
+            ok: true,
+            skipped: true,
+            email,
+            url: account.cardLink || "OAICS 已存在，未重复创建 PayPal Checkout",
+          });
+          this.patchQuickFlow(
+            runId,
+            { results: [...results], generated, skipped, failed },
+            "账号已有 OAICS，已跳过重复创建：" + email,
+          );
+          continue;
+        }
+        if (!account || account.sessionStatus !== "ready") {
+          failed += 1;
+          results.push({ ok: false, retryable: true, email, error: "注册完成，但 Session / AT 尚未就绪" });
+          this.patchQuickFlow(
+            runId,
+            { results: [...results], generated, skipped, failed },
+            "Session 未就绪，已记录：" + email,
+          );
+          continue;
+        }
+        try {
+          const data = await this.api.post(
+            "/api/account/card-link", this.quickCardLinkPayload(email, false, activeFlow),
+          );
+          const accountAttempts = Number(data.attemptCount || 1);
+          attempted += accountAttempts;
+          const classified = data.cardLinkStatus === "cs_live";
+          if (classified) {
+            failed += 1;
+            results.push({
+              ok: false, retryable: true, email,
+              error: "连续 " + accountAttempts + "/" + extractionCount +
+                " 次返回 cs_live，提链次数已用完",
+            });
+          } else {
+            generated += 1;
+            results.push({
+              ok: true, email, url: data.url,
+              country: data.country || account.cardLinkCountry,
+            });
+          }
+          this.patchQuickFlow(
+            runId,
+            { results: [...results], generated, skipped, failed },
+            classified
+              ? "cs_live 已自动重试 " + accountAttempts + " 次，次数已用完：" + email
+              : "第 " + accountAttempts + " 次生成支付链接：" + email,
+          );
+        } catch (error) {
+          failed += 1;
+          results.push({ ok: false, retryable: true, email, error: error.message || "提链失败" });
+          this.patchQuickFlow(
+            runId,
+            { results: [...results], generated, skipped, failed },
+            "提链失败：" + email + " · " + error.message,
+          );
+        }
+      }
+      const completedFlow = this.quickFlowById(runId);
+      if (!completedFlow || completedFlow.status !== "running") return;
+      await this.loadAccounts();
+      const completed = results.length > 0 && failed === 0;
+      this.patchQuickFlow(runId, {
+        status: completed ? "completed" : "failed",
+        phase: completed ? "complete" : "extract",
+        progress: 100,
+        results,
+        generated,
+        skipped,
+        failed,
+        currentEmail: "",
+        currentAction: completed ? "注册与提链流水线已完成" : "注册成功，但提链未完成",
+        message: "流水线完成：注册 " + uniqueEmails.length + "，提链调用 " + attempted +
+          " 次（单账号上限 " + extractionCount + "），补 OAICS " + generated +
+          "，跳过 " + skipped + "，失败 " + failed,
+      }, completed ? "一键注册并提链完成" : "流水线结束，但没有生成可用链接");
+    }
+
+    async pollQuickFlow(runId) {
+      const flow = this.quickFlowById(runId);
+      if (!flow || flow.status !== "running" || flow.phase !== "register") return;
+      try {
+        const protocol = flow.manager === "protocol";
+        const data = await this.api.get(protocol
+          ? "/api/protocol-registration/status" : "/api/registration/status");
+        this.store.patch(protocol
+          ? { protocolRegistrationTask: data }
+          : { registrationTask: data });
+        const task = (data.tasks || []).find((item) =>
+          item.processId === flow.taskId || item.id === flow.taskId
+        ) || (data.id === flow.taskId ? data : null);
+        if (!task) throw new Error("未找到本次注册任务状态");
+        const taskEmails = protocol
+          ? (task.accounts || []).map((item) => item.email)
+          : (task.emails || []);
+        const total = Number(task.total || task.effectiveConcurrency || task.claimed || task.requested || 1);
+        const completedCount = Number(task.completed || 0);
+        const registrationProgress = protocol
+          ? Math.round(completedCount / Math.max(1, total) * 45)
+          : task.running ? 20 : 55;
+        const latestMessage = String(task.message || "正在注册账号");
+        const changes = {
+          emails: taskEmails.length ? taskEmails : flow.emails,
+          registered: protocol ? Number(task.succeeded || 0) : (task.status === "completed" ? taskEmails.length : 0),
+          progress: Math.max(Number(flow.progress || 0), 10 + registrationProgress),
+          currentEmail: task.currentEmail || taskEmails[0] || "正在领取库存邮箱",
+          currentAction: latestMessage,
+          message: latestMessage,
+          lastTaskMessage: latestMessage,
+        };
+        this.patchQuickFlow(runId, changes, latestMessage !== flow.lastTaskMessage ? latestMessage : "");
+        if (task.running) {
+          this.schedule("quick-flow:" + runId, () => this.pollQuickFlow(runId), 1000);
+          return;
+        }
+        if (task.status !== "completed") {
+          this.patchQuickFlow(runId, {
+            status: task.status === "cancelled" ? "cancelled" : "failed",
+            phase: "register",
+            currentAction: latestMessage,
+            message: latestMessage,
+          }, "注册阶段未完成，流水线已结束");
+          return;
+        }
+        const succeededEmails = protocol
+          ? (task.accounts || []).filter((item) => item.status === "success").map((item) => item.email)
+          : taskEmails;
+        if (!succeededEmails.length) {
+          this.patchQuickFlow(
+            runId,
+            { status: "failed", phase: "session", message: "注册任务没有返回成功账号" },
+            "没有可继续提链的注册账号",
+          );
+          return;
+        }
+        this.patchQuickFlow(runId, {
+          phase: "session",
+          progress: 62,
+          registered: succeededEmails.length,
+          emails: succeededEmails,
+          currentEmail: succeededEmails[0],
+          currentAction: "注册完成，正在确认 Session / AT",
+          message: "已注册 " + succeededEmails.length + " 个账号，准备自动提链",
+        }, "注册完成，Session 已保存，开始提链");
+        await this.extractQuickFlowAccounts(runId, succeededEmails);
+      } catch (error) {
+        const current = this.quickFlowById(runId);
+        if (!current || current.status !== "running") return;
+        this.patchQuickFlow(runId, {
+          message: "读取注册进度失败：" + error.message,
+          currentAction: "正在重试读取注册状态",
+        }, "状态读取失败，2.5 秒后重试：" + error.message);
+        this.schedule("quick-flow:" + runId, () => this.pollQuickFlow(runId), 2500);
+      }
+    }
+
     bindCommands() {
       this.commands.register("refresh", async () => {
         await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal()]);
@@ -1680,6 +2404,26 @@
         frame.src = this.store.state.paypal.url || frame.dataset.src;
         frame.dataset.loaded = "1";
         return "PP 支付工作台已刷新";
+      });
+      this.commands.register("one-click-paypal-payment", async ({ element }) => {
+        const email = String(element.dataset.email || "").trim().toLowerCase();
+        if (!email) throw new Error("支付账号缺失");
+        element.disabled = true;
+        element.textContent = "正在启动 PP 协议";
+        try {
+          const data = await this.api.post("/api/account/paypal-payment", { email });
+          await this.loadPayPal();
+          this.router.navigate("pp-payment");
+          const frame = $("paypalPaymentFrame");
+          const jobId = data.job?.id || "";
+          frame.src = (data.url || "/paypal-pay/") + "?job=" + encodeURIComponent(jobId);
+          frame.dataset.loaded = "1";
+          return "一键支付已启动：自动匹配 " + data.country + " · Cookie " + data.cookieCount +
+            " 条 · 通用代理 · SMSBower";
+        } finally {
+          element.disabled = false;
+          element.textContent = "一键支付";
+        }
       });
       this.commands.register("refresh-roxy", async () => {
         await this.loadRoxyRegistration();
@@ -1698,6 +2442,144 @@
         try { await this.api.post("/api/logout"); }
         finally { location.replace("/login"); }
       });
+      this.commands.register("start-quick-flow", async () => {
+        const mode = $("quickRegistrationMode").value || "headless";
+        const protocol = mode === "protocol";
+        const roxy = mode === "roxy";
+        let concurrency = Number($("quickRegistrationConcurrency").value);
+        let targetCount = Number($("quickRegistrationTargetCount").value);
+        const extractionCount = Number($("quickExtractionCount").value);
+        const concurrencyLimit = protocol || roxy ? 5 : 10;
+        if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > concurrencyLimit) {
+          throw new Error("并发窗口必须是 1–" + concurrencyLimit + " 的整数");
+        }
+        if (protocol) {
+          concurrency = 1;
+          targetCount = 1;
+          this.assertProtocolRuntime();
+        } else if (!roxy) {
+          targetCount = concurrency;
+        }
+        if (!Number.isInteger(targetCount) || targetCount < 1 || targetCount > 100) {
+          throw new Error("目标账号数必须是 1–100 的整数");
+        }
+        if (!Number.isInteger(extractionCount) || extractionCount < 1 || extractionCount > 100) {
+          throw new Error("单账号提链次数必须是 1–100 的整数");
+        }
+        const savedExtractionProxy = await this.api.post("/api/card-link-proxy/config", {
+          cardLinkModes: { de_oaics_paypal: $("quickExtractionProxyMode").value },
+          cardLinkCountries: { de: $("quickExtractionFirstProxyCountry").value },
+        });
+        this.store.patch({ cardLinkProxy: savedExtractionProxy });
+        if (roxy) {
+          const roxyState = this.store.state.roxyRegistration || {};
+          if (!roxyState.configured) throw new Error("请先在账号设置中选择 Roxy 专用指纹环境");
+          if (concurrency > Number(roxyState.maxConcurrency || 0)) {
+            throw new Error("Roxy 可用环境不足，当前最多并发 " + Number(roxyState.maxConcurrency || 0));
+          }
+        }
+        const method = "de_oaics_paypal";
+        const startedAt = new Date().toISOString();
+        const runId = this.createQuickFlowId();
+        const flow = {
+          runId,
+          status: "running", phase: "prepare", progress: 5, taskId: "",
+          manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
+          registrationMode: mode,
+          registrationProxyMode: $("quickRegistrationProxyMode").value,
+          registrationProxyCountry: $("quickRegistrationProxyCountry").value,
+          extractionProxyMode: $("quickExtractionProxyMode").value,
+          extractionFirstProxyCountry: $("quickExtractionFirstProxyCountry").value,
+          extractionSecondProxyCountry: $("quickExtractionSecondProxyCountry").value,
+          promotionProxyChoice: $("quickPromotionProxyChoice").value || "first",
+          registered: 0, generated: 0, skipped: 0, failed: 0, emails: [], results: [],
+          message: "正在检查库存、注册方式与提链代理",
+          currentEmail: "正在领取库存邮箱", currentAction: "准备一键流水线",
+          startedAt, lastTaskMessage: "",
+          logs: [{ at: startedAt, message: "一键注册并提链已启动：无 OAICS 账号使用 PayPal 严格 0 · DE/EUR" }],
+        };
+        const flows = [...this.quickFlowList(), flow];
+        this.store.patch({ quickFlows: flows, activeQuickFlowId: runId, quickFlow: flow });
+        try {
+          const data = protocol
+            ? await this.api.post("/api/protocol-registration/start", {
+                provider: "inventory", concurrency: 1,
+              })
+            : await this.api.post("/api/registration/start", {
+                label: "一键注册并提链",
+                provider: "inventory",
+                headless: mode === "headless" ||
+                  (roxy && $("roxyWindowMode").value === "background"),
+                concurrency,
+                target_count: targetCount,
+                browser_engine: roxy ? "roxy" : "camoufox",
+              });
+          const task = data.task || {};
+          const taskId = task.id || task.processId || "";
+          this.store.patch(protocol
+            ? { protocolRegistrationTask: task }
+            : { registrationTask: task });
+          this.patchQuickFlow(runId, {
+            phase: "register",
+            progress: 10,
+            taskId,
+            emails: data.email ? [data.email] : (task.emails || []),
+            currentEmail: data.email || task.email || "正在领取库存邮箱",
+            currentAction: task.message || "注册任务已启动",
+            message: task.message || "注册任务已启动",
+          }, protocol ? "已领取 iCloud 库存邮箱并启动独立协议流程" : "已领取 iCloud 库存并启动独立注册流程");
+          this.schedule("quick-flow:" + runId, () => this.pollQuickFlow(runId), 600);
+          return "已新建第 " + flows.length + " 个注册并提链流程";
+        } catch (error) {
+          this.patchQuickFlow(runId, {
+            status: "failed", phase: "prepare", progress: 0,
+            message: error.message, currentAction: "流水线启动失败",
+          }, "启动失败：" + error.message);
+          throw error;
+        }
+      });
+      this.commands.register("select-quick-flow", async ({ element }) => {
+        const flow = this.selectQuickFlow(element.dataset.runId);
+        return "已切换到该流程" + (flow.taskId ? "：" + flow.taskId.slice(0, 8) : "");
+      });
+      this.commands.register("stop-quick-flow-run", async ({ element }) => {
+        const flow = this.quickFlowById(element.dataset.runId);
+        if (!flow) throw new Error("该流水线已不在当前列表中");
+        if (flow.status !== "running") throw new Error("该流水线当前未运行");
+        clearTimeout(this.pollTimers["quick-flow:" + flow.runId]);
+        if (flow.phase === "register" && flow.taskId) {
+          const endpoint = flow.manager === "protocol"
+            ? "/api/protocol-registration/stop" : "/api/registration/stop";
+          const data = await this.api.post(endpoint, { process_id: flow.taskId });
+          this.store.patch(flow.manager === "protocol"
+            ? { protocolRegistrationTask: data.task || {} }
+            : { registrationTask: data.task || {} });
+        }
+        this.patchQuickFlow(flow.runId, {
+          status: "cancelled",
+          message: "该注册并提链流程已停止",
+          currentAction: "流程已由用户停止",
+        }, "已发送本流程停止请求");
+        return "已停止对应的注册流程";
+      });
+      this.commands.register("dismiss-quick-flow-run", async ({ element }) => {
+        const runId = String(element.dataset.runId || "");
+        const flows = this.quickFlowList().filter((item) => item.runId !== runId);
+        const active = flows.find((item) => item.runId === this.store.state.activeQuickFlowId) || flows.at(-1) || {
+          status: "idle", phase: "prepare", progress: 0, taskId: "", manager: "browser",
+          registered: 0, generated: 0, skipped: 0, failed: 0, emails: [], results: [], logs: [],
+          message: "尚未启动流水线", currentEmail: "", currentAction: "",
+        };
+        this.store.patch({
+          quickFlows: flows,
+          activeQuickFlowId: active.runId || "",
+          quickFlow: active,
+        });
+        return "已关闭该流程记录";
+      });
+      this.commands.register("retry-quick-card-link", async ({ element }) =>
+        this.retryQuickCardLink(element.dataset.email, element.dataset.runId)
+      );
       this.commands.register("register", async () => {
         const options = this.browserOptions();
         const email = $("registrationEmail").value.trim().toLowerCase();
@@ -1720,13 +2602,60 @@
             throw new Error("协议注册当前仅支持 iCloud 库存邮箱");
           }
           this.assertProtocolRuntime();
-          const data = await this.api.post("/api/protocol-registration/start", {
-            provider: "inventory",
-            concurrency: 1,
+          const previousTask = this.store.state.protocolRegistrationTask || {};
+          const startedAt = new Date().toISOString();
+          this.store.patch({
+            protocolRegistrationTask: {
+              ...previousTask,
+              starting: true,
+              running: false,
+              status: "starting",
+              phase: "prepare",
+              message: "正在领取 iCloud 库存邮箱并准备协议注册，请稍候",
+              currentEmail: "",
+              startedAt,
+              finishedAt: "",
+              logs: [...(previousTask.logs || []), {
+                at: startedAt,
+                message: "正在领取 iCloud 库存邮箱并准备协议注册",
+                stage: "prepare",
+                status: "active",
+              }].slice(-30),
+            },
           });
-          this.store.patch({ protocolRegistrationTask: data.task });
-          this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
-          return "已从库存领取 iCloud 邮箱并启动协议注册";
+          try {
+            const data = await this.api.post("/api/protocol-registration/start", {
+              provider: "inventory",
+              concurrency: 1,
+            });
+            this.store.patch({
+              protocolRegistrationTask: { ...data.task, starting: false },
+            });
+            this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
+            return "已从库存领取 iCloud 邮箱并启动协议注册";
+          } catch (error) {
+            const finishedAt = new Date().toISOString();
+            this.store.patch({
+              protocolRegistrationTask: {
+                ...previousTask,
+                starting: false,
+                running: false,
+                status: "failed",
+                phase: "prepare",
+                message: "协议注册启动失败：" + error.message,
+                currentEmail: "",
+                startedAt,
+                finishedAt,
+                logs: [...(previousTask.logs || []), {
+                  at: finishedAt,
+                  message: "协议注册启动失败：" + error.message,
+                  stage: "prepare",
+                  status: "error",
+                }].slice(-30),
+              },
+            });
+            throw error;
+          }
         }
         const options = this.browserOptions();
         if (source === "gmail") {
@@ -1833,6 +2762,50 @@
           throw new Error(data.testResult?.message || "代理测试未通过");
         }
         return "代理测试通过：" + data.testResult.message;
+      });
+      this.commands.register("save-card-link-proxy", async () => {
+        const current = this.store.state.cardLinkProxy || {};
+        const mode = $("cardLinkRoutingMode").value || "kookeey";
+        if (mode === "clash") {
+          throw new Error("提链 Clash 模式请使用“检测并切换日本 IP”");
+        }
+        const endpoint = $("cardLinkRoutingEndpoint").value.trim();
+        const username = $("cardLinkRoutingUsername").value.trim();
+        const password = $("cardLinkRoutingPassword").value;
+        if (!current.configured && (!endpoint || !username || !password)) {
+          throw new Error("首次配置提链代理请填写用户名、密码和主机:端口");
+        }
+        const payload = {
+          mode,
+          country: $("cardLinkRoutingCountry").value || "DE",
+          enabled: true,
+        };
+        if (endpoint) payload.proxyEndpoint = endpoint;
+        if (username) payload.proxyUsername = username;
+        if (password) payload.proxyPassword = password;
+        const data = await this.api.post("/api/card-link-proxy/config", payload);
+        $("cardLinkRoutingUsername").value = "";
+        $("cardLinkRoutingPassword").value = "";
+        $("cardLinkRoutingEndpoint").dataset.dirty = "";
+        this.store.patch({ cardLinkProxy: data });
+        return "提链代理已独立保存：" + (data.countryLabel || data.country);
+      });
+      this.commands.register("rotate-card-link-proxy", async () => {
+        await this.api.post("/api/card-link-proxy/config", {
+          mode: "clash", country: "JP", enabled: true, maxLatencyMs: 900,
+        });
+        const data = await this.api.post("/api/card-link-proxy/rotate", {});
+        this.store.patch({ cardLinkProxy: data });
+        return "提链 Clash 日本出口已固定：" + (data.currentNode || "日本节点") +
+          "，延迟 " + (data.lastLatencyMs || 0) + " ms";
+      });
+      this.commands.register("test-card-link-proxy", async () => {
+        const data = await this.api.post("/api/card-link-proxy/test", {});
+        this.store.patch({ cardLinkProxy: data });
+        if (!data.testResult?.ok) {
+          throw new Error(data.testResult?.message || "提链代理测试未通过");
+        }
+        return "提链代理测试通过：" + data.testResult.message;
       });
       this.commands.register("fetch-all", async () => {
         const options = this.browserOptions();
@@ -1952,12 +2925,13 @@
           proxy_mode: $("cardLinkProxyMode").value,
           create_proxy_country: $("cardLinkCreateProxyCountry").value,
           promotion_proxy_country: config.singleProxy ? "" : $("cardLinkPromotionProxyCountry").value,
+          force_retry: cardLinkMarkedForMethod(item, method),
         });
         if (data.cardLinkStatus !== "cs_live") await this.copyText(data.url);
         await this.loadAccounts();
         setTimeout(() => this.renderer.renderCardSelection(this.store.state), 0);
         return data.cardLinkStatus === "cs_live"
-          ? "检测到 cs_live，已标注；此账号在当前模式不再提链"
+          ? "本次仍返回 cs_live，可再次点击重新提链"
           : config.success;
       });
       this.commands.register("generate-all-card-links", async ({ element }) => {
@@ -1995,6 +2969,7 @@
                 create_proxy_country: $("cardLinkCreateProxyCountry").value,
                 promotion_proxy_country: config.singleProxy
                   ? "" : $("cardLinkPromotionProxyCountry").value,
+                force_retry: cardLinkMarkedForMethod(item, method),
               });
               if (data.cardLinkStatus === "cs_live") classified += 1;
               else generated += 1;
@@ -2111,19 +3086,18 @@
         $(id).addEventListener(id === "cardSearch" ? "input" : "change", () => this.renderer.renderCardLinks(this.store.state));
       });
       $("cardLinkMethod").addEventListener("change", () => {
-        this.renderer.renderCardLinkMethod();
-        this.renderer.renderCardSelection(this.store.state);
+        this.renderer.renderCardLinks(this.store.state);
       });
       $("cardLinkProxyMode").addEventListener("change", async (event) => {
         const method = $("cardLinkMethod").value;
         try {
-          const data = await this.api.post("/api/registration-proxy/config", {
+          const data = await this.api.post("/api/card-link-proxy/config", {
             cardLinkModes: { [method]: event.target.value },
           });
-          this.store.patch({ registrationProxy: data });
+          this.store.patch({ cardLinkProxy: data });
           this.toast("提链代理模式已保存为 " + event.target.selectedOptions[0].textContent);
         } catch (error) {
-          await this.loadRegistrationProxy();
+          await this.loadCardLinkProxy();
           this.toast(error.message, "error");
         }
       });
@@ -2132,16 +3106,129 @@
           const preferenceKey = event.target.dataset.preferenceKey;
           if (!preferenceKey || !event.target.value) return;
           try {
-            const data = await this.api.post("/api/registration-proxy/config", {
+            const data = await this.api.post("/api/card-link-proxy/config", {
               cardLinkCountries: { [preferenceKey]: event.target.value },
             });
-            this.store.patch({ registrationProxy: data });
+            this.store.patch({ cardLinkProxy: data });
             this.toast("提链代理国家已保存为 " + event.target.selectedOptions[0].textContent);
           } catch (error) {
-            await this.loadRegistrationProxy();
+            await this.loadCardLinkProxy();
             this.toast(error.message, "error");
           }
         });
+      });
+      $("quickRegistrationMode").addEventListener("change", (event) => {
+        localStorage.setItem("hme_quick_registration_mode", event.target.value);
+        this.renderer.renderQuickFlow(this.store.state);
+      });
+      $("quickRegistrationProxyMode").addEventListener("change", async (event) => {
+        const mode = event.target.value;
+        localStorage.setItem("hme_quick_registration_proxy_mode", mode);
+        try {
+          if (mode === "direct") {
+            const data = await this.api.post("/api/registration-proxy/config", { enabled: false });
+            this.store.patch({ registrationProxy: data });
+            this.toast("一键注册已选择本机 IP 直连");
+            return;
+          }
+          const candidate = this.store.state.registrationProxy?.modes?.find(
+            (item) => item.code === mode
+          );
+          const country = mode === "clash" ? "JP" : ($("quickRegistrationProxyCountry").value || "NL");
+          const data = await this.api.post("/api/registration-proxy/config", {
+            mode,
+            country,
+            enabled: Boolean(candidate?.configured),
+          });
+          this.store.patch({ registrationProxy: data });
+          this.toast(candidate?.configured
+            ? "一键注册代理已切换为 " + event.target.selectedOptions[0].textContent
+            : "已选择该注册代理模式；请先在注册代理独立配置中保存凭据");
+        } catch (error) {
+          await this.loadRegistrationProxy();
+          this.toast(error.message, "error");
+        }
+      });
+      $("quickRegistrationProxyCountry").addEventListener("change", async (event) => {
+        const mode = $("quickRegistrationProxyMode").value;
+        if (mode === "direct") return;
+        const candidate = this.store.state.registrationProxy?.modes?.find(
+          (item) => item.code === mode
+        );
+        try {
+          const data = await this.api.post("/api/registration-proxy/config", {
+            mode,
+            country: event.target.value,
+            enabled: Boolean(candidate?.configured),
+          });
+          this.store.patch({ registrationProxy: data });
+          this.toast("一键注册代理国家已切换为 " + event.target.selectedOptions[0].textContent);
+        } catch (error) {
+          await this.loadRegistrationProxy();
+          this.toast(error.message, "error");
+        }
+      });
+      $("quickRegistrationConcurrency").addEventListener("change", (event) => {
+        const limit = ["protocol", "roxy"].includes($("quickRegistrationMode").value) ? 5 : 10;
+        const value = Math.max(1, Math.min(limit, Number(event.target.value) || 1));
+        event.target.value = String(value);
+        localStorage.setItem("hme_quick_registration_concurrency", String(value));
+        this.renderer.renderQuickFlow(this.store.state);
+      });
+      $("quickRegistrationTargetCount").addEventListener("change", (event) => {
+        const value = Math.max(1, Math.min(100, Number(event.target.value) || 1));
+        event.target.value = String(value);
+        localStorage.setItem("hme_quick_registration_target", String(value));
+        this.renderer.renderQuickFlow(this.store.state);
+      });
+      $("quickExtractionCount").addEventListener("change", (event) => {
+        const value = Math.max(1, Math.min(100, Number(event.target.value) || 1));
+        event.target.value = String(value);
+        localStorage.setItem("hme_quick_extraction_count", String(value));
+        this.renderer.renderQuickFlow(this.store.state);
+      });
+      $("quickCardLinkMethod").addEventListener("change", () => {
+        $("quickCardLinkMethod").value = "de_oaics_paypal";
+        this.renderer.renderQuickFlow(this.store.state);
+      });
+      $("quickExtractionProxyMode").addEventListener("change", async (event) => {
+        localStorage.setItem("hme_quick_extraction_proxy_mode", event.target.value);
+        try {
+          const data = await this.api.post("/api/card-link-proxy/config", {
+            cardLinkModes: { de_oaics_paypal: event.target.value },
+          });
+          this.store.patch({ cardLinkProxy: data });
+          const candidate = data.modes?.find((item) => item.code === event.target.value);
+          this.toast(candidate?.configured
+            ? "提链代理已选择并用于 Checkout 探测"
+            : "已选择该提链代理；请先在提链代理独立配置中保存凭据");
+        } catch (error) {
+          await this.loadCardLinkProxy();
+          this.toast(error.message, "error");
+        }
+      });
+      $("quickExtractionFirstProxyCountry").addEventListener("change", async (event) => {
+        localStorage.setItem("hme_quick_extraction_first_country", event.target.value);
+        try {
+          const data = await this.api.post("/api/card-link-proxy/config", {
+            cardLinkCountries: { de: event.target.value },
+          });
+          this.store.patch({ cardLinkProxy: data });
+          this.toast("第一代理出口已保存，并用于 Checkout 探测");
+        } catch (error) {
+          await this.loadCardLinkProxy();
+          this.toast(error.message, "error");
+        }
+      });
+      $("quickExtractionSecondProxyCountry").addEventListener("change", (event) => {
+        localStorage.setItem("hme_quick_extraction_second_country", event.target.value);
+        this.renderer.renderQuickFlow(this.store.state);
+        this.toast("第二代理出口已选择 " + event.target.selectedOptions[0].textContent);
+      });
+      $("quickPromotionProxyChoice").addEventListener("change", (event) => {
+        localStorage.setItem("hme_quick_promotion_proxy_choice", event.target.value);
+        this.renderer.renderQuickFlow(this.store.state);
+        this.toast("优惠更新已选择使用" + (event.target.value === "second" ? "第二 IP" : "第一 IP"));
       });
       $("verificationAccountSelect").addEventListener("change", (event) => {
         this.store.patch({ selectedVerificationEmail: event.target.value });
@@ -2210,6 +3297,33 @@
       });
       $("registrationEmailProvider").addEventListener("change", () => {
         this.renderer.renderAccounts(this.store.state);
+      });
+      $("cardLinkRoutingEndpoint").addEventListener("input", (event) => {
+        event.target.dataset.dirty = "1";
+      });
+      $("cardLinkRoutingMode").addEventListener("change", (event) => {
+        const mode = event.target.value;
+        const clashMode = mode === "clash";
+        $("cardLinkRoutingCredentialFields").hidden = clashMode;
+        $("rotateCardLinkRoutingButton").hidden = !clashMode;
+        $("cardLinkRoutingCountry").disabled = clashMode;
+        if (clashMode) $("cardLinkRoutingCountry").value = "JP";
+        ["cardLinkRoutingUsername", "cardLinkRoutingPassword", "cardLinkRoutingEndpoint", "saveCardLinkRoutingButton"].forEach((id) => {
+          $(id).disabled = clashMode;
+        });
+        this.toast("提链代理模式已选择；保存后只用于提链，不影响注册代理");
+      });
+      $("cardLinkRoutingCountry").addEventListener("change", async (event) => {
+        try {
+          const data = await this.api.post("/api/card-link-proxy/config", {
+            country: event.target.value,
+          });
+          this.store.patch({ cardLinkProxy: data });
+          this.toast("提链代理测试出口已切换为 " + event.target.selectedOptions[0].textContent);
+        } catch (error) {
+          await this.loadCardLinkProxy();
+          this.toast(error.message, "error");
+        }
       });
       $("registrationProxyEndpoint").addEventListener("input", (event) => {
         event.target.dataset.dirty = "1";
@@ -2318,6 +3432,27 @@
         Number.isInteger(savedRoxyTargetCount) && savedRoxyTargetCount >= 1 && savedRoxyTargetCount <= 100
           ? savedRoxyTargetCount : 5
       );
+      const savedQuickMode = localStorage.getItem("hme_quick_registration_mode");
+      $("quickRegistrationMode").value = ["headless", "headed", "roxy", "protocol"].includes(savedQuickMode)
+        ? savedQuickMode : "headless";
+      const savedQuickConcurrency = Number(localStorage.getItem("hme_quick_registration_concurrency") || 1);
+      $("quickRegistrationConcurrency").value = String(
+        Number.isInteger(savedQuickConcurrency) && savedQuickConcurrency >= 1 && savedQuickConcurrency <= 10
+          ? savedQuickConcurrency : 1
+      );
+      const savedQuickTarget = Number(localStorage.getItem("hme_quick_registration_target") || 1);
+      $("quickRegistrationTargetCount").value = String(
+        Number.isInteger(savedQuickTarget) && savedQuickTarget >= 1 && savedQuickTarget <= 100
+          ? savedQuickTarget : 1
+      );
+      const savedQuickExtractionCount = Number(localStorage.getItem("hme_quick_extraction_count") || 1);
+      $("quickExtractionCount").value = String(
+        Number.isInteger(savedQuickExtractionCount) && savedQuickExtractionCount >= 1 &&
+          savedQuickExtractionCount <= 100
+          ? savedQuickExtractionCount : 1
+      );
+      localStorage.setItem("hme_quick_card_link_method", "de_oaics_paypal");
+      $("quickCardLinkMethod").value = "de_oaics_paypal";
       this.applyTheme(savedTheme, false);
       this.store.patch({ registrationMode });
       $("accountsView").insertBefore($("protocolRegistrationPanel"), $("taskPanel"));
@@ -2326,7 +3461,7 @@
       this.router.start();
       const results = await Promise.allSettled([
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal(),
+        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadCardLinkProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal(),
       ]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");

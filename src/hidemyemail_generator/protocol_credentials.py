@@ -14,6 +14,14 @@ MFA_BASE_URL = "https://chatgpt.com/backend-api/accounts/mfa"
 SESSION_URL = "https://chatgpt.com/api/auth/session"
 
 
+def _language_header(language: str) -> str:
+    primary = str(language or "en-US").strip() or "en-US"
+    root = primary.split("-", 1)[0]
+    if primary.casefold() == "en-us":
+        return "en-US,en;q=0.9"
+    return f"{primary},{root};q=0.9,en-US;q=0.8,en;q=0.7"
+
+
 class ProtocolCredentialSetupError(RuntimeError):
     """The account exists, but its password or TOTP setup did not finish."""
 
@@ -52,33 +60,88 @@ def _detail(response: Any) -> str:
         return ""
 
 
-def _headers(access_token: str) -> dict[str, str]:
-    return {
+def _headers(
+    access_token: str,
+    *,
+    device_id: str = "",
+    target_url: str = "",
+    language: str = "en-US",
+) -> dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/141.0.0.0 Safari/537.36"
-        ),
+        "Accept-Language": _language_header(language),
+        "oai-language": str(language or "en-US"),
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+        "priority": "u=1, i",
     }
+    if device_id:
+        headers["oai-device-id"] = device_id
+    if target_url.startswith("https://chatgpt.com/backend-api/"):
+        path = "/" + target_url.split("/", 3)[-1].split("?", 1)[0]
+        headers["x-openai-target-path"] = path
+        headers["x-openai-target-route"] = path
+    return headers
 
 
-def _new_session(*, proxy_url: str, session_token: str, device_id: str) -> Any:
+def _iter_session_cookies(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, dict):
+        return [
+            {"name": str(name), "value": str(cookie_value)}
+            for name, cookie_value in value.items()
+            if str(name) and cookie_value is not None
+        ]
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+def _new_session(
+    *,
+    proxy_url: str,
+    session_token: str,
+    device_id: str,
+    session_cookies: Any = None,
+    impersonate: str = "firefox144",
+    language: str = "en-US",
+) -> Any:
     try:
         from curl_cffi.requests import Session
 
-        session = Session(impersonate="chrome136")
+        session = Session(impersonate=str(impersonate or "firefox144"))
     except ImportError:
         import requests
 
         session = requests.Session()
+    if not hasattr(session, "headers"):
+        session.headers = {}
+    session.headers.update(
+        {
+            "Accept-Language": _language_header(language),
+            "oai-language": str(language or "en-US"),
+        }
+    )
     proxy = str(proxy_url or "").strip()
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
+    for cookie in _iter_session_cookies(session_cookies):
+        name = str(cookie.get("name") or "").strip()
+        value = str(cookie.get("value") or "")
+        if not name:
+            continue
+        options: dict[str, str] = {}
+        domain = str(cookie.get("domain") or "").strip()
+        path = str(cookie.get("path") or "").strip()
+        if domain:
+            options["domain"] = domain
+        if path:
+            options["path"] = path
+        session.cookies.set(name, value, **options)
     if session_token:
         session.cookies.set(
             "__Secure-next-auth.session-token",
@@ -96,12 +159,21 @@ def _post_json(
     url: str,
     access_token: str,
     payload: dict[str, Any],
+    *,
+    device_id: str = "",
+    language: str = "en-US",
 ) -> Any:
     return session.post(
         url,
-        headers=_headers(access_token),
+        headers=_headers(
+            access_token,
+            device_id=device_id,
+            target_url=url,
+            language=language,
+        ),
         data=json.dumps(payload),
         timeout=60,
+        allow_redirects=False,
     )
 
 
@@ -115,7 +187,7 @@ def _require_success(response: Any, action: str) -> dict[str, Any]:
     return _payload(response)
 
 
-def _refresh_access_token(session: Any) -> str:
+def _refresh_access_token(session: Any, *, language: str = "en-US") -> str:
     try:
         response = session.get(
             f"{SESSION_URL}?auth_check={int(time.time() * 1000)}",
@@ -124,6 +196,8 @@ def _refresh_access_token(session: Any) -> str:
                 "Cache-Control": "no-cache, no-store",
                 "Pragma": "no-cache",
                 "Referer": "https://chatgpt.com/",
+                "Accept-Language": _language_header(language),
+                "oai-language": str(language or "en-US"),
             },
             timeout=60,
         )
@@ -158,8 +232,13 @@ def complete_protocol_credentials(
     proxy_url: str = "",
     session_token: str = "",
     device_id: str = "",
+    session_cookies: Any = None,
+    impersonate: str = "firefox144",
+    language: str = "en-US",
     existing_totp_secret: str = "",
     log: Callable[[str], None] | None = None,
+    on_password_confirmed: Callable[[], None] | None = None,
+    password_verifier: Callable[[], dict[str, Any]] | None = None,
     request_session: Any | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.time,
@@ -176,7 +255,7 @@ def complete_protocol_credentials(
 
     saved_totp = str(existing_totp_secret or "").strip()
     saved_secret = normalize_totp_secret(saved_totp) if saved_totp else ""
-    if saved_secret and password_set:
+    if saved_secret and password_set and password_verifier is None:
         logger("已保留现有密码与 TOTP 2FA")
         return {
             "password": password,
@@ -197,21 +276,45 @@ def complete_protocol_credentials(
         proxy_url=proxy_url,
         session_token=session_token,
         device_id=device_id,
+        session_cookies=session_cookies,
+        impersonate=impersonate,
+        language=language,
     )
     try:
         if not password_set:
-            _require_success(
-                _post_json(session, PASSWORD_ADD_URL, token, {"password": password}),
-                "添加密码",
-            )
-            logger("POST /api/accounts/password/add 已确认后置密码成功")
-            if session_token:
-                refreshed = _refresh_access_token(session)
-                if refreshed:
-                    token = refreshed
-                    logger("添加密码后已刷新 Access Token")
+            logger("账号尚无可验证密码；将通过当前添加密码复核流程设置并验证")
         else:
-            logger("Mail Auth 已确认密码")
+            logger("正在用全新认证会话复核已保存密码")
+        if password_verifier is not None:
+            verification = password_verifier()
+            if not isinstance(verification, dict) or not verification.get("verified"):
+                detail = (
+                    str(verification.get("error") or "")
+                    if isinstance(verification, dict)
+                    else ""
+                )
+                raise ProtocolCredentialSetupError(
+                    "密码设置响应尚未通过独立登录验证"
+                    + (f" · {detail[:300]}" if detail else "")
+                )
+            verified_token = str(
+                verification.get("access_token") or ""
+            ).strip()
+            if verified_token:
+                token = verified_token
+            logger("全新认证会话已接受保存密码")
+        elif not password_set:
+            raise ProtocolCredentialSetupError(
+                "密码设置响应缺少独立登录验证，停止配置 2FA"
+            )
+        if on_password_confirmed is not None:
+            on_password_confirmed()
+
+        if session_token:
+            refreshed = _refresh_access_token(session, language=language)
+            if refreshed:
+                token = refreshed
+                logger("MFA 前已使用原注册会话刷新 Access Token")
 
         if saved_secret:
             logger("已保留现有 TOTP 2FA")
@@ -235,6 +338,8 @@ def complete_protocol_credentials(
                 f"{MFA_BASE_URL}/enroll",
                 token,
                 {"factor_type": "totp"},
+                device_id=device_id,
+                language=language,
             ),
             "创建 2FA 验证器",
         )
@@ -264,6 +369,8 @@ def complete_protocol_credentials(
                     "session_id": session_id,
                     "code": generate_totp(secret, now=now()),
                 },
+                device_id=device_id,
+                language=language,
             ),
             "激活 2FA",
         )

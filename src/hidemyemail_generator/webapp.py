@@ -55,6 +55,7 @@ from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
 from .paypal_protocol_service import PayPalProtocolService
 from .protocol_registration import (
+    ConcurrentProtocolRegistrationManager,
     PROTOCOL_CODE_PREFIX,
     ProtocolRegistrationManager,
 )
@@ -90,7 +91,7 @@ from .registration_tasks import (
     RegistrationTaskManager,
     generate_openai_password,
 )
-from .registration_proxy import RegistrationProxyStore
+from .registration_proxy import CARD_LINK_PROXY_SETTING_KEY, RegistrationProxyStore
 from .roxy_registration import RoxyRegistrationStore
 from .scheduled_generation import (
     DEFAULT_BATCH_SIZE as DEFAULT_INVENTORY_BATCH_SIZE,
@@ -4024,13 +4025,22 @@ def create_app(
 
     app["sync_inventory_to_remote"] = sync_inventory_to_remote
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
+    app["card_link_proxy_store"] = RegistrationProxyStore(
+        app["db_file"], setting_key=CARD_LINK_PROXY_SETTING_KEY
+    )
     app["roxy_registration_store"] = RoxyRegistrationStore(app["db_file"])
     app["registration_proxy_tester"] = test_registration_proxy_connection
-    app["protocol_registration_manager"] = ProtocolRegistrationManager(
-        base_dir=base_dir,
-        db_file=app["db_file"],
-        proxy_store=app["registration_proxy_store"],
+    def create_protocol_registration_process() -> ProtocolRegistrationManager:
+        return ProtocolRegistrationManager(
+            base_dir=base_dir,
+            db_file=app["db_file"],
+            proxy_store=app["registration_proxy_store"],
+        )
+
+    app["protocol_registration_manager"] = ConcurrentProtocolRegistrationManager(
+        process_factory=create_protocol_registration_process,
         on_account_saved=sync_saved_account_to_remote,
+        max_processes=5,
     )
     app["smsbower_config_store"] = SMSBowerConfigStore(
         app["db_file"],
@@ -4049,6 +4059,7 @@ def create_app(
     app["paypal_service"] = PayPalProtocolService(
         project_dir=paypal_source,
         runtime_dir=_default_paypal_runtime_dir(),
+        config_db_file=app["db_file"],
         port=max(1, min(int(paypal_port), 65535)),
         python_executable=Path(paypal_python) if paypal_python else None,
     )
@@ -4094,6 +4105,8 @@ def create_app(
 
     async def validate_saved_registration_checkout(
         email: str,
+        *,
+        force: bool = False,
     ) -> dict[str, Any] | None:
         target = str(email or "").strip().lower()
         if not app["auto_oaics_probe"]:
@@ -4117,17 +4130,49 @@ def create_app(
             and marker
             and str(previous_probe.get("registration_marker") or "") == marker
             and str(previous_probe.get("status") or "") == "verified"
+            and not force
         ):
             await sync_saved_account_to_remote(target)
             return dict(previous_probe)
+
+        card_link_proxy_state = app["card_link_proxy_store"].public_state()
+        card_link_countries = card_link_proxy_state.get("cardLinkCountries")
+        if not isinstance(card_link_countries, dict):
+            card_link_countries = {}
+        card_link_modes = card_link_proxy_state.get("cardLinkModes")
+        if not isinstance(card_link_modes, dict):
+            card_link_modes = {}
+        checkout_proxy_country = str(
+            card_link_countries.get("de")
+            or card_link_proxy_state.get("country")
+            or "DE"
+        ).strip().upper()
+        checkout_proxy_mode = str(
+            card_link_modes.get("de_oaics_paypal")
+            or card_link_proxy_state.get("mode")
+            or "dynamic"
+        ).strip().lower()
+        checkout_country_item = next(
+            (
+                item for item in card_link_proxy_state.get("countries", [])
+                if isinstance(item, dict)
+                and str(item.get("code") or "").strip().upper()
+                == checkout_proxy_country
+            ),
+            {},
+        )
+        checkout_proxy_country_label = str(
+            checkout_country_item.get("label") or checkout_proxy_country
+        )
 
         checkout_environment: dict[str, Any] = {
             "registration_mode": "checkout_probe",
             "email_type": str(registration_environment.get("email_type") or ""),
             "proxy_enabled": True,
-            "proxy_mode": "kookeey",
-            "proxy_country": "BR",
-            "proxy_country_label": "巴西",
+            "proxy_mode": checkout_proxy_mode,
+            "proxy_country": checkout_proxy_country,
+            "proxy_country_label": checkout_proxy_country_label,
+            "proxy_role": "first_card_link_proxy",
             "proxy_endpoint": "",
             "proxy_node": "",
             "proxy_selector": "",
@@ -4159,26 +4204,27 @@ def create_app(
             for attempt in range(1, max_probe_attempts + 1):
                 attempt_count = attempt
                 checkout_proxy_url, checkout_proxy_state = await asyncio.to_thread(
-                    app["registration_proxy_store"].proxy_for_country,
-                    "BR",
-                    mode="kookeey",
+                    app["card_link_proxy_store"].proxy_for_country,
+                    checkout_proxy_country,
+                    mode=checkout_proxy_mode,
                 )
                 if not checkout_proxy_url:
-                    raise RuntimeError("Kookeey 巴西代理尚未配置")
+                    raise RuntimeError("配置的第一提链代理尚未配置")
                 checkout_state = {
                     **checkout_proxy_state,
-                    "mode": "kookeey",
-                    "country": "BR",
-                    "countryLabel": "巴西",
+                    "mode": checkout_proxy_mode,
+                    "country": checkout_proxy_country,
+                    "countryLabel": checkout_proxy_country_label,
                 }
                 checkout_environment = build_registration_environment(
                     target,
                     registration_mode="checkout_probe",
                     proxy_url=checkout_proxy_url,
                     proxy_state=checkout_state,
-                    proxy_mode="kookeey",
-                    proxy_country="BR",
+                    proxy_mode=checkout_proxy_mode,
+                    proxy_country=checkout_proxy_country,
                 )
+                checkout_environment["proxy_role"] = "first_card_link_proxy"
                 checkout_environment = await inspect_proxy_environment(
                     checkout_proxy_url, checkout_environment
                 )
@@ -4325,10 +4371,14 @@ def create_app(
         # The remote inventory database cannot see account records saved on
         # this workstation.  Consume only completed accounts; a password-only
         # record from a failed attempt stays retryable and reuses that password.
+        #
+        # The full local-to-remote sync is owned by
+        # ``remote_inventory_sync_context``.  Waiting for that multi-batch sync
+        # here used to block the start endpoint (and therefore the quick-flow
+        # UI) for about a minute.  Lease immediately instead; the duplicate
+        # check below still reconciles any completed local account safely.
         remote_error: RuntimeError | None = None
         try:
-            if not app["inventory_initial_sync_complete"]:
-                await sync_inventory_to_remote()
             for _attempt in range(100):
                 email = await app["inventory_client"].acquire_email(label)
                 if not email:
@@ -5690,6 +5740,30 @@ def create_app(
             )
         email = str(body.get("email") or "").strip().lower()
         method = str(body.get("method") or "standard").strip().lower()
+        force_retry = body.get("force_retry") is True
+        try:
+            attempt_limit = int(body.get("attempt_limit") or 1)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"ok": False, "error": "提链次数必须是 1–100 的整数"},
+                status=400,
+            )
+        if isinstance(body.get("attempt_limit"), bool) or not 1 <= attempt_limit <= 100:
+            return web.json_response(
+                {"ok": False, "error": "提链次数必须是 1–100 的整数"},
+                status=400,
+            )
+        reuse_registration_proxy = body.get("reuse_registration_proxy") is True
+        independent_proxy_pair = body.get("independent_proxy_pair") is True
+        use_secondary_proxy = body.get("use_secondary_proxy") is True
+        promotion_proxy_choice = str(
+            body.get("promotion_proxy_choice") or "first"
+        ).strip().lower()
+        if promotion_proxy_choice not in {"first", "second"}:
+            return web.json_response(
+                {"ok": False, "error": "优惠更新 IP 只能选择第一 IP 或第二 IP"},
+                status=400,
+            )
         if not email.endswith("@icloud.com") or len(email) > 320:
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
@@ -5724,6 +5798,8 @@ def create_app(
             method == "de_oaics_paypal"
             and existing_card_link.get("method") == method
             and existing_card_link.get("status") == "cs_live"
+            and not force_retry
+            and attempt_limit == 1
         ):
             return web.json_response(
                 {
@@ -5735,12 +5811,27 @@ def create_app(
                 },
                 headers={"Cache-Control": "no-store"},
             )
-        proxy_store = app["registration_proxy_store"]
+        proxy_store = (
+            app["registration_proxy_store"]
+            if reuse_registration_proxy
+            else app["card_link_proxy_store"]
+        )
         create_proxy_country = str(
             body.get("create_proxy_country") or ""
         ).strip().upper()
         promotion_proxy_country = str(
             body.get("promotion_proxy_country") or ""
+        ).strip().upper()
+        registration_environment = (
+            record.get("registration_environment") if isinstance(record, dict) else {}
+        )
+        if not isinstance(registration_environment, dict):
+            registration_environment = {}
+        secondary_proxy_country = str(
+            body.get("secondary_proxy_country")
+            or create_proxy_country
+            or registration_environment.get("proxy_country")
+            or ""
         ).strip().upper()
         proxy_mode = str(body.get("proxy_mode") or "").strip().lower()
 
@@ -5761,23 +5852,88 @@ def create_app(
                 return proxy_url
             return _normalize_card_link_proxy_url(str(legacy_value or ""))
 
+        retry_create_proxy = ""
         if method == "standard":
             create_proxy = ""
             promotion_proxy = ""
         else:
             try:
-                create_proxy = await configured_proxy_for_country(
-                    create_proxy_country,
-                    body.get("create_proxy"),
-                )
-                promotion_proxy = (
-                    ""
-                    if method == "de_oaics_paypal"
-                    else await configured_proxy_for_country(
-                        promotion_proxy_country,
-                        body.get("promotion_proxy"),
+                if not reuse_registration_proxy and independent_proxy_pair:
+                    first_proxy = await configured_proxy_for_country(
+                        create_proxy_country,
+                        body.get("create_proxy"),
                     )
-                )
+                    needs_second_proxy = (
+                        use_secondary_proxy
+                        or promotion_proxy_choice == "second"
+                        or attempt_limit > 1
+                    )
+                    second_proxy = ""
+                    if needs_second_proxy:
+                        if proxy_mode == "clash":
+                            second_proxy, _ = await asyncio.to_thread(
+                                proxy_store.next_proxy, force=True
+                            )
+                        else:
+                            second_proxy = await configured_proxy_for_country(
+                                secondary_proxy_country,
+                                body.get("secondary_proxy"),
+                            )
+                        if not second_proxy:
+                            raise RuntimeError("第二提链代理出口尚未配置")
+                    create_proxy = second_proxy if use_secondary_proxy else first_proxy
+                    retry_create_proxy = second_proxy or create_proxy
+                    promotion_proxy = (
+                        second_proxy
+                        if promotion_proxy_choice == "second"
+                        else first_proxy
+                    )
+                elif not reuse_registration_proxy:
+                    create_proxy = await configured_proxy_for_country(
+                        create_proxy_country,
+                        body.get("create_proxy"),
+                    )
+                    promotion_proxy = (
+                        ""
+                        if method == "de_oaics_paypal"
+                        else await configured_proxy_for_country(
+                            promotion_proxy_country,
+                            body.get("promotion_proxy"),
+                        )
+                    )
+                    retry_create_proxy = create_proxy
+                else:
+                    first_proxy = account_registration_proxy_url(record)
+                    if not first_proxy and proxy_mode:
+                        first_proxy = await configured_proxy_for_country(
+                            create_proxy_country or secondary_proxy_country,
+                            body.get("create_proxy"),
+                        )
+                    needs_second_proxy = (
+                        use_secondary_proxy
+                        or promotion_proxy_choice == "second"
+                        or attempt_limit > 1
+                    )
+                    second_proxy = ""
+                    if needs_second_proxy:
+                        if proxy_mode == "clash":
+                            second_proxy, _ = await asyncio.to_thread(
+                                proxy_store.next_proxy, force=True
+                            )
+                        else:
+                            second_proxy = await configured_proxy_for_country(
+                                secondary_proxy_country,
+                                body.get("secondary_proxy"),
+                            )
+                        if not second_proxy:
+                            raise RuntimeError("第二 IP 尚未配置")
+                    create_proxy = second_proxy if use_secondary_proxy else first_proxy
+                    retry_create_proxy = second_proxy or create_proxy
+                    promotion_proxy = (
+                        second_proxy
+                        if promotion_proxy_choice == "second"
+                        else first_proxy
+                    )
             except RuntimeError as error:
                 return web.json_response(
                     {"ok": False, "error": str(error)}, status=400
@@ -5805,19 +5961,31 @@ def create_app(
             )
         try:
             async with app["card_link_lock"]:
-                result = await _run_card_link_bridge(
-                    target_project_dir=browser_manager.target_project_dir,
-                    python_executable=browser_manager.python_executable,
-                    bridge_file=app["card_link_bridge_file"],
-                    access_token=access_token,
-                    method=method,
-                    country=country,
-                    currency=str(region["currency"]),
-                    locale=str(region["locale"]),
-                    account_email=email,
-                    create_proxy_url=create_proxy,
-                    promotion_proxy_url=promotion_proxy,
-                )
+                result: dict[str, Any] = {}
+                attempt_count = 0
+                for attempt_count in range(1, attempt_limit + 1):
+                    result = await _run_card_link_bridge(
+                        target_project_dir=browser_manager.target_project_dir,
+                        python_executable=browser_manager.python_executable,
+                        bridge_file=app["card_link_bridge_file"],
+                        access_token=access_token,
+                        method=method,
+                        country=country,
+                        currency=str(region["currency"]),
+                        locale=str(region["locale"]),
+                        account_email=email,
+                        create_proxy_url=(
+                            retry_create_proxy
+                            if attempt_count > 1 and retry_create_proxy
+                            else create_proxy
+                        ),
+                        promotion_proxy_url=promotion_proxy,
+                    )
+                    if not (
+                        method == "de_oaics_paypal"
+                        and result.get("classification") == "cs_live"
+                    ):
+                        break
                 saved = await asyncio.to_thread(
                     _save_account_card_link,
                     app["db_file"],
@@ -5861,6 +6029,11 @@ def create_app(
                 "ok": True,
                 "email": email,
                 "cardLinkStatus": saved["status"],
+                "attemptCount": attempt_count,
+                "attemptLimit": attempt_limit,
+                "attemptsExhausted": (
+                    saved["status"] == "cs_live" and attempt_count >= attempt_limit
+                ),
                 **saved,
             },
             headers={"Cache-Control": "no-store"},
@@ -5884,7 +6057,7 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
-        probe = await app["validate_saved_registration_checkout"](email)
+        probe = await app["validate_saved_registration_checkout"](email, force=True)
         if not isinstance(probe, dict):
             return web.json_response(
                 {
@@ -6127,7 +6300,19 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
             )
-        task = await app["registration_manager"].stop()
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        process_id = str(
+            payload.get("process_id") or payload.get("processId") or ""
+        ).strip()
+        try:
+            task = await app["registration_manager"].stop(process_id=process_id)
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=404)
         return web.json_response({"ok": True, "task": task})
 
     async def protocol_registration_status(_: web.Request) -> web.Response:
@@ -6219,7 +6404,22 @@ def create_app(
             for item in items
             if str(item.get("email") or "").strip()
         }
+        # A remote inventory lease may contain only the address payload.  Such
+        # an address is a valid registration input even though it is not yet an
+        # active Apple identity or a stored GPT account, so it will not appear
+        # in ``_browser_email_items`` until registration saves credentials.
+        if inventory_email and inventory_email not in accounts_by_email:
+            account = await asyncio.to_thread(
+                load_account_record, app["db_file"], inventory_email
+            )
+            session = account_session(account)
+            access_token = account_session_access_token(account)
+            accounts_by_email[inventory_email] = {
+                "email": inventory_email,
+                "registrationComplete": bool(session and access_token),
+            }
         run_all = bool(payload.get("all"))
+        force_recheck = bool(payload.get("force"))
         if inventory_email:
             requested = [inventory_email]
         elif run_all:
@@ -6251,13 +6451,14 @@ def create_app(
         pending = [
             email
             for email in requested
-            if not bool(accounts_by_email[email].get("registrationComplete"))
+            if force_recheck
+            or not bool(accounts_by_email[email].get("protocolReady"))
         ]
         skipped = len(requested) - len(pending)
         if not pending:
-            await release_inventory_email("库存邮箱已有完成的 OpenAI 账号")
+            await release_inventory_email("库存邮箱已完成协议凭据配置")
             message = (
-                "全部账号均已注册，无需再次协议注册"
+                "全部账号的密码、Session 与 TOTP 2FA 均已完成"
                 if requested
                 else "当前没有可协议注册的邮箱账号"
             )
@@ -6302,7 +6503,21 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
             )
-        task = await app["protocol_registration_manager"].stop()
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        process_id = str(
+            payload.get("process_id") or payload.get("processId") or ""
+        ).strip()
+        try:
+            task = await app["protocol_registration_manager"].stop(
+                process_id=process_id
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=404)
         return web.json_response({"ok": True, "task": task})
 
     async def protocol_registration_code(request: web.Request) -> web.Response:
@@ -7134,15 +7349,15 @@ def create_app(
             )
         return web.json_response({"ok": True, **state})
 
-    async def registration_proxy_status(_: web.Request) -> web.Response:
+    async def _proxy_status(_: web.Request, store_key: str) -> web.Response:
         state = await asyncio.to_thread(
-            app["registration_proxy_store"].public_state
+            app[store_key].public_state
         )
         return web.json_response(
             {"ok": True, **state}, headers={"Cache-Control": "no-store"}
         )
 
-    async def registration_proxy_config(request: web.Request) -> web.Response:
+    async def _proxy_config(request: web.Request, store_key: str) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
@@ -7252,7 +7467,7 @@ def create_app(
             )
         try:
             state = await asyncio.to_thread(
-                app["registration_proxy_store"].configure,
+                app[store_key].configure,
                 enabled=enabled,
                 mode=mode,
                 country=country,
@@ -7274,14 +7489,16 @@ def create_app(
             )
         return web.json_response({"ok": True, **state})
 
-    async def registration_proxy_rotate(request: web.Request) -> web.Response:
+    async def _proxy_rotate(
+        request: web.Request, store_key: str, scope_label: str
+    ) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
             )
         try:
             proxy_url, state = await asyncio.to_thread(
-                app["registration_proxy_store"].next_proxy,
+                app[store_key].next_proxy,
                 force=True,
             )
         except (RuntimeError, ValueError) as error:
@@ -7290,23 +7507,25 @@ def create_app(
             )
         if not proxy_url:
             return web.json_response(
-                {"ok": False, "error": "注册代理尚未配置"}, status=400
+                {"ok": False, "error": f"{scope_label}代理尚未配置"}, status=400
             )
         return web.json_response(
             {"ok": True, **state}, headers={"Cache-Control": "no-store"}
         )
 
-    async def registration_proxy_test(request: web.Request) -> web.Response:
+    async def _proxy_test(
+        request: web.Request, store_key: str, scope_label: str
+    ) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
                 {"ok": False, "error": "本地请求令牌无效"}, status=403
             )
         proxy_url, state = await asyncio.to_thread(
-            app["registration_proxy_store"].proxy_for_test
+            app[store_key].proxy_for_test
         )
         if not proxy_url:
             return web.json_response(
-                {"ok": False, "error": "注册代理尚未配置"}, status=400
+                {"ok": False, "error": f"{scope_label}代理尚未配置"}, status=400
             )
         try:
             result = await app["registration_proxy_tester"](
@@ -7324,6 +7543,30 @@ def create_app(
             {"ok": True, **state, "testResult": result},
             headers={"Cache-Control": "no-store"},
         )
+
+    async def registration_proxy_status(request: web.Request) -> web.Response:
+        return await _proxy_status(request, "registration_proxy_store")
+
+    async def registration_proxy_config(request: web.Request) -> web.Response:
+        return await _proxy_config(request, "registration_proxy_store")
+
+    async def registration_proxy_rotate(request: web.Request) -> web.Response:
+        return await _proxy_rotate(request, "registration_proxy_store", "注册")
+
+    async def registration_proxy_test(request: web.Request) -> web.Response:
+        return await _proxy_test(request, "registration_proxy_store", "注册")
+
+    async def card_link_proxy_status(request: web.Request) -> web.Response:
+        return await _proxy_status(request, "card_link_proxy_store")
+
+    async def card_link_proxy_config(request: web.Request) -> web.Response:
+        return await _proxy_config(request, "card_link_proxy_store")
+
+    async def card_link_proxy_rotate(request: web.Request) -> web.Response:
+        return await _proxy_rotate(request, "card_link_proxy_store", "提链")
+
+    async def card_link_proxy_test(request: web.Request) -> web.Response:
+        return await _proxy_test(request, "card_link_proxy_store", "提链")
 
     async def inbox_status(_: web.Request) -> web.Response:
         config_path: Path = app["inbox_config_file"]
@@ -7478,6 +7721,116 @@ def create_app(
             {"ok": True, **state}, headers={"Cache-Control": "no-store"}
         )
 
+    async def start_account_paypal_payment(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(payload.get("email") or "").strip().lower()
+        if not _valid_supported_account_email(email):
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        record = await asyncio.to_thread(load_account_record, app["db_file"], email)
+        if not record:
+            return web.json_response(
+                {"ok": False, "error": "未找到账号记录"}, status=404
+            )
+        card_link = _account_card_link(record)
+        paypal_url = str(card_link.get("url") or "").strip()
+        if not paypal_url:
+            return web.json_response(
+                {"ok": False, "error": "当前账号还没有提取成功的支付链接"},
+                status=409,
+            )
+        link_country = str(card_link.get("country") or "").strip().upper()
+        if not link_country:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "当前提链记录缺少国家，需重新提链",
+                },
+                status=409,
+            )
+        cookies = account_saved_cookies(record)
+        if not cookies:
+            return web.json_response(
+                {"ok": False, "error": "当前账号没有可传入 PP 协议的 Cookie"},
+                status=409,
+            )
+        sms_state = app["smsbower_config_store"].public_state()
+        if not sms_state.get("configured"):
+            return web.json_response(
+                {"ok": False, "error": "请先在系统设置配置 SMSBower API Key"},
+                status=409,
+            )
+        proxy_store: RegistrationProxyStore = app["registration_proxy_store"]
+        proxy_state = proxy_store.public_state()
+        proxy_mode = str(proxy_state.get("mode") or "dynamic")
+        try:
+            proxy_url, _ = proxy_store.proxy_for_country(
+                link_country, mode=proxy_mode
+            )
+        except ValueError as error:
+            return web.json_response(
+                {"ok": False, "error": str(error)}, status=409
+            )
+        if not proxy_url:
+            return web.json_response(
+                {"ok": False, "error": "请先配置通用代理与线路"}, status=409
+            )
+        device_id = secrets.token_hex(16)
+        protocol_payload = {
+            "paypal_url": paypal_url,
+            "country": link_country,
+            "sms_provider": "smsbower",
+            "sms_max_price": sms_state.get("maxPrice"),
+            "proxy_pool": [proxy_url],
+            "source_account_email": email,
+            "account_cookies": cookies,
+        }
+        status, upstream = await app["paypal_service"].create_job(
+            protocol_payload, device_id=device_id
+        )
+        if status != 201:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": str(upstream.get("error") or "PP 协议支付任务启动失败"),
+                },
+                status=status if 400 <= status < 600 else 502,
+            )
+        job = upstream.get("job") if isinstance(upstream.get("job"), dict) else {}
+        response = web.json_response(
+            {
+                "ok": True,
+                "email": email,
+                "country": link_country,
+                "cookieCount": len(cookies),
+                "proxyMode": proxy_mode,
+                "smsProvider": "smsbower",
+                "job": job,
+                "url": "/paypal-pay/",
+            },
+            status=201,
+            headers={"Cache-Control": "no-store"},
+        )
+        response.set_cookie(
+            "paypal_web_device_id",
+            device_id,
+            path="/paypal-pay/",
+            max_age=30 * 24 * 60 * 60,
+            httponly=True,
+            samesite="Strict",
+        )
+        return response
+
     async def paypal_proxy(request: web.Request) -> web.Response:
         service: PayPalProtocolService = app["paypal_service"]
         if not await service.ensure_running():
@@ -7580,6 +7933,7 @@ def create_app(
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/", index)
     app.router.add_get("/api/paypal/status", paypal_status)
+    app.router.add_post("/api/account/paypal-payment", start_account_paypal_payment)
     app.router.add_route("*", PAYPAL_PROTOCOL_PREFIX, paypal_proxy)
     app.router.add_route("*", f"{PAYPAL_PROTOCOL_PREFIX}/{{tail:.*}}", paypal_proxy)
     app.router.add_get("/api/gpt-emails", gpt_emails)
@@ -7645,6 +7999,10 @@ def create_app(
     app.router.add_post("/api/roxy-registration/config", roxy_registration_config)
     app.router.add_post("/api/registration-proxy/rotate", registration_proxy_rotate)
     app.router.add_post("/api/registration-proxy/test", registration_proxy_test)
+    app.router.add_get("/api/card-link-proxy/status", card_link_proxy_status)
+    app.router.add_post("/api/card-link-proxy/config", card_link_proxy_config)
+    app.router.add_post("/api/card-link-proxy/rotate", card_link_proxy_rotate)
+    app.router.add_post("/api/card-link-proxy/test", card_link_proxy_test)
     app.router.add_get("/api/account-verification/status", verification_status)
     app.router.add_post("/api/account-verification/start", verification_start)
     app.router.add_post("/api/account-verification/stop", verification_stop)

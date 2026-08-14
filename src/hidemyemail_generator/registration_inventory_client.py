@@ -95,6 +95,19 @@ class RemoteRegistrationInventoryClient:
         has_login = bool(self.username and self.password)
         return bool(self.service_url and (has_login or self.token))
 
+    def _http_session(self) -> aiohttp.ClientSession:
+        """Create a session that follows the host's HTTP(S) proxy settings.
+
+        Proxy clients such as Clash commonly publish synthetic DNS addresses
+        that are reachable only when the request is sent through the proxy in
+        ``HTTP_PROXY``/``HTTPS_PROXY``.  Inventory login and authenticated API
+        calls must therefore use the same host network path instead of trying
+        to connect to a synthetic address directly.
+        """
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        return aiohttp.ClientSession(timeout=timeout, trust_env=True)
+
     async def _send_once(
         self,
         method: str,
@@ -103,8 +116,7 @@ class RemoteRegistrationInventoryClient:
         payload: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with self._http_session() as session:
             async with session.request(
                 method,
                 f"{self.service_url}{path}",
@@ -189,9 +201,8 @@ class RemoteRegistrationInventoryClient:
     async def _exchange_static_token(self) -> None:
         """Exchange a configured integration token for a restart-safe web session."""
 
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with self._http_session() as session:
                 async with session.get(
                     f"{self.service_url}{STATIC_TOKEN_ACCESS_PATH}",
                     params={"token": self.token},

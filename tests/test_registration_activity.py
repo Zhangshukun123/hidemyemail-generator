@@ -215,6 +215,98 @@ class RegistrationActivityTests(unittest.TestCase):
     def test_click_retry_limit_is_five(self):
         self.assertEqual(MAX_NO_RESPONSE_CLICK_ATTEMPTS, 5)
 
+    def test_otp_submit_has_no_one_second_focus_gap_after_stable_fill(self):
+        waits = []
+        submitted_values = []
+
+        class Field:
+            def __init__(self):
+                self.value = ""
+
+            @staticmethod
+            def evaluate(_script):
+                return "stable-otp-field"
+
+            def input_value(self, **_kwargs):
+                return self.value
+
+            def fill(self, value):
+                self.value = value
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.field = Field()
+
+            @staticmethod
+            def on(_name, _callback):
+                return None
+
+            @staticmethod
+            def evaluate(_script):
+                return {}
+
+            @staticmethod
+            def locator(_selector):
+                return SimpleNamespace(count=lambda: 0)
+
+            @staticmethod
+            def wait_for_timeout(milliseconds):
+                waits.append(milliseconds)
+
+        class Worker:
+            def __init__(self, page):
+                self.page = page
+                self.logs = []
+
+            @staticmethod
+            def _register(_page, _context, **_kwargs):
+                return None
+
+            def _visible_inputs(self, _page, _selectors):
+                return [self.page.field]
+
+            def _validate_email_code_api(self, _page, _code):
+                submitted_values.append(self.page.field.value)
+                return "submitted"
+
+            def log(self, message):
+                self.logs.append(message)
+
+        page = Page()
+        worker = Worker(page)
+        self.assertTrue(
+            configure_request_driven_registration(
+                worker,
+                emit_state=lambda _state: None,
+                require_password=False,
+                enable_two_factor=False,
+            )
+        )
+        for code in (
+            "site_requested",
+            "site_loaded",
+            "registration_clicked",
+            "registration_entry_ready",
+            "email_entered",
+            "email_submitted",
+            "email_responded",
+            "verification_page",
+            "verification_requested",
+            "verification_code_received",
+        ):
+            begin_registration_step(worker, code, page=page)
+            mark_registration_chain(worker, code, page=page)
+
+        result = worker._validate_email_code_api(page, "123456")
+
+        self.assertEqual(result, "submitted")
+        self.assertEqual(submitted_values, ["123456"])
+        self.assertNotIn(1000, waits)
+        self.assertTrue(waits)
+        self.assertLessEqual(max(waits), 200)
+
 
 if __name__ == "__main__":
     unittest.main()

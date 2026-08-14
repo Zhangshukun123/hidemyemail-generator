@@ -49,10 +49,13 @@ class BrowserProfile:
             "accept": accept,
             "accept-language": self.language_header(),
             "user-agent": self.user_agent,
-            "sec-ch-ua": self.sec_ch_ua,
-            "sec-ch-ua-mobile": self.sec_ch_ua_mobile,
-            "sec-ch-ua-platform": self.sec_ch_ua_platform,
         }
+        if self.sec_ch_ua:
+            headers["sec-ch-ua"] = self.sec_ch_ua
+        if self.sec_ch_ua_mobile:
+            headers["sec-ch-ua-mobile"] = self.sec_ch_ua_mobile
+        if self.sec_ch_ua_platform:
+            headers["sec-ch-ua-platform"] = self.sec_ch_ua_platform
         if referer:
             headers["referer"] = referer
         if origin:

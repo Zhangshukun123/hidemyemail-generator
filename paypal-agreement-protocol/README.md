@@ -33,6 +33,7 @@
 - 支持 HTTP、HTTPS、SOCKS5 代理池；带认证的 SOCKS5 可通过任务级代理桥交给 Chromium 使用。
 - 自动执行协议页面初始化、风险信号、账号流程和最终授权阶段。
 - 短信验证码错误后可继续提交，也可更换手机号重新发送。
+- 接入 SMSBower PayPal 服务代码 `ts`：按任务国家自动购买号码、轮询 OTP、提交验证码，并在成功/失败/停止时完成或取消激活。
 - 出现浏览器验证时启动临时 Chromium，并将任务 Cookie 同步回协议会话。
 - 自动维护 EUAT Cookie、Buyer Context 与 Hermes `billingLite` 会话。
 - 所有国家优先使用在线地图规范地址，失败或并发繁忙时回退本地地址池。
@@ -54,6 +55,7 @@ paypal-agreement-protocol/
 │  ├─ manual_browser.py       # 临时 Chromium 与远程交互
 │  ├─ models.py               # 用户、地址、卡片及在线地图解析
 │  ├─ proxy.py                # 代理格式解析与代理池
+│  ├─ smsbower.py             # SMSBower PayPal 自动取号、取码与激活生命周期
 │  ├─ fingerprint.py          # 设备与浏览器信号
 │  ├─ analytics.py            # 页面事件与分析信号
 │  └─ tealeaf.py              # Tealeaf 会话数据
@@ -127,6 +129,10 @@ socks5h://username:password@host:port
 | `PAYPAL_WEB_MAX_ACTIVE_JOBS_PER_DEVICE` | 单设备并发数 | `2` |
 | `PAYPAL_WEB_MAX_TOTAL_JOBS` | 内存保留任务上限 | `200` |
 | `PAYPAL_WEB_OTP_TIMEOUT_SECONDS` | 短信验证码等待时间 | `1800` |
+| `SMSBOWER_API_KEY` | 独立运行时的 SMSBower API Key；嵌入账号工作台时自动复用本地 Key | `32位 Key` |
+| `SMSBOWER_OTP_TIMEOUT_SECONDS` | SMSBower 单个号码自动取码超时 | `300` |
+| `SMSBOWER_MAX_PHONE_ATTEMPTS` | 自动换号次数 | `3` |
+| `SMSBOWER_POLL_INTERVAL_SECONDS` | 取码轮询间隔 | `4` |
 | `PAYPAL_MANUAL_BROWSER_LIMIT` | 临时浏览器并发数 | `2` |
 | `PAYPAL_WEB_COOKIE_SECURE` | 为会话 Cookie 添加 Secure | `1` |
 | `PAYPAL_WEB_PRODUCTION` | 开启生产模式 | `1` |

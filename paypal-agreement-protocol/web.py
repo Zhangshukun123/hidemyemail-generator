@@ -42,6 +42,14 @@ from paypal.models import BillingAddress, CardInfo, UserInfo, generate_address, 
 from paypal.online_address import resolve_online_address
 from paypal.proxy import ProxyConfig, ProxyEntry, build_proxy_config
 from paypal.runtime_country_resolver import infer_dynamic_kyc, resolve_runtime_country_schema, validate_runtime_address, validate_runtime_phone
+from paypal.smsbower import (
+    COUNTRY_IDS as SMSBOWER_COUNTRY_IDS,
+    DEFAULT_MAX_PRICE as SMSBOWER_DEFAULT_MAX_PRICE,
+    SMSBowerPhoneActivation,
+    SMSBowerPhoneCancelled,
+    SMSBowerPhoneClient,
+    SMSBowerPhoneError,
+)
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "web_static"
@@ -81,6 +89,15 @@ def env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(value, max_value))
 
 
+def env_float(name: str, default: float, min_value: float, max_value: float) -> float:
+    raw = os.getenv(name, "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(value, max_value))
+
+
 PRODUCTION_MODE = env_bool("PAYPAL_WEB_PRODUCTION", False)
 MAX_LOG_LINES = env_int("PAYPAL_WEB_MAX_LOG_LINES", 300, 50, 2000)
 MAX_TOTAL_JOBS = env_int("PAYPAL_WEB_MAX_TOTAL_JOBS", 200, 10, 5000)
@@ -90,6 +107,8 @@ MAX_ACTIVE_JOBS_PER_DEVICE = env_int("PAYPAL_WEB_MAX_ACTIVE_JOBS_PER_DEVICE", 2,
 PROXY_PROBE_LIMIT = env_int("PAYPAL_WEB_PROXY_PROBE_LIMIT", 8, 1, 30)
 JOB_RETENTION_SECONDS = env_int("PAYPAL_WEB_JOB_RETENTION_SECONDS", 24 * 60 * 60, 60, 30 * 24 * 60 * 60)
 OTP_INPUT_TIMEOUT_SECONDS = env_int("PAYPAL_WEB_OTP_TIMEOUT_SECONDS", 30 * 60, 60, 24 * 60 * 60)
+SMSBOWER_OTP_TIMEOUT_SECONDS = 70
+SMSBOWER_MAX_PHONE_ATTEMPTS = env_int("SMSBOWER_MAX_PHONE_ATTEMPTS", 3, 1, 10)
 ALLOW_DEBUG_LOGS = env_bool("PAYPAL_WEB_ALLOW_DEBUG_LOGS", False)
 # Enable complete backend traces without exposing them through the public UI.
 # Set PAYPAL_WEB_FULL_LOGS=0 to disable local full traces.
@@ -104,6 +123,12 @@ DEVICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 BA_TOKEN_RE = re.compile(r"^BA-[A-Za-z0-9]{8,80}$")
 PHONE_RE = re.compile(r"^\+?\d{8,20}$")
 DATADOME_HOST_RE = re.compile(r"(^|\.)captcha-delivery\.com$", re.I)
+
+SMSBOWER_PHONE_CLIENT = SMSBowerPhoneClient(
+    api_url=os.getenv("SMSBOWER_API_URL", "") or "https://smsbower.page/stubs/handler_api.php",
+    poll_interval_seconds=env_float("SMSBOWER_POLL_INTERVAL_SECONDS", 4.0, 0.5, 30.0),
+    otp_timeout_seconds=SMSBOWER_OTP_TIMEOUT_SECONDS,
+)
 
 ACTIVE_STATUSES = {"queued", "running", "awaiting_otp", "awaiting_captcha", "cancelling"}
 RUNNER_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
@@ -783,6 +808,10 @@ class WebJob:
     ba_token: str
     phone: str
     country: str = "BR"
+    sms_provider: str = "manual"
+    sms_service: str = "ts"
+    sms_country: str = ""
+    sms_max_price: float = SMSBOWER_DEFAULT_MAX_PRICE
     buyer_mode: str = "identity_elevation"
     debug: bool = False
     max_card_attempts: int = 5
@@ -793,6 +822,8 @@ class WebJob:
     exclude_public_metrics: bool = False
     proxy_enabled: bool = False
     proxy_label: str = "代理关闭"
+    source_account_email: str = ""
+    account_cookie_count: int = 0
     created_at: float = field(default_factory=now_ts)
     updated_at: float = field(default_factory=now_ts)
     started_at: float | None = None
@@ -812,9 +843,12 @@ class WebJob:
     _captcha_queue: list[str] = field(default_factory=list, repr=False)
     _proxy_config: ProxyConfig | None = field(default=None, repr=False)
     _proxy_pool: list[str] = field(default_factory=list, repr=False)
+    _account_cookies: list[dict[str, Any]] = field(default_factory=list, repr=False)
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _flow: Any = field(default=None, repr=False)
     _browser: ManualBrowserController | None = field(default=None, repr=False)
+    _sms_activation: SMSBowerPhoneActivation | None = field(default=None, repr=False)
+    _sms_activation_finalized: bool = field(default=False, repr=False)
     _slot_held: bool = field(default=False, repr=False)
 
     def set_status(self, status: str, stage: str | None = None) -> None:
@@ -856,6 +890,7 @@ class WebJob:
         ).start()
 
     def _cleanup_cancelled_resources(self) -> None:
+        self.finalize_sms_activation(success=False)
         flow = self._flow
         if flow is not None:
             try:
@@ -868,6 +903,39 @@ class WebJob:
                 browser.stop()
             except Exception:
                 pass
+
+    def attach_sms_activation(self, activation: SMSBowerPhoneActivation) -> None:
+        with self._condition:
+            self._sms_activation = activation
+            self._sms_activation_finalized = False
+            self.phone = activation.phone
+            self.updated_at = now_ts()
+            self._condition.notify_all()
+
+    def sms_activation(self) -> SMSBowerPhoneActivation | None:
+        with self._condition:
+            return self._sms_activation
+
+    def finalize_sms_activation(self, *, success: bool) -> bool:
+        with self._condition:
+            activation = self._sms_activation
+            if activation is None or self._sms_activation_finalized:
+                return False
+            self._sms_activation_finalized = True
+        try:
+            if success:
+                SMSBOWER_PHONE_CLIENT.complete(activation)
+            else:
+                SMSBOWER_PHONE_CLIENT.cancel(activation)
+        except SMSBowerPhoneError as error:
+            self.add_log("WARNING", str(error))
+        finally:
+            with self._condition:
+                if self._sms_activation == activation:
+                    self._sms_activation = None
+                self.updated_at = now_ts()
+                self._condition.notify_all()
+        return True
 
     def mark_cancelled(self) -> None:
         with self._condition:
@@ -1136,6 +1204,14 @@ class WebJob:
                 "ba_token": mask_middle(self.ba_token),
                 "phone": mask_phone(self.phone),
                 "country": self.country,
+                "source_account_email": self.source_account_email,
+                "account_cookie_count": self.account_cookie_count,
+                "sms_provider": self.sms_provider,
+                "sms_service": self.sms_service,
+                "sms_country": self.sms_country,
+                "sms_max_price": self.sms_max_price,
+                "sms_auto": self.sms_provider == "smsbower",
+                "sms_activation_active": self._sms_activation is not None,
                 "buyer_mode": self.buyer_mode,
                 "debug": self.debug and ALLOW_DEBUG_LOGS,
                 "max_card_attempts": self.max_card_attempts,
@@ -1481,6 +1557,8 @@ class WebPayPalFlow(PayPalFlow):
 
     def _confirm_phone_with_retry(self, token: str, signup_url: str):
         """Web version of the CLI input loop."""
+        if self.job.sms_provider == "smsbower":
+            return self._confirm_phone_with_smsbower(token, signup_url)
         phone_example = {
             "BR": "+55119800133818",
             "GB": "+447700900123",
@@ -1541,6 +1619,91 @@ class WebPayPalFlow(PayPalFlow):
                     break
                 except ValueError as e:
                     logger.warning("输入既不是6位验证码，也不是有效手机号：{}。请重新输入。", e)
+
+    def _confirm_phone_with_smsbower(self, token: str, signup_url: str) -> None:
+        """Drive PayPal's phone challenge from one SMSBower activation at a time."""
+
+        last_error = ""
+        for attempt in range(1, SMSBOWER_MAX_PHONE_ATTEMPTS + 1):
+            self.job.check_cancelled()
+            activation = self.job.sms_activation()
+            if activation is None:
+                self.job.set_status(
+                    "running",
+                    f"SMSBower 正在更换 PayPal 手机号（{attempt}/{SMSBOWER_MAX_PHONE_ATTEMPTS}）",
+                )
+                activation = SMSBOWER_PHONE_CLIENT.acquire_phone(
+                    self.country, max_price=self.job.sms_max_price
+                )
+                self.job.attach_sms_activation(activation)
+                self._update_user_phone(activation.phone)
+                logger.info(
+                    "SMSBower replacement number acquired: {}",
+                    self._masked_phone(),
+                )
+
+            try:
+                auth_id, challenge_id = self._initiate_2fa_phone_confirmation(
+                    token, signup_url
+                )
+                try:
+                    SMSBOWER_PHONE_CLIENT.mark_sent(activation)
+                except SMSBowerPhoneError as lifecycle_error:
+                    # Status 1 is optional in SMSBower's documented chronology;
+                    # polling can continue even when the status transition races.
+                    logger.warning("SMSBower readiness update: {}", lifecycle_error)
+                self.job.set_status(
+                    "running",
+                    f"SMSBower 正在等待 PayPal 短信（70 秒超时，{attempt}/{SMSBOWER_MAX_PHONE_ATTEMPTS}）",
+                )
+                logger.info(
+                    "PayPal SMS sent; SMSBower is polling automatically for {}",
+                    self._masked_phone(),
+                )
+                code = SMSBOWER_PHONE_CLIENT.wait_for_code(
+                    activation,
+                    cancel_event=self.job._cancel_event,
+                    timeout_seconds=SMSBOWER_OTP_TIMEOUT_SECONDS,
+                )
+                self.job.check_cancelled()
+                self.job.set_status("running", "SMSBower 已收到验证码，正在提交 PayPal")
+                logger.info("SMSBower returned the PayPal OTP; submitting it automatically")
+                if self._confirm_2fa_phone_confirmation(
+                    token,
+                    signup_url,
+                    auth_id,
+                    challenge_id,
+                    code,
+                ):
+                    self.job.finalize_sms_activation(success=True)
+                    logger.success("SMSBower PayPal phone verification completed")
+                    return
+                last_error = "PayPal 拒绝了 SMSBower 返回的验证码"
+            except SMSBowerPhoneCancelled as error:
+                raise RuntimeError("Task cancelled") from error
+            except Exception as error:
+                last_error = str(error) or type(error).__name__
+                logger.warning(
+                    "SMSBower phone attempt {}/{} failed: {}",
+                    attempt,
+                    SMSBOWER_MAX_PHONE_ATTEMPTS,
+                    redact_text(last_error),
+                )
+
+            self.job.finalize_sms_activation(success=False)
+            if attempt < SMSBOWER_MAX_PHONE_ATTEMPTS:
+                retry_reason = (
+                    "70 秒未返回验证码，已取消当前号码"
+                    if "等待超时" in last_error
+                    else "当前号码未通过，已取消"
+                )
+                self.job.set_status(
+                    "running", retry_reason + "；SMSBower 正在自动换号"
+                )
+
+        raise RuntimeError(
+            "SMSBower PayPal 手机验证失败：" + (last_error or "已达到自动换号次数")
+        )
 
 
 class WebIdentityElevationPayPalFlow(WebPayPalFlow, IdentityElevationPayPalFlow):
@@ -1609,7 +1772,7 @@ def supported_country_codes() -> set[str]:
         return set()
 
 
-VERIFIED_PROTOCOL_COUNTRIES = {"BR", "GB", "US", "JP", "TH", "ID", "PH", "TW", "MX", "AE", "AU", "CA"}
+VERIFIED_PROTOCOL_COUNTRIES = {"BR", "DE", "GB", "US", "JP", "TH", "ID", "PH", "TW", "MX", "AE", "AU", "CA"}
 
 
 def create_job(
@@ -1618,6 +1781,10 @@ def create_job(
     phone: str,
     debug: bool,
     max_card_attempts: int,
+    sms_provider: str = "manual",
+    sms_service: str = "ts",
+    sms_country: str = "",
+    sms_max_price: float = SMSBOWER_DEFAULT_MAX_PRICE,
     manual_funding: bool = False,
     agreement_only: bool = False,
     require_oaics: bool = False,
@@ -1626,6 +1793,8 @@ def create_job(
     buyer_mode: str = "identity_elevation",
     proxy_pool: Any = None,
     exclude_public_metrics: bool = False,
+    source_account_email: str = "",
+    account_cookies: Any = None,
 ) -> WebJob:
     ba_token = extract_ba_token(ba_token)
     require_oaics = bool(require_oaics)
@@ -1635,6 +1804,17 @@ def create_job(
         validate_oaics_checkout(checkout_reference)
         require_oaics = True
         oaics_verified = True
+    sms_provider = str(sms_provider or "manual").strip().lower()
+    if sms_provider not in {"manual", "smsbower"}:
+        raise ValueError("短信来源参数不正确")
+    sms_service = str(sms_service or "ts").strip().lower()
+    sms_country = str(sms_country or country or "BR").strip().upper()
+    try:
+        sms_max_price = round(float(sms_max_price), 4)
+    except (TypeError, ValueError):
+        raise ValueError("SMSBower PayPal 最高价格式无效") from None
+    if not 0.001 <= sms_max_price <= 50:
+        raise ValueError("SMSBower PayPal 最高价必须在 0.001–50 美元之间")
     phone = re.sub(r"[\s().-]+", "", (phone or "").strip())
     country = str(country or "BR").strip().upper()
     buyer_mode = str(buyer_mode or "identity_elevation").strip().lower()
@@ -1643,6 +1823,26 @@ def create_job(
     allowed_countries = supported_country_codes() if ENABLE_DYNAMIC_COUNTRIES else VERIFIED_PROTOCOL_COUNTRIES
     if country not in allowed_countries:
         raise ValueError("PayPal 国家参数不正确")
+    if sms_provider == "smsbower":
+        if sms_service != "ts":
+            raise ValueError("SMSBower 支付设置当前仅支持 PayPal（ts）")
+        if sms_country != country:
+            raise ValueError("验证码国家必须与 PayPal 国家一致")
+        if country not in SMSBOWER_COUNTRY_IDS:
+            raise ValueError("SMSBower 自动取号暂不支持所选 PayPal 国家")
+        if not SMSBOWER_PHONE_CLIENT.configured():
+            raise ValueError("请先在账号工作台设置 SMSBower API Key")
+        # Reuse the existing country validators before the real number is
+        # acquired in the job thread.  The placeholder is never exposed or
+        # passed to PayPal; WebJob stores an empty phone until acquisition.
+        phone = {
+            "BR": "+55119800133818", "DE": "+4915123456789", "GB": "+447700900123",
+            "US": "+12025550123", "JP": "+819012345678",
+            "TH": "+66812345678", "ID": "+6281234567890",
+            "PH": "+639171234567", "TW": "+886912345678",
+            "MX": "+525512345678", "AE": "+971501234567",
+            "AU": "+61412345678", "CA": "+14165550123",
+        }[country]
     if not ba_token:
         raise ValueError("BA Token 不能为空")
     if not BA_TOKEN_RE.fullmatch(ba_token):
@@ -1654,6 +1854,8 @@ def create_job(
     phone_digits = phone.lstrip("+")
     if country == "BR" and not phone_digits.startswith("55"):
         raise ValueError("巴西 PayPal 请填写 +55 手机号")
+    if country == "DE" and not phone_digits.startswith("49"):
+        raise ValueError("德国 PayPal 请填写 +49 手机号")
     if country == "GB" and not phone_digits.startswith("44"):
         raise ValueError("英国 PayPal 请填写 +44 手机号")
     if country == "US" and not phone_digits.startswith("1"):
@@ -1703,13 +1905,27 @@ def create_job(
     debug = bool(debug) and ALLOW_DEBUG_LOGS
     proxy_entries = parse_proxy_pool(proxy_pool)
     proxy_config = build_ephemeral_proxy_config(proxy_entries, country=country)
+    source_account_email = str(source_account_email or "").strip().lower()
+    normalized_account_cookies = (
+        [dict(item) for item in account_cookies[:200] if isinstance(item, dict)]
+        if isinstance(account_cookies, list)
+        else []
+    )
+    if source_account_email and not normalized_account_cookies:
+        raise ValueError("当前账号 Cookie 不能为空")
+    if len(json.dumps(normalized_account_cookies, ensure_ascii=False)) > 262144:
+        raise ValueError("当前账号 Cookie 数据过大")
 
     job = WebJob(
         id=uuid.uuid4().hex[:12],
         owner_device_id=owner_device_id,
         ba_token=ba_token,
-        phone=phone,
+        phone="" if sms_provider == "smsbower" else phone,
         country=country,
+        sms_provider=sms_provider,
+        sms_service=sms_service,
+        sms_country=sms_country if sms_provider == "smsbower" else "",
+        sms_max_price=sms_max_price,
         buyer_mode=buyer_mode,
         debug=debug,
         max_card_attempts=max_card_attempts,
@@ -1720,8 +1936,11 @@ def create_job(
         exclude_public_metrics=bool(exclude_public_metrics),
         proxy_enabled=proxy_config.enabled,
         proxy_label=proxy_config.label,
+        source_account_email=source_account_email,
+        account_cookie_count=len(normalized_account_cookies),
         _proxy_config=proxy_config,
         _proxy_pool=list(proxy_entries),
+        _account_cookies=normalized_account_cookies,
     )
     with JOBS_LOCK:
         prune_jobs_locked()
@@ -1774,6 +1993,7 @@ def create_job(
         JOBS[job.id] = job
     thread = threading.Thread(target=run_job, args=(job,), name=f"paypal-web-{job.id}", daemon=True)
     thread.start()
+    job.add_log("INFO", f"已接收当前账号 Cookie {job.account_cookie_count} 条")
     return job
 
 
@@ -1797,6 +2017,18 @@ def run_job(job: WebJob) -> None:
             )
             job._proxy_config = proxy_config
             job.check_cancelled()
+            if job.sms_provider == "smsbower":
+                job.set_status("running", "SMSBower 正在获取 PayPal 手机号")
+                activation = SMSBOWER_PHONE_CLIENT.acquire_phone(
+                    job.country, max_price=job.sms_max_price
+                )
+                job.attach_sms_activation(activation)
+                logger.info(
+                    "SMSBower PayPal number acquired for {}: {}",
+                    job.country,
+                    mask_phone(activation.phone),
+                )
+                job.check_cancelled()
             user = generate_user(job.phone, country=job.country)
             job.check_cancelled()
             card = generate_card(
@@ -1916,6 +2148,7 @@ def run_job(job: WebJob) -> None:
                 logger.error("Protocol payment job failed: {}", redact_text(exc))
                 job.fail(exc)
         finally:
+            job.finalize_sms_activation(success=False)
             try:
                 record_protocol_metric(job)
             except Exception as metric_error:
@@ -1923,6 +2156,7 @@ def run_job(job: WebJob) -> None:
             job._flow = None
             job._proxy_config = None
             job._proxy_pool = []
+            job._account_cookies = []
             job.release_execution_slot()
 
 
@@ -2006,6 +2240,15 @@ class WebHandler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "time": now_ts()})
         if path == "/api/stats":
             return self.send_json(protocol_metrics_public())
+        if path == "/api/smsbower/status":
+            query = self.parse_query(parsed.query)
+            country = str(query.get("country") or "BR").strip().upper()
+            return self.send_json(
+                {
+                    "ok": True,
+                    **SMSBOWER_PHONE_CLIENT.public_status(country=country, probe=True),
+                }
+            )
         if path == "/api/supported-countries":
             country_path = Path(__file__).resolve().parent / "data" / "paypal_supported_countries.json"
             try:
@@ -2082,6 +2325,10 @@ class WebHandler(BaseHTTPRequestHandler):
                     owner_device_id=self.get_device_id(),
                     ba_token=data.get("ba_token") or data.get("paypal_url", ""),
                     phone=data.get("phone", ""),
+                    sms_provider=data.get("sms_provider") or "manual",
+                    sms_service=data.get("sms_service") or "ts",
+                    sms_country=data.get("sms_country") or data.get("country") or "BR",
+                    sms_max_price=data.get("sms_max_price") or SMSBOWER_DEFAULT_MAX_PRICE,
                     country=data.get("country") or data.get("paypal_country") or "BR",
                     buyer_mode=data.get("buyer_mode") or "identity_elevation",
                     debug=False,
@@ -2097,6 +2344,8 @@ class WebHandler(BaseHTTPRequestHandler):
                     checkout_reference=data.get("checkout_reference", ""),
                     proxy_pool=data.get("proxies") or data.get("proxy_pool"),
                     exclude_public_metrics=internal_auto,
+                    source_account_email=data.get("source_account_email", ""),
+                    account_cookies=data.get("account_cookies"),
                 )
                 return self.send_json({"job": job.to_dict(include_logs=False)}, status=HTTPStatus.CREATED)
             except Exception as exc:

@@ -1269,12 +1269,20 @@ class ConcurrentRegistrationTaskManager:
         self._active_manager_for_email(email).submit_verification_code(email, code)
         return self.snapshot()
 
-    async def stop(self) -> dict[str, Any]:
-        active_managers = [
-            manager
-            for manager in self._processes.values()
-            if manager.snapshot().get("running")
-        ]
+    async def stop(self, process_id: str = "") -> dict[str, Any]:
+        """Stop one registration process, or every active process when omitted."""
+        target_process_id = str(process_id or "").strip()
+        if target_process_id:
+            manager = self._processes.get(target_process_id)
+            if manager is None:
+                raise ValueError("注册流程不存在或已归档")
+            active_managers = [manager] if manager.snapshot().get("running") else []
+        else:
+            active_managers = [
+                manager
+                for manager in self._processes.values()
+                if manager.snapshot().get("running")
+            ]
         if active_managers:
             await asyncio.gather(*(manager.stop() for manager in active_managers))
         return self.snapshot()

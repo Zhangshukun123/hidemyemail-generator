@@ -74,9 +74,11 @@ from hidemyemail_generator.openai_account_security import (
     add_password_via_account_api as add_password_via_account_api_impl,
 )
 from hidemyemail_generator.openai_browser_cli import prepare_registration_proxy
+from hidemyemail_generator.openai_browser_selectors import PASSWORD_CONTINUE_SELECTORS
 from hidemyemail_generator.openai_mfa import MfaSetupError
 from hidemyemail_generator.openai_registration_otp import EmailVerificationPageAdvanced
 from hidemyemail_generator.openai_registration_flow import (
+    _detect_verification_language,
     configure_lightweight_registration_resources,
 )
 from hidemyemail_generator.registration_activity import (
@@ -184,6 +186,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
         class Field:
             def __init__(self):
                 self.value = ""
+                self.type_calls = 0
 
             def input_value(self, **_kwargs):
                 return self.value
@@ -196,7 +199,8 @@ class BrowserTaskHelperTests(unittest.TestCase):
                 self.value = value
 
             def type(self, value, **_kwargs):
-                self.value += value
+                self.type_calls += 1
+                raise AssertionError("OTP must use atomic fill, not keyboard typing")
 
         class Page:
             @staticmethod
@@ -218,8 +222,55 @@ class BrowserTaskHelperTests(unittest.TestCase):
         ensure_email_verification_code_entered(worker, Page(), "123456")
 
         self.assertEqual(worker.field.value, "123456")
+        self.assertEqual(worker.field.type_calls, 0)
+        self.assertEqual(worker._hme_otp_input_attestation["stableReads"], 2)
         self.assertIn("输入检查通过", worker.logs[-1])
-        self.assertIn("现在点击继续", worker.logs[-1])
+        self.assertIn("立即点击继续", worker.logs[-1])
+
+    def test_email_otp_value_that_changes_between_reads_never_opens_submit_gate(self):
+        class Field:
+            def __init__(self):
+                self.value = ""
+                self.reads_after_fill = 0
+
+            @staticmethod
+            def evaluate(_script):
+                return "unstable-otp-field"
+
+            def input_value(self, **_kwargs):
+                if not self.value:
+                    return ""
+                self.reads_after_fill += 1
+                if self.reads_after_fill >= 2:
+                    self.value = ""
+                return self.value
+
+            def fill(self, value):
+                self.value = value
+                self.reads_after_fill = 0
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.field = Field()
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _visible_inputs(self, _page, _selectors):
+                return [self.field]
+
+        worker = Worker()
+        with self.assertRaisesRegex(RuntimeError, "已阻止提交"):
+            ensure_email_verification_code_entered(worker, Page(), "123456")
+
+        self.assertIsNone(worker._hme_otp_input_attestation)
+        self.assertTrue(any("重新定位" in line for line in worker.logs))
 
     def test_email_otp_deduplicates_locators_for_the_same_dom_input(self):
         state = {"value": ""}
@@ -266,7 +317,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         self.assertEqual(state["value"], "123456")
         self.assertIn("输入检查通过", worker.logs[-1])
-        self.assertIn("现在点击继续", worker.logs[-1])
+        self.assertIn("立即点击继续", worker.logs[-1])
 
     def test_registration_page_recognition_reports_done_and_next_action(self):
         class Candidate:
@@ -2841,6 +2892,50 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(worker._has_otp_input(page))
         self.assertEqual(actions, ["password"])
         self.assertEqual(worker.continue_calls, 1)
+
+    def test_password_choice_uses_locale_independent_route(self):
+        self.assertEqual(
+            PASSWORD_CONTINUE_SELECTORS[0],
+            'a[href="/create-account/password"]',
+        )
+        self.assertIn(
+            'button:has-text("Continuer avec un mot de passe")',
+            PASSWORD_CONTINUE_SELECTORS,
+        )
+        self.assertIn(
+            'button:has-text("Mit Passwort fortfahren")',
+            PASSWORD_CONTINUE_SELECTORS,
+        )
+        self.assertIn(
+            'button:has-text("Continuar con contraseña")',
+            PASSWORD_CONTINUE_SELECTORS,
+        )
+        self.assertIn(
+            'button:has-text("비밀번호로 계속")',
+            PASSWORD_CONTINUE_SELECTORS,
+        )
+
+    def test_thai_and_brazilian_portuguese_password_registration_locales(self):
+        self.assertEqual(
+            _detect_verification_language(
+                "ตรวจสอบกล่องข้อความของคุณ ดำเนินการต่อด้วยรหัสผ่าน"
+            ),
+            "泰文（泰国）",
+        )
+        self.assertEqual(
+            _detect_verification_language(
+                "Confira sua caixa de entrada Continuar com uma senha"
+            ),
+            "葡萄牙文（巴西）",
+        )
+        self.assertIn(
+            'button:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
+            PASSWORD_CONTINUE_SELECTORS,
+        )
+        self.assertIn(
+            'button:has-text("Continuar com uma senha")',
+            PASSWORD_CONTINUE_SELECTORS,
+        )
 
     def test_direct_email_code_submit_forces_password_then_uses_new_code_window(self):
         actions = []

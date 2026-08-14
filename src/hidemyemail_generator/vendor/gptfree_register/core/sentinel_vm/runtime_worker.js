@@ -83,6 +83,8 @@ const rectProfile = (profile.dom || {}).rect || {};
 const pageUrl = profile.url || 'https://auth.openai.com/about-you';
 const language = navigatorProfile.language || input.language || 'en-US';
 const languages = navigatorProfile.languages || [language, 'en'];
+const timezone = profile.timezone || 'UTC';
+process.env.TZ = timezone;
 
 function genericElement(tagName) {
   const elementListeners = new Map();

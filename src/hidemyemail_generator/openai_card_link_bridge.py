@@ -107,7 +107,7 @@ def main() -> int:
             checkout = app_backend.generate_opll_de_oaics_paypal_link(
                 token,
                 create_proxy_url,
-                "",
+                promotion_proxy_url,
                 "0",
                 account_email=str(args.account_email or "").strip(),
             )

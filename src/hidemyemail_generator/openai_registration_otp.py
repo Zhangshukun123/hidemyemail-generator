@@ -417,6 +417,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
             or str(attestation.get("pageUrl") or "")
             != str(getattr(page, "url", "") or "")
             or time.monotonic() - float(attestation.get("verifiedAt") or 0.0) > 5.0
+            or int(attestation.get("stableReads") or 0) < 2
         ):
             raise RuntimeError("验证码输入尚未完成回读确认，已阻止点击继续")
         inputs = visible_inputs_with_localized_email_code(
@@ -468,8 +469,8 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
                     candidate.click(timeout=5000, no_wait_after=True)
                     worker._hme_otp_visible_submit = True
                     worker.log(
-                        "[验证码] 输入框已回读一致；已直接点击当前页面的继续按钮，"
-                        "未刷新验证码页面"
+                        "[验证码] 提交前已再次回读一致；已立即点击当前页面的继续按钮，"
+                        "未等待键盘焦点、未刷新验证码页面"
                     )
                     return ""
                 except Exception:

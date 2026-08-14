@@ -677,8 +677,16 @@ class SentinelTokenProvider:
     BACKEND_URL = "https://sentinel.openai.com/backend-api/sentinel/"
     FRAME_REFERER = "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
 
-    def __init__(self, impersonate: str = "chrome136", cookies: dict = None):
+    def __init__(
+        self,
+        impersonate: str = "chrome136",
+        cookies: dict = None,
+        language: str = "en-US",
+        timezone_name: str = "UTC",
+    ):
         self.impersonate = impersonate
+        self.language = str(language or "en-US")
+        self.timezone_name = str(timezone_name or "UTC")
         self._session: Optional[requests.AsyncSession] = None
         self.sid = str(uuid.uuid4())
         self._cookies = cookies or {}
@@ -696,14 +704,27 @@ class SentinelTokenProvider:
     def _browser_profile(self, device_id: str):
         from gpt_trial_protocol.models import BrowserProfile
 
+        firefox = str(self.impersonate or "").casefold().startswith("firefox")
         return BrowserProfile(
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+                "Gecko/20100101 Firefox/144.0"
+                if firefox
+                else (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.0.0 Safari/537.36"
+                )
             ),
-            sec_ch_ua='"Chromium";v="136", "Not=A?Brand";v="24", "Google Chrome";v="136"',
-            language="en-US",
+            sec_ch_ua=(
+                ""
+                if firefox
+                else '"Chromium";v="136", "Not=A?Brand";v="24", "Google Chrome";v="136"'
+            ),
+            sec_ch_ua_platform="" if firefox else '"Windows"',
+            sec_ch_ua_mobile="" if firefox else "?0",
+            language=self.language,
+            timezone=self.timezone_name,
             device_id=device_id,
         )
 
@@ -721,7 +742,11 @@ class SentinelTokenProvider:
 
     async def _get_session(self) -> requests.AsyncSession:
         if not self._session:
-            self._session = requests.AsyncSession(impersonate=self.impersonate)
+            profile = self._browser_profile(self._device_id or str(uuid.uuid4()))
+            self._session = requests.AsyncSession(
+                impersonate=self.impersonate,
+                headers={"accept-language": profile.language_header()},
+            )
         return self._session
 
     async def _post_proof(self, proof: str, flow: str) -> dict:

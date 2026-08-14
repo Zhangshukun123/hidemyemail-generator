@@ -32,6 +32,7 @@ from hidemyemail_generator.webapp import (
     _generation_failure_message,
     _latest_code_for_email,
     _load_local_env_file,
+    _save_account_card_link,
     create_app,
 )
 
@@ -360,7 +361,83 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(bridge.await_args.kwargs["locale"], "ja-JP")
 
-    async def test_registration_callback_probes_de_checkout_with_br_kookeey(self):
+    async def test_one_click_paypal_uses_matching_country_cookie_proxy_and_sms(self):
+        cookies = [{"name": "session", "value": "current-account-cookie", "domain": ".openai.com"}]
+        _save_account_record(
+            self.app["db_file"],
+            "card-link@icloud.com",
+            result={"cookies_json": json.dumps(cookies)},
+        )
+        _save_account_card_link(
+            self.app["db_file"],
+            "card-link@icloud.com",
+            url="https://www.paypal.com/agreements/approve?ba_token=th_one_click",
+            country="TH",
+            currency="THB",
+            method="de_oaics_paypal",
+        )
+        self.app["registration_proxy_store"].configure(
+            enabled=True,
+            mode="dynamic",
+            country="TH",
+            proxy_line="proxy.example:8000:shared-user:shared-pass",
+        )
+        self.app["smsbower_config_store"].configure(api_key="smsbower-test-key")
+        created = mock.AsyncMock(return_value=(201, {"job": {"id": "pay-th-1"}}))
+        with mock.patch.object(self.app["paypal_service"], "create_job", created):
+            response = await self.client.post(
+                "/api/account/paypal-payment",
+                json={"email": "card-link@icloud.com"},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        protocol = created.await_args.args[0]
+        self.assertEqual(response.status, 201)
+        self.assertEqual(payload["country"], "TH")
+        self.assertEqual(payload["smsProvider"], "smsbower")
+        self.assertEqual(protocol["source_account_email"], "card-link@icloud.com")
+        self.assertEqual(protocol["account_cookies"], cookies)
+        self.assertEqual(protocol["country"], "TH")
+        self.assertEqual(protocol["sms_provider"], "smsbower")
+        self.assertIn("-region-TH-sid-", unquote(urlsplit(protocol["proxy_pool"][0]).username or ""))
+        self.assertIn("paypal_web_device_id=", response.headers.get("Set-Cookie", ""))
+
+    async def test_one_click_paypal_ignores_manual_country_and_uses_link_country(self):
+        _save_account_record(
+            self.app["db_file"],
+            "card-link@icloud.com",
+            result={"cookies_json": '[{"name":"session","value":"cookie"}]'},
+        )
+        _save_account_card_link(
+            self.app["db_file"],
+            "card-link@icloud.com",
+            url="https://www.paypal.com/agreements/approve?ba_token=th_country_lock",
+            country="TH",
+            currency="THB",
+            method="de_oaics_paypal",
+        )
+        self.app["registration_proxy_store"].configure(
+            enabled=True,
+            mode="dynamic",
+            country="TH",
+            proxy_line="proxy.example:8000:shared-user:shared-pass",
+        )
+        self.app["smsbower_config_store"].configure(api_key="smsbower-test-key")
+        created = mock.AsyncMock(return_value=(201, {"job": {"id": "pay-th-auto"}}))
+        with mock.patch.object(self.app["paypal_service"], "create_job", created):
+            response = await self.client.post(
+                "/api/account/paypal-payment",
+                json={"email": "card-link@icloud.com", "country": "US"},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 201)
+        self.assertEqual(payload["country"], "TH")
+        self.assertEqual(created.await_args.args[0]["country"], "TH")
+
+    async def test_registration_callback_uses_configured_first_card_link_proxy(self):
         email = "probe@icloud.com"
         _save_account_record(
             self.app["db_file"],
@@ -380,10 +457,12 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        self.app["registration_proxy_store"].configure(
+        self.app["card_link_proxy_store"].configure(
             enabled=True,
             mode="kookeey",
             country="JP",
+            card_link_countries={"de": "TH"},
+            card_link_modes={"de_oaics_paypal": "kookeey"},
             proxy_line=(
                 "gate.kookeey.info:1000:1234567-AbCdEf1234:private-secret"
             ),
@@ -391,7 +470,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_proxy_test(_proxy_url, expected_country):
             return {
-                "exitIp": "203.0.113.10" if expected_country == "BR" else "192.0.2.10",
+                "exitIp": "203.0.113.10" if expected_country == "TH" else "192.0.2.10",
                 "country": expected_country,
                 "latencyMs": 125,
             }
@@ -422,18 +501,19 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe["checkout_id_type"], "oaics")
         self.assertEqual(probe["registration_environment"]["exit_ip"], "192.0.2.10")
         self.assertEqual(probe["checkout_proxy"]["proxy_mode"], "kookeey")
-        self.assertEqual(probe["checkout_proxy"]["proxy_country"], "BR")
+        self.assertEqual(probe["checkout_proxy"]["proxy_country"], "TH")
+        self.assertEqual(probe["checkout_proxy"]["proxy_role"], "first_card_link_proxy")
         self.assertEqual(probe["checkout_proxy"]["exit_ip"], "203.0.113.10")
         self.assertTrue(probe["differences"]["proxy_mode_changed"])
         self.assertTrue(probe["differences"]["proxy_country_changed"])
         self.assertEqual(bridge.await_args.kwargs["method"], "oaics_probe")
         self.assertEqual(bridge.await_args.kwargs["country"], "DE")
         self.assertEqual(bridge.await_args.kwargs["currency"], "EUR")
-        self.assertIn("-BR-", bridge.await_args.kwargs["create_proxy_url"])
+        self.assertIn("-TH-", bridge.await_args.kwargs["create_proxy_url"])
         self.assertIn("gate.kookeey.info:1000", bridge.await_args.kwargs["create_proxy_url"])
         self.assertNotIn("private-secret", json.dumps(probe))
 
-    async def test_registration_callback_retries_failed_probe_with_fresh_br_proxy(self):
+    async def test_registration_callback_retries_probe_with_fresh_first_proxy(self):
         email = "probe-retry@icloud.com"
         _save_account_record(
             self.app["db_file"],
@@ -448,10 +528,12 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        self.app["registration_proxy_store"].configure(
+        self.app["card_link_proxy_store"].configure(
             enabled=True,
             mode="kookeey",
             country="JP",
+            card_link_countries={"de": "GB"},
+            card_link_modes={"de_oaics_paypal": "kookeey"},
             proxy_line=(
                 "gate.kookeey.info:1000:1234567-AbCdEf1234:private-secret"
             ),
@@ -513,9 +595,91 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(call.kwargs["locale"] == "de-DE" for call in bridge.await_args_list)
         )
-        self.assertTrue(all("-BR-" in proxy for proxy in proxies))
+        self.assertTrue(all("-GB-" in proxy for proxy in proxies))
         self.assertEqual(len(set(proxies)), 3)
         self.assertNotIn("private-secret", json.dumps(probe))
+
+    async def test_cs_live_retries_until_attempt_limit_then_returns_link(self):
+        classified = {
+            "status": "classified",
+            "classification": "cs_live",
+            "checkout_id_type": "cs_live",
+            "method": "de_oaics_paypal",
+        }
+        generated = {
+            "status": "success",
+            "url": "https://www.paypal.com/agreements/approve?ba_token=retry_limit",
+            "method": "de_oaics_paypal",
+            "country": "DE",
+            "currency": "EUR",
+        }
+        bridge = mock.AsyncMock(side_effect=[classified, classified, generated])
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=bridge,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "de_oaics_paypal",
+                    "create_proxy": "create.example:8000:user:pass",
+                    "attempt_limit": 5,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(bridge.await_count, 3)
+        self.assertEqual(payload["cardLinkStatus"], "generated")
+        self.assertEqual(payload["attemptCount"], 3)
+        self.assertEqual(payload["attemptLimit"], 5)
+        self.assertFalse(payload["attemptsExhausted"])
+
+    async def test_cs_live_stops_only_after_attempt_limit_is_exhausted(self):
+        classified = {
+            "status": "classified",
+            "classification": "cs_live",
+            "checkout_id_type": "cs_live",
+            "method": "de_oaics_paypal",
+        }
+        bridge = mock.AsyncMock(return_value=classified)
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=bridge,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "de_oaics_paypal",
+                    "create_proxy": "create.example:8000:user:pass",
+                    "attempt_limit": 3,
+                    "force_retry": True,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(bridge.await_count, 3)
+        self.assertEqual(payload["cardLinkStatus"], "cs_live")
+        self.assertEqual(payload["attemptCount"], 3)
+        self.assertEqual(payload["attemptLimit"], 3)
+        self.assertTrue(payload["attemptsExhausted"])
 
     async def test_failed_checkout_probe_can_be_retried_from_account_action(self):
         callback = mock.AsyncMock(
@@ -539,7 +703,45 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue(payload["is_oaics"])
         self.assertEqual(payload["attempt_count"], 2)
-        callback.assert_awaited_once_with("probe-retry@icloud.com")
+        callback.assert_awaited_once_with("probe-retry@icloud.com", force=True)
+
+    async def test_registration_stop_targets_only_requested_process(self):
+        manager = mock.Mock()
+        manager.stop = mock.AsyncMock(
+            return_value={"runningCount": 1, "tasks": [{"processId": "process-b"}]}
+        )
+        manager.close = mock.AsyncMock()
+        self.app["registration_manager"] = manager
+
+        response = await self.client.post(
+            "/api/registration/stop",
+            json={"process_id": "process-a"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["task"]["runningCount"], 1)
+        manager.stop.assert_awaited_once_with(process_id="process-a")
+
+    async def test_protocol_stop_targets_only_requested_process(self):
+        manager = mock.Mock()
+        manager.stop = mock.AsyncMock(
+            return_value={"runningCount": 1, "tasks": [{"processId": "protocol-b"}]}
+        )
+        manager.close = mock.AsyncMock()
+        self.app["protocol_registration_manager"] = manager
+
+        response = await self.client.post(
+            "/api/protocol-registration/stop",
+            json={"processId": "protocol-a"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["task"]["runningCount"], 1)
+        manager.stop.assert_awaited_once_with(process_id="protocol-a")
 
     async def test_rejects_unsupported_card_region(self):
         response = await self.client.post(
@@ -622,7 +824,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("代理", (await response.json())["error"])
 
     async def test_resolves_selected_card_link_countries_from_saved_proxy(self):
-        self.app["registration_proxy_store"].configure(
+        self.app["card_link_proxy_store"].configure(
             enabled=False,
             country="NL",
             proxy_line="proxy.example:3010:private-user:private-password",
@@ -728,7 +930,207 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
             bridge.await_args.kwargs["account_email"], "card-link@icloud.com"
         )
 
-    async def test_marks_de_cs_live_and_skips_only_that_mode_next_time(self):
+    async def test_independent_extraction_proxy_selects_first_and_second_exits(self):
+        self.app["card_link_proxy_store"].configure(
+            enabled=True,
+            mode="dynamic",
+            country="DE",
+            proxy_line="extract.example:3010:extract-user:extract-password",
+        )
+        generated = {
+            "status": "success",
+            "url": "https://www.paypal.com/agreements/approve?ba_token=independent_pair",
+            "method": "de_oaics_paypal",
+            "country": "DE",
+            "currency": "EUR",
+        }
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(return_value=generated),
+            ) as bridge,
+        ):
+            first = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "de_oaics_paypal",
+                    "proxy_mode": "dynamic",
+                    "create_proxy_country": "US",
+                    "secondary_proxy_country": "TH",
+                    "reuse_registration_proxy": False,
+                    "independent_proxy_pair": True,
+                    "promotion_proxy_choice": "second",
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            first_call = bridge.await_args.kwargs
+            retry = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "de_oaics_paypal",
+                    "proxy_mode": "dynamic",
+                    "create_proxy_country": "US",
+                    "secondary_proxy_country": "TH",
+                    "reuse_registration_proxy": False,
+                    "independent_proxy_pair": True,
+                    "use_secondary_proxy": True,
+                    "promotion_proxy_choice": "first",
+                    "force_retry": True,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            retry_call = bridge.await_args.kwargs
+
+        self.assertEqual(first.status, 200)
+        self.assertEqual(retry.status, 200)
+        self.assertIn("-region-US-sid-", unquote(urlsplit(first_call["create_proxy_url"]).username or ""))
+        self.assertIn("-region-TH-sid-", unquote(urlsplit(first_call["promotion_proxy_url"]).username or ""))
+        self.assertIn("-region-TH-sid-", unquote(urlsplit(retry_call["create_proxy_url"]).username or ""))
+        self.assertIn("-region-US-sid-", unquote(urlsplit(retry_call["promotion_proxy_url"]).username or ""))
+
+    async def test_quick_flow_reuses_registration_ip_and_only_retry_uses_second_ip(self):
+        email = "shared-proxy@icloud.com"
+        first_proxy = "http://same-user:same-pass@register.example:8000"
+        _save_account_record(
+            self.app["db_file"],
+            email,
+            result={
+                "access_token": "at-shared-proxy",
+                "session_json": '{"accessToken":"at-shared-proxy"}',
+                "registration_proxy_url": first_proxy,
+                "registration_environment": {
+                    "proxy_mode": "dynamic",
+                    "proxy_country": "DE",
+                },
+            },
+        )
+        self.app["registration_proxy_store"].configure(
+            enabled=True,
+            mode="dynamic",
+            country="DE",
+            proxy_line="fresh.example:3010:shared-user:shared-password",
+        )
+        generated = {
+            "status": "success",
+            "url": "https://www.paypal.com/agreements/approve?ba_token=shared_proxy",
+            "method": "de_oaics_paypal",
+            "country": "DE",
+            "currency": "EUR",
+        }
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(return_value=generated),
+            ) as bridge,
+        ):
+            first = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": email,
+                    "method": "de_oaics_paypal",
+                    "proxy_mode": "dynamic",
+                    "create_proxy_country": "DE",
+                    "secondary_proxy_country": "DE",
+                    "reuse_registration_proxy": True,
+                    "promotion_proxy_choice": "first",
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            first_call = bridge.await_args.kwargs
+            retry = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": email,
+                    "method": "de_oaics_paypal",
+                    "proxy_mode": "dynamic",
+                    "create_proxy_country": "DE",
+                    "secondary_proxy_country": "DE",
+                    "reuse_registration_proxy": True,
+                    "use_secondary_proxy": True,
+                    "promotion_proxy_choice": "first",
+                    "force_retry": True,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            retry_call = bridge.await_args.kwargs
+
+        self.assertEqual(first.status, 200)
+        self.assertEqual(retry.status, 200)
+        self.assertEqual(first_call["create_proxy_url"], first_proxy)
+        self.assertEqual(first_call["promotion_proxy_url"], first_proxy)
+        self.assertNotEqual(retry_call["create_proxy_url"], first_proxy)
+        self.assertIn("-region-DE-sid-", unquote(urlsplit(retry_call["create_proxy_url"]).username or ""))
+        self.assertEqual(retry_call["promotion_proxy_url"], first_proxy)
+
+    async def test_quick_flow_can_update_promotion_with_second_ip(self):
+        email = "promotion-second@icloud.com"
+        first_proxy = "http://same-user:same-pass@register.example:8000"
+        _save_account_record(
+            self.app["db_file"],
+            email,
+            result={
+                "access_token": "at-promotion-second",
+                "session_json": '{"accessToken":"at-promotion-second"}',
+                "registration_proxy_url": first_proxy,
+                "registration_environment": {
+                    "proxy_mode": "dynamic",
+                    "proxy_country": "DE",
+                },
+            },
+        )
+        self.app["registration_proxy_store"].configure(
+            enabled=True,
+            mode="dynamic",
+            country="DE",
+            proxy_line="fresh.example:3010:shared-user:shared-password",
+        )
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(return_value={
+                    "status": "success",
+                    "url": "https://www.paypal.com/agreements/approve?ba_token=promotion_second",
+                    "method": "de_oaics_paypal",
+                    "country": "DE",
+                    "currency": "EUR",
+                }),
+            ) as bridge,
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": email,
+                    "method": "de_oaics_paypal",
+                    "proxy_mode": "dynamic",
+                    "create_proxy_country": "DE",
+                    "secondary_proxy_country": "DE",
+                    "reuse_registration_proxy": True,
+                    "promotion_proxy_choice": "second",
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        call = bridge.await_args.kwargs
+        self.assertEqual(response.status, 200)
+        self.assertEqual(call["create_proxy_url"], first_proxy)
+        self.assertNotEqual(call["promotion_proxy_url"], first_proxy)
+        self.assertIn("-region-DE-sid-", unquote(urlsplit(call["promotion_proxy_url"]).username or ""))
+
+    async def test_marks_de_cs_live_but_force_retry_reprocesses_same_account(self):
         classified = {
             "status": "classified",
             "classification": "cs_live",
@@ -781,6 +1183,48 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account["cardLinkStatus"], "cs_live")
         self.assertEqual(account["cardLinkMethod"], "de_oaics_paypal")
         self.assertFalse(account["cardLink"])
+
+        retried_link = "https://www.paypal.com/agreements/approve?ba_token=retry_same_account"
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(
+                    return_value={
+                        "status": "success",
+                        "url": retried_link,
+                        "method": "de_oaics_paypal",
+                        "country": "DE",
+                        "currency": "EUR",
+                    }
+                ),
+            ) as retry_bridge,
+        ):
+            retried = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "de_oaics_paypal",
+                    "create_proxy": "create.example:8000:user:pass",
+                    "force_retry": True,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        retried_payload = await retried.json()
+        self.assertEqual(retried.status, 200)
+        self.assertEqual(retried_payload["cardLinkStatus"], "generated")
+        self.assertEqual(retried_payload["url"], retried_link)
+        retry_bridge.assert_awaited_once()
+        self.assertEqual(
+            load_account_record(
+                self.app["db_file"], "card-link@icloud.com"
+            )["card_link"]["url"],
+            retried_link,
+        )
 
         ph_generated = {
             "status": "success",

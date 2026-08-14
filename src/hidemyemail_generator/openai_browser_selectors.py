@@ -109,6 +109,13 @@ ONE_TIME_CODE_LOGIN_SELECTORS = (
     'text="ワンタイムコードでログインする"',
 )
 PASSWORD_CONTINUE_SELECTORS = (
+    # The href is stable across every OpenAI locale, unlike the rendered CTA.
+    # Keep semantic route selectors first so registration supports languages
+    # that are not explicitly listed below.
+    'a[href="/create-account/password"]',
+    'a[href$="/create-account/password"]',
+    'a[href="/log-in/password"]',
+    'a[href$="/log-in/password"]',
     'button:has-text("Continue with password")',
     '[role="button"]:has-text("Continue with password")',
     'a:has-text("Continue with password")',
@@ -121,6 +128,22 @@ PASSWORD_CONTINUE_SELECTORS = (
     'button:has-text("パスワードで続行")',
     '[role="button"]:has-text("パスワードで続行")',
     'a:has-text("パスワードで続行")',
+    'button:has-text("Continuer avec un mot de passe")',
+    'a:has-text("Continuer avec un mot de passe")',
+    'button:has-text("Mit Passwort fortfahren")',
+    'a:has-text("Mit Passwort fortfahren")',
+    'button:has-text("Continuar con contraseña")',
+    'a:has-text("Continuar con contraseña")',
+    'button:has-text("Continuar com a senha")',
+    'a:has-text("Continuar com a senha")',
+    'button:has-text("Continuar com uma senha")',
+    '[role="button"]:has-text("Continuar com uma senha")',
+    'a:has-text("Continuar com uma senha")',
+    'button:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
+    '[role="button"]:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
+    'a:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
+    'button:has-text("비밀번호로 계속")',
+    'a:has-text("비밀번호로 계속")',
 )
 PASSWORD_RESET_CONFIRM_MARKERS = (
     "reset your password",

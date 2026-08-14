@@ -58,6 +58,20 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-src="/paypal-pay/"', page)
         self.assertIn("/api/paypal/status", page)
         self.assertIn("renderPayPal", page)
+        self.assertIn("提取链接成功", page)
+        self.assertIn('data-action="one-click-paypal-payment"', page)
+        self.assertIn('this.commands.register("one-click-paypal-payment"', page)
+        self.assertIn("/api/account/paypal-payment", page)
+        self.assertIn('this.api.post("/api/account/paypal-payment", { email })', page)
+        self.assertIn("根据提链记录自动使用国家", page)
+        self.assertNotIn('data-payment-country="1"', page)
+        self.assertIn("支付地址</span><strong>自动匹配", page)
+        self.assertIn("当前账号 Cookie、通用代理与 SMSBower", page)
+        self.assertIn("单账号提链次数", page)
+        self.assertIn("返回 cs_live 时自动继续同模式提链", page)
+        self.assertIn("attempt_limit:", page)
+        self.assertIn('cardLinkCountries: { de: $("quickExtractionFirstProxyCountry").value }', page)
+        self.assertIn('cardLinkModes: { de_oaics_paypal: $("quickExtractionProxyMode").value }', page)
         self.assertIn("协议注册", page)
         self.assertIn('id="protocolRegistrationPanel"', page)
         self.assertNotIn('data-route="protocol-registration"', page)
@@ -68,7 +82,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("/api/protocol-registration/start", page)
         self.assertIn("/api/protocol-registration/status", page)
         self.assertIn("renderProtocolRegistration", page)
-        self.assertIn("添加密码", page)
+        self.assertIn("设置密码", page)
         self.assertIn("激活 2FA", page)
         self.assertIn('item.checkoutIdType === "oaics"', page)
         self.assertIn('"OAICS"', page)
@@ -93,6 +107,15 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("无头浏览器", page)
         self.assertIn("有头浏览器", page)
         self.assertIn("Mail Auth · 无浏览器", page)
+        self.assertIn("Mail Auth 协议（先设置密码）", page)
+        self.assertIn("无浏览器先设置账号密码", page)
+        password_step = page.index('data-protocol-stage="password"')
+        otp_step = page.index('data-protocol-stage="email_verification"')
+        self.assertLess(password_step, otp_step)
+        self.assertIn(
+            'const stageOrder = ["password", "email_verification", "session", "two_factor", "completed"]',
+            page,
+        )
         self.assertIn('$("protocolRegistrationPanel").hidden = !protocolMode', page)
         self.assertIn('$("taskPanel").hidden = protocolMode', page)
         self.assertIn('browser_engine: mode === "roxy" ? "roxy" : "camoufox"', page)
@@ -100,6 +123,14 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="roxyProfile"', page)
         self.assertIn("/api/roxy-registration/status", page)
         self.assertIn('localStorage.setItem("hme_registration_mode", mode)', page)
+
+    def test_account_plan_filter_includes_oai_accounts(self):
+        page = build_app_page()
+
+        self.assertIn('<option value="oai">OAI 账号</option>', page)
+        self.assertIn('plan === "oai"', page)
+        self.assertIn('item.checkoutIsOaics', page)
+        self.assertIn('item.checkoutIdType === "oaics"', page)
 
     def test_protocol_registration_uses_inventory_entry_without_account_picker(self):
         page = build_app_page()
@@ -126,8 +157,16 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-route="network"', page)
         self.assertIn('id="networkView" data-view="network"', page)
         self.assertIn('id="registrationProxyPanel"', page)
+        self.assertIn('id="cardLinkProxyPanel"', page)
         self.assertIn("代理与线路", page)
         self.assertIn("代理与注册方式互相独立", page)
+        self.assertIn("注册代理与提链代理分开配置", page)
+        self.assertIn("提链代理独立配置", page)
+        self.assertIn('data-action="save-card-link-proxy"', page)
+        self.assertIn('data-action="test-card-link-proxy"', page)
+        self.assertIn("/api/card-link-proxy/status", page)
+        self.assertIn("/api/card-link-proxy/config", page)
+        self.assertIn("cardLinkProxy: data", page)
         self.assertIn("无头浏览器、有头浏览器、Roxy 和协议注册都会使用该出口", page)
         self.assertIn('value="kookeey">Kookeey 动态住宅', page)
         self.assertIn("国家、8 位 Session 和 5m", page)
@@ -154,6 +193,16 @@ class StructuredWebUiTests(unittest.TestCase):
 
     def test_card_link_uses_saved_proxy_country_selectors(self):
         page = build_app_page()
+        webapp_source = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "hidemyemail_generator"
+            / "webapp.py"
+        ).read_text(encoding="utf-8")
+        card_link_handler = webapp_source[
+            webapp_source.index("async def create_card_link"):
+            webapp_source.index("async def retry_registration_checkout_probe")
+        ]
 
         self.assertIn('id="cardLinkCreateProxyCountry"', page)
         self.assertIn('id="cardLinkPromotionProxyCountry"', page)
@@ -165,6 +214,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("promotion_proxy_country", page)
         self.assertNotIn('id="cardLinkCreateProxy" type="password"', page)
         self.assertNotIn('id="cardLinkPromotionProxy" type="password"', page)
+        self.assertIn('app["registration_proxy_store"]', card_link_handler)
+        self.assertIn('app["card_link_proxy_store"]', card_link_handler)
 
     def test_card_link_supports_saved_proxy_mode_and_one_click_extraction(self):
         page = build_app_page()
@@ -178,8 +229,89 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('this.commands.register("generate-all-card-links"', page)
         self.assertIn("cardLinkMarkedForMethod", page)
         self.assertIn('item?.cardLinkMethod === method', page)
-        self.assertIn("cs_live 已标注", page)
-        self.assertIn("当前模式不再提链", page)
+        self.assertIn("cs_live 可重新提链", page)
+        self.assertIn("重新提链当前账号", page)
+        self.assertIn("force_retry: cardLinkMarkedForMethod(item, method)", page)
+
+    def test_one_click_registration_and_card_link_is_a_separate_pipeline_module(self):
+        page = build_app_page()
+
+        self.assertIn('data-route="quick-flow"', page)
+        self.assertIn('id="quickFlowView" data-view="quick-flow"', page)
+        self.assertIn("一键注册并提链", page)
+        self.assertIn('id="quickRegistrationMode"', page)
+        self.assertIn('id="quickRegistrationProxyMode"', page)
+        self.assertIn('id="quickRegistrationProxyCountry"', page)
+        self.assertIn('<option value="direct">本机 IP 直连</option>', page)
+        self.assertIn('id="quickRegistrationTargetCount"', page)
+        self.assertIn('id="quickCardLinkMethod"', page)
+        self.assertIn('data-action="start-quick-flow"', page)
+        self.assertIn('id="quickFlowRunList"', page)
+        self.assertIn('id="quickFlowRunCount"', page)
+        self.assertIn('data-action="stop-quick-flow-run"', page)
+        self.assertIn('this.commands.register("start-quick-flow"', page)
+        self.assertIn('this.commands.register("stop-quick-flow-run"', page)
+        self.assertIn('this.commands.register("dismiss-quick-flow-run"', page)
+        self.assertIn('quickFlows: []', page)
+        self.assertIn('activeQuickFlowId', page)
+        self.assertIn('this.schedule("quick-flow:" + runId', page)
+        self.assertIn('await this.extractQuickFlowAccounts(runId, succeededEmails)', page)
+        self.assertIn('this.api.post("/api/registration/start"', page)
+        self.assertIn('this.api.post("/api/protocol-registration/start"', page)
+        self.assertIn('this.api.post("/api/account/card-link"', page)
+        self.assertIn('this.commands.register("retry-quick-card-link"', page)
+        self.assertIn('data-action="retry-quick-card-link"', page)
+        self.assertIn("this.quickCardLinkPayload(target, true, flow)", page)
+        self.assertIn("force_retry: Boolean(forceRetry)", page)
+        self.assertIn('id="quickRegistrationProxySummary"', page)
+        self.assertIn('id="quickExtractionProxySummary"', page)
+        self.assertIn("注册代理：", page)
+        self.assertIn("提链代理：", page)
+        self.assertIn('id="quickPromotionProxyChoice"', page)
+        self.assertIn('id="quickExtractionProxyMode"', page)
+        self.assertIn('id="quickExtractionFirstProxyCountry"', page)
+        self.assertIn('id="quickExtractionSecondProxyCountry"', page)
+        self.assertIn("第一代理出口", page)
+        self.assertIn("第二代理出口", page)
+        self.assertIn("reuse_registration_proxy: false", page)
+        self.assertIn("independent_proxy_pair: true", page)
+        self.assertIn("use_secondary_proxy: Boolean(forceRetry)", page)
+        self.assertIn('promotion_proxy_choice: snapshot.promotionProxyChoice', page)
+        self.assertIn('localStorage.setItem("hme_quick_registration_proxy_mode", mode)', page)
+        self.assertIn('每次点击都会创建独立注册流程', page)
+        self.assertIn('停止或关闭在下方对应流程卡片中操作', page)
+        self.assertIn('process_id: flow.taskId', page)
+        self.assertIn('enabled: Boolean(candidate?.configured)', page)
+        self.assertIn('provider: "inventory"', page)
+        self.assertIn('class="quick-flow-steps"', page)
+        self.assertIn(".quick-flow-layout", page)
+
+    def test_one_click_pipeline_uses_de_paypal_only_for_accounts_without_oaics(self):
+        page = build_app_page()
+
+        self.assertIn("PayPal / 严格 0 · DE / EUR", page)
+        self.assertIn("提链代理与注册代理独立", page)
+        self.assertIn("首次提链使用第一代理出口", page)
+        self.assertIn("重新提链使用第二代理出口", page)
+        self.assertIn("更新优惠使用 IP", page)
+        self.assertIn("第一提链 IP", page)
+        self.assertIn("第二提链 IP", page)
+        self.assertIn('const method = "de_oaics_paypal";', page)
+        self.assertIn('account.checkoutIsOaics || account.checkoutIdType === "oaics"', page)
+        self.assertIn("账号已有 OAICS，已跳过重复创建", page)
+        self.assertIn("cs_live 已自动重试", page)
+        self.assertIn("提链未完成 · 可重试", page)
+        self.assertIn("results.length > 0 && failed === 0", page)
+        self.assertIn('id="quickFlowSkippedCount"', page)
+        self.assertIn("无 OAICS 账号使用 PayPal 严格 0 · DE/EUR", page)
+        self.assertIn('id="quickExtractionCount"', page)
+        self.assertIn("单账号提链次数必须是 1–100 的整数", page)
+        self.assertIn("attempt_limit:", page)
+        self.assertIn('localStorage.setItem("hme_quick_extraction_count"', page)
+        self.assertIn("返回 cs_live 时自动继续同模式提链", page)
+        quick_flow = page[page.index('id="quickFlowView"'):page.index('id="networkView"')]
+        self.assertNotIn('value="ph_hosted"', quick_flow)
+        self.assertIn('value="de_oaics_paypal"', quick_flow)
 
     def test_proxy_module_is_not_disabled_by_registration_mode(self):
         page = build_app_page()
@@ -577,7 +709,6 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
                         "state": "unused",
                         "source": "generated",
                     },
-                    "account": {"email": leased_email},
                 }
 
             async def complete_email(
@@ -620,10 +751,91 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inventory.completed[0][:3], (email, True, "registered"))
         self.assertIsNotNone(inventory.completed[0][3])
 
-    async def test_protocol_registration_skips_account_with_saved_session(self):
+    async def test_protocol_registration_skips_protocol_ready_account(self):
         _save_account_record(
             self.app["db_file"],
             "registered@icloud.com",
+            result={
+                "access_token": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                "session_json": json.dumps(
+                    {
+                        "accessToken": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                        "sessionToken": "saved-session-token",
+                    }
+                ),
+                "two_factor": {
+                    "enabled": True,
+                    "status": "enabled",
+                    "secret": "JBSWY3DPEHPK3PXP",
+                },
+            },
+            password="GeneratedPassword!1",
+            password_confirmed=True,
+        )
+
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"all": True, "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 409)
+        self.assertFalse(payload["ok"])
+        self.assertIn("均已完成", payload["error"])
+
+    async def test_protocol_registration_force_rechecks_protocol_ready_account(self):
+        email = "password-recheck@icloud.com"
+        _save_account_record(
+            self.app["db_file"],
+            email,
+            result={
+                "access_token": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                "session_json": json.dumps(
+                    {
+                        "accessToken": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                        "sessionToken": "saved-session-token",
+                    }
+                ),
+                "two_factor": {
+                    "enabled": True,
+                    "status": "enabled",
+                    "secret": "JBSWY3DPEHPK3PXP",
+                },
+            },
+            password="GeneratedPassword!1",
+            password_confirmed=True,
+        )
+
+        class ProtocolManagerStub:
+            def __init__(self):
+                self.options = None
+
+            def start(self, **options):
+                self.options = options
+                return {"status": "running", "running": True}
+
+            async def close(self):
+                return None
+
+        manager = ProtocolManagerStub()
+        self.app["protocol_registration_manager"] = manager
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"emails": [email], "concurrency": 1, "force": True},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["started"])
+        self.assertEqual(manager.options["emails"], [email])
+
+    async def test_protocol_registration_resumes_unconfirmed_saved_session(self):
+        email = "passwordless-session@icloud.com"
+        _save_account_record(
+            self.app["db_file"],
+            email,
             result={
                 "access_token": "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
                 "session_json": json.dumps(
@@ -637,16 +849,29 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
             password_confirmed=False,
         )
 
+        class ProtocolManagerStub:
+            def __init__(self):
+                self.options = None
+
+            def start(self, **options):
+                self.options = options
+                return {"status": "running", "running": True}
+
+            async def close(self):
+                return None
+
+        manager = ProtocolManagerStub()
+        self.app["protocol_registration_manager"] = manager
         response = await self.client.post(
             "/api/protocol-registration/start",
             headers={"X-Local-Token": self.app["local_token"]},
-            json={"all": True, "concurrency": 1},
+            json={"emails": [email], "concurrency": 1},
         )
         payload = await response.json()
 
-        self.assertEqual(response.status, 409)
-        self.assertFalse(payload["ok"])
-        self.assertIn("均已注册", payload["error"])
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["started"])
+        self.assertEqual(manager.options["emails"], [email])
 
     async def test_protocol_registration_api_persists_complete_credentials(self):
         email = "api-protocol@icloud.com"

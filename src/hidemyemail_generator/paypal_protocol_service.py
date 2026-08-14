@@ -20,12 +20,16 @@ class PayPalProtocolService:
         *,
         project_dir: Path,
         runtime_dir: Path,
+        config_db_file: Path | None = None,
         host: str = "127.0.0.1",
         port: int = 18097,
         python_executable: Path | None = None,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self.runtime_dir = runtime_dir.resolve()
+        self.config_db_file = (
+            Path(config_db_file).resolve() if config_db_file is not None else None
+        )
         self.host = host
         self.port = port
         self.python_executable = Path(python_executable or sys.executable).resolve()
@@ -55,7 +59,7 @@ class PayPalProtocolService:
 
     def _runtime_environment(self) -> dict[str, str]:
         runtime = self.runtime_dir
-        return {
+        environment = {
             **os.environ,
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
@@ -64,6 +68,9 @@ class PayPalProtocolService:
             "PAYPAL_WEB_PAYMENT_AUDIT_KEY_PATH": str(runtime / ".payment_audit_hmac_key"),
             "PAYPAL_WEB_FULL_LOG_PATH": str(runtime / "protocol_full.log"),
         }
+        if self.config_db_file is not None:
+            environment["HME_DB_FILE"] = str(self.config_db_file)
+        return environment
 
     async def ensure_running(self) -> bool:
         async with self._lock:
@@ -144,6 +151,32 @@ class PayPalProtocolService:
             "url": "/paypal-pay/",
             "upstream": self.upstream_url,
         }
+
+    async def create_job(
+        self, payload: dict[str, object], *, device_id: str
+    ) -> tuple[int, dict[str, object]]:
+        """Create a device-owned protocol job through the loopback API."""
+        if not await self.ensure_running():
+            return 503, {"error": self.error or "PayPal 协议服务暂不可用"}
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {
+            "Cookie": f"paypal_web_device_id={device_id}",
+            "X-Internal-Auto-Channel": "1",
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.upstream_url}/api/jobs", json=payload, headers=headers
+                ) as response:
+                    try:
+                        data = await response.json()
+                    except (aiohttp.ContentTypeError, ValueError):
+                        data = {"error": (await response.text()).strip()}
+                    return response.status, data if isinstance(data, dict) else {}
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            self.ready = False
+            self.error = f"PayPal 协议服务连接失败：{error}"
+            return 502, {"error": self.error}
 
     async def close(self) -> None:
         async with self._lock:
