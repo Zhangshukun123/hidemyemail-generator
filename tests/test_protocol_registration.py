@@ -581,6 +581,9 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 "hidemyemail_generator.protocol_credentials.complete_protocol_credentials",
                 side_effect=complete,
             ),
+            patch(
+                "hidemyemail_generator.protocol_registration_worker.time.sleep"
+            ) as sleep_mock,
         ):
             result = run(
                 {
@@ -648,6 +651,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             sum(stage == "password_checkpoint" for stage, *_rest in events),
             1,
         )
+        sleep_mock.assert_called_once_with(45.0)
 
     def test_saved_password_session_reauthenticates_before_missing_totp(self):
         constructor_calls = []

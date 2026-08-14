@@ -1589,6 +1589,11 @@ class ChatGPTRegister:
             # the login branch before password verify; never submit another
             # username_password_create password for a staged account.
             init_page_path = str(init.get("page_path") or "").rstrip("/").lower()
+            if init_page_path == "/error":
+                return self._failed(
+                    "account_auth_init_error_page: "
+                    f"status={int(init.get('status', 0) or 0)}"
+                )
             password_page_ready = False
             password_after_otp_required = bool(
                 password_signup_first

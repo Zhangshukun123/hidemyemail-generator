@@ -20,6 +20,9 @@ RESULT_PREFIX = "HME_PROTOCOL_RESULT:"
 INVALID_STATE_FULL_RETRY_LIMIT = 1
 PASSWORD_RESET_LOGIN_RETRY_LIMIT = 1
 PASSWORDLESS_SESSION_RECOVERY_LIMIT = 1
+PASSWORD_VERIFICATION_TRANSIENT_RETRY_LIMIT = 1
+PASSWORD_ADD_SETTLE_SECONDS = 45.0
+PASSWORD_VERIFICATION_RETRY_SECONDS = 60.0
 TRANSIENT_INIT_FULL_RETRY_LIMIT = 2
 DEFAULT_IMPERSONATE = "firefox144"
 TLS_FALLBACK_IMPERSONATE = "chrome136"
@@ -187,6 +190,29 @@ def _is_password_verified_mfa_required(result: Any) -> bool:
         detail = str(error or "")
     return "account_password_verified_mfa_required" in detail.casefold()
 
+
+
+
+def _is_transient_password_verification_failure(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("status") or "").strip().casefold() == "success":
+        return False
+    error = result.get("error")
+    detail = (
+        " ".join(str(value or "") for value in error.values())
+        if isinstance(error, dict)
+        else str(error or "")
+    ).casefold()
+    return any(
+        marker in detail
+        for marker in (
+            "account_auth_init_error_page",
+            "sentinel main token id binding mismatch",
+            "rate_limit_exceeded",
+            "temporarily_unavailable",
+        )
+    )
 
 def _is_password_add_reauth_required(result: Any) -> bool:
     if not isinstance(result, dict):
@@ -674,7 +700,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         nonlocal password_reset_login_retries
         password_add_reauth = False
         password_add_reauth_completed = False
-        verification_limit = PASSWORD_RESET_LOGIN_RETRY_LIMIT + 3
+        transient_verification_retries = 0
+        verification_limit = (
+            PASSWORD_RESET_LOGIN_RETRY_LIMIT
+            + PASSWORD_VERIFICATION_TRANSIENT_RETRY_LIMIT
+            + 3
+        )
 
         def verified_password_checkpoint(
             candidate_password: str,
@@ -749,9 +780,27 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
                 password_add_reauth_completed = True
                 _emit_event(
                     "password",
-                    "复核认证已添加保存密码；正在用全新会话验证密码",
+                    "复核认证已添加保存密码；等待服务端同步后再用全新会话验证",
                     "success",
                 )
+                time.sleep(PASSWORD_ADD_SETTLE_SECONDS)
+                continue
+            if _is_transient_password_verification_failure(verified_raw):
+                if (
+                    transient_verification_retries
+                    >= PASSWORD_VERIFICATION_TRANSIENT_RETRY_LIMIT
+                ):
+                    return {
+                        "verified": False,
+                        "error": "独立密码登录复核仍处于认证冷却期",
+                    }
+                transient_verification_retries += 1
+                _emit_event(
+                    "password",
+                    "认证服务仍在同步或限流冷却；等待后创建全新会话复核",
+                    "warning",
+                )
+                time.sleep(PASSWORD_VERIFICATION_RETRY_SECONDS)
                 continue
             if _is_password_verified_mfa_required(verified_raw):
                 password_confirmed = True
