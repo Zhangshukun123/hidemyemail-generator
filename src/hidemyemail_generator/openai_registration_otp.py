@@ -15,11 +15,19 @@ try:
         LOCALIZED_EMAIL_OTP_INPUT_SELECTORS,
         OTP_POLL_INTERVAL_SECONDS,
     )
+    from .registration_locale import (
+        registration_action_selectors,
+        registration_verification_ui_markers,
+    )
 except ImportError:
     from openai_browser_dom import _activate_visible_registration_page
     from openai_browser_selectors import (
         LOCALIZED_EMAIL_OTP_INPUT_SELECTORS,
         OTP_POLL_INTERVAL_SECONDS,
+    )
+    from registration_locale import (
+        registration_action_selectors,
+        registration_verification_ui_markers,
     )
 
 
@@ -39,50 +47,22 @@ EMAIL_VERIFICATION_CONTEXT_INPUT_SELECTORS = (
     'input[role="textbox"]',
 )
 
-EMAIL_VERIFICATION_RESEND_SELECTORS = (
-    'button:has-text("Resend email")',
-    '[role="button"]:has-text("Resend email")',
-    'button:has-text("Resend code")',
-    'button:has-text("メールを再送信する")',
-    '[role="button"]:has-text("メールを再送信する")',
-    'button:has-text("重新发送邮件")',
-    'button:has-text("重新傳送電子郵件")',
-)
+EMAIL_VERIFICATION_RESEND_SELECTORS = registration_action_selectors("resend")
 EMAIL_VERIFICATION_SUBMIT_SELECTORS = (
     'button[data-dd-action-name="Continue"][type="submit"]',
-    'button[type="submit"]:has-text("Continue")',
-    'button[type="submit"]:has-text("続行")',
-    'button[type="submit"]:has-text("继续")',
-    'button[type="submit"]:has-text("繼續")',
-    'button:has-text("Continue")',
-    'button:has-text("続行")',
-    'button:has-text("继续")',
-    'button:has-text("繼續")',
+    *registration_action_selectors(
+        "continue",
+        controls=('button[type="submit"]', "button", '[role="button"]'),
+    ),
     'button[type="submit"]',
 )
-EMAIL_VERIFICATION_UI_MARKERS = {
-    "日文": (
-        "受信箱を確認",
-        "検証コード",
-        "確認コード",
-        "メールを再送信",
-        "続行",
-    ),
-    "中文": (
-        "检查收件箱",
-        "查看收件箱",
-        "验证码",
-        "重新发送邮件",
-        "继续",
-    ),
-    "英文": (
-        "check your inbox",
-        "verification code",
-        "enter the code",
-        "resend email",
-        "continue",
-    ),
-}
+EMAIL_VERIFICATION_UI_MARKERS = registration_verification_ui_markers()
+
+_SEMANTIC_EMAIL_OTP_INPUT_SELECTORS = (
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    *LOCALIZED_EMAIL_OTP_INPUT_SELECTORS,
+)
 
 # Forwarded iCloud messages can carry a provider timestamp a few seconds
 # earlier than the browser observes the OTP page.  The server still clamps the
@@ -126,17 +106,39 @@ def _email_verification_ui_state(
         )
     except Exception:
         inputs = []
+    semantic_input = False
+    for selector in _SEMANTIC_EMAIL_OTP_INPUT_SELECTORS:
+        try:
+            candidates = page.locator(selector)
+            count = min(6, int(candidates.count()))
+        except Exception:
+            continue
+        for index in range(count):
+            try:
+                candidate = candidates.nth(index)
+                try:
+                    visible = bool(candidate.is_visible(timeout=300))
+                except TypeError:
+                    visible = bool(candidate.is_visible())
+            except Exception:
+                visible = False
+            if visible:
+                semantic_input = True
+                break
+        if semantic_input:
+            break
     route_match = "email-verification" in url.casefold()
     email_match = bool(target and target in folded)
     has_input = bool(inputs)
     content_match = marker_count >= 2
-    signal_count = sum((route_match, email_match, content_match))
+    signal_count = sum((route_match, email_match, content_match, semantic_input))
     return {
         "recognized": has_input and signal_count >= 2,
         "url": url,
         "routeMatch": route_match,
         "emailMatch": email_match,
         "contentMatch": content_match,
+        "semanticInput": semantic_input,
         "locale": locale_label or "本地化",
         "markerCount": marker_count,
         "inputs": inputs,

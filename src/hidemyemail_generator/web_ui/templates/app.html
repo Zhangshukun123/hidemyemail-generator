@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="dark" data-sidebar-collapsed="false">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#08111f">
+  <meta name="theme-color" content="#0d0d0d">
   <title>账号工作台</title>
   <style>{{PAGE_STYLES}}</style>
 </head>
@@ -18,20 +18,49 @@
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
     <symbol id="i-paypal" viewBox="0 0 24 24"><path d="M7 20 9.3 4h6.2a4.8 4.8 0 0 1 0 9.6h-4.7"/><path d="m10.1 20 1.4-9.5h4.4a3.6 3.6 0 0 1 0 7.2h-3.4"/></symbol>
     <symbol id="i-checklist" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="m8 9 1.5 1.5L12 8M13 10h3M8 15h8"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M12 15h5"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-panel-collapse" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m7-12-4 4 4 4"/></symbol>
+    <symbol id="i-panel-expand" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m3-12 4 4-4 4"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
     <symbol id="i-logout" viewBox="0 0 24 24"><path d="m10 17 5-5-5-5M15 12H3"/><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"/></symbol>
   </svg>
 
+  <header class="workbench-titlebar" aria-label="工作台标题栏">
+    <div class="titlebar-brand"><span class="codex-glyph" aria-hidden="true">⌁</span><span>Hide My Email · 账号工作台</span></div>
+    <button class="command-center" type="button" data-route="overview" aria-label="返回账号工作台概览">
+      <svg aria-hidden="true"><use href="#i-dashboard"/></svg><span>账号工作台 — 输入命令或搜索</span><kbd>Ctrl K</kbd>
+    </button>
+    <div class="header-actions">
+      <span class="runtime-pill"><i id="runtimeDot"></i><span id="runtimeLabel">正在连接运行环境</span></span>
+      <button id="runtimeLogButton" class="runtime-log-trigger" type="button" data-action="open-runtime-log" aria-label="打开运行日志，0 条" aria-controls="runtimeLogDrawer" aria-expanded="false"><svg aria-hidden="true"><use href="#i-terminal"/></svg><span>运行日志</span><b id="runtimeLogTriggerCount">0</b><i id="runtimeLogLiveDot" aria-hidden="true"></i></button>
+      <button class="icon-button" type="button" data-action="refresh" aria-label="刷新"><svg><use href="#i-refresh"/></svg></button>
+      <button class="icon-button" id="themeToggle" type="button" data-action="toggle-theme" aria-label="切换主题">◐</button>
+      <button class="icon-button" type="button" data-action="logout" aria-label="退出登录"><svg><use href="#i-logout"/></svg></button>
+    </div>
+  </header>
+
   <div class="app-shell">
-    <aside class="sidebar" aria-label="主导航">
+    <nav class="activity-bar" aria-label="工作台活动栏">
+      <button class="nav-item activity-item" type="button" data-route="overview" aria-label="概览" title="概览"><svg><use href="#i-dashboard"/></svg><span class="activity-label">概览</span></button>
+      <button class="nav-item activity-item" type="button" data-route="accounts" aria-label="账号管理" title="账号管理"><svg><use href="#i-mail"/></svg><span class="activity-label">账号管理</span></button>
+      <button class="nav-item activity-item" type="button" data-route="quick-flow" aria-label="注册并提链" title="注册并提链"><svg><use href="#i-rocket"/></svg><span class="activity-label">注册并提链</span></button>
+      <button class="nav-item activity-item" type="button" data-route="network" aria-label="代理与线路" title="代理与线路"><svg><use href="#i-network"/></svg><span class="activity-label">代理与线路</span></button>
+      <button class="nav-item activity-item" type="button" data-route="card-links" aria-label="直卡提链接" title="直卡提链接"><svg><use href="#i-link"/></svg><span class="activity-label">直卡提链接</span></button>
+      <button class="nav-item activity-item" type="button" data-route="pp-payment" aria-label="PP 支付" title="PP 支付"><svg><use href="#i-paypal"/></svg><span class="activity-label">PP 支付</span></button>
+      <button class="nav-item activity-item" type="button" data-route="verification" aria-label="验证记录" title="验证记录"><svg><use href="#i-checklist"/></svg><span class="activity-label">验证记录</span></button>
+      <button class="nav-item activity-item" type="button" data-route="settings" aria-label="系统设置" title="系统设置"><svg><use href="#i-settings"/></svg><span class="activity-label">系统设置</span></button>
+    </nav>
+    <aside id="workbenchSidebar" class="sidebar" aria-label="主导航">
       <div class="product-lockup sidebar-brand">
         <span class="product-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7.2 18.2h10a4.3 4.3 0 0 0 .7-8.5A6 6 0 0 0 6.5 8.1a5.1 5.1 0 0 0 .7 10.1Z"/><path d="m7.5 11.5 4.5 3.2 4.5-3.2"/><rect x="7.5" y="10" width="9" height="6.5" rx="1.5"/></svg></span>
-        <span><strong>账号工作台</strong><small>ACCOUNT WORKSPACE</small></span>
+        <span class="sidebar-brand-copy"><strong>账号工作台</strong><small>ACCOUNT WORKSPACE</small></span>
+        <button id="sidebarCollapseButton" class="sidebar-collapse-button" type="button" data-action="toggle-sidebar" aria-controls="workbenchSidebar" aria-expanded="true" aria-label="折叠导航" title="折叠导航"><svg aria-hidden="true"><use href="#i-panel-collapse"/></svg></button>
       </div>
+      <div class="nav-section-title">账号工作区</div>
       <nav class="nav-list">
         <button class="nav-item" type="button" data-route="overview"><svg><use href="#i-dashboard"/></svg><span>概览</span></button>
-        <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>账号设置</span><b id="accountNavCount">—</b></button>
+        <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>账号管理</span><b id="accountNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="quick-flow"><svg><use href="#i-rocket"/></svg><span>注册并提链</span><b id="quickFlowNavState">NEW</b></button>
         <button class="nav-item" type="button" data-route="network"><svg><use href="#i-network"/></svg><span>代理与线路</span><b id="networkNavState">—</b></button>
         <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>直卡提链接</span><b id="cardLinkNavCount">—</b></button>
@@ -39,18 +68,13 @@
         <button class="nav-item" type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span>验证记录</span></button>
         <button class="nav-item" type="button" data-route="settings"><svg><use href="#i-settings"/></svg><span>系统设置</span></button>
       </nav>
-      <div class="sidebar-status"><span><i id="sidebarRuntimeDot"></i>系统运行正常</span><small>版本 1.3.0</small></div>
+      <div class="sidebar-status"><span><i id="sidebarRuntimeDot"></i><b id="sidebarRuntimeLabel">正在检查运行环境</b></span><small>版本 1.3.0</small></div>
     </aside>
+    <button id="sidebarExpandRail" class="sidebar-expand-rail" type="button" data-action="toggle-sidebar" aria-controls="workbenchSidebar" aria-expanded="false" aria-label="展开导航" title="展开导航" hidden><svg aria-hidden="true"><use href="#i-panel-expand"/></svg></button>
 
     <main class="workspace">
       <header class="workspace-header">
-        <div><span id="viewEyebrow" class="eyebrow">ACCOUNT WORKSPACE</span><h1 id="viewTitle">概览</h1><p id="viewSubtitle">集中查看账号、任务与服务状态</p></div>
-        <div class="header-actions">
-          <span class="runtime-pill"><i id="runtimeDot"></i><span id="runtimeLabel">正在连接运行环境</span></span>
-          <button class="icon-button" type="button" data-action="refresh" aria-label="刷新"><svg><use href="#i-refresh"/></svg></button>
-          <button class="icon-button" id="themeToggle" type="button" data-action="toggle-theme" aria-label="切换主题">◐</button>
-          <button class="icon-button" type="button" data-action="logout" aria-label="退出登录"><svg><use href="#i-logout"/></svg></button>
-        </div>
+        <div class="workspace-title-group"><div class="editor-breadcrumb"><span>账号工作台</span><i>›</i><span id="viewEyebrow" class="eyebrow">ACCOUNT WORKSPACE</span></div><h1 id="viewTitle">概览</h1><p id="viewSubtitle">集中查看账号、任务与服务状态</p></div>
       </header>
 
       <section class="view" id="overviewView" data-view="overview">
@@ -65,26 +89,26 @@
 
       <section class="view account-workspace-view" id="accountsView" data-view="accounts" data-layout="task-first" hidden>
         <div class="view-actions registration-launch-shell">
-          <div class="registration-command-deck" aria-label="注册命令栏">
+          <div class="registration-command-deck" data-density="compact" aria-label="紧凑注册命令台">
             <div class="registration-launch-head">
-              <div><span class="eyebrow">REGISTER</span><h2>启动注册</h2><p>选择注册方式、邮箱来源与网络后开始任务</p></div>
-              <span class="badge blue">Roxy 最多 5 个并发</span>
+              <div><span class="eyebrow">QUICK REGISTER</span><h2>快速注册</h2><p>方式、来源与网络集中配置，减少滚动后即可启动</p></div>
+              <span class="badge blue registration-capacity"><i aria-hidden="true"></i>Roxy · 最多 5 个并发</span>
             </div>
             <div class="command-block command-source" id="registrationSourceBlock">
-              <div class="command-heading"><span>REGISTER</span><strong>注册来源</strong></div>
+              <div class="command-heading"><span>02 · SOURCE</span><strong>注册来源</strong></div>
               <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="gmail">Gmail · SMSBower</option></select></label>
               <div id="smsbowerControls" class="command-subcontrols" hidden><span id="smsbowerStatus" class="badge warning">SMSBower 未配置</span><label class="command-field smsbower-price-field" for="smsbowerMaxPrice"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="10" step="0.001" value="0.05"></label><button class="button" data-action="set-smsbower-key">SMSBower API</button></div>
               <button id="registerProviderButton" class="button primary command-primary" data-action="register-provider"><span aria-hidden="true">▶</span>开始注册</button>
             </div>
             <div class="command-block command-network" id="registrationNetworkBlock">
-              <div class="command-heading"><span>NETWORK</span><strong>注册网络</strong></div>
+              <div class="command-heading"><span>03 · NETWORK</span><strong>注册网络</strong></div>
               <label class="switch command-switch"><input id="registrationProxyEnabled" type="checkbox"><span></span>注册使用代理</label>
               <span id="registrationNetworkMode" class="badge blue">本机 IP 直连 · 语言随出口</span>
               <label class="command-field command-country" for="registrationProxyCountrySearch"><span>注册出口</span><input id="registrationProxyCountrySearch" type="search" list="registrationProxyCountryOptions" autocomplete="off" placeholder="输入国家或代码"><input id="registrationProxyCountry" type="hidden" value="NL"><datalist id="registrationProxyCountryOptions"></datalist></label>
               <button id="registrationProxySetupButton" class="button" data-action="focus-registration-proxy">代理设置</button>
             </div>
             <div class="command-block command-utilities">
-              <div class="command-heading"><span>MODE</span><strong>注册方式</strong></div>
+              <div class="command-heading"><span>01 · MODE</span><strong>注册方式</strong></div>
               <div class="registration-mode-selector" role="radiogroup" aria-label="注册方式">
                 <label><input type="radio" name="registrationMode" value="headless"><span><b>无头浏览器</b><small>后台自动运行</small></span></label>
                 <label><input type="radio" name="registrationMode" value="headed" checked><span><b>有头浏览器</b><small>显示前台窗口</small></span></label>
@@ -98,104 +122,41 @@
                 <label class="command-field"><span>目标账号数</span><input id="roxyTargetCount" type="number" min="1" max="100" step="1" value="5"></label>
                 <label class="command-field"><span>窗口方式</span><select id="roxyWindowMode"><option value="background">无头效果（后台隐藏）</option><option value="headed">有头窗口</option></select></label>
                 <button class="button" data-action="refresh-roxy">刷新 Roxy 环境</button>
-                <span id="roxyRegistrationStatus" class="badge warning">等待连接 Roxy</span>
-                <small id="roxyProfileAllocation">选择首个环境后，系统将使用最多 5 个互不重复的 Roxy 环境，按目标账号数自动分轮执行；每个账号重新生成随机指纹并写入独立代理。</small>
+                <div class="roxy-control-meta">
+                  <span id="roxyRegistrationStatus" class="badge warning">等待连接 Roxy</span>
+                  <small id="roxyProfileAllocation" title="选择首个环境后，将按目标账号数自动分轮使用最多 5 个互不重复的 Roxy 环境。">最多 5 个独立环境自动轮换，每个账号使用独立指纹与代理。</small>
+                </div>
               </div>
               <input id="headless" type="checkbox" hidden>
               <input id="concurrency" type="hidden" value="1">
             </div>
-            <div class="command-manual" id="registrationManualBlock">
-              <div><span>自有邮箱</span><small>iCloud 自动扫描收件箱与垃圾邮件；其他邮箱在浏览器中手动输入</small></div>
-              <label class="command-field registration-email-field" for="registrationEmail"><span>自有邮箱（iCloud 支持自动取码）</span><input id="registrationEmail" type="email" placeholder="name@example.com" autocomplete="email"></label>
-              <button id="registerEmailButton" class="button" data-action="register">添加邮箱并注册</button>
+            <div id="registrationRuntimeControls" class="registration-runtime-controls" aria-label="注册任务操作">
+              <div class="registration-runtime-state"><span id="registrationRuntimeState">当前无运行任务</span><small id="registrationRuntimeMessage">运行详情请打开日志界面查看</small></div>
+              <details id="registrationMoreOptions" class="registration-more-options">
+                <summary class="button"><span>更多选项</span><small>自有邮箱 · Session</small></summary>
+                <div class="registration-more-panel">
+                  <div class="command-manual" id="registrationManualBlock">
+                    <div><span>自有邮箱</span><small>可选 · iCloud 支持自动取码</small></div>
+                    <label class="command-field registration-email-field" for="registrationEmail"><span>邮箱地址（可选）</span><input id="registrationEmail" type="email" placeholder="name@example.com" autocomplete="email"></label>
+                    <button id="registerEmailButton" class="button" data-action="register">添加邮箱并注册</button>
+                  </div>
+                  <button id="fetchAllButton" class="button registration-fetch-all" data-action="fetch-all">批量获取全部 Session</button>
+                </div>
+              </details>
+              <button class="button" type="button" data-action="open-runtime-log" aria-controls="runtimeLogDrawer" aria-expanded="false">查看运行日志</button>
+              <button id="stopTaskButton" class="button danger small" type="button" data-action="stop-task" disabled>停止任务</button>
             </div>
-            <button id="fetchAllButton" class="button registration-fetch-all" data-action="fetch-all">批量获取全部 Session</button>
+            <div id="registrationCodePanel" class="registration-code-panel registration-code-command" hidden>
+              <div><strong>输入邮箱验证码</strong><small id="registrationCodeEmail">等待注册页面请求验证码</small></div>
+              <input id="registrationCode" type="text" inputmode="numeric" maxlength="10" autocomplete="one-time-code" placeholder="4–10 位验证码">
+              <button class="button primary" type="button" data-action="submit-registration-code">提交验证码</button>
+            </div>
           </div>
         </div>
-        <article id="taskPanel" class="panel task-panel" data-task-tone="idle" data-stage-group="prepare">
-          <div class="task-panel-header">
-            <div class="task-title-group">
-              <span id="taskStatusIcon" class="task-status-icon" aria-hidden="true">—</span>
-              <div class="task-title-copy">
-                <div class="task-title-line">
-                  <h2 id="registrationSummary">邮箱注册 · 等待开始</h2>
-                  <span id="taskStateBadge" class="task-state-badge">空闲</span>
-                </div>
-                <p id="taskMessage">尚未启动注册或 Session 获取任务</p>
-              </div>
-            </div>
-            <button id="stopTaskButton" class="button danger small" data-action="stop-task" disabled>停止当前任务</button>
-          </div>
-          <div class="task-console-grid">
-            <section class="task-console-main" aria-label="当前任务详情">
-              <ol class="task-flow-strip" aria-label="注册流程">
-                <li class="task-flow-step" data-flow="prepare"><i>1</i><span><strong>准备</strong><small>邮箱与网络</small></span></li>
-                <li class="task-flow-step" data-flow="auth"><i>2</i><span><strong>认证</strong><small>邮箱与密码</small></span></li>
-                <li class="task-flow-step" data-flow="verify"><i>3</i><span><strong>验证</strong><small>安全与验证码</small></span></li>
-                <li class="task-flow-step" data-flow="profile"><i>4</i><span><strong>资料</strong><small>基础信息</small></span></li>
-                <li class="task-flow-step" data-flow="session"><i>5</i><span><strong>完成</strong><small>Session 与 2FA</small></span></li>
-              </ol>
-              <div class="task-live-context" aria-label="当前浏览器状态">
-                <div class="task-live-primary">
-                  <span class="live-signal" aria-hidden="true"></span>
-                  <div><small>当前界面</small><strong id="taskCurrentLocation">等待任务</strong></div>
-                  <span id="taskCurrentStage" class="task-stage-chip">准备</span>
-                </div>
-                <div class="task-live-action">
-                  <div><small>正在执行</small><strong id="taskCurrentAction">尚未开始</strong></div>
-                  <span id="taskCurrentAccount">未选择账号</span>
-                </div>
-              </div>
-              <div class="task-recognition-detail" aria-label="注册页面识别结果">
-                <div><small>已经完成</small><strong id="taskCompletedSteps">等待识别注册进度</strong></div>
-                <div><small>下一步</small><strong id="taskNextAction">等待浏览器页面出现</strong><span id="taskRecognitionMeta">DOM / URL 实时识别</span></div>
-              </div>
-              <div id="taskStepLedger" class="task-step-ledger" aria-label="完整注册步骤状态">
-                <div class="task-step-ledger-empty">等待完整注册步骤开始</div>
-              </div>
-              <div id="taskAssistance" class="task-assistance" data-mode="automatic">
-                <span id="taskAssistanceBadge">自动化执行</span>
-                <div><strong id="taskAssistanceTitle">页面状态持续监测</strong><small id="taskAssistanceText">遇到页面跳转时会自动识别并继续</small></div>
-              </div>
-              <div class="task-metrics" aria-label="任务摘要">
-                <div class="task-stat">
-                  <span class="task-stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18M7 7h.01"/></svg></span>
-                  <span><small>浏览器任务</small><strong id="browserTaskSummary">0 / 0</strong></span>
-                </div>
-                <div class="task-stat success">
-                  <span class="task-stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/></svg></span>
-                  <span><small>成功</small><strong id="browserTaskSuccess">0</strong></span>
-                </div>
-                <div class="task-stat elapsed">
-                  <span class="task-stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
-                  <span><small>耗时</small><strong id="taskElapsed">00:00</strong></span>
-                </div>
-              </div>
-              <div class="task-progress-row">
-                <progress id="browserTaskProgress" value="0" max="100" aria-label="任务完成进度"></progress>
-                <strong id="browserTaskProgressValue">0%</strong>
-              </div>
-              <div id="registrationCodePanel" class="registration-code-panel" hidden>
-                <div><strong>输入邮箱验证码</strong><small id="registrationCodeEmail">等待注册页面请求验证码</small></div>
-                <input id="registrationCode" type="text" inputmode="numeric" maxlength="10" autocomplete="one-time-code" placeholder="4–10 位验证码">
-                <button class="button primary" data-action="submit-registration-code">提交验证码</button>
-              </div>
-            </section>
-            <aside class="task-console-activity" aria-label="浏览器执行轨迹">
-              <div class="task-log-head">
-                <div><strong>浏览器执行轨迹</strong><span>页面位置、操作与结果</span></div>
-                <span id="taskLogCount">0 条</span>
-              </div>
-              <div id="taskLog" class="inline-log task-timeline" role="log" aria-live="polite">
-                <div class="task-log-empty">暂无任务日志</div>
-              </div>
-            </aside>
-          </div>
-        </article>
         <article class="panel table-panel">
           <div class="panel-head account-list-head">
             <div class="account-list-heading"><div><h2>邮箱账号</h2><p id="accountSummary">正在加载…</p></div><div id="accountMetrics" class="metric-grid compact account-inline-metrics"></div></div>
-            <div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="oai">OAI 账号</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select></div>
+            <div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select></div>
           </div>
           <div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>注册状态</th><th>套餐</th><th>Session 状态</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
         </article>
@@ -260,7 +221,7 @@
                 <div class="quick-flow-context-group"><div id="quickRegistrationHint" class="mode-label">无头浏览器将在后台完成注册；验证码自动从 iCloud 收件箱读取。</div><div id="quickRegistrationProxySummary" class="mode-label">第一 IP：注册与首次提链共用</div></div>
               </section>
               <section class="quick-flow-form-section">
-                <div class="quick-flow-section-title"><i>02</i><div><strong>PayPal 提链接</strong><small>保存 Session 后生成支付链接，已有 OAICS 自动跳过</small></div><span>PAYPAL LINK</span></div>
+                <div class="quick-flow-section-title"><i>02</i><div><strong>PayPal 提链接</strong><small>保存 Session 后生成支付链接，已有同模式链接自动跳过</small></div><span>PAYPAL LINK</span></div>
                 <div class="quick-flow-field-grid quick-flow-extraction-main-grid">
                   <label class="field-label">提链方式<select id="quickCardLinkMethod"><option value="de_oaics_paypal" data-legacy-label="PayPal / 严格 0 · DE / EUR">PayPal 提链接 · 严格 0 · DE / EUR</option></select></label>
                   <label class="field-label">单账号提链次数<input id="quickExtractionCount" type="number" min="1" max="100" step="1" value="1"></label>
@@ -272,7 +233,7 @@
                   <label class="field-label">更新优惠使用 IP<select id="quickPromotionProxyChoice"><option value="first">第一提链 IP</option><option value="second">第二提链 IP</option></select></label>
                 </div>
                 <div class="quick-flow-context-group"><div id="quickCardLinkHint" class="mode-label">返回 cs_live 时自动继续同模式提链，直到单账号次数用完；首次使用第一代理出口，重试切换第二代理出口。</div><div id="quickExtractionProxySummary" class="mode-label">提链代理：请选择模式与两个出口</div></div>
-                <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 无 OAICS 才创建</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span></div>
+                <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span></div>
               </section>
             </div>
             <div class="quick-flow-actions"><div><strong>每次点击都会创建独立注册流程</strong><span>流程可并行运行；停止或关闭在下方对应流程卡片中操作</span></div><button id="startQuickFlowButton" class="button primary" type="button" data-action="start-quick-flow"><span>启动新的自动流水线</span><b aria-hidden="true">▶</b></button></div>
@@ -397,6 +358,30 @@
       </section>
     </main>
   </div>
+  <div id="runtimeLogBackdrop" class="runtime-log-backdrop" data-action="close-runtime-log" hidden></div>
+  <aside id="runtimeLogDrawer" class="runtime-log-drawer" role="dialog" aria-modal="true" aria-labelledby="runtimeLogTitle" aria-describedby="runtimeLogSubtitle" hidden>
+    <div id="runtimeLogResizeHandle" class="runtime-log-resize-handle" role="separator" tabindex="0" aria-label="调整运行日志宽度" aria-orientation="vertical" aria-controls="runtimeLogDrawer" aria-valuemin="420" aria-valuemax="1200" aria-valuenow="680" aria-valuetext="680 像素" title="左右拖动调整宽度；方向键微调；双击恢复默认">
+      <span class="sr-only">左右拖动，或使用左右方向键调整运行日志宽度</span>
+    </div>
+    <header class="runtime-log-header">
+      <div><span class="eyebrow">LIVE RUNTIME</span><h2 id="runtimeLogTitle">当前运行日志</h2><p id="runtimeLogSubtitle">等待任务数据</p></div>
+      <button id="runtimeLogCloseButton" class="icon-button" type="button" data-action="close-runtime-log" aria-label="关闭运行日志">×</button>
+    </header>
+    <section class="runtime-log-summary" aria-label="当前日志任务摘要">
+      <div><small>任务状态</small><strong id="runtimeLogState">等待任务</strong></div>
+      <div><small>任务 / 进程</small><strong id="runtimeLogTask">—</strong></div>
+      <div><small>开始时间</small><strong id="runtimeLogStartedAt">—</strong></div>
+      <div><small>当前记录</small><strong id="runtimeLogTotal">0 条</strong></div>
+    </section>
+    <div class="runtime-log-toolbar">
+      <label class="runtime-log-search" for="runtimeLogSearch"><span>搜索日志</span><input id="runtimeLogSearch" type="search" autocomplete="off" placeholder="消息、邮箱、任务 ID、页面或动作"></label>
+      <label for="runtimeLogLevel"><span>日志级别</span><select id="runtimeLogLevel"><option value="all">全部级别</option><option value="error">错误</option><option value="warning">警告 / 等待</option><option value="success">成功</option><option value="active">运行信息</option></select></label>
+      <label class="runtime-log-autoscroll"><input id="runtimeLogAutoscroll" type="checkbox" checked><span>自动滚动</span></label>
+      <button class="button" type="button" data-action="copy-runtime-logs">复制当前日志</button>
+    </div>
+    <div id="runtimeLogList" class="runtime-log-list" role="log" aria-live="off"><div class="runtime-log-empty"><strong>暂无运行日志</strong><span>启动注册、浏览器、协议或验证任务后，详细日志会实时显示在这里。</span></div></div>
+    <footer class="runtime-log-footer"><span id="runtimeLogVisibleCount">显示 0 / 0 条</span><span id="runtimeLogUpdatedAt">尚未更新</span><span id="runtimeLogAnnouncement" class="sr-only" role="status" aria-live="polite"></span></footer>
+  </aside>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>window.__HME_LOCAL_TOKEN__ = __LOCAL_TOKEN__;</script>
   <script>{{PAGE_SCRIPT}}</script>

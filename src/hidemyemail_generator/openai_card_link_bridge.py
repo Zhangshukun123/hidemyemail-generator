@@ -46,7 +46,7 @@ def main() -> int:
     parser.add_argument("--source-dir", required=True)
     parser.add_argument(
         "--method",
-        choices=("standard", "ph_hosted", "de_oaics_paypal", "oaics_probe"),
+        choices=("standard", "ph_hosted", "de_oaics_paypal"),
         default="standard",
     )
     parser.add_argument("--account-email", default="")
@@ -72,22 +72,6 @@ def main() -> int:
         ensure_tkinter_importable()
         import app_backend
 
-        if args.method == "oaics_probe":
-            checkout = app_backend.opll_create_checkout(
-                token,
-                str(args.country or "DE").upper(),
-                str(args.currency or "EUR").upper(),
-                create_proxy_url,
-                request_locale=str(args.locale or "de-DE"),
-                include_trial_promo=True,
-                checkout_ui_mode="custom",
-                return_raw_payload=True,
-            )
-            emit_checkout_classification(
-                args.method,
-                checkout_id_type(checkout.get("cs_id")),
-            )
-            return 0
         if args.method == "ph_hosted":
             checkout = app_backend.generate_opll_philippines_short_link(
                 token,

@@ -3496,6 +3496,7 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_task_specific_completion_callback_reports_success_and_failure(self):
         completions = []
+        failures = []
 
         async def runner(payload, on_event):
             if payload["email"].startswith("failed"):
@@ -3521,6 +3522,7 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
             base_dir=self.base_dir,
             db_file=self.db_file,
             worker_runner=runner,
+            record_failure=failures.append,
         )
         manager.start(
             emails=["success@icloud.com", "failed@icloud.com"],
@@ -3536,6 +3538,72 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(by_email["success@icloud.com"][0])
         self.assertFalse(by_email["failed@icloud.com"][0])
         self.assertIn("protocol rejected", by_email["failed@icloud.com"][1])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["mode"], "protocol")
+        self.assertEqual(failures[0]["email"], "failed@icloud.com")
+        self.assertEqual(failures[0]["status"], "failed")
+        self.assertIn("protocol rejected", failures[0]["failureContext"]["message"])
+        self.assertTrue(failures[0]["logs"])
+
+    async def test_proxy_setup_failure_reaches_monitor_and_terminal_state(self):
+        failures = []
+
+        class BadProxyStore:
+            def next_proxy(self):
+                raise OSError("proxy database unavailable")
+
+        manager = ProtocolRegistrationManager(
+            base_dir=self.base_dir,
+            db_file=self.db_file,
+            proxy_store=BadProxyStore(),
+            worker_runner=lambda _payload, _on_event: asyncio.sleep(0),
+            record_failure=failures.append,
+        )
+        manager.start(
+            emails=["setup-failed@icloud.com"],
+            base_url="http://127.0.0.1:8080",
+        )
+
+        final = await manager.wait()
+
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["failed"], 1)
+        self.assertEqual(final["completed"], 1)
+        self.assertEqual(final["accounts"][0]["status"], "failed")
+        self.assertEqual(final["accounts"][0]["stage"], "proxy")
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["failureContext"]["failedStage"], "proxy")
+
+    async def test_failure_monitor_retries_transient_storage_error(self):
+        attempts = 0
+        failures = []
+
+        async def runner(_payload, _on_event):
+            raise RuntimeError("protocol rejected")
+
+        def flaky_recorder(failure):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("database is busy")
+            failures.append(failure)
+
+        manager = ProtocolRegistrationManager(
+            base_dir=self.base_dir,
+            db_file=self.db_file,
+            worker_runner=runner,
+            record_failure=flaky_recorder,
+        )
+        manager.start(
+            emails=["retry-monitor@icloud.com"],
+            base_url="http://127.0.0.1:8080",
+        )
+
+        final = await manager.wait()
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(failures), 1)
+        self.assertNotIn("monitorError", final["accounts"][0])
 
 
 class ConcurrentProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):

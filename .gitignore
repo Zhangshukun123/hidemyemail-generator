@@ -29,3 +29,12 @@ android/build/
 android/*.apk
 android/*.aab
 android/*.png
+
+# BEGIN codex generated-file cleanup
+/.codex/
+/.codex-diagnostics/
+/artifacts/
+/output/
+/.pytest_cache/
+/.ruff_cache/
+# END codex generated-file cleanup

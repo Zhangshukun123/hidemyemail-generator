@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 from .browser_tasks import BrowserTaskManager, browser_log_context
 
 
+MAX_LOG_ITEMS = 300
 AcquireInventoryEmail = Callable[[str], Awaitable[str]]
 ConfirmEmail = Callable[[str], Awaitable[None]]
 SavePassword = Callable[[str, str], Awaitable[None]]
@@ -89,7 +90,10 @@ class RegistrationTaskManager:
         self._provider_code_cache: dict[tuple[str, str], str] = {}
         self._provider_code_started_at: dict[tuple[str, str], float] = {}
         self._provider_cancelled_emails: set[str] = set()
-        self._last_relayed_browser_log_key: tuple[str, str, str] | None = None
+        self._log_sequence = 0
+        self._last_relayed_browser_log_key: (
+            tuple[str, int, str, str, str] | None
+        ) = None
 
     @staticmethod
     def _idle_state() -> dict[str, Any]:
@@ -109,6 +113,8 @@ class RegistrationTaskManager:
             "currentLocation": "等待任务",
             "currentAction": "尚未开始",
             "currentStatus": "idle",
+            "failureContext": {},
+            "failedAccounts": [],
             "startedAt": "",
             "finishedAt": "",
         }
@@ -166,6 +172,7 @@ class RegistrationTaskManager:
         reset_browser_state = getattr(self.browser_manager, "reset", None)
         if callable(reset_browser_state):
             reset_browser_state()
+        self._log_sequence = 0
         self._manual_codes.clear()
         self._awaiting_code_emails.clear()
         self._provider_code_request_ids.clear()
@@ -206,6 +213,8 @@ class RegistrationTaskManager:
             "currentLocation": "注册准备",
             "currentAction": "准备注册邮箱",
             "currentStatus": "active",
+            "failureContext": {},
+            "failedAccounts": [],
             "startedAt": utc_now(),
             "finishedAt": "",
         }
@@ -220,6 +229,16 @@ class RegistrationTaskManager:
                 if selected_browser_engine == "roxy"
                 else f"开始并发注册：计划领取 {target_count} 个库存邮箱"
             )
+        self._append_log(
+            "启动参数："
+            f"邮箱来源 {provider}；"
+            f"引擎 {'Roxy' if selected_browser_engine == 'roxy' else 'Camoufox'}；"
+            f"请求并发 {concurrency}；目标账号 {target_count}；"
+            f"窗口模式 {'无头' if headless else '前台显示'}；"
+            f"指定邮箱 {'是' if manual_email else '否'}",
+            source="registration_manager",
+            event_type="task_parameters",
+        )
         self._task = asyncio.create_task(
             self._run(
                 label=label,
@@ -233,20 +252,86 @@ class RegistrationTaskManager:
         )
         return self.snapshot()
 
-    def _append_log(self, message: str) -> None:
+    def _append_log(
+        self,
+        message: str,
+        *,
+        at: str = "",
+        email: str = "",
+        stage: str = "",
+        location: str = "",
+        action: str = "",
+        status: str = "",
+        source: str = "registration_manager",
+        event_type: str = "log",
+        origin_task_id: str = "",
+        origin_sequence: int = 0,
+        preserved_sequence: int = 0,
+    ) -> None:
         text = str(message or "").strip()
         if not text:
             return
+        self._log_sequence += 1
+        relay_sequence = self._log_sequence
+        try:
+            sequence = max(0, int(preserved_sequence or relay_sequence))
+        except (TypeError, ValueError):
+            sequence = relay_sequence
+        task_id = str(self._state.get("id") or "")
+        source_task_id = str(origin_task_id or task_id)
+        try:
+            source_sequence = max(0, int(origin_sequence or sequence))
+        except (TypeError, ValueError):
+            source_sequence = sequence
         context = browser_log_context(text)
-        self._state.setdefault("logs", []).append(
-            {"at": utc_now(), "message": text[:1000], **context}
-        )
-        del self._state["logs"][:-100]
+        entry = {
+            "sequence": sequence,
+            "seq": sequence,
+            "relaySequence": relay_sequence,
+            "taskId": task_id,
+            "originTaskId": source_task_id,
+            "originSequence": source_sequence,
+            "originSeq": source_sequence,
+            "source": str(source or "registration_manager")[:80],
+            "eventType": str(event_type or "log")[:80],
+            "at": str(at or utc_now())[:80],
+            "email": str(email or "")[:254],
+            "message": text[:1000],
+            "stage": str(stage or context["stage"])[:80],
+            "location": str(location or context["location"])[:180],
+            "action": str(action or context["action"])[:300],
+            "status": str(status or context["status"])[:40],
+        }
+        self._state.setdefault("logs", []).append(entry)
+        del self._state["logs"][:-MAX_LOG_ITEMS]
         self._state.update(
-            currentStage=context["stage"],
-            currentLocation=context["location"],
-            currentAction=context["action"],
-            currentStatus=context["status"],
+            currentStage=entry["stage"],
+            currentLocation=entry["location"],
+            currentAction=entry["action"],
+            currentStatus=entry["status"],
+        )
+
+    @staticmethod
+    def _browser_log_key(
+        entry: dict[str, Any], fallback_task_id: str
+    ) -> tuple[str, int, str, str, str]:
+        try:
+            sequence = max(
+                0,
+                int(entry.get("sequence") or entry.get("seq") or 0),
+            )
+        except (TypeError, ValueError):
+            sequence = 0
+        return (
+            str(
+                entry.get("originTaskId")
+                or entry.get("taskId")
+                or fallback_task_id
+            ),
+            sequence,
+            str(entry.get("at") or ""),
+            str(entry.get("email") or ""),
+            str(entry.get("message") or ""),
         )
 
     def _relay_browser_logs(
@@ -272,11 +357,7 @@ class RegistrationTaskManager:
                     index
                     for index in range(len(logs) - 1, -1, -1)
                     if isinstance(logs[index], dict)
-                    and (
-                        str(logs[index].get("at") or ""),
-                        str(logs[index].get("email") or ""),
-                        str(logs[index].get("message") or ""),
-                    )
+                    and self._browser_log_key(logs[index], current_task_id)
                     == self._last_relayed_browser_log_key
                 ),
                 -1,
@@ -289,14 +370,38 @@ class RegistrationTaskManager:
             if not message:
                 continue
             context = browser_log_context(message)
-            self._append_log(message)
-            self._last_relayed_browser_log_key = (
-                str(entry.get("at") or ""),
-                str(entry.get("email") or ""),
+            try:
+                origin_sequence = max(
+                    0,
+                    int(entry.get("sequence") or entry.get("seq") or 0),
+                )
+            except (TypeError, ValueError):
+                origin_sequence = 0
+            origin_task_id = str(
+                entry.get("originTaskId")
+                or entry.get("taskId")
+                or current_task_id
+            )
+            stage = str(entry.get("stage") or context["stage"])
+            self._append_log(
                 message,
+                at=str(entry.get("at") or ""),
+                email=str(entry.get("email") or ""),
+                stage=stage,
+                location=str(entry.get("location") or context["location"]),
+                action=str(entry.get("action") or context["action"]),
+                status=str(entry.get("status") or context["status"]),
+                source=str(entry.get("source") or "browser_manager"),
+                event_type=str(entry.get("eventType") or "browser_log"),
+                origin_task_id=origin_task_id,
+                origin_sequence=origin_sequence,
+                preserved_sequence=origin_sequence,
+            )
+            self._last_relayed_browser_log_key = self._browser_log_key(
+                entry, current_task_id
             )
             self._state.update(
-                phase=context["stage"],
+                phase=stage,
                 message=message[:500],
             )
         return task_id, len(logs)
@@ -912,6 +1017,33 @@ class RegistrationTaskManager:
                 failed_items = [
                     item for item in result_accounts if item.get("status") != "success"
                 ]
+                self._state["failedAccounts"] = [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "email",
+                            "status",
+                            "phase",
+                            "message",
+                            "latestLog",
+                            "stage",
+                            "location",
+                            "action",
+                            "logStatus",
+                            "fingerprintRetries",
+                            "registrationChain",
+                            "pageState",
+                            "terminalReasonCode",
+                            "terminalRetryDecision",
+                            "lastRetryCode",
+                            "retryState",
+                            "diagnosticCode",
+                        )
+                        if item.get(key) not in (None, "", [], {})
+                    }
+                    for item in failed_items
+                    if isinstance(item, dict)
+                ][:20]
                 detail = str((failed_items[0] if failed_items else {}).get("message") or "")
                 raise RuntimeError(
                     f"并发注册未全部成功：成功 {succeeded}/{effective_concurrency}"
@@ -921,12 +1053,51 @@ class RegistrationTaskManager:
             self._finalize_cancelled_state()
             raise
         except Exception as error:
+            failure_message = str(error or "一键注册失败")[:500]
             self._state.update(
                 status="failed",
                 phase="failed",
-                message=str(error or "一键注册失败")[:500],
+                message=failure_message,
             )
             self._append_log(f"失败：{self._state['message']}")
+            # Freeze the root-cause context before inventory/provider finalizers
+            # append follow-up logs and replace the live currentStage fields.
+            primary_failure = next(
+                (
+                    item
+                    for item in self._state.get("failedAccounts", [])
+                    if isinstance(item, dict)
+                ),
+                {},
+            )
+            self._state["failureContext"] = {
+                "failedAt": utc_now(),
+                "message": failure_message,
+                "phase": str(self._state.get("currentStage") or "failed"),
+                "currentStage": str(self._state.get("currentStage") or "failed"),
+                "currentLocation": str(
+                    self._state.get("currentLocation") or "注册流程"
+                ),
+                "currentAction": str(
+                    self._state.get("currentAction") or "检查注册失败原因"
+                ),
+                "currentStatus": "error",
+                "failureLogIndex": max(
+                    0, len(self._state.get("logs", [])) - 1
+                ),
+                "registrationChain": self._state.get("registrationChain") or {},
+                "pageState": self._state.get("pageState") or {},
+                "failedAccounts": list(self._state.get("failedAccounts") or []),
+                "reasonCode": str(
+                    primary_failure.get("terminalReasonCode")
+                    or primary_failure.get("lastRetryCode")
+                    or ""
+                ),
+                "failureReason": str(
+                    primary_failure.get("terminalRetryDecision")
+                    or failure_message
+                ),
+            }
         finally:
             try:
                 finalization_emails = (
@@ -1041,6 +1212,7 @@ class ConcurrentRegistrationTaskManager:
         self._processes: dict[str, RegistrationTaskManager] = {}
         self._monitor_tasks: dict[str, asyncio.Task] = {}
         self._recorded_failures: set[str] = set()
+        self._failure_recording_errors: dict[str, str] = {}
         self._latest_process_id = ""
 
     def _process_snapshots(self) -> list[tuple[str, dict[str, Any]]]:
@@ -1068,6 +1240,7 @@ class ConcurrentRegistrationTaskManager:
                 "maxProcesses": self.max_processes,
                 "canStartNext": True,
                 "recordedFailureCount": len(self._recorded_failures),
+                "failureRecordingErrors": dict(self._failure_recording_errors),
                 "tasks": [],
             }
 
@@ -1108,13 +1281,36 @@ class ConcurrentRegistrationTaskManager:
                     "failureRecorded": process_id in self._recorded_failures,
                 }
             )
-            for log in state.get("logs", []):
+            for log_index, log in enumerate(state.get("logs", []), start=1):
                 entry = dict(log)
+                try:
+                    sequence = max(
+                        1,
+                        int(entry.get("sequence") or entry.get("seq") or log_index),
+                    )
+                except (TypeError, ValueError):
+                    sequence = log_index
+                entry.setdefault("sequence", sequence)
+                entry.setdefault("seq", sequence)
+                entry.setdefault("relaySequence", sequence)
+                entry.setdefault("taskId", process_id)
+                entry.setdefault("originTaskId", entry["taskId"])
+                entry.setdefault("originSequence", sequence)
+                entry.setdefault("originSeq", entry["originSequence"])
+                entry.setdefault("source", "registration_manager")
+                entry.setdefault("eventType", "log")
                 entry["processId"] = process_id
                 entry["processIndex"] = process_index
+                entry["processLabel"] = process_label
                 entry["message"] = f"[{process_label}] {entry.get('message', '')}"
                 combined_logs.append(entry)
-        combined_logs.sort(key=lambda item: str(item.get("at") or ""))
+        combined_logs.sort(
+            key=lambda item: (
+                str(item.get("at") or ""),
+                int(item.get("processIndex") or 0),
+                int(item.get("relaySequence") or item.get("sequence") or 0),
+            )
+        )
         summary_snapshots = active or [display]
         summary_states = [state for _, state in summary_snapshots]
         summary_emails: list[str] = []
@@ -1142,12 +1338,13 @@ class ConcurrentRegistrationTaskManager:
                 int(state.get("effectiveConcurrency") or 0) for state in summary_states
             ),
             claimed=sum(int(state.get("claimed") or 0) for state in summary_states),
-            logs=combined_logs[-100:],
+            logs=combined_logs[-MAX_LOG_ITEMS:],
             runningCount=active_count,
             processCount=len(snapshots),
             maxProcesses=self.max_processes,
             canStartNext=active_count < self.max_processes,
             recordedFailureCount=len(self._recorded_failures),
+            failureRecordingErrors=dict(self._failure_recording_errors),
             tasks=public_tasks,
         )
         return display_state
@@ -1245,9 +1442,21 @@ class ConcurrentRegistrationTaskManager:
             "processId": process_id,
             "recordedAt": utc_now(),
         }
-        result = self.record_failure(failure)
-        if inspect.isawaitable(result):
-            await result
+        for attempt in range(3):
+            try:
+                result = self.record_failure(failure)
+                if inspect.isawaitable(result):
+                    await result
+                break
+            except Exception as error:
+                # Monitoring is observational: a storage outage must not alter
+                # the registration terminal state. Brief transient failures get
+                # two bounded retries before the error is exposed in snapshot.
+                self._failure_recording_errors[process_id] = str(error)[:300]
+                if attempt == 2:
+                    return
+                await asyncio.sleep(0.05 * (2**attempt))
+        self._failure_recording_errors.pop(process_id, None)
         self._recorded_failures.add(process_id)
 
     def poll_verification_code(self, email: str) -> str:

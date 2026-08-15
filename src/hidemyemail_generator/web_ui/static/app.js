@@ -5,8 +5,8 @@
   const localToken = window.__HME_LOCAL_TOKEN__;
   const pageDetails = {
     overview: ["DASHBOARD", "概览", "集中查看账号、任务与服务状态"],
-    accounts: ["ACCOUNT SETTINGS", "账号设置", "发起注册任务、跟踪执行状态并维护账号资产"],
-    "quick-flow": ["ONE-CLICK PIPELINE", "一键注册并提链", "注册后仅为不带 OAICS 的账号补齐 PayPal 严格 0 · DE/EUR 链接"],
+    accounts: ["ACCOUNT MANAGEMENT", "账号管理", "集中管理账号资产，并以紧凑流程发起注册任务"],
+    "quick-flow": ["ONE-CLICK PIPELINE", "一键注册并提链", "注册后为尚未生成 PayPal 严格 0 链接的账号提链"],
     network: ["NETWORK ROUTING", "代理与线路", "独立管理所有注册方式共用的代理出口"],
     "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "提取 gpt-link 严格 0 链接或 PayPal DE/EUR OAICS 授权链接"],
     "pp-payment": ["PAYPAL WORKSPACE", "PP 支付", "PayPal BA 协议授权与支付任务"],
@@ -31,7 +31,7 @@
       country: "DE",
       summary: "创建 DE/EUR oaics_ Checkout 并提取 PayPal BA 授权链接",
       label: "PayPal / 严格 0 · DE / EUR",
-      checks: ["✓ Session 可用", "✓ 无 OAICS 才创建", "✓ DE / EUR", "✓ 优惠后金额 0"],
+      checks: ["✓ Session 可用", "✓ 未生成同模式链接", "✓ DE / EUR", "✓ 优惠后金额 0"],
       button: "提取 PayPal 链接",
       success: "PayPal DE/EUR 链接已提取并复制",
       singleProxy: true,
@@ -47,6 +47,20 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  function redactRuntimeLogText(value) {
+    return String(value ?? "")
+      .replace(/([a-z][a-z0-9+.-]*:\/\/)([^@\s/:]+):([^@\s]+)@/gi,
+        "$1[REDACTED]:[REDACTED]@")
+      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+={0,2}/gi, "$1 [REDACTED]")
+      .replace(
+        /(["']?)(authorization|password|passwd|pwd|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?(?:token|id)|session|token|cookie|set-cookie|secret|totp|otp|verification[_-]?code|email[_-]?code|one[_-]?time[_-]?(?:code|password)|two(?:[_-]?factor)?[_-]?secret|private[_-]?key|proxy[_-]?password|openai[_-]?key)\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+        "$1$2$1$3[REDACTED]"
+      )
+      .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{6,}\b/gi, "[REDACTED_API_KEY]")
+      .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+        "[REDACTED_JWT]");
   }
 
   function formatDate(value) {
@@ -65,6 +79,16 @@
     return date.toLocaleTimeString("zh-CN", {
       hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
     });
+  }
+
+  function formatLogTimestamp(value) {
+    const date = new Date(value || "");
+    if (Number.isNaN(date.getTime())) return "---- -- -- --:--:--.---";
+    const pad = (part, width = 2) => String(part).padStart(width, "0");
+    return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" +
+      pad(date.getDate()) + " " + pad(date.getHours()) + ":" +
+      pad(date.getMinutes()) + ":" + pad(date.getSeconds()) + "." +
+      pad(date.getMilliseconds(), 3);
   }
 
   function formatElapsed(startValue, endValue) {
@@ -196,6 +220,14 @@
     return item?.cardLinkStatus === "cs_live" && item?.cardLinkMethod === method;
   }
 
+  function hasGeneratedCardLinkForMethod(item, method) {
+    return Boolean(
+      item?.cardLink &&
+      item.cardLinkStatus === "generated" &&
+      item.cardLinkMethod === method
+    );
+  }
+
   function cardLinkEligible(item, method) {
     return Boolean(
       item?.email?.toLowerCase().endsWith("@icloud.com") &&
@@ -229,6 +261,8 @@
       if (!response.ok || data.ok === false) {
         const error = new Error(data.error || "请求失败 (" + response.status + ")");
         error.status = response.status;
+        error.code = data.code || "";
+        error.canDeleteLocal = Boolean(data.canDeleteLocal);
         throw error;
       }
       return data;
@@ -315,6 +349,602 @@
     }
   }
 
+  class NavigationSidebarView {
+    constructor() {
+      this.root = document.documentElement;
+      this.sidebar = $("workbenchSidebar");
+      this.collapseButton = $("sidebarCollapseButton");
+      this.expandRail = $("sidebarExpandRail");
+    }
+
+    render(collapsed) {
+      const expanded = !collapsed;
+      this.root.dataset.sidebarCollapsed = String(collapsed);
+      this.sidebar.hidden = collapsed;
+      this.sidebar.setAttribute("aria-hidden", String(collapsed));
+      this.sidebar.toggleAttribute("inert", collapsed);
+      this.collapseButton.setAttribute("aria-expanded", String(expanded));
+      this.expandRail.setAttribute("aria-expanded", String(expanded));
+      this.expandRail.hidden = expanded;
+    }
+
+    focusToggle(collapsed) {
+      requestAnimationFrame(() => {
+        (collapsed ? this.expandRail : this.collapseButton).focus();
+      });
+    }
+  }
+
+  class NavigationSidebarPresenter {
+    constructor(view, storage = localStorage) {
+      this.view = view;
+      this.storage = storage;
+      this.collapsed = false;
+    }
+
+    restore() {
+      try {
+        this.collapsed = this.storage.getItem("hme_sidebar_collapsed") === "true";
+      } catch (_error) {
+        this.collapsed = false;
+      }
+      this.view.render(this.collapsed);
+    }
+
+    toggle() {
+      this.collapsed = !this.collapsed;
+      try {
+        this.storage.setItem("hme_sidebar_collapsed", String(this.collapsed));
+      } catch (_error) {
+        // The visual state remains usable when persistent storage is unavailable.
+      }
+      this.view.render(this.collapsed);
+      this.view.focusToggle(this.collapsed);
+    }
+  }
+
+  class RuntimeLogResizeView {
+    constructor() {
+      this.drawer = $("runtimeLogDrawer");
+      this.handle = $("runtimeLogResizeHandle");
+      this.compactQuery = matchMedia("(max-width: 640px)");
+    }
+
+    isCompact() { return this.compactQuery.matches; }
+
+    availableWidth() {
+      const activityBarWidth = Number.parseFloat(getComputedStyle(document.documentElement)
+        .getPropertyValue("--workbench-activitybar-width")) || 0;
+      const layoutWidth = document.documentElement.getBoundingClientRect().width;
+      return Math.max(1, layoutWidth - activityBarWidth);
+    }
+
+    measuredWidth() { return this.drawer.getBoundingClientRect().width; }
+
+    render({ width, min, max, compact }) {
+      const roundedWidth = Math.round(width);
+      const moveFocusInsideDialog = compact && document.activeElement === this.handle &&
+        !this.drawer.hidden;
+      this.drawer.style.setProperty("--runtime-log-drawer-width", roundedWidth + "px");
+      this.handle.hidden = compact;
+      this.handle.tabIndex = compact ? -1 : 0;
+      this.handle.setAttribute("aria-disabled", String(compact));
+      this.handle.setAttribute("aria-valuemin", String(Math.round(min)));
+      this.handle.setAttribute("aria-valuemax", String(Math.round(max)));
+      this.handle.setAttribute("aria-valuenow", String(roundedWidth));
+      this.handle.setAttribute("aria-valuetext", roundedWidth + " 像素");
+      this.handle.title = compact
+        ? "小屏幕使用全屏日志视图"
+        : "当前宽度 " + roundedWidth + " 像素；左右拖动调整，方向键微调，双击恢复默认";
+      if (moveFocusInsideDialog) $("runtimeLogCloseButton").focus();
+    }
+
+    startPointer(pointerId) {
+      document.body.classList.add("runtime-log-resizing");
+      try { this.handle.setPointerCapture(pointerId); } catch (_error) {}
+    }
+
+    stopPointer(pointerId) {
+      document.body.classList.remove("runtime-log-resizing");
+      try {
+        if (this.handle.hasPointerCapture(pointerId)) this.handle.releasePointerCapture(pointerId);
+      } catch (_error) {}
+    }
+  }
+
+  class RuntimeLogResizePresenter {
+    constructor(view, storage = window.localStorage) {
+      this.view = view;
+      this.storage = storage;
+      this.storageKey = "hme_runtime_log_width";
+      this.defaultWidth = 680;
+      this.minimumWidth = 420;
+      this.maximumWidth = 1200;
+      this.preferredWidth = this.defaultWidth;
+      this.effectiveWidth = this.defaultWidth;
+      this.drag = null;
+    }
+
+    normalizePreferred(value) {
+      if (value == null || String(value).trim() === "") return this.defaultWidth;
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return this.defaultWidth;
+      return Math.min(this.maximumWidth, Math.max(this.minimumWidth, numeric));
+    }
+
+    bounds() {
+      const max = Math.min(this.maximumWidth, this.view.availableWidth());
+      return { min: Math.min(this.minimumWidth, max), max };
+    }
+
+    apply() {
+      if (this.view.isCompact()) {
+        this.effectiveWidth = window.innerWidth;
+        this.view.render({
+          width: this.effectiveWidth,
+          min: this.effectiveWidth,
+          max: this.effectiveWidth,
+          compact: true,
+        });
+        return;
+      }
+      const { min, max } = this.bounds();
+      this.effectiveWidth = Math.min(max, Math.max(min, this.preferredWidth));
+      this.view.render({ width: this.effectiveWidth, min, max, compact: false });
+    }
+
+    restore() {
+      let saved = this.defaultWidth;
+      try { saved = this.storage.getItem(this.storageKey) ?? this.defaultWidth; } catch (_error) {}
+      this.preferredWidth = this.normalizePreferred(saved);
+      this.apply();
+    }
+
+    persist() {
+      try { this.storage.setItem(this.storageKey, String(Math.round(this.preferredWidth))); }
+      catch (_error) {}
+    }
+
+    begin(event) {
+      if (this.view.isCompact() || !event.isPrimary || event.button !== 0) return;
+      event.preventDefault();
+      this.drag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth: this.effectiveWidth || this.view.measuredWidth(),
+        startPreferredWidth: this.preferredWidth,
+      };
+      this.view.startPointer(event.pointerId);
+    }
+
+    move(event) {
+      if (!this.drag || event.pointerId !== this.drag.pointerId) return;
+      event.preventDefault();
+      const next = this.drag.startWidth + this.drag.startX - event.clientX;
+      const { min, max } = this.bounds();
+      this.preferredWidth = Math.min(max, Math.max(min, next));
+      this.apply();
+    }
+
+    finish(event) {
+      if (!this.drag || (event?.pointerId != null && event.pointerId !== this.drag.pointerId)) return;
+      const pointerId = this.drag.pointerId;
+      this.drag = null;
+      this.view.stopPointer(pointerId);
+      this.persist();
+    }
+
+    cancel(event) {
+      if (!this.drag || (event?.pointerId != null && event.pointerId !== this.drag.pointerId)) return;
+      const { pointerId, startPreferredWidth } = this.drag;
+      this.drag = null;
+      this.preferredWidth = startPreferredWidth;
+      this.view.stopPointer(pointerId);
+      this.apply();
+    }
+
+    handleKeydown(event) {
+      if (this.view.isCompact()) return;
+      const { min, max } = this.bounds();
+      const step = event.shiftKey ? 64 : 16;
+      let next = null;
+      if (event.key === "Home") next = min;
+      if (event.key === "End") next = max;
+      if (event.key === "ArrowLeft") next = this.effectiveWidth + step;
+      if (event.key === "ArrowRight") next = this.effectiveWidth - step;
+      if (next == null) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this.preferredWidth = Math.min(max, Math.max(min, next));
+      this.apply();
+      this.persist();
+    }
+
+    reset(event) {
+      if (this.view.isCompact()) return;
+      event?.preventDefault();
+      this.preferredWidth = this.defaultWidth;
+      this.apply();
+      this.persist();
+    }
+
+    handleViewportResize() {
+      if (this.drag) this.cancel();
+      this.apply();
+    }
+  }
+
+  class RuntimeLogView {
+    constructor() {
+      this.drawer = $("runtimeLogDrawer");
+      this.backdrop = $("runtimeLogBackdrop");
+      this.trigger = $("runtimeLogButton");
+      this.triggers = [...document.querySelectorAll('[data-action="open-runtime-log"]')];
+      this.list = $("runtimeLogList");
+      this.search = $("runtimeLogSearch");
+      this.level = $("runtimeLogLevel");
+      this.autoscroll = $("runtimeLogAutoscroll");
+      this.announcement = $("runtimeLogAnnouncement");
+      this.lastKnownTotal = 0;
+      this.lastKnownCursor = "";
+      this.focusFrame = 0;
+    }
+
+    isOpen() { return !this.drawer.hidden; }
+
+    open(opener) {
+      this.returnFocus = opener?.closest?.("button") || document.activeElement || this.trigger;
+      document.querySelectorAll(".workbench-titlebar, .app-shell")
+        .forEach((element) => element.setAttribute("inert", ""));
+      this.drawer.hidden = false;
+      this.backdrop.hidden = false;
+      this.triggers.forEach((element) => element.setAttribute("aria-expanded", "true"));
+      document.body.classList.add("runtime-log-open");
+      this.scrollOnNextRender = true;
+      cancelAnimationFrame(this.focusFrame);
+      this.focusFrame = requestAnimationFrame(() => {
+        this.focusFrame = 0;
+        if (this.isOpen()) $("runtimeLogCloseButton").focus();
+      });
+    }
+
+    close() {
+      cancelAnimationFrame(this.focusFrame);
+      this.focusFrame = 0;
+      this.drawer.hidden = true;
+      this.backdrop.hidden = true;
+      this.triggers.forEach((element) => element.setAttribute("aria-expanded", "false"));
+      document.body.classList.remove("runtime-log-open");
+      document.querySelectorAll(".workbench-titlebar, .app-shell")
+        .forEach((element) => element.removeAttribute("inert"));
+      const fallback = this.triggers.find((element) => element.getClientRects().length) || this.trigger;
+      const focusTarget = this.returnFocus?.isConnected && this.returnFocus.getClientRects().length
+        ? this.returnFocus : fallback;
+      focusTarget.focus();
+    }
+
+    trapFocus(event) {
+      if (event.key !== "Tab" || !this.isOpen()) return;
+      const focusable = [...this.drawer.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )].filter((element) => element.getClientRects().length &&
+        !element.closest("[hidden], [inert]"));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    filters() {
+      return {
+        query: this.search.value.trim().toLocaleLowerCase("zh-CN"),
+        level: this.level.value || "all",
+      };
+    }
+
+    render(model, visibleLogs, { forceList = false } = {}) {
+      const previousTotal = this.lastKnownTotal;
+      const previousCursor = this.lastKnownCursor;
+      this.lastKnownTotal = model.logs.length;
+      this.lastKnownCursor = model.cursor;
+      const wasNearBottom = this.list.scrollHeight - this.list.scrollTop -
+        this.list.clientHeight < 80;
+      const count = model.logs.length > 999 ? "999+" : String(model.logs.length);
+      $("runtimeLogTriggerCount").textContent = count;
+      this.trigger.setAttribute("aria-label", "打开运行日志，" + model.logs.length + " 条");
+      $("runtimeLogLiveDot").classList.toggle("live", model.runningCount > 0);
+      $("runtimeLogState").textContent = model.statusLabel;
+      $("runtimeLogTask").textContent = model.taskLabel;
+      $("runtimeLogStartedAt").textContent = formatLogTimestamp(model.startedAt);
+      $("runtimeLogTotal").textContent = model.logs.length + " 条";
+      $("runtimeLogSubtitle").textContent = model.subtitle;
+      $("runtimeLogVisibleCount").textContent = "显示 " + visibleLogs.length +
+        " / " + model.logs.length + " 条";
+      $("runtimeLogUpdatedAt").textContent = "界面更新 " + formatLogTimestamp(model.updatedAt);
+      if (!this.isOpen() && !forceList) return;
+      this.list.innerHTML = visibleLogs.length ? visibleLogs.map((item, index) => {
+        const levelLabels = {
+          error: "错误", warning: "警告", waiting: "等待", success: "成功",
+          active: "运行", idle: "信息",
+        };
+        const contexts = [
+          ["账号", item.email],
+          ["阶段", taskStageLabel(item.stage) + " · " + item.stage],
+          ["页面位置", item.location],
+          ["正在执行", item.action],
+          ["任务 ID", item.taskId],
+          ["进程", item.processLabel || item.processId],
+          ["诊断码", item.diagnosticCode],
+          ["事件来源", [item.source, item.eventType].filter(Boolean).join(" / ")],
+        ].filter((entry) => String(entry[1] || "").trim());
+        return '<article class="runtime-log-entry" data-level="' +
+          escapeHtml(item.status) + '"><div class="runtime-log-entry-head"><span class="runtime-log-level">' +
+          escapeHtml(levelLabels[item.status] || "信息") + '</span><span class="runtime-log-source">' +
+          escapeHtml(item.sourceLabel) + '</span><time datetime="' + escapeHtml(item.at) + '">' +
+          escapeHtml(formatLogTimestamp(item.at)) + '</time><span class="runtime-log-sequence">#' +
+          escapeHtml(item.sequence || index + 1) + '</span></div><p class="runtime-log-message">' +
+          escapeHtml(item.message || "（无消息内容）") + '</p><dl class="runtime-log-context-grid">' +
+          contexts.map((entry) => '<div><dt>' + escapeHtml(entry[0]) + '</dt><dd title="' +
+            escapeHtml(entry[1]) + '">' +
+            escapeHtml(entry[1]) + '</dd></div>').join("") + "</dl></article>";
+      }).join("") : '<div class="runtime-log-empty"><strong>没有匹配的日志</strong><span>' +
+        (model.logs.length
+          ? "请调整搜索关键词或日志级别。"
+          : "启动注册、浏览器、协议或验证任务后，详细日志会实时显示在这里。") +
+        "</span></div>";
+      if (this.isOpen() && this.autoscroll.checked && (wasNearBottom || this.scrollOnNextRender)) {
+        requestAnimationFrame(() => { this.list.scrollTop = this.list.scrollHeight; });
+      }
+      if (this.isOpen() && previousCursor && model.cursor !== previousCursor) {
+        const delta = Math.max(0, model.logs.length - previousTotal);
+        this.announcement.textContent = delta
+          ? "新增 " + delta + " 条运行日志，最新序号 " + (model.logs.at(-1)?.sequence || "—")
+          : "运行日志已更新，最新序号 " + (model.logs.at(-1)?.sequence || "—");
+      }
+      this.scrollOnNextRender = false;
+    }
+  }
+
+  class RuntimeLogPresenter {
+    constructor(view) {
+      this.view = view;
+      this.model = this.buildModel({});
+      this.visibleLogs = [];
+    }
+
+    candidate(kind, label, task, overrides = {}) {
+      if (!task || typeof task !== "object") return null;
+      const status = String(task.status || (task.running ? "running" : "idle"));
+      const running = Boolean(task.running || task.starting || status === "running");
+      const currentLogs = Array.isArray(task.logs) ? task.logs : [];
+      const historyLogs = Array.isArray(task.historyLogs) ? task.historyLogs : [];
+      const logs = Array.isArray(overrides.logs)
+        ? overrides.logs
+        : running ? currentLogs : historyLogs.length ? historyLogs : currentLogs;
+      if (!logs.length && !task.running && ["", "idle"].includes(status)) return null;
+      const id = String(overrides.id || task.processId || task.id || task.taskId || "");
+      const startedAt = String(overrides.startedAt || task.startedAt || "");
+      const finishedAt = String(overrides.finishedAt || task.finishedAt || "");
+      const lastAt = String(logs.at(-1)?.at || finishedAt || startedAt || "");
+      return {
+        kind, label, task, logs, id, startedAt, finishedAt, lastAt,
+        processId: String(overrides.processId || task.processId || ""),
+        processLabel: String(overrides.processLabel || task.processLabel || ""),
+        running,
+        status,
+      };
+    }
+
+    buildModel(state) {
+      const candidates = [];
+      const registration = state.registrationTask || {};
+      const processTasks = Array.isArray(registration.tasks) ? registration.tasks : [];
+      if (processTasks.length) {
+        processTasks.forEach((task, index) => {
+          const item = this.candidate("registration", "注册进程", task, {
+            id: task.processId || task.id,
+            processId: task.processId || task.id,
+            processLabel: task.processLabel || "注册进程 " + (index + 1),
+          });
+          if (item) candidates.push(item);
+        });
+      } else {
+        const item = this.candidate("registration", "注册任务", registration);
+        if (item) candidates.push(item);
+      }
+      const diagnosticLogs = (registration.failureRecords || []).map((record, index) => ({
+        at: record.recordedAt || record.finishedAt || record.startedAt || "",
+        email: record.email || (record.emails || [])[0] || "",
+        message: "[" + (record.category || "未分类失败") + "] " +
+          (record.failureReason || record.message || "注册失败"),
+        stage: record.failedStage || record.currentStage || "failed",
+        location: record.currentLocation || "注册失败诊断",
+        action: record.suggestedAction || "打开运行日志检查失败上下文后重新注册",
+        status: "error",
+        diagnosticCode: record.reasonCode || "",
+        source: "registration_diagnostic",
+        eventType: "failure_record",
+        taskId: record.taskId || record.processId || registration.id || "",
+        sequence: record.sequence || index + 1,
+      })).sort((left, right) =>
+        new Date(left.at || 0) - new Date(right.at || 0));
+      if (diagnosticLogs.length) {
+        const item = this.candidate("registration_diagnostic", "注册诊断", {
+          id: registration.id || "registration-diagnostic",
+          status: "failed",
+          running: false,
+          startedAt: diagnosticLogs[0]?.at || "",
+          finishedAt: diagnosticLogs.at(-1)?.at || "",
+          logs: diagnosticLogs,
+          historyLogs: [],
+        }, { id: registration.id || "registration-diagnostic" });
+        if (item) candidates.push(item);
+      }
+      [
+        this.candidate("browser", "浏览器任务", state.browserTask || {}),
+        this.candidate("protocol", "协议注册", state.protocolRegistrationTask || {}),
+        this.candidate("verification", "账号验证", state.verificationTask || {}),
+      ].forEach((item) => { if (item) candidates.push(item); });
+      const quickFlows = Array.isArray(state.quickFlows) && state.quickFlows.length
+        ? state.quickFlows : state.quickFlow?.runId ? [state.quickFlow] : [];
+      quickFlows.forEach((flow, index) => {
+        const item = this.candidate("pipeline", "注册提链流水线", flow, {
+          id: flow.runId || flow.taskId,
+          processId: flow.runId || "",
+          processLabel: "流水线 " + (index + 1),
+        });
+        if (item) candidates.push(item);
+      });
+
+      const active = candidates.filter((item) => item.running);
+      const selected = active.length ? active : [...candidates]
+        .sort((left, right) => new Date(right.lastAt || 0) - new Date(left.lastAt || 0))
+        .slice(0, 1);
+      const seen = new Set();
+      const logs = [];
+      selected.forEach((candidate) => {
+        candidate.logs.forEach((raw, index) => {
+          if (!raw || typeof raw !== "object") return;
+          const message = redactRuntimeLogText(raw.message).slice(0, 5000);
+          const at = redactRuntimeLogText(raw.at || candidate.startedAt || "");
+          const email = String(raw.email || candidate.task.email || "");
+          const taskId = redactRuntimeLogText(raw.originTaskId || raw.taskId || candidate.id || "");
+          const originSequence = Number(raw.originSeq || raw.originSequence ||
+            (raw.originTaskId && raw.originTaskId === raw.taskId
+              ? raw.sequence || raw.seq : 0));
+          const sequence = Number(originSequence || raw.sequence || raw.seq || index + 1);
+          const rawStatus = String(raw.level || raw.status || "").toLowerCase();
+          const normalizedStatus = {
+            debug: "active", info: "active", warn: "warning", fatal: "error",
+          }[rawStatus] || rawStatus;
+          const stableKey = raw.originTaskId && originSequence
+            ? "origin|" + raw.originTaskId + "|" + originSequence
+            : [candidate.kind, candidate.id, raw.source, raw.eventType || raw.event_type,
+              sequence, at, email, message].join("|");
+          if (seen.has(stableKey)) return;
+          seen.add(stableKey);
+          const contextual = inferLogContext({
+            at, email, message,
+            stage: redactRuntimeLogText(raw.stage),
+            location: redactRuntimeLogText(raw.location),
+            action: redactRuntimeLogText(raw.action),
+            status: normalizedStatus,
+          });
+          logs.push({
+            ...contextual,
+            key: stableKey,
+            taskId,
+            sequence: Number.isFinite(sequence) && sequence > 0 ? sequence : index + 1,
+            source: redactRuntimeLogText(raw.source || candidate.kind),
+            eventType: redactRuntimeLogText(raw.eventType || raw.event_type || "log"),
+            sourceLabel: redactRuntimeLogText(candidate.label),
+            processId: redactRuntimeLogText(raw.processId || candidate.processId || ""),
+            processLabel: redactRuntimeLogText(raw.processLabel || candidate.processLabel || ""),
+            diagnosticCode: redactRuntimeLogText(raw.diagnosticCode || raw.reasonCode || ""),
+          });
+        });
+      });
+      logs.sort((left, right) => {
+        const timeDelta = new Date(left.at || 0) - new Date(right.at || 0);
+        return timeDelta || Number(left.sequence || 0) - Number(right.sequence || 0);
+      });
+      const retainedLogs = logs.slice(-1200);
+      const startedAt = selected.map((item) => item.startedAt).filter(Boolean)
+        .sort()[0] || "";
+      const latest = selected[0] || null;
+      const statusLabel = active.length
+        ? active.length + " 个任务运行中"
+        : latest ? "当前无运行任务 · " + taskStatusMeta(latest.status)[0] : "等待任务";
+      const taskIds = selected.map((item) => item.id).filter(Boolean);
+      const taskLabel = taskIds.length
+        ? taskIds.slice(0, 2).map((item) => item.slice(0, 12)).join(" · ") +
+          (taskIds.length > 2 ? " · +" + (taskIds.length - 2) : "")
+        : "—";
+      const sourceLabels = [...new Set(selected.map((item) => item.label))];
+      return {
+        logs: retainedLogs,
+        cursor: retainedLogs.at(-1)?.key || "",
+        runningCount: active.length,
+        statusLabel,
+        taskLabel,
+        startedAt,
+        updatedAt: new Date().toISOString(),
+        subtitle: active.length
+          ? "正在实时跟踪：" + sourceLabels.join("、") + " · 任务状态轮询会自动更新"
+          : latest ? "当前无运行任务，显示最近一次“" + latest.label + "”的完整日志"
+            : "等待注册、浏览器、协议、验证或提链任务启动",
+      };
+    }
+
+    filteredLogs() {
+      const filters = this.view.filters();
+      return this.model.logs.filter((item) => {
+        const levelMatches = filters.level === "all" ||
+          (filters.level === "warning"
+            ? ["warning", "waiting"].includes(item.status)
+            : item.status === filters.level);
+        if (!levelMatches) return false;
+        if (!filters.query) return true;
+        return [
+          item.message, item.email, item.taskId, item.processId, item.processLabel,
+          item.stage, item.location, item.action, item.source, item.sourceLabel,
+          item.diagnosticCode,
+        ].join(" ").toLocaleLowerCase("zh-CN").includes(filters.query);
+      });
+    }
+
+    present(state) {
+      this.model = this.buildModel(state);
+      this.visibleLogs = this.filteredLogs();
+      this.view.render(this.model, this.visibleLogs);
+    }
+
+    refilter() {
+      this.visibleLogs = this.filteredLogs();
+      this.view.render(this.model, this.visibleLogs, { forceList: true });
+    }
+
+    open(opener) {
+      this.view.open(opener);
+      this.view.render(this.model, this.visibleLogs, { forceList: true });
+    }
+
+    close() { this.view.close(); }
+
+    isOpen() { return this.view.isOpen(); }
+
+    handleKeydown(event) {
+      this.view.trapFocus(event);
+      if (event.key === "Escape" && this.view.isOpen()) {
+        event.preventDefault();
+        this.close();
+      }
+    }
+
+    exportText() {
+      return this.visibleLogs.map((item, index) => [
+        formatLogTimestamp(item.at),
+        "[" + (item.status || "info").toUpperCase() + "]",
+        "[" + item.sourceLabel + "]",
+        "#" + (item.sequence || index + 1),
+        item.taskId ? "task=" + item.taskId : "",
+        item.processLabel || item.processId ? "process=" + (item.processLabel || item.processId) : "",
+        item.email ? "email=" + item.email : "",
+        item.stage ? "stage=" + item.stage : "",
+        item.location ? "location=" + item.location : "",
+        item.action ? "action=" + item.action : "",
+        item.diagnosticCode ? "diagnostic=" + item.diagnosticCode : "",
+        "message=" + (item.message || ""),
+      ].filter(Boolean).join(" | ")).join("\n");
+    }
+  }
+
   class WorkspaceRenderer {
     constructor(store) { this.store = store; }
 
@@ -348,6 +978,7 @@
       $("runtimeDot").className = available ? "ok" : "bad";
       $("sidebarRuntimeDot").className = available ? "" : "bad";
       $("runtimeLabel").textContent = available ? "运行环境已连接" : "运行环境不可用";
+      $("sidebarRuntimeLabel").textContent = available ? "运行环境已连接" : "运行环境不可用";
     }
 
     renderOverview(state) {
@@ -418,9 +1049,7 @@
       const session = $("accountSessionFilter")?.value || "all";
       return state.accounts.filter((item) =>
         (!query || item.email.toLowerCase().includes(query)) &&
-        (plan === "all" ||
-          (plan === "oai" && (item.checkoutIsOaics || item.checkoutIdType === "oaics")) ||
-          item.accountType === plan) &&
+        (plan === "all" || item.accountType === plan) &&
         (session === "all" || item.sessionStatus === session)
       );
     }
@@ -450,7 +1079,6 @@
         (roxyMode && $("roxyWindowMode").value === "background");
       this.renderRoxyRegistration(state, roxyMode);
       $("protocolRegistrationPanel").hidden = !protocolMode;
-      $("taskPanel").hidden = protocolMode;
       $("registrationSourceBlock").classList.remove("mode-disabled");
       $("registrationManualBlock").classList.toggle("mode-disabled", protocolMode);
       const smsBower = state.smsBower || {};
@@ -479,8 +1107,7 @@
         const roxyTargetCount = Number($("roxyTargetCount").value || roxyWindows);
         $("registerProviderButton").textContent = activeRegistrationProcesses
           ? "Roxy 并发注册运行中"
-          : "开始 iCloud 注册（" + roxyWindows + " 窗口 · 目标 " +
-            roxyTargetCount + " 个）";
+          : "Roxy 注册 · " + roxyWindows + "×" + roxyTargetCount;
       }
       $("registerProviderButton").disabled = protocolMode
         ? registrationProvider !== "icloud" || protocolBusy
@@ -493,241 +1120,26 @@
       $("registerEmailButton").textContent = activeRegistrationProcesses
         ? `启动下一个注册进程（运行中 ${activeRegistrationProcesses}）`
         : "添加邮箱并注册";
-      const task = state.browserTask;
+      const task = state.browserTask || {};
       const hasRegistration = Boolean(registration.id && registration.status !== "idle");
       const primaryTask = hasRegistration ? registration : task;
       const status = primaryTask.status || "idle";
       const statusMeta = taskStatusMeta(status);
-      const taskTotal = Number(task.total || (hasRegistration
-        ? registration.effectiveConcurrency || registration.claimed || registration.requested || 1
-        : 0));
-      const taskCompleted = Number(task.total
-        ? task.completed || 0
-        : (hasRegistration && !registration.running ? 1 : 0));
-      const taskSucceeded = Number(task.succeeded || (registration.status === "completed" ? 1 : 0));
-      let progress = taskTotal ? Math.round(taskCompleted / taskTotal * 100) : 0;
-      if (hasRegistration && registration.running && !task.total) {
-        progress = {
-          generating_email: 12,
-          purchasing_gmail: 12,
-          preparing_email: 18,
-          claiming_inventory: 12,
-          confirming_email: 28,
-          registering_openai: 40,
-          awaiting_verification_code: 65,
-          cancelling: 40,
-        }[registration.phase] || progress;
-      }
-      if (registration.status === "completed") progress = 100;
-
-      $("taskPanel").dataset.taskTone = statusMeta[1];
-      $("taskStatusIcon").textContent = statusMeta[2];
-      $("taskStateBadge").textContent = statusMeta[0];
-      $("registrationSummary").textContent = hasRegistration
-        ? "邮箱注册 · " + this.registrationLabel(registration)
-        : (task.status && task.status !== "idle"
-          ? "浏览器任务 · " + statusMeta[0]
-          : "邮箱注册 · 等待开始");
-      const latestTaskLog = (task.logs || []).at(-1);
-      $("taskMessage").textContent = hasRegistration
-        ? (registration.message || "正在处理注册任务")
-        : (latestTaskLog?.message || "尚未启动注册或 Session 获取任务");
-      $("browserTaskSummary").textContent = taskCompleted + " / " + taskTotal;
-      $("browserTaskSuccess").textContent = taskSucceeded;
-      $("taskElapsed").textContent = formatElapsed(
-        hasRegistration ? registration.startedAt : task.startedAt,
-        primaryTask.running ? "" : primaryTask.finishedAt
-      );
-      $("stopTaskButton").disabled = !(task.running || registration.running);
-      $("browserTaskProgress").value = progress;
-      $("browserTaskProgress").setAttribute("aria-valuenow", String(progress));
-      $("browserTaskProgressValue").textContent = progress + "%";
+      const runtimeRunning = Boolean(task.running || registration.running);
+      const processCount = Number(registration.runningCount || 0);
+      $("registrationRuntimeState").textContent = runtimeRunning
+        ? (processCount > 1 ? processCount + " 个注册进程运行中" : statusMeta[0])
+        : (hasRegistration ? "最近任务：" + statusMeta[0] : "当前无运行任务");
+      $("registrationRuntimeMessage").textContent = runtimeRunning
+        ? "日志正在实时更新，点击“查看运行日志”查看页面、动作与诊断详情"
+        : "运行详情请打开日志界面查看";
+      $("stopTaskButton").disabled = !runtimeRunning;
       const codePanel = $("registrationCodePanel");
       const awaitingEmail = (registration.awaitingCodeEmails || [])[0] || registration.email || "";
       codePanel.hidden = !registration.awaitingCode || registration.provider === "smsbower";
       $("registrationCodeEmail").textContent = registration.awaitingCode
         ? "验证码将用于 " + awaitingEmail
         : "等待注册页面请求验证码";
-
-      const seenLogs = new Set();
-      const recordedFailureLogs = (registration.failureRecords || []).map((record) => ({
-        at: record.recordedAt || record.finishedAt || record.startedAt || "",
-        email: record.email || (record.emails || [])[0] || "",
-        message: "失败邮箱已记录，可重新点击注册：" + (record.message || "注册失败"),
-        stage: record.currentStage || "failed",
-        location: record.currentLocation || "注册失败记录",
-        action: "失败邮箱已记录，可重新注册",
-        status: "error",
-      }));
-      const logs = [
-        ...(registration.logs || []).map((item) => ({ ...item, email: item.email || registration.email || "" })),
-        ...recordedFailureLogs,
-        ...(task.logs || []),
-      ].filter((item) => {
-        const key = [item.at, item.email, item.message].join("|");
-        if (seenLogs.has(key)) return false;
-        seenLogs.add(key);
-        return true;
-      }).sort((left, right) => new Date(left.at || 0) - new Date(right.at || 0))
-        .slice(-16).map(inferLogContext);
-      let latestContext = logs.at(-1) || inferLogContext({
-        stage: primaryTask.currentStage || "idle",
-        location: primaryTask.currentLocation || "等待任务",
-        action: primaryTask.currentAction || "尚未开始",
-        status: primaryTask.currentStatus || "idle",
-        email: registration.email || "",
-      });
-      const pageRecognition = task.pageState || (task.accounts || [])
-        .filter((item) => item.pageState)
-        .sort((left, right) => new Date(right.pageState.updatedAt || 0) -
-          new Date(left.pageState.updatedAt || 0))
-        .map((item) => ({ ...item.pageState, email: item.email }))[0] || null;
-      const registrationChain = task.registrationChain || (task.accounts || [])
-        .filter((item) => item.registrationChain)
-        .sort((left, right) => new Date(right.registrationChain.updatedAt || 0) -
-          new Date(left.registrationChain.updatedAt || 0))
-        .map((item) => ({ ...item.registrationChain, email: item.email }))[0] || null;
-      if (pageRecognition?.currentPage) {
-        latestContext = inferLogContext({
-          ...latestContext,
-          stage: pageRecognition.stage || latestContext.stage,
-          location: pageRecognition.currentPage,
-          action: pageRecognition.nextAction || latestContext.action,
-          status: pageRecognition.actionMode === "error" ? "error" :
-            pageRecognition.actionMode === "manual" ? "waiting" : "active",
-          email: pageRecognition.email || latestContext.email,
-        });
-      }
-      const stageGroup = taskStageGroup(latestContext.stage);
-      $("taskPanel").dataset.currentStage = latestContext.stage;
-      $("taskPanel").dataset.stageGroup = stageGroup;
-      document.querySelectorAll("#taskPanel .task-flow-step").forEach((step) => {
-        const active = step.dataset.flow === stageGroup;
-        step.classList.toggle("active", active);
-        if (active) step.setAttribute("aria-current", "step");
-        else step.removeAttribute("aria-current");
-      });
-      $("taskCurrentLocation").textContent = latestContext.location;
-      $("taskCurrentStage").textContent = taskStageLabel(latestContext.stage);
-      $("taskCurrentAction").textContent = latestContext.action;
-      $("taskCurrentAccount").textContent = latestContext.email
-        ? abbreviateEmail(latestContext.email) : "未选择账号";
-      if (registrationChain?.currentStep) {
-        latestContext.action = registrationChain.nextAction || latestContext.action;
-        latestContext.email = registrationChain.email || latestContext.email;
-        $("taskCurrentAction").textContent = registrationChain.currentStep;
-        $("taskCurrentAccount").textContent = latestContext.email
-          ? abbreviateEmail(latestContext.email) : "未选择账号";
-      }
-      const completedSteps = registrationChain?.completedSteps ||
-        pageRecognition?.completedSteps || [];
-      $("taskCompletedSteps").textContent = completedSteps.length
-        ? completedSteps.join(" → ")
-        : "等待识别注册进度";
-      $("taskNextAction").textContent = registrationChain?.nextAction ||
-        pageRecognition?.nextAction ||
-        latestContext.action || "继续监测页面变化";
-      const recognitionSource = {
-        dom: "DOM 结构", url: "URL 路由", ocr: "截图 OCR",
-      }[pageRecognition?.source] || "日志推断";
-      const requestActivity = registrationChain?.requestActivity || {};
-      $("taskRecognitionMeta").textContent = registrationChain
-        ? "步骤 " + (registrationChain.currentCode || "等待") +
-          " · 当前完成=" + (registrationChain.currentCompleted ? "是" : "否") +
-          " · 下一步骤=" + (registrationChain.nextCode || "完成") +
-          " · 请求 " + Number(requestActivity.requestCount || 0) +
-          " / 响应 " + Number(requestActivity.responseCount || 0) +
-          (requestActivity.lastStatus ? " · HTTP " + requestActivity.lastStatus : "")
-        : pageRecognition
-        ? recognitionSource + " · 置信度 " + Number(pageRecognition.confidence || 0) + "%" +
-          (pageRecognition.stalledSeconds
-            ? " · 当前界面停留 " + pageRecognition.stalledSeconds + " 秒"
-            : "")
-        : "DOM / URL 实时识别";
-      const ledger = registrationChain?.steps || [];
-      $("taskStepLedger").innerHTML = ledger.length
-        ? ledger.map((step) => '<div class="task-ledger-step" data-status="' +
-          escapeHtml(step.status || "pending") + '"><i>' +
-          escapeHtml(step.completed ? "✓" : String(step.index || "·")) +
-          '</i><span><strong title="' + escapeHtml(step.label || "") + '">' +
-          escapeHtml(step.label || step.code || "待处理") +
-          '</strong><small title="' + escapeHtml(step.value || "") + '">' +
-          escapeHtml(step.value || ({ pending: "等待前一步完成", running: "执行中", completed: "已完成", failed: "失败", skipped: "已跳过" }[step.status] || "等待")) +
-          '</small></span></div>').join("")
-        : '<div class="task-step-ledger-empty">等待完整注册步骤开始</div>';
-      let assistance = {
-        mode: "automatic", badge: "自动化执行", title: "页面状态持续监测",
-        text: "遇到页面跳转时会自动识别并继续",
-      };
-      if (latestContext.stage === "security") {
-        assistance = {
-          mode: "manual", badge: "需要人工操作", title: "请完成当前安全验证",
-          text: "浏览器会保持登录状态，验证完成后程序自动继续",
-        };
-      } else if (latestContext.stage === "google_oauth") {
-        assistance = {
-          mode: "recovering", badge: "正在自动恢复", title: "检测到 Google 登录页",
-          text: "本轮已判定失败；正在关闭当前浏览器、生成全新指纹并重新打开注册",
-        };
-      } else if (latestContext.stage === "email_verification" && registration.provider === "manual") {
-        assistance = {
-          mode: "manual", badge: "等待人工输入", title: "请在浏览器输入邮箱验证码",
-          text: "提交后程序会继续完成资料、Session 与 2FA",
-        };
-      } else if (latestContext.status === "error") {
-        assistance = {
-          mode: "error", badge: "需要检查", title: "当前步骤出现异常",
-          text: "请查看右侧最后一条执行记录中的失败原因",
-        };
-      } else if (latestContext.stage === "completed") {
-        assistance = {
-          mode: "completed", badge: "任务已完成", title: "账号结果已保存",
-          text: "Session、Cookie 与 2FA 状态已写入账号记录",
-        };
-      }
-      if (pageRecognition?.actionMode === "manual") {
-        assistance = {
-          mode: "manual", badge: "需要人工操作",
-          title: pageRecognition.currentPage,
-          text: pageRecognition.nextAction,
-        };
-      } else if (pageRecognition?.actionMode === "recovering") {
-        assistance = {
-          mode: "recovering", badge: "正在自动恢复",
-          title: pageRecognition.currentPage,
-          text: pageRecognition.nextAction,
-        };
-      } else if (pageRecognition?.actionMode === "error") {
-        assistance = {
-          mode: "error", badge: "页面异常",
-          title: pageRecognition.currentPage,
-          text: pageRecognition.nextAction,
-        };
-      } else if (pageRecognition?.stalled) {
-        assistance = {
-          mode: "recovering", badge: "页面停留过久",
-          title: pageRecognition.currentPage,
-          text: (pageRecognition.diagnosticScreenshot
-            ? "已保存诊断截图；"
-            : "页面状态持续未变化；") + pageRecognition.nextAction,
-        };
-      }
-      $("taskAssistance").dataset.mode = assistance.mode;
-      $("taskAssistanceBadge").textContent = assistance.badge;
-      $("taskAssistanceTitle").textContent = assistance.title;
-      $("taskAssistanceText").textContent = assistance.text;
-      $("taskLogCount").textContent = logs.length + " 条";
-      $("taskLog").innerHTML = logs.length ? logs.map((item) => {
-        const glyph = item.status === "error" ? "!" : item.status === "warning" ? "×" :
-          item.status === "waiting" ? "…" : item.status === "success" ? "✓" : "•";
-        return '<div class="task-log-row ' + escapeHtml(item.status) + '"><span class="task-log-rail"><i class="task-log-icon ' +
-          escapeHtml(item.status) + '">' + glyph + '</i></span><time datetime="' + escapeHtml(item.at || "") + '">' +
-          formatClock(item.at) + '</time><div class="task-log-context"><div><span class="task-log-stage">' +
-          escapeHtml(taskStageLabel(item.stage)) + '</span><strong>' + escapeHtml(item.location) + '</strong></div><span class="task-log-email" title="' +
-          escapeHtml(item.email || "") + '">' + escapeHtml(abbreviateEmail(item.email)) + '</span></div><div class="task-log-copy"><strong>' +
-          escapeHtml(item.action) + '</strong><span>' + escapeHtml(item.message || "") + "</span></div></div>";
-      }).join("") : '<div class="task-log-empty">暂无任务日志</div>';
-      $("taskLog").scrollTop = $("taskLog").scrollHeight;
 
       const items = this.filteredAccounts(state);
       $("accountSummary").textContent = "显示 " + items.length + " / " + total + " 个账号";
@@ -913,13 +1325,14 @@
       const targetCount = Math.max(1, Number(targetCountInput.value || concurrency));
       const rounds = Math.ceil(targetCount / concurrency);
       const finalRoundCount = targetCount % concurrency || concurrency;
-      $("roxyProfileAllocation").textContent = orderedProfiles.length
-        ? "本次将使用：" + orderedProfiles.map((item) =>
+      const allocationText = orderedProfiles.length
+        ? "使用 " + orderedProfiles.map((item) =>
           (item.sortNumber ? "#" + item.sortNumber + " " : "") + item.name
-        ).join("、") + "；目标 " + targetCount + " 个账号，自动执行 " + rounds +
-          " 轮" + (rounds > 1 ? "（最后一轮 " + finalRoundCount + " 个）" : "") +
-          "；同一环境不会并行执行两个账号。"
-        : "选择首个环境后，将按目标账号数自动分轮使用最多 5 个互不重复的 Roxy 环境。";
+        ).join("、") + " · " + targetCount + " 个账号 / " + rounds +
+          " 轮" + (rounds > 1 ? " / 末轮 " + finalRoundCount + " 个" : "")
+        : "选择首个环境后，最多 5 个独立环境将按目标数自动轮换。";
+      $("roxyProfileAllocation").textContent = allocationText;
+      $("roxyProfileAllocation").title = allocationText + "；同一环境不会并行执行两个账号。";
       const status = $("roxyRegistrationStatus");
       status.className = "badge " + (roxy.configured ? "success" : roxy.available ? "warning" : "error");
       status.textContent = roxy.configured
@@ -938,12 +1351,6 @@
 
     accountRows(item, selected) {
       const registered = item.hasPassword || item.hasSession;
-      const checkoutKind = item.checkoutIdType === "oaics" ? "success" :
-        item.checkoutProbeStatus === "error" ? "error" : "warning";
-      const checkoutLabel = item.checkoutIdType === "oaics" ? "OAICS" :
-        item.checkoutIdType === "cs_live" ? "CS LIVE" :
-        item.checkoutIdType === "cs" ? "CS" :
-        item.checkoutProbeStatus === "error" ? "检测失败" : "待检测";
       const planKind = item.accountType === "plus" ? "plus" : item.accountType === "free" ? "" : "warning";
       const sessionKind = item.sessionStatus === "ready" ? "success" : item.sessionStatus === "expired" ? "error" : "warning";
       const main = '<tr data-selectable data-action="select-account" data-email="' + escapeHtml(item.email) +
@@ -951,7 +1358,6 @@
         initials(item.email) + '</span><span class="identity-copy"><strong>' + escapeHtml(item.email) +
         '</strong><small>' + (item.hasTwoFactor ? "2FA 已开启" : "2FA 未开启") +
         '</small></span></div></td><td>' + badge(registered ? "已注册" : "未注册", registered ? "success" : "warning") +
-        (registered ? " " + badge(checkoutLabel, checkoutKind) : "") +
         '</td><td>' + badge(planName(item.accountType), planKind) + '</td><td>' +
         badge(sessionName(item.sessionStatus), sessionKind) + '</td><td>' +
         formatDate(item.lastActivity || item.createdAt) + '</td><td><div class="row-actions"><button class="row-action" data-action="copy-email" data-email="' +
@@ -967,8 +1373,6 @@
         (item.hasTwoFactor ? "已开启" : "未开启") + '</code></span><span><b>注册方式</b><code>' +
         escapeHtml(item.registrationMode || "未记录") + '</code></span><span><b>注册出口</b><code>' +
         escapeHtml([item.registrationProxyMode, item.registrationProxyCountry, item.registrationProxyEndpoint, item.registrationExitIp].filter(Boolean).join(" · ") || "直连/未记录") +
-        '</code></span><span><b>Checkout</b><code>' + escapeHtml(checkoutLabel + " · " +
-        ([item.checkoutProxyMode, item.checkoutProxyCountry, item.checkoutProxyEndpoint, item.checkoutExitIp].filter(Boolean).join(" · ") || "等待检测")) +
         '</code></span></div><div class="credential-actions">' +
         this.credentialButton("复制密码", "copy-credential", item, "password", !item.hasPassword) +
         twoFactorPrimaryAction +
@@ -977,9 +1381,6 @@
         this.credentialButton("复制 Session", "copy-credential", item, "session", !item.hasSession) +
         this.credentialButton("获取验证码", "get-code", item) +
         this.credentialButton(item.hasCookies ? "Cookie 刷新状态" : "尚未保存 Cookie", "verify-account", item, "", !item.hasCookies) +
-        (item.checkoutProbeStatus === "error"
-          ? this.credentialButton("重新检测 Checkout", "retry-checkout-probe", item, "", !item.hasSession)
-          : "") +
         (item.cardLinkStatus === "cs_live" && item.cardLinkMethod === "de_oaics_paypal"
           ? this.credentialButton("重新提链", "retry-quick-card-link", item, "", item.sessionStatus !== "ready")
           : "") +
@@ -1178,7 +1579,7 @@
       $("quickRegistrationHint").textContent = protocolMode
         ? "Mail Auth 协议将领取 1 个 iCloud 库存邮箱，无需启动浏览器。"
         : roxyMode
-          ? "Roxy 使用账号设置中已保存的专用环境，最多 5 个并发窗口并按目标数分轮。"
+          ? "Roxy 使用账号管理中已保存的专用环境，最多 5 个并发窗口并按目标数分轮。"
           : registrationMode === "headed"
             ? "有头浏览器会显示注册窗口；验证码自动从 iCloud 收件箱读取。"
             : "无头浏览器将在后台完成注册；验证码自动从 iCloud 收件箱读取。";
@@ -1309,7 +1710,7 @@
       $("quickFlowLog").scrollTop = $("quickFlowLog").scrollHeight;
       $("quickFlowResults").innerHTML = results.length ? results.map((item) =>
         '<div class="quick-flow-result ' + (item.ok ? (item.skipped ? "skipped" : "") : "failed") + '"><strong>' +
-        escapeHtml(item.email) + "</strong><span>" + (item.skipped ? (item.skipLabel || "已有 OAICS · 已跳过") : item.ok ? "提取链接成功" : item.retrying ? "正在重新提链" : "提链未完成 · 可重试") +
+        escapeHtml(item.email) + "</strong><span>" + (item.skipped ? (item.skipLabel || "已有同模式链接 · 已跳过") : item.ok ? "提取链接成功" : item.retrying ? "正在重新提链" : "提链未完成 · 可重试") +
         "</span><code>" + escapeHtml(item.url || item.error || "—") + "</code>" +
         (item.ok && !item.skipped ? this.paypalPaymentAction(item, state) : "") +
         (item.retryable ? '<div class="quick-flow-result-actions"><button class="button small" data-action="retry-quick-card-link" data-email="' +
@@ -1676,8 +2077,15 @@
         ? " · 上次：" + formatDate(inbox.lastBackgroundSync)
         : "";
       const syncStatus = "按需同步（仅接码时连接）" + lastSync;
-      $("settingsStatus").className = "badge " + (inbox.configured ? "success" : "warning");
-      $("settingsStatus").textContent = inbox.configured ? "IMAP 已保存" : "等待配置";
+      const retrySeconds = Number(inbox.retryAfterSeconds || 0);
+      const errorDetail = inbox.backgroundError
+        ? '<span>收件异常：' + escapeHtml(inbox.backgroundError) +
+          '；最长 ' + retrySeconds + ' 秒后自动重试，也可点击“立即同步”恢复。</span>'
+        : "";
+      $("settingsStatus").className = "badge " +
+        (inbox.backgroundError ? "error" : inbox.configured ? "success" : "warning");
+      $("settingsStatus").textContent = inbox.backgroundError
+        ? "IMAP 自动重试中" : inbox.configured ? "IMAP 已保存" : "等待配置";
       $("settingsPanel").innerHTML =
         '<form id="imapForm" class="settings-form"><section class="form-section"><h3>邮箱连接</h3><div class="form-grid two">' +
         '<label class="field-label">IMAP 主机<input id="imapHost" value="' + escapeHtml(inbox.host || "") +
@@ -1688,7 +2096,7 @@
         '<section class="form-section"><h3>连接状态</h3><div class="connection-card"><strong>' +
         (inbox.configured ? "✓ IMAP 配置已保存" : "尚未配置 IMAP") + '</strong><span>验证码数量：' +
         (inbox.codeCount || 0) + '</span><span>收件模式：' + escapeHtml(syncStatus) +
-        '</span></div></section><div class="settings-actions"><button class="button" type="button" data-action="sync-inbox">立即同步</button><button class="button primary" type="button" data-action="save-imap">保存并测试</button></div></form>';
+        '</span>' + errorDetail + '</div></section><div class="settings-actions"><button class="button" type="button" data-action="sync-inbox">立即同步</button><button class="button primary" type="button" data-action="save-imap">保存并测试</button></div></form>';
     }
 
     renderBrowserSettings(state) {
@@ -1770,6 +2178,11 @@
         settingsSection: "imap",
       });
       this.renderer = new WorkspaceRenderer(this.store);
+      this.sidebarPresenter = new NavigationSidebarPresenter(new NavigationSidebarView());
+      this.runtimeLogPresenter = new RuntimeLogPresenter(new RuntimeLogView());
+      this.runtimeLogResizePresenter = new RuntimeLogResizePresenter(
+        new RuntimeLogResizeView()
+      );
       this.router = new HashRouter({
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
@@ -1794,6 +2207,7 @@
       this.renderer.renderQuickFlow(state);
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
+      this.runtimeLogPresenter.present(state);
       if (this.router.current === "pp-payment") this.renderer.renderPayPal(state);
       if (this.router.current === "settings") this.renderer.renderSettings(state);
     }
@@ -1803,7 +2217,7 @@
         ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
         : theme;
       document.documentElement.dataset.theme = resolved;
-      document.querySelector('meta[name="theme-color"]').content = resolved === "dark" ? "#08111f" : "#f3f6fa";
+      document.querySelector('meta[name="theme-color"]').content = resolved === "dark" ? "#0d0d0d" : "#f7f7f5";
       if (persist) localStorage.setItem("hme_theme", theme);
       if (this.router.current === "settings") this.renderer.renderSettings(this.store.state);
     }
@@ -1820,6 +2234,18 @@
     schedule(name, callback, delay = 1500) {
       clearTimeout(this.pollTimers[name]);
       this.pollTimers[name] = setTimeout(callback, delay);
+    }
+
+    async refreshRuntimeLogStatus() {
+      await Promise.allSettled([
+        this.loadBrowserTask(),
+        this.loadRegistrationTask(),
+        this.loadProtocolRegistrationTask(),
+        this.loadVerificationTask(),
+      ]);
+      if (this.runtimeLogPresenter.isOpen()) {
+        this.schedule("runtime-log-discovery", () => this.refreshRuntimeLogStatus(), 3000);
+      }
     }
 
     async loadAccounts() {
@@ -2228,19 +2654,19 @@
           currentEmail: email,
           currentAction: "正在提取严格 0 支付链接（" + (index + 1) + "/" + uniqueEmails.length + "）",
           results: [...results], generated, skipped, failed,
-        }, "检查 OAICS：" + email);
-        if (account && (account.checkoutIsOaics || account.checkoutIdType === "oaics")) {
+        }, "检查已有 PayPal 链接：" + email);
+        if (hasGeneratedCardLinkForMethod(account, "de_oaics_paypal")) {
           skipped += 1;
           results.push({
             ok: true,
             skipped: true,
             email,
-            url: account.cardLink || "OAICS 已存在，未重复创建 PayPal Checkout",
+            url: account.cardLink,
           });
           this.patchQuickFlow(
             runId,
             { results: [...results], generated, skipped, failed },
-            "账号已有 OAICS，已跳过重复创建：" + email,
+            "账号已有 PayPal 链接，已跳过重复创建：" + email,
           );
           continue;
         }
@@ -2391,6 +2817,25 @@
     }
 
     bindCommands() {
+      this.commands.register("toggle-sidebar", async () => {
+        this.sidebarPresenter.toggle();
+      });
+      this.commands.register("open-runtime-log", async ({ element }) => {
+        this.runtimeLogResizePresenter.handleViewportResize();
+        this.runtimeLogPresenter.open(element);
+        void this.refreshRuntimeLogStatus();
+      });
+      this.commands.register("close-runtime-log", async () => {
+        clearTimeout(this.pollTimers["runtime-log-discovery"]);
+        this.runtimeLogResizePresenter.cancel();
+        this.runtimeLogPresenter.close();
+      });
+      this.commands.register("copy-runtime-logs", async () => {
+        const output = this.runtimeLogPresenter.exportText();
+        if (!output) throw new Error("当前没有可复制的运行日志");
+        await this.copyText(output);
+        return "已复制 " + this.runtimeLogPresenter.visibleLogs.length + " 条详细日志";
+      });
       this.commands.register("refresh", async () => {
         await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal()]);
         return "数据已刷新";
@@ -2473,7 +2918,7 @@
         this.store.patch({ cardLinkProxy: savedExtractionProxy });
         if (roxy) {
           const roxyState = this.store.state.roxyRegistration || {};
-          if (!roxyState.configured) throw new Error("请先在账号设置中选择 Roxy 专用指纹环境");
+          if (!roxyState.configured) throw new Error("请先在账号管理中选择 Roxy 专用指纹环境");
           if (concurrency > Number(roxyState.maxConcurrency || 0)) {
             throw new Error("Roxy 可用环境不足，当前最多并发 " + Number(roxyState.maxConcurrency || 0));
           }
@@ -2496,7 +2941,7 @@
           message: "正在检查库存、注册方式与提链代理",
           currentEmail: "正在领取库存邮箱", currentAction: "准备一键流水线",
           startedAt, lastTaskMessage: "",
-          logs: [{ at: startedAt, message: "一键注册并提链已启动：无 OAICS 账号使用 PayPal 严格 0 · DE/EUR" }],
+          logs: [{ at: startedAt, message: "一键注册并提链已启动：未生成同模式链接的账号使用 PayPal 严格 0 · DE/EUR" }],
         };
         const flows = [...this.quickFlowList(), flow];
         this.store.patch({ quickFlows: flows, activeQuickFlowId: runId, quickFlow: flow });
@@ -2879,17 +3324,6 @@
       this.commands.register("verify-account", async ({ element }) => {
         return this.startAccountVerification(element.dataset.email);
       });
-      this.commands.register("retry-checkout-probe", async ({ element }) => {
-        const data = await this.api.post("/api/account/checkout-probe", {
-          email: element.dataset.email,
-        });
-        await this.loadAccounts();
-        const labels = { oaics: "OAICS", cs_live: "CS LIVE", cs: "CS", other: "OTHER", error: "检测失败" };
-        const result = labels[data.checkout_id_type] || "待检测";
-        const attempts = Number(data.attempt_count || 1);
-        const maxAttempts = Number(data.max_attempts || 3);
-        return "Checkout 检测完成：" + result + "（第 " + attempts + "/" + maxAttempts + " 次）";
-      });
       this.commands.register("copy-account", async ({ element }) => {
         const response = await fetch("/api/gpt-accounts/export", {
           method: "POST",
@@ -2908,7 +3342,21 @@
           ? "从本机账号列表删除 " + email + "？这会清除本地账号凭据和 SMSBower 激活记录，但不会删除 Gmail 服务商侧的邮箱。"
           : "永久删除邮箱 " + email + "？该操作无法撤销。";
         if (!confirm(warning)) throw Object.assign(new Error(), { name: "AbortError" });
-        const data = await this.api.post("/api/gpt-email/delete", { email });
+        let data;
+        try {
+          data = await this.api.post("/api/gpt-email/delete", { email });
+        } catch (error) {
+          const canDeleteLocally =
+            error.code === "icloud_session_expired" && error.canDeleteLocal;
+          if (isGmail || !canDeleteLocally) {
+            throw error;
+          }
+          const localWarning =
+            "iCloud 登录已过期，Apple 端邮箱当前无法操作。是否仅从工作台移除本地记录？" +
+            "\n\n若 Apple 端仍存在该地址，它将继续转发邮件。";
+          if (!confirm(localWarning)) throw Object.assign(new Error(), { name: "AbortError" });
+          data = await this.api.post("/api/gpt-email/delete", { email, local_only: true });
+        }
         await this.loadAccounts();
         return data.message || "邮箱已删除";
       });
@@ -3081,6 +3529,31 @@
       });
       ["accountSearch", "accountPlanFilter", "accountSessionFilter"].forEach((id) => {
         $(id).addEventListener(id === "accountSearch" ? "input" : "change", () => this.renderer.renderAccounts(this.store.state));
+      });
+      $("runtimeLogSearch").addEventListener("input", () => this.runtimeLogPresenter.refilter());
+      $("runtimeLogLevel").addEventListener("change", () => this.runtimeLogPresenter.refilter());
+      $("runtimeLogAutoscroll").addEventListener("change", () => this.runtimeLogPresenter.refilter());
+      const resizeHandle = $("runtimeLogResizeHandle");
+      resizeHandle.addEventListener("pointerdown", (event) =>
+        this.runtimeLogResizePresenter.begin(event));
+      resizeHandle.addEventListener("pointermove", (event) =>
+        this.runtimeLogResizePresenter.move(event));
+      resizeHandle.addEventListener("pointerup", (event) =>
+        this.runtimeLogResizePresenter.finish(event));
+      resizeHandle.addEventListener("pointercancel", (event) =>
+        this.runtimeLogResizePresenter.cancel(event));
+      resizeHandle.addEventListener("lostpointercapture", (event) =>
+        this.runtimeLogResizePresenter.finish(event));
+      resizeHandle.addEventListener("keydown", (event) =>
+        this.runtimeLogResizePresenter.handleKeydown(event));
+      resizeHandle.addEventListener("dblclick", (event) =>
+        this.runtimeLogResizePresenter.reset(event));
+      window.addEventListener("resize", () =>
+        this.runtimeLogResizePresenter.handleViewportResize());
+      window.addEventListener("blur", () => this.runtimeLogResizePresenter.cancel());
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") this.runtimeLogResizePresenter.cancel();
+        this.runtimeLogPresenter.handleKeydown(event);
       });
       ["cardSearch", "cardStatusFilter"].forEach((id) => {
         $(id).addEventListener(id === "cardSearch" ? "input" : "change", () => this.renderer.renderCardLinks(this.store.state));
@@ -3454,8 +3927,10 @@
       localStorage.setItem("hme_quick_card_link_method", "de_oaics_paypal");
       $("quickCardLinkMethod").value = "de_oaics_paypal";
       this.applyTheme(savedTheme, false);
+      this.sidebarPresenter.restore();
+      this.runtimeLogResizePresenter.restore();
       this.store.patch({ registrationMode });
-      $("accountsView").insertBefore($("protocolRegistrationPanel"), $("taskPanel"));
+      $("accountsView").insertBefore($("protocolRegistrationPanel"), $("accountsView").querySelector(".table-panel"));
       this.store.subscribe((state) => this.render(state));
       this.bindEvents();
       this.router.start();

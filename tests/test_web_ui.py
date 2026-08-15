@@ -84,21 +84,24 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("renderProtocolRegistration", page)
         self.assertIn("设置密码", page)
         self.assertIn("激活 2FA", page)
-        self.assertIn('item.checkoutIdType === "oaics"', page)
-        self.assertIn('"OAICS"', page)
-        self.assertIn('"重新检测 Checkout"', page)
-        self.assertIn('this.commands.register("retry-checkout-probe"', page)
-        self.assertIn('/api/account/checkout-probe', page)
+        self.assertNotIn('badge(checkoutLabel, checkoutKind)', page)
+        self.assertNotIn('"重新检测 Checkout"', page)
+        self.assertNotIn('this.commands.register("retry-checkout-probe"', page)
+        self.assertNotIn('/api/account/checkout-probe', page)
+        self.assertNotIn('checkoutIdType', page)
         self.assertIn("注册出口", page)
-        self.assertIn("item.checkoutExitIp", page)
+        self.assertIn("item.registrationExitIp", page)
+        self.assertNotIn("item.checkoutExitIp", page)
         self.assertIn('id="registrationProxyMode"', page)
         self.assertIn("Clash 日本轮询", page)
         self.assertIn("/api/registration-proxy/rotate", page)
 
-    def test_account_settings_selects_browser_or_protocol_registration(self):
+    def test_account_management_selects_browser_or_protocol_registration(self):
         page = build_app_page()
 
-        self.assertIn("账号设置", page)
+        self.assertIn("账号管理", page)
+        self.assertIn("ACCOUNT MANAGEMENT", page)
+        self.assertNotIn("账号设置", page)
         self.assertIn('role="radiogroup" aria-label="注册方式"', page)
         self.assertIn('name="registrationMode" value="headless"', page)
         self.assertIn('name="registrationMode" value="headed"', page)
@@ -117,20 +120,21 @@ class StructuredWebUiTests(unittest.TestCase):
             page,
         )
         self.assertIn('$("protocolRegistrationPanel").hidden = !protocolMode', page)
-        self.assertIn('$("taskPanel").hidden = protocolMode', page)
+        self.assertNotIn('$("taskPanel")', page)
+        self.assertIn('querySelector(".table-panel")', page)
         self.assertIn('browser_engine: mode === "roxy" ? "roxy" : "camoufox"', page)
         self.assertIn('id="roxyWindowMode"', page)
         self.assertIn('id="roxyProfile"', page)
         self.assertIn("/api/roxy-registration/status", page)
         self.assertIn('localStorage.setItem("hme_registration_mode", mode)', page)
 
-    def test_account_plan_filter_includes_oai_accounts(self):
+    def test_account_plan_filter_uses_saved_account_type(self):
         page = build_app_page()
 
-        self.assertIn('<option value="oai">OAI 账号</option>', page)
-        self.assertIn('plan === "oai"', page)
-        self.assertIn('item.checkoutIsOaics', page)
-        self.assertIn('item.checkoutIdType === "oaics"', page)
+        self.assertNotIn('<option value="oai">OAI 账号</option>', page)
+        self.assertIn('(plan === "all" || item.accountType === plan)', page)
+        self.assertNotIn('item.checkoutIsOaics', page)
+        self.assertNotIn('item.checkoutIdType', page)
 
     def test_protocol_registration_uses_inventory_entry_without_account_picker(self):
         page = build_app_page()
@@ -201,7 +205,7 @@ class StructuredWebUiTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         card_link_handler = webapp_source[
             webapp_source.index("async def create_card_link"):
-            webapp_source.index("async def retry_registration_checkout_probe")
+            webapp_source.index("async def browser_status")
         ]
 
         self.assertIn('id="cardLinkCreateProxyCountry"', page)
@@ -286,7 +290,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('class="quick-flow-steps"', page)
         self.assertIn(".quick-flow-layout", page)
 
-    def test_one_click_pipeline_uses_de_paypal_only_for_accounts_without_oaics(self):
+    def test_one_click_pipeline_skips_only_an_existing_generated_paypal_link(self):
         page = build_app_page()
 
         self.assertIn("PayPal / 严格 0 · DE / EUR", page)
@@ -297,13 +301,13 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("第一提链 IP", page)
         self.assertIn("第二提链 IP", page)
         self.assertIn('const method = "de_oaics_paypal";', page)
-        self.assertIn('account.checkoutIsOaics || account.checkoutIdType === "oaics"', page)
-        self.assertIn("账号已有 OAICS，已跳过重复创建", page)
+        self.assertIn('hasGeneratedCardLinkForMethod(account, "de_oaics_paypal")', page)
+        self.assertIn("账号已有 PayPal 链接，已跳过重复创建", page)
         self.assertIn("cs_live 已自动重试", page)
         self.assertIn("提链未完成 · 可重试", page)
         self.assertIn("results.length > 0 && failed === 0", page)
         self.assertIn('id="quickFlowSkippedCount"', page)
-        self.assertIn("无 OAICS 账号使用 PayPal 严格 0 · DE/EUR", page)
+        self.assertIn("未生成同模式链接的账号使用 PayPal 严格 0 · DE/EUR", page)
         self.assertIn('id="quickExtractionCount"', page)
         self.assertIn("单账号提链次数必须是 1–100 的整数", page)
         self.assertIn("attempt_limit:", page)
@@ -378,7 +382,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn("backdrop-filter", page)
         self.assertNotIn("cdn.jsdelivr.net", page)
 
-    def test_registration_task_panel_exposes_live_status_details(self):
+    def test_inline_registration_task_panel_is_removed(self):
         page = build_app_page()
 
         for element_id in (
@@ -397,35 +401,108 @@ class StructuredWebUiTests(unittest.TestCase):
             "taskAssistanceBadge",
             "taskAssistanceTitle",
             "taskAssistanceText",
-            "taskLogCount",
-            "taskLog",
         ):
-            self.assertIn(f'id="{element_id}"', page)
-        self.assertIn("formatElapsed", page)
-        self.assertIn("abbreviateEmail", page)
-        self.assertIn("task-log-row", page)
-        self.assertIn("task-live-context", page)
+            self.assertNotIn(f'id="{element_id}"', page)
         self.assertIn("registration-command-deck", page)
-        self.assertIn("task-console-grid", page)
-        self.assertIn("task-flow-strip", page)
-        self.assertIn("taskStageGroup", page)
-        self.assertIn("task-timeline", page)
+        self.assertIn('id="registrationRuntimeControls"', page)
+        self.assertIn('id="registrationRuntimeState"', page)
+        self.assertIn('id="registrationRuntimeMessage"', page)
+        self.assertIn('id="stopTaskButton"', page)
         self.assertIn("taskStageLabel", page)
         self.assertIn("inferLogContext", page)
-        self.assertIn("浏览器执行轨迹", page)
-        self.assertIn("data-task-tone", page)
+        self.assertNotIn('id="taskLogCount"', page)
+        self.assertNotIn('id="taskLog"', page)
+        self.assertNotIn("浏览器执行轨迹", page)
+        self.assertNotIn("task-console-activity", page)
+        self.assertNotIn("task-timeline", page)
 
-    def test_account_workspace_uses_task_first_two_level_layout(self):
+    def test_runtime_log_drawer_uses_mvp_and_shows_detailed_current_logs(self):
+        page = build_app_page()
+
+        for element_id in (
+            "runtimeLogButton",
+            "runtimeLogTriggerCount",
+            "runtimeLogLiveDot",
+            "runtimeLogBackdrop",
+            "runtimeLogDrawer",
+            "runtimeLogCloseButton",
+            "runtimeLogState",
+            "runtimeLogTask",
+            "runtimeLogStartedAt",
+            "runtimeLogTotal",
+            "runtimeLogSearch",
+            "runtimeLogLevel",
+            "runtimeLogAutoscroll",
+            "runtimeLogList",
+            "runtimeLogVisibleCount",
+            "runtimeLogUpdatedAt",
+            "runtimeLogAnnouncement",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn('aria-controls="runtimeLogDrawer"', page)
+        self.assertIn('aria-expanded="false"', page)
+        self.assertIn('role="dialog" aria-modal="true"', page)
+        self.assertIn('id="runtimeLogList" class="runtime-log-list" role="log" aria-live="off"', page)
+        self.assertIn('data-action="open-runtime-log"', page)
+        self.assertIn('data-action="close-runtime-log"', page)
+        self.assertIn('data-action="copy-runtime-logs"', page)
+        self.assertIn("class RuntimeLogView", page)
+        self.assertIn("class RuntimeLogPresenter", page)
+        self.assertIn("this.runtimeLogPresenter.present(state)", page)
+        self.assertIn('this.candidate("registration", "注册进程"', page)
+        self.assertIn('this.candidate("browser", "浏览器任务"', page)
+        self.assertIn('this.candidate("protocol", "协议注册"', page)
+        self.assertIn('this.candidate("verification", "账号验证"', page)
+        self.assertIn('this.candidate("pipeline", "注册提链流水线"', page)
+        self.assertIn("raw.originTaskId || raw.taskId", page)
+        self.assertIn("raw.originSeq || raw.originSequence", page)
+        self.assertIn("function redactRuntimeLogText", page)
+        self.assertIn("redactRuntimeLogText(raw.message)", page)
+        self.assertIn("REDACTED_API_KEY", page)
+        self.assertIn("running ? currentLogs : historyLogs.length", page)
+        self.assertIn('{ forceList: true }', page)
+        self.assertIn('element.setAttribute("inert", "")', page)
+        self.assertIn("logs.slice(-1200)", page)
+        self.assertIn("formatLogTimestamp", page)
+        self.assertIn("item.location", page)
+        self.assertIn("item.action", page)
+        self.assertIn("item.diagnosticCode", page)
+        self.assertIn('escapeHtml(item.message || "（无消息内容）")', page)
+        self.assertIn("打开运行日志检查失败上下文后重新注册", page)
+        self.assertIn("refreshRuntimeLogStatus", page)
+        self.assertIn("this.runtimeLogPresenter.handleKeydown(event)", page)
+        self.assertIn("cursor: retainedLogs.at(-1)?.key", page)
+
+    def test_account_workspace_uses_compact_registration_launchpad(self):
         page = build_app_page()
 
         self.assertIn('data-layout="task-first"', page)
         self.assertIn("registration-launch-shell", page)
         self.assertIn("registration-launch-head", page)
         self.assertIn("account-inline-metrics", page)
-        self.assertIn("发起注册任务、跟踪执行状态并维护账号资产", page)
+        self.assertIn("集中管理账号资产，并以紧凑流程发起注册任务", page)
+        self.assertIn('data-density="compact"', page)
         self.assertIn("批量获取全部 Session", page)
-        self.assertIn("grid-template-columns: minmax(390px, 5fr) minmax(620px, 7fr)", page)
-        self.assertIn("#accountsView > .table-panel { min-width: 0; grid-column: 1 / -1; }", page)
+        self.assertIn("grid-template-areas:", page)
+        self.assertIn('"source network"', page)
+        self.assertIn("roxy-control-meta", page)
+        self.assertIn("#accountsView:not([hidden])", page)
+        self.assertIn("grid-template-columns: minmax(0, 1fr)", page)
+        self.assertIn("#accountsView > .table-panel { min-width: 0; grid-column: 1; margin: 0; }", page)
+
+        runtime_start = page.index('id="registrationRuntimeControls"')
+        runtime_end = page.index('id="registrationCodePanel"')
+        self.assertIn('id="fetchAllButton"', page[runtime_start:runtime_end])
+        for element_id in (
+            "registrationEmailProvider", "registerProviderButton",
+            "registrationProxyEnabled", "registrationProxyCountrySearch",
+            "registrationProxySetupButton", "roxyWorkspace", "roxyProfile",
+            "roxyConcurrency", "roxyTargetCount", "roxyWindowMode",
+            "registrationEmail", "registerEmailButton", "fetchAllButton",
+            "registrationRuntimeControls", "stopTaskButton",
+            "registrationCodePanel", "registrationCode",
+        ):
+            self.assertEqual(page.count(f'id="{element_id}"'), 1, element_id)
 
     def test_running_registration_keeps_start_next_process_available(self):
         page = build_app_page()
@@ -434,7 +511,9 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("registration.runningCount || 0", page)
         self.assertIn("启动下一个注册进程（运行中", page)
         self.assertIn("registration.failureRecords || []", page)
-        self.assertIn("失败邮箱已记录，可重新点击注册", page)
+        self.assertIn("record.failureReason || record.message", page)
+        self.assertIn("record.suggestedAction ||", page)
+        self.assertIn("record.reasonCode ||", page)
         self.assertNotIn(
             '$("registerEmailButton").disabled = Boolean(state.registrationTask.running)',
             page,
@@ -467,20 +546,15 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('target_count: mode === "roxy" ? roxyTargetCount', page)
         self.assertIn("同一环境不会并行执行两个账号", page)
 
-    def test_registration_task_exposes_structured_page_recognition(self):
+    def test_removed_inline_panel_keeps_page_context_in_runtime_logs(self):
         page = build_app_page()
 
-        self.assertIn('id="taskCompletedSteps"', page)
-        self.assertIn('id="taskNextAction"', page)
-        self.assertIn('id="taskRecognitionMeta"', page)
-        self.assertIn('id="taskStepLedger"', page)
-        self.assertIn("task.pageState", page)
-        self.assertIn("task.registrationChain", page)
-        self.assertIn("pageRecognition?.completedSteps", page)
-        self.assertIn("registrationChain.currentCompleted", page)
-        self.assertIn("registrationChain.nextCode", page)
-        self.assertIn("task-ledger-step", page)
-        self.assertIn("当前界面停留 ", page)
+        self.assertNotIn('id="taskCompletedSteps"', page)
+        self.assertNotIn('id="taskNextAction"', page)
+        self.assertNotIn('id="taskRecognitionMeta"', page)
+        self.assertNotIn('id="taskStepLedger"', page)
+        self.assertIn('["页面位置", item.location]', page)
+        self.assertIn('["正在执行", item.action]', page)
         self.assertIn(
             'this.schedule("browser", () => this.loadBrowserTask(), 500)', page
         )
@@ -500,8 +574,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="registrationEmail"', page)
         self.assertIn('id="registerEmailButton"', page)
         self.assertIn("添加邮箱并注册", page)
-        self.assertIn("iCloud 自动扫描收件箱与垃圾邮件", page)
-        self.assertIn("其他邮箱在浏览器中手动输入", page)
+        self.assertIn("可选 · iCloud 支持自动取码", page)
+        self.assertIn("邮箱地址（可选）", page)
         self.assertIn('id="registrationCodePanel"', page)
         self.assertIn('id="registrationCode"', page)
         self.assertIn("submit-registration-code", page)
@@ -916,6 +990,36 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record["two_factor"]["enabled"])
         self.assertEqual(record["session_acquisition_method"], "gptfree_mail_auth")
 
+    async def test_protocol_registration_failure_is_saved_by_monitor(self):
+        email = "api-protocol-failed@icloud.com"
+        _save_account_record(self.app["db_file"], email)
+
+        async def runner(_payload, _on_event):
+            raise RuntimeError("Mail Auth protocol rejected token=private-value")
+
+        manager = self.app["protocol_registration_manager"]
+        manager.worker_runner = runner
+        manager._runtime_cache = None
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"emails": [email], "concurrency": 1},
+        )
+        self.assertEqual(response.status, 200)
+
+        final = await manager.wait()
+        self.assertEqual(final["failed"], 1)
+        response = await self.client.get(
+            "/api/registration/failures?reason=protocol_auth_failed"
+        )
+        failures = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(failures["total"], 1)
+        self.assertEqual(failures["records"][0]["mode"], "protocol")
+        self.assertEqual(failures["records"][0]["email"], email)
+        self.assertNotIn("private-value", json.dumps(failures, ensure_ascii=False))
+
     async def test_registration_failure_record_is_persisted_in_status(self):
         manager = self.app["registration_manager"]
         await manager.record_failure(
@@ -956,9 +1060,53 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["failureRecords"][0]["processId"], "failed-process-1")
         self.assertEqual(payload["failureRecords"][0]["email"], "retry@icloud.com")
         self.assertEqual(payload["failureRecords"][0]["message"], "验证码失败")
+        self.assertEqual(
+            payload["failureRecords"][0]["reasonCode"], "email_verification"
+        )
+        self.assertEqual(
+            payload["failureRecords"][0]["failedStage"], "email_verification"
+        )
+        self.assertTrue(payload["failureRecords"][0]["suggestedAction"])
+        self.assertEqual(payload["failureSummary"]["total"], 1)
+        self.assertTrue(Path(payload["failureLogFile"]).is_file())
         self.assertNotIn("password", payload["failureRecords"][0])
         self.assertNotIn("token", payload["failureRecords"][0])
-        self.assertNotIn("password", payload["failureRecords"][0]["logs"][0])
+        self.assertNotIn("logs", payload["failureRecords"][0])
+        self.assertEqual(payload["failureRecords"][0]["logCount"], 1)
+
+        response = await self.client.get(
+            "/api/registration/failures?limit=1&reason=email_verification"
+        )
+        failures = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(failures["ok"])
+        self.assertEqual(failures["total"], 1)
+        self.assertEqual(failures["records"][0]["processId"], "failed-process-1")
+        self.assertNotIn("password", failures["records"][0]["logs"][0])
+        self.assertEqual(
+            failures["summary"]["byReason"], {"email_verification": 1}
+        )
+
+    async def test_registration_status_survives_monitor_read_failure(self):
+        class BrokenMonitor:
+            def snapshot(self, **_options):
+                raise OSError("monitor database unavailable")
+
+        self.app["registration_monitor"] = BrokenMonitor()
+
+        response = await self.client.get("/api/registration/status")
+        status = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["failureRecords"], [])
+        self.assertEqual(status["failureSummary"]["total"], 0)
+        self.assertIn("monitor database unavailable", status["failureMonitorError"])
+
+        response = await self.client.get("/api/registration/failures")
+        failures = await response.json()
+        self.assertEqual(response.status, 503)
+        self.assertFalse(failures["ok"])
+        self.assertIn("monitor database unavailable", failures["error"])
 
 
 if __name__ == "__main__":

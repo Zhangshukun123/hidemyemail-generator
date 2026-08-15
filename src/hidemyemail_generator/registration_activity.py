@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 import types
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -70,6 +71,120 @@ def _safe_request_route(value: str) -> tuple[str, str]:
         return "", "/"
     host = str(parsed.hostname or "").lower()
     return host, str(parsed.path or "/")[:180]
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationNetworkEvent:
+    """Model for one sanitized browser-network observation."""
+
+    event: str
+    method: str
+    route: str
+    resource_type: str
+    status: int
+    registration_entry: bool
+    at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "event": self.event,
+            "method": self.method,
+            "route": self.route,
+            "resourceType": self.resource_type,
+            "status": self.status,
+            "registrationEntry": self.registration_entry,
+            "at": self.at,
+        }
+
+
+class RegistrationEntryRequestStrategy:
+    """Strategy that separates an auth-entry request from background traffic."""
+
+    _CHATGPT_ENTRY_PATHS = {
+        "/auth/login",
+        "/auth/log-in",
+        "/auth/signup",
+        "/auth/sign-up",
+        "/auth/register",
+        "/auth/create-account",
+    }
+    _AUTH_ACTION_MARKERS = (
+        "authorize",
+        "signup",
+        "sign-up",
+        "register",
+        "create-account",
+    )
+
+    @classmethod
+    def route_matches(cls, host: str, path: str, resource_type: str) -> bool:
+        folded_host = str(host or "").casefold()
+        folded_path = str(path or "/").rstrip("/").casefold() or "/"
+        kind = str(resource_type or "").casefold()
+        auth_host = folded_host == "auth.openai.com" or folded_host.endswith(
+            ".auth.openai.com"
+        )
+        if kind == "document":
+            return auth_host or (
+                folded_host == "chatgpt.com"
+                and folded_path in cls._CHATGPT_ENTRY_PATHS
+            )
+        if kind not in {"xhr", "fetch"}:
+            return False
+        if not auth_host:
+            return False
+        return any(marker in folded_path for marker in cls._AUTH_ACTION_MARKERS)
+
+    @classmethod
+    def matches(cls, request: Any) -> bool:
+        resource_type = str(_value(request, "resource_type", "") or "").lower()
+        host, path = _safe_request_route(str(_value(request, "url", "") or ""))
+        return cls.route_matches(host, path, resource_type)
+
+
+class RegistrationActivityPresenter:
+    """Presenter that converts page/network observations into UI-safe evidence."""
+
+    @staticmethod
+    def network_event(
+        event: str,
+        request: Any,
+        *,
+        status: int = 0,
+    ) -> RegistrationNetworkEvent:
+        method = str(_value(request, "method", "GET") or "GET").upper()[:12]
+        resource_type = str(
+            _value(request, "resource_type", "") or ""
+        ).lower()[:32]
+        host, path = _safe_request_route(str(_value(request, "url", "") or ""))
+        return RegistrationNetworkEvent(
+            event=str(event or "")[:24],
+            method=method,
+            route=f"{host}{path}"[:220],
+            resource_type=resource_type,
+            status=max(0, int(status or 0)),
+            registration_entry=RegistrationEntryRequestStrategy.route_matches(
+                host,
+                path,
+                resource_type,
+            ),
+            at=_utc_now(),
+        )
+
+    @staticmethod
+    def evidence(snapshot: dict[str, Any], *, signal: str) -> dict[str, Any]:
+        prefix = "lastEntry" if signal == "registration_entry" else "last"
+        at_key = "lastEntryAt" if signal == "registration_entry" else "lastActivityAt"
+        return {
+            "event": str(snapshot.get(f"{prefix}Event") or ""),
+            "method": str(snapshot.get(f"{prefix}Method") or ""),
+            "route": str(snapshot.get(f"{prefix}Route") or ""),
+            "resourceType": str(
+                snapshot.get(f"{prefix}ResourceType") or ""
+            ),
+            "status": max(0, int(snapshot.get(f"{prefix}Status") or 0)),
+            "at": str(snapshot.get(at_key) or ""),
+        }
 
 
 def _relevant_request(request: Any) -> bool:
@@ -164,10 +279,21 @@ class RegistrationActivityMonitor:
         self.response_count = 0
         self.failed_count = 0
         self.load_count = 0
+        self.entry_request_count = 0
+        self.entry_response_count = 0
+        self.entry_failed_count = 0
+        self.last_event = ""
         self.last_method = ""
         self.last_route = ""
+        self.last_resource_type = ""
         self.last_status = 0
         self.last_activity_at = ""
+        self.last_entry_event = ""
+        self.last_entry_method = ""
+        self.last_entry_route = ""
+        self.last_entry_resource_type = ""
+        self.last_entry_status = 0
+        self.last_entry_at = ""
         self.milestone_callback: Callable[[str, str], Any] | None = None
         self.begin_callback: Callable[[str, str], Any] | None = None
         self.skip_callback: Callable[[str, str], Any] | None = None
@@ -183,17 +309,42 @@ class RegistrationActivityMonitor:
         except Exception:
             self.available = False
 
-    def _record_request(self, request: Any) -> None:
-        host, path = _safe_request_route(str(_value(request, "url", "") or ""))
-        self.last_method = str(_value(request, "method", "GET") or "GET").upper()[:12]
-        self.last_route = f"{host}{path}"[:220]
-        self.last_activity_at = _utc_now()
+    def _record_network_event(
+        self,
+        event: str,
+        request: Any,
+        *,
+        status: int = 0,
+    ) -> RegistrationNetworkEvent:
+        observation = RegistrationActivityPresenter.network_event(
+            event,
+            request,
+            status=status,
+        )
+        self.last_event = observation.event
+        self.last_method = observation.method
+        self.last_route = observation.route
+        self.last_resource_type = observation.resource_type
+        # A request must not inherit an earlier response status.  The dedicated
+        # entry channel keeps its own atomic route/status evidence as well.
+        self.last_status = observation.status
+        self.last_activity_at = observation.at
+        if observation.registration_entry:
+            self.last_entry_event = observation.event
+            self.last_entry_method = observation.method
+            self.last_entry_route = observation.route
+            self.last_entry_resource_type = observation.resource_type
+            self.last_entry_status = observation.status
+            self.last_entry_at = observation.at
+        return observation
 
     def _on_request(self, request: Any) -> None:
         if not _relevant_request(request):
             return
         self.request_count += 1
-        self._record_request(request)
+        observation = self._record_network_event("request", request)
+        if observation.registration_entry:
+            self.entry_request_count += 1
         self.mark("site_requested", "检测到网站请求")
 
     def _on_response(self, response: Any) -> None:
@@ -201,20 +352,33 @@ class RegistrationActivityMonitor:
         if request is None or not _relevant_request(request):
             return
         self.response_count += 1
-        self._record_request(request)
         try:
-            self.last_status = max(0, int(_value(response, "status", 0) or 0))
+            status = max(0, int(_value(response, "status", 0) or 0))
         except (TypeError, ValueError):
-            self.last_status = 0
+            status = 0
+        observation = self._record_network_event(
+            "response",
+            request,
+            status=status,
+        )
+        if observation.registration_entry:
+            self.entry_response_count += 1
 
     def _on_request_failed(self, request: Any) -> None:
         if not _relevant_request(request):
             return
         self.failed_count += 1
-        self._record_request(request)
+        observation = self._record_network_event("request_failed", request)
+        if observation.registration_entry:
+            self.entry_failed_count += 1
 
     def _on_load(self, *_args: Any) -> None:
         self.load_count += 1
+        self.last_event = "load"
+        self.last_method = ""
+        self.last_route = ""
+        self.last_resource_type = ""
+        self.last_status = 0
         self.last_activity_at = _utc_now()
         self.mark("site_loaded", "页面 load 事件完成")
 
@@ -236,10 +400,21 @@ class RegistrationActivityMonitor:
             "responseCount": self.response_count,
             "failedCount": self.failed_count,
             "loadCount": self.load_count,
+            "entryRequestCount": self.entry_request_count,
+            "entryResponseCount": self.entry_response_count,
+            "entryFailedCount": self.entry_failed_count,
+            "lastEvent": self.last_event,
             "lastMethod": self.last_method,
             "lastRoute": self.last_route,
+            "lastResourceType": self.last_resource_type,
             "lastStatus": self.last_status,
             "lastActivityAt": self.last_activity_at,
+            "lastEntryEvent": self.last_entry_event,
+            "lastEntryMethod": self.last_entry_method,
+            "lastEntryRoute": self.last_entry_route,
+            "lastEntryResourceType": self.last_entry_resource_type,
+            "lastEntryStatus": self.last_entry_status,
+            "lastEntryAt": self.last_entry_at,
             "dom": _lightweight_dom_state(self.page),
         }
 
@@ -277,7 +452,23 @@ def registration_activity_snapshot(page: Any) -> dict[str, Any]:
 def registration_activity_changed(
     before: dict[str, Any],
     after: dict[str, Any],
+    *,
+    signal: str = "any",
 ) -> tuple[bool, str]:
+    if signal == "registration_entry":
+        for key, label in (
+            ("entryResponseCount", "registration_entry_response"),
+            ("entryFailedCount", "registration_entry_request_failed"),
+            ("entryRequestCount", "registration_entry_request"),
+        ):
+            if int(after.get(key) or 0) > int(before.get(key) or 0):
+                return True, label
+        if _registration_entry_dom_changed(
+            before.get("dom"),
+            after.get("dom"),
+        ):
+            return True, "page"
+        return False, ""
     for key, label in (
         ("requestCount", "request"),
         ("responseCount", "response"),
@@ -291,6 +482,29 @@ def registration_activity_changed(
     return False, ""
 
 
+def _registration_entry_dom_changed(before: Any, after: Any) -> bool:
+    if not isinstance(before, tuple) or not isinstance(after, tuple):
+        return False
+    if len(before) < 4 or len(after) < 4:
+        return False
+    if not bool(before[3]) and bool(after[3]):
+        return True
+    before_host = str(before[0] or "").casefold()
+    before_path = str(before[1] or "/").rstrip("/").casefold() or "/"
+    after_host = str(after[0] or "").casefold()
+    after_path = str(after[1] or "/").rstrip("/").casefold() or "/"
+    auth_host = after_host == "auth.openai.com" or after_host.endswith(
+        ".auth.openai.com"
+    )
+    chatgpt_entry = (
+        after_host == "chatgpt.com"
+        and after_path in RegistrationEntryRequestStrategy._CHATGPT_ENTRY_PATHS
+    )
+    return (auth_host or chatgpt_entry) and (
+        after_host != before_host or after_path != before_path
+    )
+
+
 def wait_for_registration_activity(
     page: Any,
     before: dict[str, Any],
@@ -298,6 +512,7 @@ def wait_for_registration_activity(
     timeout_seconds: float = CLICK_RESPONSE_SECONDS,
     wait: Callable[[Any, int], Any] | None = None,
     transition: Callable[[], bool] | None = None,
+    signal: str = "any",
 ) -> dict[str, Any]:
     timeout_value = max(0.05, float(timeout_seconds))
     if callable(wait):
@@ -307,12 +522,46 @@ def wait_for_registration_activity(
     if callable(transition):
         try:
             if transition():
-                return {"changed": True, "reason": "transition"}
+                after = registration_activity_snapshot(page)
+                return {
+                    "changed": True,
+                    "reason": "transition",
+                    "activity": after,
+                    "evidence": RegistrationActivityPresenter.evidence(
+                        after,
+                        signal=signal,
+                    ),
+                }
         except Exception:
             pass
     after = registration_activity_snapshot(page)
-    changed, reason = registration_activity_changed(before, after)
-    return {"changed": changed, "reason": reason, "activity": after}
+    changed, reason = registration_activity_changed(
+        before,
+        after,
+        signal=signal,
+    )
+    ignored_activity = False
+    ignored_reason = ""
+    if not changed and signal != "any":
+        ignored_activity, ignored_reason = registration_activity_changed(
+            before,
+            after,
+        )
+    return {
+        "changed": changed,
+        "reason": reason,
+        "activity": after,
+        "evidence": RegistrationActivityPresenter.evidence(
+            after,
+            signal=signal,
+        ),
+        "ignoredActivity": ignored_activity,
+        "ignoredReason": ignored_reason,
+        "ignoredEvidence": RegistrationActivityPresenter.evidence(
+            after,
+            signal="any",
+        ),
+    }
 
 
 def mark_page_registration_milestone(page: Any, step: str, detail: str = "") -> None:

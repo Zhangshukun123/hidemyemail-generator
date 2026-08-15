@@ -10,22 +10,8 @@ from hidemyemail_generator.openai_card_link_bridge import EVENT_PREFIX
 
 
 class CardLinkBridgeTests(unittest.TestCase):
-    def test_classifies_de_kookeey_checkout_probe_without_exposing_id(self):
+    def test_rejects_removed_registration_checkout_probe_method(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            target = Path(temp_dir)
-            (target / "app_backend.py").write_text(
-                "def opll_create_checkout(token, country, currency, proxy, **options):\n"
-                "    assert token == 'at-test'\n"
-                "    assert country == 'DE'\n"
-                "    assert currency == 'EUR'\n"
-                "    assert proxy == 'http://kookeey.example:1000'\n"
-                "    assert options['request_locale'] == 'de-DE'\n"
-                "    assert options['include_trial_promo'] is True\n"
-                "    assert options['checkout_ui_mode'] == 'custom'\n"
-                "    assert options['return_raw_payload'] is True\n"
-                "    return {'cs_id':'oaics_private_probe_id'}\n",
-                encoding="utf-8",
-            )
             bridge = (
                 Path(__file__).resolve().parents[1]
                 / "src"
@@ -33,28 +19,15 @@ class CardLinkBridgeTests(unittest.TestCase):
                 / "openai_card_link_bridge.py"
             )
             env = os.environ.copy()
-            env.update(
-                {
-                    "HME_OPENAI_ACCESS_TOKEN": "at-test",
-                    "HME_CARD_LINK_CREATE_PROXY_URL": (
-                        "http://kookeey.example:1000"
-                    ),
-                }
-            )
+            env["HME_OPENAI_ACCESS_TOKEN"] = "at-test"
             process = subprocess.run(
                 [
                     sys.executable,
                     str(bridge),
                     "--source-dir",
-                    str(target),
+                    temp_dir,
                     "--method",
                     "oaics_probe",
-                    "--country",
-                    "DE",
-                    "--currency",
-                    "EUR",
-                    "--locale",
-                    "de-DE",
                 ],
                 env=env,
                 capture_output=True,
@@ -63,16 +36,9 @@ class CardLinkBridgeTests(unittest.TestCase):
                 check=False,
             )
 
-        event_line = next(
-            line for line in process.stdout.splitlines() if line.startswith(EVENT_PREFIX)
-        )
-        event = json.loads(event_line[len(EVENT_PREFIX) :])
-        self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertEqual(event["status"], "classified")
-        self.assertEqual(event["classification"], "oaics")
-        self.assertEqual(event["checkout_id_type"], "oaics")
-        self.assertEqual(event["method"], "oaics_probe")
-        self.assertNotIn("oaics_private_probe_id", process.stdout)
+        self.assertEqual(process.returncode, 2)
+        self.assertIn("invalid choice", process.stderr)
+        self.assertNotIn(EVENT_PREFIX, process.stdout)
 
     def test_builds_standard_chatgpt_checkout_link(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -32,11 +32,11 @@ from .browser_tasks import (
     account_session,
     account_session_access_token,
     access_token_is_expired,
-    build_registration_environment,
     load_account_record,
     set_manual_account_type,
 )
 from .code_portal import CODE_PORTAL_HTML
+from .deleted_email_repository import DeletedEmailRepository
 from .inbox import (
     DEFAULT_DB_FILE,
     DEFAULT_FOLDER,
@@ -50,6 +50,7 @@ from .inbox import (
     save_config,
     sync_inbox,
 )
+from .inbox_retry_policy import InboxRetryPolicy
 from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
@@ -86,6 +87,7 @@ from .registration_inventory_sync import (
     export_inventory_records,
     import_inventory_records,
 )
+from .registration_monitor import RegistrationMonitorPresenter
 from .registration_tasks import (
     ConcurrentRegistrationTaskManager,
     RegistrationTaskManager,
@@ -125,14 +127,10 @@ PUBLIC_PATHS = {
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
 ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 15
-ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS = 60
-ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS = 15 * 60
-ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS = 60 * 60
 OPENAI_CODE_INBOX_SYNC_LIMIT = 3
 OPENAI_CODE_INBOX_WAIT_SECONDS = 7.0
 DEACTIVATION_SCAN_INTERVAL_SECONDS = 5 * 60
 INVENTORY_SYNC_INTERVAL_SECONDS = 5 * 60
-REGISTRATION_PROCESS_FAILURE_PREFIX = "registration_process_failure:"
 CARD_LINK_REGIONS = {
     "US": {"label": "美国", "currency": "USD", "locale": "en-US"},
     "JP": {"label": "日本", "currency": "JPY", "locale": "ja-JP"},
@@ -3145,91 +3143,6 @@ def _save_account_card_link(
     return card_link
 
 
-def _save_registration_checkout_probe(
-    db_file: Path,
-    email: str,
-    *,
-    registration_environment: dict[str, Any],
-    checkout_proxy: dict[str, Any],
-    classification: str = "",
-    error: str = "",
-    attempt_count: int = 1,
-    max_attempts: int = 1,
-    attempt_errors: list[str] | None = None,
-) -> dict[str, Any]:
-    """Persist a comparison-safe Checkout classification without its ID."""
-
-    target = str(email or "").strip().lower()
-    record = load_account_record(db_file, target)
-    if not record:
-        raise RuntimeError("未找到账户记录")
-    normalized = str(classification or "").strip().lower()
-    if normalized not in {"oaics", "cs_live", "cs", "other"}:
-        normalized = ""
-    checked_at = datetime.now(timezone.utc).isoformat()
-    registration_snapshot = dict(registration_environment or {})
-    checkout_snapshot = dict(checkout_proxy or {})
-    differences = {
-        "proxy_mode_changed": str(registration_snapshot.get("proxy_mode") or "")
-        != str(checkout_snapshot.get("proxy_mode") or ""),
-        "proxy_country_changed": str(
-            registration_snapshot.get("proxy_country") or ""
-        ).upper()
-        != str(checkout_snapshot.get("proxy_country") or "").upper(),
-        "proxy_endpoint_changed": str(
-            registration_snapshot.get("proxy_endpoint") or ""
-        )
-        != str(checkout_snapshot.get("proxy_endpoint") or ""),
-        "exit_ip_changed": bool(
-            registration_snapshot.get("exit_ip")
-            and checkout_snapshot.get("exit_ip")
-            and registration_snapshot.get("exit_ip")
-            != checkout_snapshot.get("exit_ip")
-        ),
-    }
-    probe = {
-        "status": "verified" if normalized else "error",
-        "checkout_id_type": normalized or "error",
-        "is_oaics": normalized == "oaics",
-        "method": "oaics_probe",
-        "country": "DE",
-        "currency": "EUR",
-        "attempt_count": max(1, int(attempt_count or 1)),
-        "max_attempts": max(1, int(max_attempts or 1)),
-        "attempt_errors": [
-            str(item or "").strip()[:300]
-            for item in (attempt_errors or [])
-            if str(item or "").strip()
-        ],
-        "checked_at": checked_at,
-        "registration_marker": str(
-            registration_snapshot.get("captured_at")
-            or record.get("registration_completed_at")
-            or ""
-        ),
-        "registration_environment": registration_snapshot,
-        "checkout_proxy": checkout_snapshot,
-        "differences": differences,
-        "error": str(error or "").strip()[:500] if not normalized else "",
-    }
-    record["registration_environment"] = registration_snapshot
-    record["registration_checkout_probe"] = probe
-    record["updated_at"] = checked_at
-    conn = connect_db(str(db_file))
-    try:
-        conn.execute(
-            """
-            INSERT INTO settings(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (f"gpt_account:{target}", json.dumps(record, ensure_ascii=False)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return probe
-
-
 async def _run_card_link_bridge(
     *,
     target_project_dir: Path,
@@ -3322,10 +3235,6 @@ async def _run_card_link_bridge(
                 detail = detail.replace(proxy, "[REDACTED_PROXY]")
         raise RuntimeError((detail or "直卡支付链接生成失败")[:1000])
     if event_status == "classified":
-        if method == "oaics_probe" and str(
-            event.get("classification") or ""
-        ) in {"oaics", "cs_live", "cs", "other"}:
-            return event
         if (
             method == "de_oaics_paypal"
             and event.get("classification") == "cs_live"
@@ -3339,19 +3248,9 @@ async def _run_card_link_bridge(
 
 def _remove_deleted_email_records(db_file: Path, email: str) -> None:
     target = email.strip().lower()
-    now = datetime.now(timezone.utc).isoformat()
     conn = connect_db(str(db_file))
     try:
-        conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_account:{target}",))
-        conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_removed:{target}",))
-        conn.execute(
-            """
-            UPDATE addresses
-            SET state = 'trash', note = 'iCloud alias deleted', updated_at = ?
-            WHERE lower(email) = ?
-            """,
-            (now, target),
-        )
+        DeletedEmailRepository(conn).mark_deleted(target)
         conn.commit()
     finally:
         conn.close()
@@ -3636,12 +3535,6 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         registration_environment = account.get("registration_environment")
         if not isinstance(registration_environment, dict):
             registration_environment = {}
-        checkout_probe = account.get("registration_checkout_probe")
-        if not isinstance(checkout_probe, dict):
-            checkout_probe = {}
-        checkout_proxy = checkout_probe.get("checkout_proxy")
-        if not isinstance(checkout_proxy, dict):
-            checkout_proxy = {}
         token_expired = bool(access_token) and (
             access_token_is_expired(access_token)
             or bool(account.get("session_invalid_at"))
@@ -3705,32 +3598,6 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 ),
                 "registrationExitCountry": str(
                     registration_environment.get("exit_country") or ""
-                ),
-                "checkoutProbeStatus": str(checkout_probe.get("status") or ""),
-                "checkoutIdType": str(
-                    checkout_probe.get("checkout_id_type") or ""
-                ),
-                "checkoutIsOaics": bool(checkout_probe.get("is_oaics")),
-                "checkoutProbeCheckedAt": str(
-                    checkout_probe.get("checked_at") or ""
-                ),
-                "checkoutProbeError": str(checkout_probe.get("error") or ""),
-                "checkoutProbeAttemptCount": max(
-                    0, int(checkout_probe.get("attempt_count") or 0)
-                ),
-                "checkoutProbeMaxAttempts": max(
-                    0, int(checkout_probe.get("max_attempts") or 0)
-                ),
-                "checkoutProxyMode": str(checkout_proxy.get("proxy_mode") or ""),
-                "checkoutProxyCountry": str(
-                    checkout_proxy.get("proxy_country") or ""
-                ),
-                "checkoutProxyEndpoint": str(
-                    checkout_proxy.get("proxy_endpoint") or ""
-                ),
-                "checkoutExitIp": str(checkout_proxy.get("exit_ip") or ""),
-                "checkoutExitCountry": str(
-                    checkout_proxy.get("exit_country") or ""
                 ),
                 "hasCookies": bool(account_saved_cookies(account)),
                 "hasImportableSession": bool(
@@ -3910,7 +3777,6 @@ def create_app(
     paypal_python: str = "",
     paypal_port: int = 18097,
     deactivation_scan_interval_seconds: float = DEACTIVATION_SCAN_INTERVAL_SECONDS,
-    auto_oaics_probe: bool = True,
 ) -> web.Application:
     app = web.Application(
         client_max_size=4 * 1024 * 1024, middlewares=[auth_middleware]
@@ -3923,6 +3789,20 @@ def create_app(
     app["cookie_file"] = _resolve_data_path(base_dir, cookie_file)
     app["output_file"] = _resolve_data_path(base_dir, output_file)
     app["db_file"] = _resolve_data_path(base_dir, db_file)
+    monitor_log_setting = str(
+        os.environ.get("HME_REGISTRATION_MONITOR_LOG") or ""
+    ).strip()
+    monitor_log_file = (
+        _resolve_data_path(base_dir, monitor_log_setting)
+        if monitor_log_setting
+        else app["db_file"].parent
+        / "output"
+        / "registration-monitor"
+        / "registration-failures.jsonl"
+    )
+    app["registration_monitor"] = RegistrationMonitorPresenter.from_paths(
+        app["db_file"], monitor_log_file
+    )
     credential_store = InventoryCredentialStore(app["db_file"])
     if str(web_username or "").strip():
         if not web_password:
@@ -3938,6 +3818,8 @@ def create_app(
     app["inbox_on_demand_next_attempt"] = 0.0
     app["inbox_on_demand_failures"] = 0
     app["inbox_on_demand_retry_after"] = 0
+    app["inbox_retry_kind"] = ""
+    app["inbox_retry_policy"] = InboxRetryPolicy()
     app["inbox_code_sync_task"] = None
     app["deactivation_scan_state"] = {
         "intervalSeconds": max(0.05, float(deactivation_scan_interval_seconds)),
@@ -3953,8 +3835,6 @@ def create_app(
     app["inbox_sync_lock"] = asyncio.Lock()
     app["identity_lock"] = asyncio.Lock()
     app["card_link_lock"] = asyncio.Lock()
-    app["auto_oaics_probe"] = bool(auto_oaics_probe)
-    app["auto_oaics_probe_sleep"] = asyncio.sleep
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
     app["inventory_server_enabled"] = bool(inventory_server_enabled)
@@ -4023,6 +3903,18 @@ def create_app(
             if not app["inventory_fallback_active"]:
                 raise
 
+    async def remove_and_sync_deleted_email(email: str) -> None:
+        target = str(email or "").strip().lower()
+        await asyncio.to_thread(_remove_deleted_email_records, app["db_file"], target)
+        if not app["inventory_client"].configured:
+            return
+        try:
+            await sync_inventory_to_remote([target])
+        except Exception:
+            # The local tombstone still blocks stale remote leases.  The
+            # background inventory synchronizer retries the targeted record.
+            pass
+
     app["sync_inventory_to_remote"] = sync_inventory_to_remote
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
     app["card_link_proxy_store"] = RegistrationProxyStore(
@@ -4035,6 +3927,9 @@ def create_app(
             base_dir=base_dir,
             db_file=app["db_file"],
             proxy_store=app["registration_proxy_store"],
+            record_failure=lambda task: asyncio.to_thread(
+                app["registration_monitor"].record_failure, task
+            ),
         )
 
     app["protocol_registration_manager"] = ConcurrentProtocolRegistrationManager(
@@ -4083,212 +3978,6 @@ def create_app(
         "openai_card_link_bridge.py"
     ).resolve()
 
-    async def inspect_proxy_environment(
-        proxy_url: str, environment: dict[str, Any]
-    ) -> dict[str, Any]:
-        snapshot = dict(environment)
-        try:
-            tested = await app["registration_proxy_tester"](
-                proxy_url, str(snapshot.get("proxy_country") or "")
-            )
-        except Exception as error:
-            snapshot["exit_ip_status"] = "error"
-            snapshot["exit_ip_error"] = _registration_proxy_test_error(error)[:300]
-            return snapshot
-        snapshot.update(
-            exit_ip=str(tested.get("exitIp") or "").strip(),
-            exit_country=str(tested.get("country") or "").strip().upper(),
-            exit_ip_status="verified" if tested.get("exitIp") else "unknown",
-            proxy_test_latency_ms=max(0, int(tested.get("latencyMs") or 0)),
-        )
-        return snapshot
-
-    async def validate_saved_registration_checkout(
-        email: str,
-        *,
-        force: bool = False,
-    ) -> dict[str, Any] | None:
-        target = str(email or "").strip().lower()
-        if not app["auto_oaics_probe"]:
-            await sync_saved_account_to_remote(target)
-            return None
-        record = await asyncio.to_thread(
-            load_account_record, app["db_file"], target
-        )
-        registration_environment = record.get("registration_environment")
-        if not isinstance(registration_environment, dict):
-            await sync_saved_account_to_remote(target)
-            return None
-        marker = str(
-            registration_environment.get("captured_at")
-            or record.get("registration_completed_at")
-            or ""
-        )
-        previous_probe = record.get("registration_checkout_probe")
-        if (
-            isinstance(previous_probe, dict)
-            and marker
-            and str(previous_probe.get("registration_marker") or "") == marker
-            and str(previous_probe.get("status") or "") == "verified"
-            and not force
-        ):
-            await sync_saved_account_to_remote(target)
-            return dict(previous_probe)
-
-        card_link_proxy_state = app["card_link_proxy_store"].public_state()
-        card_link_countries = card_link_proxy_state.get("cardLinkCountries")
-        if not isinstance(card_link_countries, dict):
-            card_link_countries = {}
-        card_link_modes = card_link_proxy_state.get("cardLinkModes")
-        if not isinstance(card_link_modes, dict):
-            card_link_modes = {}
-        checkout_proxy_country = str(
-            card_link_countries.get("de")
-            or card_link_proxy_state.get("country")
-            or "DE"
-        ).strip().upper()
-        checkout_proxy_mode = str(
-            card_link_modes.get("de_oaics_paypal")
-            or card_link_proxy_state.get("mode")
-            or "dynamic"
-        ).strip().lower()
-        checkout_country_item = next(
-            (
-                item for item in card_link_proxy_state.get("countries", [])
-                if isinstance(item, dict)
-                and str(item.get("code") or "").strip().upper()
-                == checkout_proxy_country
-            ),
-            {},
-        )
-        checkout_proxy_country_label = str(
-            checkout_country_item.get("label") or checkout_proxy_country
-        )
-
-        checkout_environment: dict[str, Any] = {
-            "registration_mode": "checkout_probe",
-            "email_type": str(registration_environment.get("email_type") or ""),
-            "proxy_enabled": True,
-            "proxy_mode": checkout_proxy_mode,
-            "proxy_country": checkout_proxy_country,
-            "proxy_country_label": checkout_proxy_country_label,
-            "proxy_role": "first_card_link_proxy",
-            "proxy_endpoint": "",
-            "proxy_node": "",
-            "proxy_selector": "",
-            "proxy_latency_ms": 0,
-            "exit_ip": "",
-            "exit_country": "",
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-        }
-        access_token = account_session_access_token(record)
-        registration_proxy_url = account_registration_proxy_url(record)
-        max_probe_attempts = 3
-        probe_retry_delays = (2, 5)
-        attempt_count = 0
-        attempt_errors: list[str] = []
-        try:
-            if not access_token:
-                raise RuntimeError("账户没有可用 Access Token")
-            if access_token_is_expired(access_token):
-                raise RuntimeError("Access Token 已过期")
-            browser_manager: BrowserTaskManager = app["browser_manager"]
-            if not browser_manager.target_project_dir.is_dir():
-                raise RuntimeError("OpenAI 支付运行目录不存在")
-            if not browser_manager.python_executable.is_file():
-                raise RuntimeError("OpenAI 支付运行环境不可用")
-            registration_environment = await inspect_proxy_environment(
-                registration_proxy_url, registration_environment
-            )
-            result: dict[str, Any] = {}
-            for attempt in range(1, max_probe_attempts + 1):
-                attempt_count = attempt
-                checkout_proxy_url, checkout_proxy_state = await asyncio.to_thread(
-                    app["card_link_proxy_store"].proxy_for_country,
-                    checkout_proxy_country,
-                    mode=checkout_proxy_mode,
-                )
-                if not checkout_proxy_url:
-                    raise RuntimeError("配置的第一提链代理尚未配置")
-                checkout_state = {
-                    **checkout_proxy_state,
-                    "mode": checkout_proxy_mode,
-                    "country": checkout_proxy_country,
-                    "countryLabel": checkout_proxy_country_label,
-                }
-                checkout_environment = build_registration_environment(
-                    target,
-                    registration_mode="checkout_probe",
-                    proxy_url=checkout_proxy_url,
-                    proxy_state=checkout_state,
-                    proxy_mode=checkout_proxy_mode,
-                    proxy_country=checkout_proxy_country,
-                )
-                checkout_environment["proxy_role"] = "first_card_link_proxy"
-                checkout_environment = await inspect_proxy_environment(
-                    checkout_proxy_url, checkout_environment
-                )
-                try:
-                    async with app["card_link_lock"]:
-                        result = await _run_card_link_bridge(
-                            target_project_dir=browser_manager.target_project_dir,
-                            python_executable=browser_manager.python_executable,
-                            bridge_file=app["card_link_bridge_file"],
-                            access_token=access_token,
-                            method="oaics_probe",
-                            country="DE",
-                            currency="EUR",
-                            locale="de-DE",
-                            account_email=target,
-                            create_proxy_url=checkout_proxy_url,
-                        )
-                    break
-                except Exception as error:
-                    attempt_errors.append(
-                        _registration_proxy_test_error(error)[:300]
-                    )
-                    if attempt >= max_probe_attempts:
-                        raise
-                    await app["auto_oaics_probe_sleep"](
-                        probe_retry_delays[attempt - 1]
-                    )
-            probe = await asyncio.to_thread(
-                _save_registration_checkout_probe,
-                app["db_file"],
-                target,
-                registration_environment=registration_environment,
-                checkout_proxy=checkout_environment,
-                classification=str(
-                    result.get("checkout_id_type")
-                    or result.get("classification")
-                    or ""
-                ),
-                attempt_count=attempt_count,
-                max_attempts=max_probe_attempts,
-                attempt_errors=attempt_errors,
-            )
-        except Exception as error:
-            probe = await asyncio.to_thread(
-                _save_registration_checkout_probe,
-                app["db_file"],
-                target,
-                registration_environment=registration_environment,
-                checkout_proxy=checkout_environment,
-                error=_registration_proxy_test_error(error),
-                attempt_count=max(1, attempt_count),
-                max_attempts=max_probe_attempts,
-                attempt_errors=attempt_errors,
-            )
-        await sync_saved_account_to_remote(target)
-        return probe
-
-    app["browser_manager"].on_account_saved = validate_saved_registration_checkout
-    app["protocol_registration_manager"].on_account_saved = (
-        validate_saved_registration_checkout
-    )
-    app["validate_saved_registration_checkout"] = (
-        validate_saved_registration_checkout
-    )
     gpt_code_identity_cache: list[dict] = []
     gpt_code_identity_cache_at = 0.0
 
@@ -4390,6 +4079,15 @@ def create_app(
                         app["db_file"],
                         [leased_record],
                     )
+                if email in await asyncio.to_thread(
+                    removed_account_emails, app["db_file"]
+                ):
+                    await app["inventory_client"].complete_email(
+                        email,
+                        True,
+                        "本地已标记删除，已从远端库存永久排除",
+                    )
+                    continue
                 record = await asyncio.to_thread(
                     load_account_record, app["db_file"], email
                 )
@@ -4473,86 +4171,10 @@ def create_app(
         return await asyncio.to_thread(load_account_record, app["db_file"], email)
 
     async def record_registration_failure(task: dict) -> None:
-        process_id = str(task.get("processId") or task.get("id") or "").strip()
-        if not process_id:
-            return
-        record = {
-            "processId": process_id,
-            "status": "failed",
-            "provider": str(task.get("provider") or ""),
-            "email": str(task.get("email") or "").strip().lower(),
-            "emails": [
-                str(item or "").strip().lower()
-                for item in task.get("emails", [])
-                if str(item or "").strip()
-            ],
-            "message": str(task.get("message") or "注册失败")[:1000],
-            "currentStage": str(task.get("currentStage") or "failed"),
-            "currentLocation": str(task.get("currentLocation") or "注册流程"),
-            "currentAction": str(task.get("currentAction") or "注册失败")[:500],
-            "startedAt": str(task.get("startedAt") or ""),
-            "finishedAt": str(task.get("finishedAt") or ""),
-            "recordedAt": str(task.get("recordedAt") or ""),
-            "logs": [
-                {
-                    key: str(log.get(key) or "")[:1000]
-                    for key in (
-                        "at",
-                        "message",
-                        "stage",
-                        "location",
-                        "action",
-                        "status",
-                    )
-                }
-                for log in task.get("logs", [])[-30:]
-                if isinstance(log, dict)
-            ],
-        }
-
-        def save_failure() -> None:
-            conn = connect_db(str(app["db_file"]))
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO settings(key, value) VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (
-                        f"{REGISTRATION_PROCESS_FAILURE_PREFIX}{process_id}",
-                        json.dumps(record, ensure_ascii=False),
-                    ),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-
-        await asyncio.to_thread(save_failure)
-
-    def load_registration_failures(limit: int = 20) -> list[dict]:
-        conn = connect_db(str(app["db_file"]))
-        try:
-            rows = conn.execute(
-                """
-                SELECT value
-                FROM settings
-                WHERE key LIKE ?
-                ORDER BY rowid DESC
-                LIMIT ?
-                """,
-                (f"{REGISTRATION_PROCESS_FAILURE_PREFIX}%", max(1, int(limit))),
-            ).fetchall()
-        finally:
-            conn.close()
-        records: list[dict] = []
-        for row in rows:
-            try:
-                item = json.loads(str(row["value"] or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(item, dict):
-                records.append(item)
-        return records
+        await asyncio.to_thread(
+            app["registration_monitor"].record_failure,
+            task,
+        )
 
     def create_registration_process() -> RegistrationTaskManager:
         primary_browser = app["browser_manager"]
@@ -4566,7 +4188,7 @@ def create_app(
             force_headless=primary_browser.force_headless,
             registration_proxy_store=primary_browser.registration_proxy_store,
             roxy_registration_store=primary_browser.roxy_registration_store,
-            on_account_saved=validate_saved_registration_checkout,
+            on_account_saved=sync_saved_account_to_remote,
         )
         return RegistrationTaskManager(
             browser_manager=process_browser,
@@ -4625,6 +4247,7 @@ def create_app(
         app["inbox_on_demand_next_attempt"] = 0.0
         app["inbox_on_demand_failures"] = 0
         app["inbox_on_demand_retry_after"] = 0
+        app["inbox_retry_kind"] = ""
         app["inbox_background_error"] = ""
 
     async def sync_inbox_on_demand(limit: int, *, force: bool = False) -> list[dict]:
@@ -4649,17 +4272,13 @@ def create_app(
             except Exception as error:
                 public_message = _inbox_error_message(error)
                 failures = app["inbox_on_demand_failures"] + 1
-                base_delay = (
-                    ON_DEMAND_INBOX_AUTH_BACKOFF_SECONDS
-                    if "IMAP 登录失败" in public_message
-                    else ON_DEMAND_INBOX_FAILURE_BACKOFF_SECONDS
+                decision = app["inbox_retry_policy"].decide(
+                    public_message, failures
                 )
-                delay = min(
-                    ON_DEMAND_INBOX_MAX_BACKOFF_SECONDS,
-                    base_delay * (2 ** min(failures - 1, 6)),
-                )
+                delay = decision.delay_seconds
                 app["inbox_on_demand_failures"] = failures
                 app["inbox_on_demand_retry_after"] = delay
+                app["inbox_retry_kind"] = decision.kind
                 app["inbox_on_demand_next_attempt"] = time.monotonic() + delay
                 app["inbox_background_error"] = public_message
                 raise
@@ -5302,12 +4921,14 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
+        local_only = bool(payload.get("local_only", False))
         if any(
             manager.snapshot().get("running")
             for manager in (
                 app["registration_manager"],
                 app["browser_manager"],
                 app["verification_manager"],
+                app["protocol_registration_manager"],
             )
         ):
             return web.json_response(
@@ -5318,9 +4939,7 @@ def create_app(
         async with app["delete_lock"]:
             if email.endswith("@gmail.com"):
                 await app["smsbower_client"].forget_email(email)
-                await asyncio.to_thread(
-                    _remove_deleted_email_records, app["db_file"], email
-                )
+                await remove_and_sync_deleted_email(email)
                 return web.json_response(
                     {
                         "ok": True,
@@ -5330,11 +4949,38 @@ def create_app(
                     }
                 )
 
+            if local_only:
+                await remove_and_sync_deleted_email(email)
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "deleted": True,
+                        "deactivated": False,
+                        "localOnly": True,
+                        "providerDeleted": False,
+                        "message": "已从工作台移除本地记录；iCloud 端邮箱未操作",
+                    }
+                )
+
             try:
                 identities = await active_icloud_identities()
             except RuntimeError as error:
+                detail = str(error)
+                if "invalid global session" in detail.lower():
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "code": "icloud_session_expired",
+                            "canDeleteLocal": True,
+                            "error": (
+                                "iCloud 登录已过期，暂时不能操作 Apple 端邮箱；"
+                                "可确认后仅从工作台移除本地记录"
+                            ),
+                        },
+                        status=409,
+                    )
                 return web.json_response(
-                    {"ok": False, "error": str(error)}, status=502
+                    {"ok": False, "error": detail}, status=502
                 )
             identity = next(
                 (
@@ -5345,8 +4991,17 @@ def create_app(
                 None,
             )
             if identity is None:
+                await remove_and_sync_deleted_email(email)
                 return web.json_response(
-                    {"ok": False, "error": "邮箱不存在或已经停用"}, status=404
+                    {
+                        "ok": True,
+                        "deleted": True,
+                        "deactivated": False,
+                        "localOnly": False,
+                        "providerDeleted": True,
+                        "alreadyAbsent": True,
+                        "message": "iCloud 端已不存在该邮箱，工作台本地记录已清理",
+                    }
                 )
             anonymous_id = str(identity.get("anonymousId") or "").strip()
             if not anonymous_id:
@@ -5369,9 +5024,7 @@ def create_app(
                     )
                 deleted = await hme.delete_email(anonymous_id)
 
-            await asyncio.to_thread(
-                _remove_deleted_email_records, app["db_file"], email
-            )
+            await remove_and_sync_deleted_email(email)
             if not deleted or not deleted.get("success"):
                 return web.json_response(
                     {
@@ -5389,6 +5042,8 @@ def create_app(
                     "ok": True,
                     "deleted": True,
                     "deactivated": True,
+                    "localOnly": False,
+                    "providerDeleted": True,
                     "message": "邮箱及本地账号凭据已删除",
                 }
             )
@@ -6039,37 +5694,6 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
-    async def retry_registration_checkout_probe(
-        request: web.Request,
-    ) -> web.Response:
-        if not _local_token_valid(request, app):
-            return web.json_response(
-                {"ok": False, "error": "本地请求令牌无效"}, status=403
-            )
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, web.HTTPBadRequest):
-            return web.json_response(
-                {"ok": False, "error": "请求格式无效"}, status=400
-            )
-        email = str(body.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email):
-            return web.json_response(
-                {"ok": False, "error": "邮箱地址无效"}, status=400
-            )
-        probe = await app["validate_saved_registration_checkout"](email, force=True)
-        if not isinstance(probe, dict):
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "账号缺少注册环境记录，无法重新检测 Checkout",
-                },
-                status=409,
-            )
-        return web.json_response(
-            {"ok": True, **probe}, headers={"Cache-Control": "no-store"}
-        )
-
     async def browser_status(_: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, **app["browser_manager"].snapshot()},
@@ -6078,11 +5702,57 @@ def create_app(
 
     async def registration_status(_: web.Request) -> web.Response:
         task = app["registration_manager"].snapshot()
-        task["failureRecords"] = await asyncio.to_thread(
-            load_registration_failures
-        )
+        try:
+            monitor = await asyncio.to_thread(
+                app["registration_monitor"].snapshot,
+                limit=20,
+                include_details=False,
+            )
+        except Exception as error:
+            monitor = {
+                "records": [],
+                "summary": {
+                    "total": 0,
+                    "returned": 0,
+                    "retryable": 0,
+                    "nonRetryable": 0,
+                    "byReason": {},
+                    "byCategory": {},
+                },
+                "logFile": "",
+            }
+            task["failureMonitorError"] = str(error)[:300]
+        task["failureRecords"] = monitor["records"]
+        task["failureSummary"] = monitor["summary"]
+        task["failureLogFile"] = monitor["logFile"]
         return web.json_response(
             {"ok": True, **task},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def registration_failures(request: web.Request) -> web.Response:
+        try:
+            limit = max(1, min(200, int(request.query.get("limit", "50"))))
+            offset = max(0, int(request.query.get("offset", "0")))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"ok": False, "error": "分页参数必须是整数"}, status=400
+            )
+        try:
+            monitor = await asyncio.to_thread(
+                app["registration_monitor"].snapshot,
+                limit=limit,
+                offset=offset,
+                email=str(request.query.get("email") or ""),
+                reason_code=str(request.query.get("reason") or ""),
+            )
+        except Exception as error:
+            return web.json_response(
+                {"ok": False, "error": f"注册失败记录读取失败：{str(error)[:300]}"},
+                status=503,
+            )
+        return web.json_response(
+            {"ok": True, **monitor},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -7621,6 +7291,8 @@ def create_app(
                 "lastBackgroundSync": app["inbox_background_last_sync"],
                 "backgroundError": app["inbox_background_error"],
                 "retryAfterSeconds": app["inbox_on_demand_retry_after"],
+                "retryKind": app["inbox_retry_kind"],
+                "failureCount": app["inbox_on_demand_failures"],
                 "deactivationCleanup": cleanup_status,
             },
             headers={"Cache-Control": "no-store"},
@@ -7944,9 +7616,6 @@ def create_app(
         "/api/account/import-workbench", import_workbench_account
     )
     app.router.add_post("/api/account/card-link", create_card_link)
-    app.router.add_post(
-        "/api/account/checkout-probe", retry_registration_checkout_probe
-    )
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
     app.router.add_post("/api/gpt-code", gpt_code)
     app.router.add_post(WORKBENCH_OPENAI_CODE_PATH, workbench_openai_code)
@@ -7958,6 +7627,7 @@ def create_app(
     app.router.add_post("/api/browser/fetch-selected", browser_fetch_selected)
     app.router.add_post("/api/browser/stop", browser_stop)
     app.router.add_get("/api/registration/status", registration_status)
+    app.router.add_get("/api/registration/failures", registration_failures)
     app.router.add_post("/api/registration/start", registration_start)
     app.router.add_post("/api/registration/code", registration_code_submit)
     app.router.add_post("/api/registration/code/poll", registration_code_poll)
@@ -8088,10 +7758,6 @@ async def run_server(args: argparse.Namespace) -> None:
         paypal_project_dir=os.environ.get("PAYPAL_PROTOCOL_PROJECT_DIR", ""),
         paypal_python=os.environ.get("PAYPAL_PROTOCOL_PYTHON", ""),
         paypal_port=int(os.environ.get("PAYPAL_PROTOCOL_PORT", "18097")),
-        auto_oaics_probe=os.environ.get(
-            "HIDEMYEMAIL_AUTO_OAICS_PROBE", "1"
-        ).strip().lower()
-        in {"1", "true", "yes", "on"},
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

@@ -10,6 +10,19 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+try:
+    from .registration_locale import (
+        REGISTRATION_LOCALE_PRESENTER,
+        detect_registration_locale,
+        registration_markers,
+    )
+except ImportError:
+    from registration_locale import (
+        REGISTRATION_LOCALE_PRESENTER,
+        detect_registration_locale,
+        registration_markers,
+    )
+
 
 # Registration pages are small, and the status is consumed by a local UI.  A
 # one-second heartbeat keeps the display responsive without changing or
@@ -72,81 +85,13 @@ _TRANSIENT_PAGE_CODES = {"loading", "unknown"}
 class RegistrationDomStateMismatch(RuntimeError):
     """A mutating browser operation did not match the current DOM page."""
 
-_SECURITY_MARKERS = (
-    "security verification",
-    "verify you are human",
-    "checking your browser",
-    "just a moment",
-    "captcha",
-    "cloudflare",
-    "安全验证",
-    "人机验证",
-    "验证您是真人",
-    "セキュリティ",
-    "人間であることを確認",
-    "私はロボットではありません",
-)
-_COMPLETED_MARKERS = (
-    "you're all set",
-    "you’re all set",
-    "you are all set",
-    "準備が完了しました",
-    "准备就绪",
-    "準備就緒",
-)
-_PROFILE_MARKERS = (
-    "tell us about you",
-    "date of birth",
-    "full name",
-    "about you",
-    "お名前",
-    "生年月日",
-    "氏名",
-    "出生日期",
-    "你的姓名",
-    "您的姓名",
-)
-_OTP_MARKERS = (
-    "check your inbox",
-    "verification code",
-    "6-digit code",
-    "one-time code",
-    "受信箱を確認",
-    "確認コード",
-    "验证码",
-    "驗證碼",
-)
-_PASSWORD_MARKERS = (
-    "continue with password",
-    "create a password",
-    "enter your password",
-    "パスワードで続行",
-    "パスワードを作成",
-    "使用密码继续",
-    "创建密码",
-    "使用密碼繼續",
-)
-_EMAIL_MARKERS = (
-    "email address",
-    "continue with email",
-    "create your account",
-    "メールアドレス",
-    "メールで続行",
-    "电子邮件地址",
-    "邮箱地址",
-    "電郵地址",
-)
-_ERROR_MARKERS = (
-    "something went wrong",
-    "try again later",
-    "too many requests",
-    "access denied",
-    "发生错误",
-    "出了点问题",
-    "稍后重试",
-    "エラーが発生",
-    "しばらくしてから",
-)
+_SECURITY_MARKERS = (*registration_markers("security"), "captcha", "cloudflare")
+_COMPLETED_MARKERS = registration_markers("completed")
+_PROFILE_MARKERS = registration_markers("profile")
+_OTP_MARKERS = registration_markers("otp")
+_PASSWORD_MARKERS = registration_markers("password")
+_EMAIL_MARKERS = registration_markers("email")
+_ERROR_MARKERS = registration_markers("error")
 
 _PASSWORD_SELECTORS = ('input[type="password"]', 'input[autocomplete="new-password"]')
 _OTP_SELECTORS = (
@@ -192,6 +137,16 @@ def _safe_ready_state(page) -> str:
     except Exception:
         return "unknown"
     return str(value or "unknown")[:32]
+
+
+def _safe_document_locale(page) -> str:
+    try:
+        value = page.evaluate(
+            "() => document.documentElement.lang || navigator.language || ''"
+        )
+    except Exception:
+        return ""
+    return str(value or "").strip().replace("_", "-")[:32]
 
 
 def _selector_visible(page, selectors: tuple[str, ...]) -> bool:
@@ -261,6 +216,18 @@ def recognize_registration_page(
     combined = f"{folded} {ocr_folded}".strip()
     source = "dom" if body_text else "ocr" if ocr_text else "url"
     ready_state = _safe_ready_state(page)
+    declared_locale = _safe_document_locale(page)
+    text_locale = detect_registration_locale(combined)
+    declared_profile = detect_registration_locale(
+        "",
+        declared_locale=declared_locale,
+    )
+    locale_profile = text_locale or declared_profile
+    locale_fields = REGISTRATION_LOCALE_PRESENTER.present(
+        locale_profile,
+        declared_locale=declared_locale,
+        source="text" if text_locale is not None else "document",
+    )
 
     password_visible = _selector_visible(page, _PASSWORD_SELECTORS)
     otp_visible = _selector_visible(page, _OTP_SELECTORS)
@@ -268,6 +235,7 @@ def recognize_registration_page(
     email_visible = _selector_visible(page, _EMAIL_SELECTORS)
     dom_signals = {
         "bodyText": bool(body_text),
+        "documentLocale": declared_profile is not None,
         "emailInput": email_visible,
         "passwordInput": password_visible,
         "otpInput": otp_visible,
@@ -277,6 +245,7 @@ def recognize_registration_page(
         label
         for key, label in (
             ("bodyText", "body-text"),
+            ("documentLocale", "document-lang"),
             ("emailInput", "email-input"),
             ("passwordInput", "password-input"),
             ("otpInput", "otp-input"),
@@ -355,6 +324,7 @@ def recognize_registration_page(
         "route": route,
         "readyState": ready_state,
         "updatedAt": _utc_now(),
+        **locale_fields,
     }
 
 

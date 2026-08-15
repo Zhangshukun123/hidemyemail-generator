@@ -151,7 +151,7 @@ class RegistrationRetryPolicy:
     _NAVIGATION_STALLED = re.compile(
         r"(?:page\.goto|navigation).{0,80}(?:timeout|timed out|interrupted)|"
         r"(?:首页邮箱弹窗|免费注册|邮箱已输入并点击继续|邮箱已提交).{0,100}"
-        r"(?:没有变化|未完成变化|点击失败|未找到|超时)|"
+        r"(?:没有变化|未(?:在限定时间内)?完成变化|点击失败|未找到|超时)|"
         r"(?:未找到继续/创建账号按钮|首页尚未完成加载)",
         re.I | re.S,
     )

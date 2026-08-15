@@ -1988,15 +1988,67 @@ class BrowserTaskManager:
                             "loadCount": max(
                                 0, int(request_activity.get("loadCount") or 0)
                             ),
+                            "entryRequestCount": max(
+                                0,
+                                int(
+                                    request_activity.get("entryRequestCount")
+                                    or 0
+                                ),
+                            ),
+                            "entryResponseCount": max(
+                                0,
+                                int(
+                                    request_activity.get("entryResponseCount")
+                                    or 0
+                                ),
+                            ),
+                            "entryFailedCount": max(
+                                0,
+                                int(
+                                    request_activity.get("entryFailedCount")
+                                    or 0
+                                ),
+                            ),
+                            "lastEvent": str(
+                                request_activity.get("lastEvent") or ""
+                            )[:24],
                             "lastMethod": str(
                                 request_activity.get("lastMethod") or ""
                             )[:12],
                             "lastRoute": str(
                                 request_activity.get("lastRoute") or ""
                             )[:220],
+                            "lastResourceType": str(
+                                request_activity.get("lastResourceType") or ""
+                            )[:32],
                             "lastStatus": max(
                                 0, int(request_activity.get("lastStatus") or 0)
                             ),
+                            "lastActivityAt": str(
+                                request_activity.get("lastActivityAt") or ""
+                            )[:80],
+                            "lastEntryEvent": str(
+                                request_activity.get("lastEntryEvent") or ""
+                            )[:24],
+                            "lastEntryMethod": str(
+                                request_activity.get("lastEntryMethod") or ""
+                            )[:12],
+                            "lastEntryRoute": str(
+                                request_activity.get("lastEntryRoute") or ""
+                            )[:220],
+                            "lastEntryResourceType": str(
+                                request_activity.get("lastEntryResourceType")
+                                or ""
+                            )[:32],
+                            "lastEntryStatus": max(
+                                0,
+                                int(
+                                    request_activity.get("lastEntryStatus") or 0
+                                ),
+                            ),
+                            "lastEntryAt": str(
+                                request_activity.get("lastEntryAt") or ""
+                            )[:80],
                         },
                         "startedAt": str(chain_state.get("startedAt") or "")[:80],
                         "updatedAt": utc_now(),

@@ -406,6 +406,155 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restarted["tasks"][-1]["email"], "retry@icloud.com")
         await coordinator.stop()
 
+    async def test_failure_context_is_frozen_before_inventory_finalization_logs(self):
+        class FailedBrowserManager(FakeBrowserManager):
+            async def wait(self):
+                await asyncio.sleep(0)
+                email = self.started_accounts[0]["email"]
+                self.state.update(
+                    id="browser-failure-1",
+                    status="completed",
+                    running=False,
+                    succeeded=0,
+                    logs=[
+                        {
+                            "at": "2026-08-15T00:00:01+00:00",
+                            "email": email,
+                            "message": "验证码提交后页面仍停留在邮箱验证页",
+                        }
+                    ],
+                    accounts=[
+                        {
+                            "email": email,
+                            "status": "failed",
+                            "phase": "failed",
+                            "message": "验证码提交后页面仍停留在邮箱验证页",
+                            "stage": "email_verification",
+                            "location": "邮箱验证码页",
+                            "action": "检查验证码是否过期",
+                            "terminalReasonCode": "retry_limit",
+                            "terminalRetryDecision": "瞬时失败重试次数已用尽",
+                            "lastRetryCode": "navigation_stalled",
+                            "retryState": "exhausted",
+                            "registrationChain": {
+                                "currentCode": "verification_submitted",
+                                "requestActivity": {"lastStatus": 400},
+                            },
+                        }
+                    ],
+                )
+                return self.snapshot()
+
+        completed = []
+
+        async def complete(email, success, message):
+            completed.append((email, success, message))
+
+        manager = RegistrationTaskManager(
+            browser_manager=FailedBrowserManager(),
+            acquire_email=lambda _label: asyncio.sleep(
+                0, result="failed@icloud.com"
+            ),
+            confirm_email=lambda _email: asyncio.sleep(0),
+            complete_email=complete,
+        )
+        manager.start(label="failure context", headless=True, concurrency=1)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["currentStage"], "prepare")
+        self.assertEqual(
+            snapshot["failureContext"]["currentStage"], "email_verification"
+        )
+        self.assertEqual(
+            snapshot["failureContext"]["failedAccounts"][0]["registrationChain"][
+                "currentCode"
+            ],
+            "verification_submitted",
+        )
+        self.assertEqual(snapshot["failureContext"]["reasonCode"], "retry_limit")
+        self.assertEqual(
+            snapshot["failureContext"]["failureReason"], "瞬时失败重试次数已用尽"
+        )
+        self.assertEqual(completed[0][0], "failed@icloud.com")
+        self.assertFalse(completed[0][1])
+
+    async def test_monitor_storage_error_does_not_change_registration_failure(self):
+        processes = []
+        attempts = 0
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        def broken_recorder(_failure):
+            nonlocal attempts
+            attempts += 1
+            raise OSError("monitor disk unavailable")
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            record_failure=broken_recorder,
+            max_processes=2,
+        )
+        coordinator.start(
+            label="broken monitor",
+            headless=True,
+            concurrency=1,
+            email="monitor-error@icloud.com",
+            provider="manual",
+        )
+        processes[0].fail("验证码失败")
+        await asyncio.sleep(0.3)
+
+        snapshot = coordinator.snapshot()
+        self.assertEqual(snapshot["tasks"][0]["status"], "failed")
+        self.assertEqual(snapshot["recordedFailureCount"], 0)
+        self.assertEqual(attempts, 3)
+        self.assertIn("monitor disk unavailable", "".join(
+            snapshot["failureRecordingErrors"].values()
+        ))
+
+    async def test_monitor_retries_a_transient_storage_failure(self):
+        processes = []
+        attempts = 0
+        failures = []
+
+        def process_factory():
+            process = FakeRegistrationProcess(len(processes) + 1)
+            processes.append(process)
+            return process
+
+        def flaky_recorder(failure):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("database is busy")
+            failures.append(failure)
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=process_factory,
+            record_failure=flaky_recorder,
+            max_processes=2,
+        )
+        coordinator.start(
+            label="flaky monitor",
+            headless=True,
+            concurrency=1,
+            email="monitor-retry@icloud.com",
+            provider="manual",
+        )
+        processes[0].fail("验证码失败")
+        await asyncio.sleep(0.2)
+
+        snapshot = coordinator.snapshot()
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(snapshot["recordedFailureCount"], 1)
+        self.assertEqual(snapshot["failureRecordingErrors"], {})
+
     async def test_generated_password_contains_required_character_groups(self):
         password = generate_openai_password()
         self.assertGreaterEqual(len(password), 16)
@@ -499,6 +648,17 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         state = manager.start(label="OpenAI 一键注册", headless=True, concurrency=1)
         self.assertTrue(state["running"])
+        parameter_log = next(
+            item
+            for item in state["logs"]
+            if item.get("eventType") == "task_parameters"
+        )
+        self.assertEqual(parameter_log["taskId"], state["id"])
+        self.assertEqual(parameter_log["originTaskId"], state["id"])
+        self.assertEqual(parameter_log["source"], "registration_manager")
+        self.assertIn("邮箱来源 inventory", parameter_log["message"])
+        self.assertIn("引擎 Camoufox", parameter_log["message"])
+        self.assertIn("目标账号 1", parameter_log["message"])
         await asyncio.wait_for(manager._task, timeout=5)
 
         snapshot = manager.snapshot()
@@ -580,8 +740,23 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             acquire_email=lambda _label: None,
             confirm_email=lambda _email: None,
         )
+        manager._state["id"] = "registration-relay"
+        manager._append_log("registration-native-log")
         first_logs = [
-            {"at": f"2026-08-13T00:00:0{index}Z", "message": f"line-{index}"}
+            {
+                "taskId": "rolling",
+                "sequence": index + 1,
+                "seq": index + 1,
+                "at": f"2026-08-13T00:00:0{index}Z",
+                "email": "relay@icloud.com",
+                "message": f"line-{index}",
+                "stage": "email_verification",
+                "location": "OpenAI 验证码页",
+                "action": f"执行步骤 {index}",
+                "status": "active",
+                "source": "browser_worker",
+                "eventType": "worker_log",
+            }
             for index in range(3)
         ]
         task_id, cursor = manager._relay_browser_logs(
@@ -590,7 +765,20 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             cursor=0,
         )
         rolling_logs = first_logs[1:] + [
-            {"at": "2026-08-13T00:00:03Z", "message": "line-3"}
+            {
+                "taskId": "rolling",
+                "sequence": 4,
+                "seq": 4,
+                "at": "2026-08-13T00:00:03Z",
+                "email": "relay@icloud.com",
+                "message": "line-3",
+                "stage": "password",
+                "location": "OpenAI 密码页",
+                "action": "填写并提交密码",
+                "status": "waiting",
+                "source": "browser_worker",
+                "eventType": "page_transition",
+            }
         ]
 
         _, next_cursor = manager._relay_browser_logs(
@@ -600,7 +788,57 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(next_cursor, 3)
-        self.assertEqual(manager.snapshot()["logs"][-1]["message"], "line-3")
+        relayed = manager.snapshot()["logs"][-1]
+        self.assertEqual(relayed["message"], "line-3")
+        self.assertEqual(relayed["at"], "2026-08-13T00:00:03Z")
+        self.assertEqual(relayed["email"], "relay@icloud.com")
+        self.assertEqual(relayed["stage"], "password")
+        self.assertEqual(relayed["location"], "OpenAI 密码页")
+        self.assertEqual(relayed["action"], "填写并提交密码")
+        self.assertEqual(relayed["status"], "waiting")
+        self.assertEqual(relayed["source"], "browser_worker")
+        self.assertEqual(relayed["eventType"], "page_transition")
+        self.assertEqual(relayed["taskId"], "registration-relay")
+        self.assertEqual(relayed["originTaskId"], "rolling")
+        self.assertEqual(relayed["originSequence"], 4)
+        self.assertEqual(relayed["sequence"], 4)
+        self.assertEqual(relayed["relaySequence"], 5)
+
+    async def test_single_and_concurrent_log_buffers_keep_latest_three_hundred(self):
+        manager = RegistrationTaskManager(
+            browser_manager=FakeBrowserManager(),
+            acquire_email=lambda _label: None,
+            confirm_email=lambda _email: None,
+        )
+        manager._state.update(
+            id="registration-buffer",
+            status="completed",
+            running=False,
+        )
+        for index in range(350):
+            manager._append_log(
+                f"buffer-line-{index}",
+                at=f"2026-08-13T00:{index // 60:02d}:{index % 60:02d}Z",
+                event_type="buffer_test",
+            )
+
+        single = manager.snapshot()
+        self.assertEqual(len(single["logs"]), 300)
+        self.assertEqual(single["logs"][0]["sequence"], 51)
+        self.assertEqual(single["logs"][-1]["sequence"], 350)
+
+        coordinator = ConcurrentRegistrationTaskManager(
+            process_factory=lambda: manager,
+        )
+        coordinator._processes["registration-buffer"] = manager
+        coordinator._latest_process_id = "registration-buffer"
+        combined = coordinator.snapshot()
+        self.assertEqual(len(combined["logs"]), 300)
+        self.assertEqual(combined["logs"][0]["sequence"], 51)
+        self.assertEqual(combined["logs"][-1]["sequence"], 350)
+        self.assertTrue(
+            all(item["processId"] == "registration-buffer" for item in combined["logs"])
+        )
 
     async def test_manual_email_skips_inventory_and_starts_single_registration(self):
         browser = FakeBrowserManager()

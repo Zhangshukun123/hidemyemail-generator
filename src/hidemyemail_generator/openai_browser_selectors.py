@@ -1,5 +1,16 @@
 """Selectors and browser-side scripts for OpenAI account automation."""
 
+try:
+    from .registration_locale import (
+        registration_action_selectors,
+        registration_text_selectors,
+    )
+except ImportError:
+    from registration_locale import (
+        registration_action_selectors,
+        registration_text_selectors,
+    )
+
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
 AUTH_RESOURCE_RELOAD_ATTEMPTS = 2
 CHATGPT_HOME_URL = "https://chatgpt.com/"
@@ -77,24 +88,8 @@ SETTINGS_MENU_SELECTORS = (
     '[role="menuitem"]:has-text("設定")',
     'button:has-text("設定")',
 )
-COMPLETED_ONBOARDING_MARKERS = (
-    'text="You’re all set"',
-    'text="You\'re all set"',
-    'text="You are all set"',
-    'text="準備が完了しました"',
-    'text="准备就绪"',
-    'text="準備就緒"',
-)
-COMPLETED_ONBOARDING_CONTINUE_SELECTORS = (
-    'button:has-text("Continue")',
-    '[role="button"]:has-text("Continue")',
-    'button:has-text("続行")',
-    '[role="button"]:has-text("続行")',
-    'button:has-text("继续")',
-    '[role="button"]:has-text("继续")',
-    'button:has-text("繼續")',
-    '[role="button"]:has-text("繼續")',
-)
+COMPLETED_ONBOARDING_MARKERS = registration_text_selectors("completed")
+COMPLETED_ONBOARDING_CONTINUE_SELECTORS = registration_action_selectors("continue")
 ONE_TIME_CODE_LOGIN_SELECTORS = (
     'button:has-text("Log in with a one-time code")',
     '[role="button"]:has-text("Log in with a one-time code")',
@@ -116,34 +111,10 @@ PASSWORD_CONTINUE_SELECTORS = (
     'a[href$="/create-account/password"]',
     'a[href="/log-in/password"]',
     'a[href$="/log-in/password"]',
-    'button:has-text("Continue with password")',
-    '[role="button"]:has-text("Continue with password")',
-    'a:has-text("Continue with password")',
-    'button:has-text("使用密码继续")',
-    '[role="button"]:has-text("使用密码继续")',
-    'a:has-text("使用密码继续")',
-    'button:has-text("使用密碼繼續")',
-    '[role="button"]:has-text("使用密碼繼續")',
-    'a:has-text("使用密碼繼續")',
-    'button:has-text("パスワードで続行")',
-    '[role="button"]:has-text("パスワードで続行")',
-    'a:has-text("パスワードで続行")',
-    'button:has-text("Continuer avec un mot de passe")',
-    'a:has-text("Continuer avec un mot de passe")',
-    'button:has-text("Mit Passwort fortfahren")',
-    'a:has-text("Mit Passwort fortfahren")',
-    'button:has-text("Continuar con contraseña")',
-    'a:has-text("Continuar con contraseña")',
-    'button:has-text("Continuar com a senha")',
-    'a:has-text("Continuar com a senha")',
-    'button:has-text("Continuar com uma senha")',
-    '[role="button"]:has-text("Continuar com uma senha")',
-    'a:has-text("Continuar com uma senha")',
-    'button:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
-    '[role="button"]:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
-    'a:has-text("ดำเนินการต่อด้วยรหัสผ่าน")',
-    'button:has-text("비밀번호로 계속")',
-    'a:has-text("비밀번호로 계속")',
+    *registration_action_selectors(
+        "password_continue",
+        controls=("button", '[role="button"]', "a"),
+    ),
 )
 PASSWORD_RESET_CONFIRM_MARKERS = (
     "reset your password",

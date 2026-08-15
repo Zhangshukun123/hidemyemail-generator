@@ -42,7 +42,7 @@ def build_app_page() -> str:
     return PageBuilder().build(
         PageSpec(
             template="templates/app.html",
-            styles=("static/base.css", "static/app.css"),
+            styles=("static/base.css", "static/app.css", "static/workbench.css"),
             script="static/app.js",
         )
     )

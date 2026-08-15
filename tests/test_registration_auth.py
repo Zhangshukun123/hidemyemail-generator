@@ -592,6 +592,374 @@ class RegistrationAuthTests(unittest.TestCase):
             ["activate", ("click", 1), "activate", ("click", 2)],
         )
 
+    def test_home_entry_ignores_background_response_and_retries_once(self):
+        handlers = {}
+        clicks = []
+
+        class Candidate:
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                clicks.append(len(clicks) + 1)
+                if len(clicks) == 2:
+                    page.url = "https://auth.openai.com/create-account"
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            @staticmethod
+            def wait_for_load_state(_state, **_kwargs):
+                return None
+
+            @staticmethod
+            def evaluate(_script):
+                return {}
+
+            @staticmethod
+            def on(name, callback):
+                handlers[name] = callback
+
+        page = Page()
+        candidate = Candidate()
+        background_sent = False
+
+        def wait(_page, _milliseconds):
+            nonlocal background_sent
+            if len(clicks) != 1 or background_sent or "response" not in handlers:
+                return
+            request = type(
+                "Request",
+                (),
+                {
+                    "url": "https://chatgpt.com/api/auth/session?token=secret",
+                    "method": "GET",
+                    "resource_type": "fetch",
+                },
+            )()
+            handlers["request"](request)
+            handlers["response"](
+                type("Response", (), {"request": request, "status": 200})()
+            )
+            background_sent = True
+
+        logs = []
+        self.assertTrue(
+            click_chatgpt_home_signup(
+                page,
+                logs.append,
+                first_visible=lambda _page, selectors, **_kwargs: (
+                    candidate
+                    if selectors == CHATGPT_HOME_SIGNUP_SELECTORS
+                    else None
+                ),
+                wait=wait,
+                timeout_seconds=0.01,
+                transition_timeout_seconds=0.01,
+            )
+        )
+
+        self.assertEqual(clicks, [1, 2])
+        self.assertTrue(any("未将其当作注册入口响应" in line for line in logs))
+        self.assertFalse(any("token=secret" in line for line in logs))
+
+    def test_home_entry_correlated_response_waits_without_reclicking(self):
+        handlers = {}
+        clicks = []
+        response_sent = False
+        transition_waits = 0
+
+        class Candidate:
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            @staticmethod
+            def click(**_kwargs):
+                clicks.append("click")
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            @staticmethod
+            def wait_for_load_state(_state, **_kwargs):
+                return None
+
+            @staticmethod
+            def evaluate(_script):
+                return {}
+
+            @staticmethod
+            def on(name, callback):
+                handlers[name] = callback
+
+        page = Page()
+        candidate = Candidate()
+
+        def wait(_page, _milliseconds):
+            nonlocal response_sent, transition_waits
+            if not clicks or "response" not in handlers:
+                return
+            if not response_sent:
+                request = type(
+                    "Request",
+                    (),
+                    {
+                        "url": (
+                            "https://auth.openai.com/create-account"
+                            "?state=secret"
+                        ),
+                        "method": "GET",
+                        "resource_type": "document",
+                    },
+                )()
+                handlers["request"](request)
+                handlers["response"](
+                    type("Response", (), {"request": request, "status": 302})()
+                )
+                response_sent = True
+                return
+            transition_waits += 1
+            page.url = "https://auth.openai.com/create-account"
+
+        logs = []
+        self.assertTrue(
+            click_chatgpt_home_signup(
+                page,
+                logs.append,
+                first_visible=lambda _page, selectors, **_kwargs: (
+                    candidate
+                    if selectors == CHATGPT_HOME_SIGNUP_SELECTORS
+                    else None
+                ),
+                wait=wait,
+                timeout_seconds=0.01,
+                transition_timeout_seconds=0.01,
+            )
+        )
+
+        self.assertEqual(clicks, ["click"])
+        self.assertGreaterEqual(transition_waits, 1)
+        self.assertTrue(any("status=302" in line for line in logs))
+        self.assertFalse(any("state=secret" in line for line in logs))
+
+    def test_home_entry_correlated_stall_records_evidence_and_stops_reclick(self):
+        handlers = {}
+        clicks = []
+        response_sent = False
+
+        class Candidate:
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            @staticmethod
+            def click(**_kwargs):
+                clicks.append("click")
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            @staticmethod
+            def wait_for_load_state(_state, **_kwargs):
+                return None
+
+            @staticmethod
+            def evaluate(_script):
+                return {}
+
+            @staticmethod
+            def on(name, callback):
+                handlers[name] = callback
+
+        page = Page()
+        candidate = Candidate()
+
+        def wait(_page, _milliseconds):
+            nonlocal response_sent
+            if not clicks or response_sent or "response" not in handlers:
+                return
+            request = type(
+                "Request",
+                (),
+                {
+                    "url": (
+                        "https://auth.openai.com/create-account"
+                        "?state=secret&email=person@example.com"
+                    ),
+                    "method": "GET",
+                    "resource_type": "document",
+                },
+            )()
+            handlers["request"](request)
+            handlers["response"](
+                type("Response", (), {"request": request, "status": 200})()
+            )
+            response_sent = True
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"未在限定时间内完成变化.*route=auth\.openai\.com/create-account.*status=200",
+        ) as raised:
+            click_chatgpt_home_signup(
+                page,
+                lambda _message: None,
+                first_visible=lambda _page, selectors, **_kwargs: (
+                    candidate
+                    if selectors == CHATGPT_HOME_SIGNUP_SELECTORS
+                    else None
+                ),
+                wait=wait,
+                timeout_seconds=0.01,
+                transition_timeout_seconds=0.01,
+            )
+
+        self.assertEqual(clicks, ["click"])
+        self.assertNotIn("state=secret", str(raised.exception))
+        self.assertNotIn("person@example.com", str(raised.exception))
+
+    def test_home_entry_http_error_stops_same_page_reclick(self):
+        for status in (403, 429):
+            with self.subTest(status=status):
+                handlers = {}
+                clicks = []
+                response_sent = False
+
+                class Candidate:
+                    @staticmethod
+                    def is_enabled(**_kwargs):
+                        return True
+
+                    @staticmethod
+                    def scroll_into_view_if_needed(**_kwargs):
+                        return None
+
+                    @staticmethod
+                    def click(**_kwargs):
+                        clicks.append("click")
+
+                class Page:
+                    url = "https://chatgpt.com/"
+
+                    @staticmethod
+                    def wait_for_load_state(_state, **_kwargs):
+                        return None
+
+                    @staticmethod
+                    def evaluate(_script):
+                        return {}
+
+                    @staticmethod
+                    def on(name, callback):
+                        handlers[name] = callback
+
+                page = Page()
+                candidate = Candidate()
+
+                def wait(_page, _milliseconds):
+                    nonlocal response_sent
+                    if not clicks or response_sent or "response" not in handlers:
+                        return
+                    request = type(
+                        "Request",
+                        (),
+                        {
+                            "url": (
+                                "https://auth.openai.com/authorize"
+                                "?state=secret"
+                            ),
+                            "method": "GET",
+                            "resource_type": "document",
+                        },
+                    )()
+                    handlers["request"](request)
+                    handlers["response"](
+                        type(
+                            "Response",
+                            (),
+                            {"request": request, "status": status},
+                        )()
+                    )
+                    response_sent = True
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"HTTP {status}.*route=auth\.openai\.com/authorize.*status={status}",
+                ) as raised:
+                    click_chatgpt_home_signup(
+                        page,
+                        lambda _message: None,
+                        first_visible=(
+                            lambda _page, selectors, **_kwargs: (
+                                candidate
+                                if selectors == CHATGPT_HOME_SIGNUP_SELECTORS
+                                else None
+                            )
+                        ),
+                        wait=wait,
+                        timeout_seconds=0.01,
+                        transition_timeout_seconds=0.01,
+                    )
+
+                self.assertEqual(clicks, ["click"])
+                self.assertNotIn("state=secret", str(raised.exception))
+
+    def test_homepage_query_change_is_not_a_registration_transition(self):
+        clicks = []
+
+        class Candidate:
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            @staticmethod
+            def click(**_kwargs):
+                clicks.append("click")
+                page.url = f"https://chatgpt.com/?attempt={len(clicks)}"
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            @staticmethod
+            def wait_for_load_state(_state, **_kwargs):
+                return None
+
+        page = Page()
+        candidate = Candidate()
+
+        with self.assertRaisesRegex(RuntimeError, "最多点击 5 次"):
+            click_chatgpt_home_signup(
+                page,
+                lambda _message: None,
+                first_visible=lambda _page, selectors, **_kwargs: (
+                    candidate
+                    if selectors == CHATGPT_HOME_SIGNUP_SELECTORS
+                    else None
+                ),
+                wait=lambda _page, _milliseconds: None,
+                timeout_seconds=0.01,
+                transition_timeout_seconds=0.01,
+            )
+
+        self.assertEqual(len(clicks), 5)
+
     def test_home_entry_reloads_once_when_signup_control_is_missing(self):
         events = []
 

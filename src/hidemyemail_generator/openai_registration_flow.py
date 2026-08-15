@@ -29,6 +29,11 @@ try:
         PASSWORD_RESET_CONFIRM_CONTINUE_SELECTORS,
         PASSWORD_RESET_CONFIRM_MARKERS,
     )
+    from .registration_locale import (
+        detect_registration_locale,
+        registration_action_labels,
+        registration_action_selectors,
+    )
     from . import registration_auth as _registration_auth
 except ImportError:
     from browser_platform import (
@@ -49,6 +54,11 @@ except ImportError:
         PASSWORD_RESET_CONFIRM_CONTINUE_SELECTORS,
         PASSWORD_RESET_CONFIRM_MARKERS,
     )
+    from registration_locale import (
+        detect_registration_locale,
+        registration_action_labels,
+        registration_action_selectors,
+    )
     import registration_auth as _registration_auth
 
 _auth_click_email_submit = _registration_auth.click_email_submit
@@ -63,53 +73,13 @@ OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS = (
 _REGISTRATION_CLIPBOARD_LOCK = registration_clipboard_lock()
 _copy_registration_clipboard_text = copy_registration_clipboard_text
 
-PASSWORD_OTP_RESEND_SELECTORS = (
-    'button:has-text("Resend email")',
-    '[role="button"]:has-text("Resend email")',
-    'button:has-text("Resend code")',
-    'button:has-text("メールを再送信する")',
-    '[role="button"]:has-text("メールを再送信する")',
-    'button:has-text("重新发送邮件")',
-    'button:has-text("重新傳送電子郵件")',
-    'button:has-text("Reenviar e-mail")',
-    '[role="button"]:has-text("Reenviar e-mail")',
-    'button:has-text("ส่งอีเมลซ้ำ")',
-    '[role="button"]:has-text("ส่งอีเมลซ้ำ")',
-)
+PASSWORD_OTP_RESEND_SELECTORS = registration_action_selectors("resend")
 
 
 def _detect_verification_language(body_text: str) -> str:
     """Identify supported localized verification pages from official labels."""
-    normalized = re.sub(r"\s+", " ", str(body_text or "")).strip()
-    folded = normalized.casefold()
-    if any(marker in normalized for marker in ("受信箱", "パスワードで続行", "コード")):
-        return "日文"
-    if any(marker in normalized for marker in ("收件箱", "使用密码继续", "验证码")):
-        return "中文"
-    if any(
-        marker in normalized
-        for marker in (
-            "ตรวจสอบกล่องข้อความของคุณ",
-            "ดำเนินการต่อด้วยรหัสผ่าน",
-            "ส่งอีเมลซ้ำ",
-        )
-    ):
-        return "泰文（泰国）"
-    if any(
-        marker in folded
-        for marker in (
-            "confira sua caixa de entrada",
-            "continuar com uma senha",
-            "reenviar e-mail",
-        )
-    ):
-        return "葡萄牙文（巴西）"
-    if any(
-        marker in folded
-        for marker in ("check your inbox", "continue with password", "code")
-    ):
-        return "英文"
-    return "未确认"
+    profile = detect_registration_locale(body_text)
+    return profile.label if profile is not None else "未确认"
 
 
 def _locator_state(candidate, method: str, *, default: bool) -> bool:
@@ -1238,15 +1208,12 @@ def configure_resilient_about_you_input(
     worker._fill_about_you_inputs = types.MethodType(profile_fill_with_readback, worker)
     if callable(original_finish_click):
         finish_selectors = (
-            'button:has-text("Finish creating account")',
-            'button:has-text("Finalizar la creación de la cuenta")',
-            'button:has-text("Finalizar la creacion de la cuenta")',
-            'button:has-text("アカウントの作成を完了する")',
-            'button:has-text("作成を完了")',
-            'button:has-text("完成帐户创建")',
-            'button:has-text("完成账户创建")',
-            'button[type="submit"]:has-text("Finish")',
-            'button[type="submit"]:has-text("作成")',
+            *registration_action_selectors("finish", controls=("button",)),
+            *registration_action_selectors(
+                "finish",
+                controls=('button[type="submit"]',),
+            ),
+            'button[type="submit"]',
         )
 
         def click_finish_after_stable_form(self, page):
@@ -1477,18 +1444,7 @@ def configure_email_password_only_registration(
             clipboard_write=clipboard_write,
             clipboard_lock=clipboard_lock,
             submit_selectors=OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS,
-            submit_allowed_labels=(
-                "Continue",
-                "继续",
-                "继续注册",
-                "続行",
-                "続ける",
-                "Create account",
-                "Create an account",
-                "创建账号",
-                "建立帳戶",
-                "アカウントを作成",
-            ),
+            submit_allowed_labels=registration_action_labels("email_submit"),
             allow_enter_submit=False,
             submit_diagnostic_message=(
                 "已点击注册继续；注册流程未按 Enter，且不会匹配登录按钮"

@@ -105,6 +105,80 @@ class RegistrationRetryPolicyTests(unittest.TestCase):
         self.assertFalse(decision.retryable)
         self.assertEqual(decision.reason_code, "retry_limit")
 
+    def test_exact_home_entry_stall_is_safely_retryable_before_verification(self):
+        decision = self.policy.decide(
+            RegistrationRetryContext(
+                error=(
+                    "ChatGPT 首页免费注册已有网络请求，"
+                    "但页面未在限定时间内完成变化；"
+                    "为避免重复提交已停止补点"
+                ),
+                stage="openai_auth",
+                registration_chain={"currentCode": "registration_entry_ready"},
+            )
+        )
+
+        self.assertTrue(decision.retryable)
+        self.assertEqual(decision.reason_code, "navigation_stalled")
+        self.assertFalse(decision.rotate_proxy)
+
+    def test_home_entry_stall_does_not_cross_verification_boundary(self):
+        error = (
+            "ChatGPT 首页免费注册已有注册入口网络请求，"
+            "但页面未在限定时间内完成变化"
+        )
+        unsafe_stage = self.policy.decide(
+            RegistrationRetryContext(
+                error=error,
+                stage="email_verification",
+                registration_chain={"currentCode": "verification_page"},
+            )
+        )
+        unsafe_ledger = self.policy.decide(
+            RegistrationRetryContext(
+                error=error,
+                stage="openai_auth",
+                registration_chain={
+                    "currentCode": "registration_entry_ready",
+                    "steps": [
+                        {"code": "verification_page", "status": "completed"}
+                    ],
+                },
+            )
+        )
+
+        self.assertFalse(unsafe_stage.retryable)
+        self.assertEqual(unsafe_stage.reason_code, "unsafe_page_stage")
+        self.assertFalse(unsafe_ledger.retryable)
+        self.assertEqual(unsafe_ledger.reason_code, "unsafe_replay_boundary")
+
+    def test_bounded_home_click_exhaustion_is_navigation_stalled(self):
+        decision = self.policy.decide(
+            RegistrationRetryContext(
+                error=(
+                    "ChatGPT 首页免费注册最多点击 5 次后，"
+                    "页面未在限定时间内完成变化且未检测到注册入口响应"
+                ),
+                stage="openai_auth",
+                registration_chain={"currentCode": "registration_entry_ready"},
+            )
+        )
+
+        self.assertTrue(decision.retryable)
+        self.assertEqual(decision.reason_code, "navigation_stalled")
+
+    def test_unrelated_background_stall_phrase_is_not_retryable(self):
+        decision = self.policy.decide(
+            RegistrationRetryContext(
+                error="后台刷新未在限定时间内完成变化",
+                stage="openai_auth",
+                registration_chain={"currentCode": "registration_entry_ready"},
+            )
+        )
+
+        self.assertFalse(decision.retryable)
+        self.assertEqual(decision.reason_code, "not_retryable")
+
     def test_reliability_gate_requires_at_least_98_percent_of_100(self):
         passing = build_reliability_report(98, 2)
         failing = build_reliability_report(97, 3)
@@ -199,6 +273,64 @@ print(prefix + json.dumps({"type": "result", "result": result}), flush=True)
             self.assertEqual(diagnostics["transient_retries"], 1)
             self.assertEqual(diagnostics["worker_attempts"], 2)
             self.assertTrue(diagnostics["recovered_after_retry"])
+
+    async def test_latest_home_entry_stall_retries_in_clean_worker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self._manager(
+                root,
+                """
+import json
+import os
+import sys
+from pathlib import Path
+
+prefix = "HME_BROWSER_EVENT:"
+attempt = int(os.environ.get("HME_BROWSER_WORKER_ATTEMPT", "0"))
+counter = Path(__file__).with_name("attempts.txt")
+counter.write_text(counter.read_text() + "x" if counter.exists() else "x")
+if attempt == 0:
+    page = {"stage": "openai_auth", "code": "home"}
+    chain = {
+        "currentCode": "registration_entry_ready",
+        "registrationCreated": False,
+        "sessionReady": False,
+        "passwordConfirmed": False,
+        "twoFactorEnabled": False,
+    }
+    error = (
+        "ChatGPT 首页免费注册已有网络请求，"
+        "但页面未在限定时间内完成变化；"
+        "为避免重复提交已停止补点"
+    )
+    print(prefix + json.dumps({"type": "page_state", "state": page}), flush=True)
+    print(prefix + json.dumps({"type": "registration_chain", "state": chain}), flush=True)
+    print(prefix + json.dumps({"type": "error", "error": error}, ensure_ascii=False), flush=True)
+    sys.exit(1)
+result = {"access_token": "at-recovered", "session_json": "{}"}
+print(prefix + json.dumps({"type": "result", "result": result}), flush=True)
+""",
+            )
+            manager.start(
+                [{"email": "home-stall@icloud.com", "password": ""}],
+                headless=True,
+                concurrency=1,
+            )
+            snapshot = await asyncio.wait_for(manager.wait(), timeout=15)
+
+            account = snapshot["accounts"][0]
+            self.assertEqual(snapshot["succeeded"], 1)
+            self.assertEqual(snapshot["transientRetries"], 1)
+            self.assertEqual(account["workerAttempts"], 2)
+            self.assertEqual(account["retryState"], "recovered")
+            self.assertEqual(
+                account["retryHistory"][0]["reasonCode"],
+                "navigation_stalled",
+            )
+            self.assertEqual(
+                (root / "attempts.txt").read_text(encoding="utf-8"),
+                "xx",
+            )
 
     async def test_invalid_otp_is_not_replayed(self):
         with tempfile.TemporaryDirectory() as temp_dir:

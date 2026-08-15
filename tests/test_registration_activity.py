@@ -9,6 +9,7 @@ from hidemyemail_generator.registration_activity import (
     ensure_registration_activity_monitor,
     finalize_registration_chain,
     mark_registration_chain,
+    registration_activity_changed,
     registration_activity_snapshot,
     registration_chain_snapshot,
     wait_for_registration_activity,
@@ -84,6 +85,167 @@ class RegistrationActivityTests(unittest.TestCase):
         handlers["request"](Request())
 
         self.assertEqual(registration_activity_snapshot(page)["requestCount"], 0)
+
+    def test_background_session_response_is_not_registration_entry_activity(self):
+        handlers = {}
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            def on(self, name, callback):
+                handlers[name] = callback
+
+            def evaluate(self, _script):
+                return {}
+
+        request = SimpleNamespace(
+            url="https://chatgpt.com/api/auth/session?token=secret",
+            method="GET",
+            resource_type="fetch",
+        )
+        response = SimpleNamespace(request=request, status=200)
+        page = Page()
+        ensure_registration_activity_monitor(page)
+        before = registration_activity_snapshot(page)
+
+        def wait(_page, _milliseconds):
+            handlers["request"](request)
+            handlers["response"](response)
+
+        result = wait_for_registration_activity(
+            page,
+            before,
+            wait=wait,
+            signal="registration_entry",
+        )
+
+        self.assertFalse(result["changed"])
+        self.assertTrue(result["ignoredActivity"])
+        self.assertEqual(result["ignoredReason"], "request")
+        self.assertEqual(result["activity"]["entryResponseCount"], 0)
+        self.assertEqual(
+            result["ignoredEvidence"]["route"],
+            "chatgpt.com/api/auth/session",
+        )
+        self.assertEqual(result["ignoredEvidence"]["status"], 200)
+
+    def test_auth_document_response_is_correlated_and_sanitized(self):
+        handlers = {}
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            def on(self, name, callback):
+                handlers[name] = callback
+
+            def evaluate(self, _script):
+                return {}
+
+        request = SimpleNamespace(
+            url=(
+                "https://auth.openai.com/create-account"
+                "?state=secret&email=person@example.com"
+            ),
+            method="GET",
+            resource_type="document",
+        )
+        response = SimpleNamespace(request=request, status=302)
+        page = Page()
+        ensure_registration_activity_monitor(page)
+        before = registration_activity_snapshot(page)
+
+        def wait(_page, _milliseconds):
+            handlers["request"](request)
+            handlers["response"](response)
+
+        result = wait_for_registration_activity(
+            page,
+            before,
+            wait=wait,
+            signal="registration_entry",
+        )
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["reason"], "registration_entry_response")
+        self.assertEqual(
+            result["evidence"],
+            {
+                "event": "response",
+                "method": "GET",
+                "route": "auth.openai.com/create-account",
+                "resourceType": "document",
+                "status": 302,
+                "at": result["evidence"]["at"],
+            },
+        )
+        self.assertNotIn("secret", result["evidence"]["route"])
+        self.assertNotIn("person@example.com", result["evidence"]["route"])
+
+    def test_new_request_clears_stale_response_status(self):
+        handlers = {}
+
+        class Page:
+            url = "https://chatgpt.com/"
+
+            def on(self, name, callback):
+                handlers[name] = callback
+
+            def evaluate(self, _script):
+                return {}
+
+        page = Page()
+        ensure_registration_activity_monitor(page)
+        first = SimpleNamespace(
+            url="https://chatgpt.com/api/first",
+            method="POST",
+            resource_type="fetch",
+        )
+        handlers["response"](SimpleNamespace(request=first, status=200))
+        second = SimpleNamespace(
+            url="https://chatgpt.com/api/second",
+            method="POST",
+            resource_type="fetch",
+        )
+        handlers["request"](second)
+
+        snapshot = registration_activity_snapshot(page)
+
+        self.assertEqual(snapshot["lastRoute"], "chatgpt.com/api/second")
+        self.assertEqual(snapshot["lastStatus"], 0)
+        self.assertEqual(snapshot["lastEvent"], "request")
+
+    def test_registration_entry_dom_signal_ignores_noise_but_accepts_email(self):
+        before = (
+            "chatgpt.com",
+            "/",
+            "complete",
+            False,
+            False,
+            False,
+            False,
+            0,
+            2,
+            0,
+        )
+        noisy = (*before[:8], 3, 1)
+        email = (*before[:3], True, *before[4:])
+
+        self.assertEqual(
+            registration_activity_changed(
+                {"dom": before},
+                {"dom": noisy},
+                signal="registration_entry",
+            ),
+            (False, ""),
+        )
+        self.assertEqual(
+            registration_activity_changed(
+                {"dom": before},
+                {"dom": email},
+                signal="registration_entry",
+            ),
+            (True, "page"),
+        )
 
     def test_step_ledger_blocks_next_step_until_current_is_completed(self):
         emitted = []

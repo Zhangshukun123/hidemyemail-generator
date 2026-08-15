@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -34,10 +35,11 @@ WorkerRunner = Callable[
 ]
 AccountSaved = Callable[[str], Awaitable[dict[str, Any] | None]]
 AccountFinished = Callable[[str, bool, str], Awaitable[None]]
+RecordFailure = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _valid_email(value: str) -> bool:
@@ -70,12 +72,14 @@ class ProtocolRegistrationManager:
         python_executable: Path | None = None,
         worker_runner: WorkerRunner | None = None,
         on_account_saved: AccountSaved | None = None,
+        record_failure: RecordFailure | None = None,
     ) -> None:
         self.base_dir = Path(base_dir).resolve()
         self.db_file = Path(db_file).resolve()
         self.proxy_store = proxy_store
         self.worker_runner = worker_runner
         self.on_account_saved = on_account_saved
+        self.record_failure = record_failure
         self.worker_script = Path(__file__).with_name(
             "protocol_registration_worker.py"
         ).resolve()
@@ -431,68 +435,78 @@ class ProtocolRegistrationManager:
         token = secrets.token_urlsafe(24)
         since = _utc_now()
         self._code_tokens[token] = {"email": email, "since": since}
-        record = await asyncio.to_thread(load_account_record, self.db_file, email)
-        existing_two_factor = record.get("two_factor")
-        existing_totp = (
-            str(existing_two_factor.get("secret") or "")
-            if isinstance(existing_two_factor, dict)
-            else ""
-        )
-        existing_session = account_session(record)
-        existing_cookies = account_saved_cookies(record)
-        existing_device_id = next(
-            (
-                str(cookie.get("value") or "")
-                for cookie in existing_cookies
-                if str(cookie.get("name") or "") == "oai-did"
-            ),
-            "",
-        )
-        existing_diagnostics = record.get("registration_diagnostics")
-        existing_impersonate = (
-            str(existing_diagnostics.get("impersonate") or "")
-            if isinstance(existing_diagnostics, dict)
-            else ""
-        )
+        setup_error: BaseException | None = None
+        payload: dict[str, Any] = {}
         proxy_url = ""
         proxy_state: dict[str, Any] = {}
-        if self.proxy_store is not None:
-            proxy_url, proxy_state = await asyncio.to_thread(
-                self.proxy_store.next_proxy
+        setup_stage = "account_load"
+        try:
+            record = await asyncio.to_thread(load_account_record, self.db_file, email)
+            existing_two_factor = record.get("two_factor")
+            existing_totp = (
+                str(existing_two_factor.get("secret") or "")
+                if isinstance(existing_two_factor, dict)
+                else ""
             )
-            if proxy_url:
-                self._append_log(
-                    f"已分配注册代理：{proxy_state.get('countryLabel') or proxy_state.get('country') or '代理出口'}",
-                    email=email,
-                    stage="network",
+            existing_session = account_session(record)
+            existing_cookies = account_saved_cookies(record)
+            existing_device_id = next(
+                (
+                    str(cookie.get("value") or "")
+                    for cookie in existing_cookies
+                    if str(cookie.get("name") or "") == "oai-did"
+                ),
+                "",
+            )
+            existing_diagnostics = record.get("registration_diagnostics")
+            existing_impersonate = (
+                str(existing_diagnostics.get("impersonate") or "")
+                if isinstance(existing_diagnostics, dict)
+                else ""
+            )
+            if self.proxy_store is not None:
+                setup_stage = "proxy"
+                proxy_url, proxy_state = await asyncio.to_thread(
+                    self.proxy_store.next_proxy
                 )
-        payload = {
-            "email": email,
-            "code_url": f"{base_url}{PROTOCOL_CODE_PREFIX}{quote(token)}",
-            "proxy_url": proxy_url,
-            "proxy_country": str(
-                proxy_state.get("lastExitCountry")
-                or proxy_state.get("country")
-                or ""
-            ).strip().upper(),
-            "existing_password": str(record.get("password") or ""),
-            "existing_password_confirmed": bool(
-                record.get("password") and record.get("password_confirmed")
-            ),
-            "existing_totp_secret": existing_totp,
-            "existing_access_token": account_session_access_token(record),
-            "existing_session_token": str(
-                existing_session.get("sessionToken")
-                or existing_session.get("session_token")
-                or ""
-            ),
-            "existing_session_json": existing_session,
-            "existing_session_cookies": existing_cookies,
-            "existing_device_id": existing_device_id,
-            "existing_impersonate": existing_impersonate,
-            "project_root": str(self.gptfree_root),
-            "source_root": str(Path(__file__).resolve().parents[1]),
-        }
+                if proxy_url:
+                    self._append_log(
+                        f"已分配注册代理：{proxy_state.get('countryLabel') or proxy_state.get('country') or '代理出口'}",
+                        email=email,
+                        stage="network",
+                    )
+            setup_stage = "protocol_auth"
+            payload = {
+                "email": email,
+                "code_url": f"{base_url}{PROTOCOL_CODE_PREFIX}{quote(token)}",
+                "proxy_url": proxy_url,
+                "proxy_country": str(
+                    proxy_state.get("lastExitCountry")
+                    or proxy_state.get("country")
+                    or ""
+                ).strip().upper(),
+                "existing_password": str(record.get("password") or ""),
+                "existing_password_confirmed": bool(
+                    record.get("password") and record.get("password_confirmed")
+                ),
+                "existing_totp_secret": existing_totp,
+                "existing_access_token": account_session_access_token(record),
+                "existing_session_token": str(
+                    existing_session.get("sessionToken")
+                    or existing_session.get("session_token")
+                    or ""
+                ),
+                "existing_session_json": existing_session,
+                "existing_session_cookies": existing_cookies,
+                "existing_device_id": existing_device_id,
+                "existing_impersonate": existing_impersonate,
+                "project_root": str(self.gptfree_root),
+                "source_root": str(Path(__file__).resolve().parents[1]),
+            }
+        except asyncio.CancelledError as error:
+            setup_error = error
+        except Exception as error:
+            setup_error = error
         password_candidate_saved = False
         session_checkpoint_saved = False
 
@@ -537,6 +551,8 @@ class ProtocolRegistrationManager:
                 )
 
         try:
+            if setup_error is not None:
+                raise setup_error
             runner = self.worker_runner or self._run_worker
             result = await runner(payload, on_event)
             password = str(result.get("password") or "").strip()
@@ -570,37 +586,7 @@ class ProtocolRegistrationManager:
             )
             if self.on_account_saved is not None:
                 try:
-                    saved_callback_result = await self.on_account_saved(email)
-                    if isinstance(saved_callback_result, dict):
-                        checkout_type = str(
-                            saved_callback_result.get("checkout_id_type") or ""
-                        ).strip().lower()
-                        account_state["checkoutIdType"] = checkout_type
-                        account_state["checkoutProbeStatus"] = str(
-                            saved_callback_result.get("status") or ""
-                        )
-                        checkout_labels = {
-                            "oaics": "OAICS",
-                            "cs_live": "CS LIVE",
-                            "cs": "CS",
-                            "other": "OTHER",
-                            "error": "检测失败",
-                        }
-                        self._append_log(
-                            "Checkout 自动验证："
-                            + checkout_labels.get(checkout_type, "待检测")
-                            + (
-                                f"（第 {int(saved_callback_result.get('attempt_count') or 1)}"
-                                f"/{int(saved_callback_result.get('max_attempts') or 1)} 次）"
-                                if int(saved_callback_result.get("attempt_count") or 1) > 1
-                                else ""
-                            ),
-                            email=email,
-                            stage="checkout_probe",
-                            status=(
-                                "success" if checkout_type == "oaics" else "warning"
-                            ),
-                        )
+                    await self.on_account_saved(email)
                 except Exception as error:
                     self._append_log(
                         f"账号已保存，但同步到远程服务器失败：{error}",
@@ -627,11 +613,12 @@ class ProtocolRegistrationManager:
             raise
         except Exception as error:
             account_state["status"] = "failed"
-            account_state["stage"] = (
+            failed_stage = (
                 "two_factor"
                 if session_checkpoint_saved
-                else "password" if password_candidate_saved else "failed"
+                else "password" if password_candidate_saved else setup_stage
             )
+            account_state["stage"] = failed_stage
             account_state["message"] = (
                 "账号注册和密码已保存；TOTP 2FA 待补跑："
                 + _sanitize_message(error)
@@ -656,17 +643,59 @@ class ProtocolRegistrationManager:
                     )
                 ),
                 email=email,
-                stage=(
-                    "two_factor"
-                    if session_checkpoint_saved
-                    else "password" if password_candidate_saved else "failed"
-                ),
+                stage=failed_stage,
                 status=(
                     "warning"
                     if session_checkpoint_saved or password_candidate_saved
                     else "error"
                 ),
             )
+            if self.record_failure is not None:
+                failed_stage = str(account_state.get("stage") or "failed")
+                failure_logs = [
+                    dict(log)
+                    for log in self._state.get("logs", [])
+                    if isinstance(log, dict)
+                    and str(log.get("email") or "") in {"", email}
+                ][-80:]
+                failure = {
+                    "processId": f"{self._state.get('id') or 'protocol'}:{email}",
+                    "status": "failed",
+                    "mode": "protocol",
+                    "provider": "mail_auth",
+                    "browserEngine": "protocol",
+                    "email": email,
+                    "emails": [email],
+                    "message": account_state["message"],
+                    "currentStage": failed_stage,
+                    "currentLocation": "Mail Auth 协议注册",
+                    "currentAction": "检查协议注册失败步骤并重试",
+                    "startedAt": str(self._state.get("startedAt") or ""),
+                    "recordedAt": _utc_now(),
+                    "logs": failure_logs,
+                    "failureContext": {
+                        "message": account_state["message"],
+                        "currentStage": failed_stage,
+                        "currentLocation": "Mail Auth 协议注册",
+                        "currentAction": "检查协议注册失败步骤并重试",
+                        "failedStage": failed_stage,
+                        "logs": failure_logs,
+                        "failedAccounts": [dict(account_state)],
+                    },
+                }
+                for attempt in range(3):
+                    try:
+                        stored = self.record_failure(failure)
+                        if inspect.isawaitable(stored):
+                            await stored
+                        account_state.pop("monitorError", None)
+                        break
+                    except Exception as monitor_error:
+                        account_state["monitorError"] = _sanitize_message(
+                            monitor_error
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(0.05 * (2**attempt))
         finally:
             self._code_tokens.pop(token, None)
             self._state["completed"] += 1

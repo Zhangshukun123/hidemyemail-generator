@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .deleted_email_repository import DeletedEmailRepository
 from .inbox import ADDRESS_STATES, connect_db, utc_now
 
 
@@ -92,6 +93,9 @@ def export_inventory_records(
         account_rows = conn.execute(
             "SELECT key, value FROM settings WHERE key LIKE 'gpt_account:%'"
         ).fetchall()
+        removed_rows = conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'gpt_removed:%'"
+        ).fetchall()
     finally:
         conn.close()
 
@@ -107,7 +111,18 @@ def export_inventory_records(
         if email and account is not None:
             accounts[email] = account
 
-    all_emails = set(addresses) | set(accounts)
+    removed: dict[str, dict[str, Any]] = {}
+    for row in removed_rows:
+        email = str(row["key"] or "").removeprefix("gpt_removed:").strip().lower()
+        tombstone = _parse_account(row["value"])
+        if email:
+            removed[email] = {
+                "email": email,
+                "removed_at": str((tombstone or {}).get("removed_at") or ""),
+                "reason": str((tombstone or {}).get("reason") or "邮箱已删除")[:1000],
+            }
+
+    all_emails = set(addresses) | set(accounts) | set(removed)
     if requested is not None:
         all_emails &= requested
     return [
@@ -115,6 +130,7 @@ def export_inventory_records(
             "email": email,
             "address": addresses.get(email),
             "account": accounts.get(email),
+            "removed": removed.get(email),
         }
         for email in sorted(all_emails)
     ]
@@ -147,7 +163,14 @@ def import_inventory_records(
 ) -> dict[str, int]:
     """Idempotently merge complete mailbox/account records into one database."""
 
-    normalized: list[tuple[str, dict[str, Any] | None, dict[str, Any] | None]] = []
+    normalized: list[
+        tuple[
+            str,
+            dict[str, Any] | None,
+            dict[str, Any] | None,
+            dict[str, Any] | None,
+        ]
+    ] = []
     seen: set[str] = set()
     for raw_record in records:
         if not isinstance(raw_record, dict):
@@ -158,6 +181,9 @@ def import_inventory_records(
         account = raw_record.get("account")
         if account is not None and not isinstance(account, dict):
             raise ValueError("account 必须是对象或 null")
+        removed = raw_record.get("removed")
+        if removed is not None and not isinstance(removed, dict):
+            raise ValueError("removed 必须是对象或 null")
         email = _normalize_email(
             raw_record.get("email")
             or (address or {}).get("email")
@@ -166,14 +192,34 @@ def import_inventory_records(
         if email in seen:
             raise ValueError(f"同步批次包含重复邮箱：{email}")
         seen.add(email)
-        normalized.append((email, dict(address) if address else None, dict(account) if account else None))
+        normalized.append(
+            (
+                email,
+                dict(address) if address else None,
+                dict(account) if account else None,
+                dict(removed) if removed else None,
+            )
+        )
 
     conn = connect_db(str(db_file))
     address_count = 0
     account_count = 0
     try:
         conn.execute("BEGIN IMMEDIATE")
-        for email, address, account in normalized:
+        deleted_repository = DeletedEmailRepository(conn)
+        for email, address, account, removed in normalized:
+            if removed is not None:
+                deleted_repository.mark_deleted(
+                    email,
+                    reason=str(removed.get("reason") or "邮箱已删除"),
+                    removed_at=str(removed.get("removed_at") or ""),
+                )
+                continue
+            if deleted_repository.contains(email):
+                # A stale workstation/server snapshot must never override an
+                # explicit deletion tombstone.  Restores remove the tombstone
+                # through the existing account-save flow before syncing.
+                continue
             existing_address = conn.execute(
                 f"SELECT {', '.join(ADDRESS_SYNC_FIELDS)} FROM addresses WHERE lower(email) = lower(?)",
                 (email,),

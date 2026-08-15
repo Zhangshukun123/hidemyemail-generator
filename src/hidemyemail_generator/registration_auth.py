@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 try:
     from .browser_diagnostics import BrowserDiagnosticCode, emit_browser_diagnostic
+    from .registration_locale import registration_action_labels
     from .registration_activity import (
         CLICK_RESPONSE_SECONDS,
         MAX_NO_RESPONSE_CLICK_ATTEMPTS,
@@ -19,6 +20,7 @@ try:
     )
 except ImportError:
     from browser_diagnostics import BrowserDiagnosticCode, emit_browser_diagnostic
+    from registration_locale import registration_action_labels
     from registration_activity import (
         CLICK_RESPONSE_SECONDS,
         MAX_NO_RESPONSE_CLICK_ATTEMPTS,
@@ -138,18 +140,7 @@ _EMAIL_CONTROL_SCOPES = (
     '[class*="drawer" i]):has('
     f'{_EMAIL_INPUT_SCOPE_SELECTOR})',
 )
-_EMAIL_REGISTRATION_ACTION_LABELS = (
-    "Continue",
-    "继续",
-    "继续注册",
-    "続行",
-    "続ける",
-    "Create account",
-    "Create an account",
-    "创建账号",
-    "建立帳戶",
-    "アカウントを作成",
-)
+_EMAIL_REGISTRATION_ACTION_LABELS = registration_action_labels("email_submit")
 OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS = (
     *tuple(
         f'{scope} {control}:text-is("{label}")'
@@ -339,13 +330,35 @@ def _wait_for_candidate(
 
 def _transitioned(page, before_url: str, *, first_visible: Callable) -> bool:
     current_url = str(getattr(page, "url", "") or "")
-    if current_url and current_url != before_url:
+    if is_openai_auth_url(current_url) or is_chatgpt_auth_entry_url(current_url):
         return True
-    if is_openai_auth_url(current_url):
-        return True
+    # A query/hash update on the homepage or a jump to an unrelated host is
+    # not proof that the registration drawer opened.
+    _ = before_url
     return (
         first_visible(page, OPENAI_EMAIL_LOGIN_INPUT_SELECTORS, timeout=300)
         is not None
+    )
+
+
+def _entry_evidence_from_snapshot(snapshot: object) -> dict[str, object]:
+    state = snapshot if isinstance(snapshot, dict) else {}
+    return {
+        "event": str(state.get("lastEntryEvent") or ""),
+        "method": str(state.get("lastEntryMethod") or ""),
+        "route": str(state.get("lastEntryRoute") or ""),
+        "resourceType": str(state.get("lastEntryResourceType") or ""),
+        "status": max(0, int(state.get("lastEntryStatus") or 0)),
+    }
+
+
+def _entry_evidence_text(evidence: object) -> str:
+    state = evidence if isinstance(evidence, dict) else {}
+    return (
+        f"event={str(state.get('event') or 'unknown')[:24]} "
+        f"route={str(state.get('route') or 'unknown')[:220]} "
+        f"status={max(0, int(state.get('status') or 0))} "
+        f"type={str(state.get('resourceType') or 'unknown')[:32]}"
     )
 
 
@@ -715,12 +728,15 @@ def click_chatgpt_home_login(
                 before_url,
                 first_visible=first_visible,
             ),
+            signal="registration_entry",
         )
         if activity.get("changed"):
             if activity.get("reason") != "transition":
+                evidence = activity.get("evidence")
                 log(
                     f"[请求监测] 第 {attempt} 次点击{entry_label}后检测到"
-                    f"{activity.get('reason') or '网络'}活动；停止补点并等待页面完成"
+                    f"{activity.get('reason') or '注册入口网络'}活动；"
+                    f"停止补点并等待页面完成；{_entry_evidence_text(evidence)}"
                 )
                 transitioned = _wait_for_transition(
                     page,
@@ -729,8 +745,14 @@ def click_chatgpt_home_login(
                     first_visible=first_visible,
                     wait=wait,
                 )
+                latest_evidence = _entry_evidence_from_snapshot(
+                    registration_activity_snapshot(page)
+                )
+                if latest_evidence.get("event"):
+                    evidence = latest_evidence
             else:
                 transitioned = True
+                evidence = activity.get("evidence")
             if transitioned:
                 mark_page_registration_milestone(
                     page,
@@ -744,9 +766,25 @@ def click_chatgpt_home_login(
                     attempt=attempt,
                 )
                 return True
+            status = max(
+                0,
+                int((evidence if isinstance(evidence, dict) else {}).get("status") or 0),
+            )
+            if status >= 400:
+                raise RuntimeError(
+                    f"ChatGPT 首页{entry_label}入口响应 HTTP {status}；"
+                    f"{_entry_evidence_text(evidence)}；已停止补点"
+                )
             raise RuntimeError(
-                f"ChatGPT 首页{entry_label}已有网络请求，"
-                "但页面未在限定时间内完成变化；为避免重复提交已停止补点"
+                f"ChatGPT 首页{entry_label}已有注册入口网络请求，"
+                "但页面未在限定时间内完成变化；"
+                f"{_entry_evidence_text(evidence)}；为避免重复提交已停止补点"
+            )
+        if activity.get("ignoredActivity"):
+            log(
+                f"[请求监测] 第 {attempt} 次点击{entry_label}后仅检测到"
+                f"{activity.get('ignoredReason') or '后台'}活动，未将其当作注册入口响应；"
+                f"{_entry_evidence_text(activity.get('ignoredEvidence'))}"
             )
         if click_error is not None and attempt >= MAX_NO_RESPONSE_CLICK_ATTEMPTS:
             raise RuntimeError(
@@ -765,8 +803,22 @@ def click_chatgpt_home_login(
         if current_candidate is None or not is_chatgpt_homepage(
             str(getattr(page, "url", "") or "")
         ):
+            if _wait_for_transition(
+                page,
+                before_url,
+                timeout_seconds=transition_timeout_seconds,
+                first_visible=first_visible,
+                wait=wait,
+            ):
+                mark_page_registration_milestone(
+                    page,
+                    "registration_entry_ready",
+                    f"第 {attempt} 次点击后延迟进入注册入口",
+                )
+                return True
             raise RuntimeError(
-                f"第 {attempt} 次点击{entry_label}后无请求且按钮已不可再次操作"
+                f"ChatGPT 首页{entry_label}按钮已不可再次操作，"
+                "但页面未在限定时间内完成变化"
             )
         log(
             f"[请求监测] 第 {attempt} 次点击{entry_label}后 "
@@ -774,7 +826,9 @@ def click_chatgpt_home_login(
             f"准备第 {attempt + 1}/{MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次点击"
         )
     raise RuntimeError(
-        f"最多点击 {MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次{entry_label}后仍无请求或页面响应"
+        f"ChatGPT 首页{entry_label}最多点击 "
+        f"{MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次后，"
+        "页面未在限定时间内完成变化且未检测到注册入口响应"
     )
 
 

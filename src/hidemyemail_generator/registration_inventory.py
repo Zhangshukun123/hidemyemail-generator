@@ -112,8 +112,12 @@ def _reconcile_terminal_addresses(conn, now_text: str) -> None:
         """
         UPDATE addresses AS address
         SET state = 'unused', updated_at = ?
-        WHERE address.state != 'used'
+        WHERE address.state = 'unused'
           AND address.source = 'generated'
+          AND NOT EXISTS (
+              SELECT 1 FROM settings AS removed
+              WHERE removed.key = 'gpt_removed:' || lower(address.email)
+          )
           AND EXISTS (
               SELECT 1 FROM registration_inventory_leases AS lease
               WHERE lower(lease.email) = lower(address.email)
@@ -137,7 +141,11 @@ def _reconcile_terminal_addresses(conn, now_text: str) -> None:
         UPDATE addresses AS address
         SET state = 'used', updated_at = ?
         WHERE address.source = 'generated'
-          AND address.state != 'used'
+          AND address.state = 'unused'
+          AND NOT EXISTS (
+              SELECT 1 FROM settings AS removed
+              WHERE removed.key = 'gpt_removed:' || lower(address.email)
+          )
           AND EXISTS (
               SELECT 1 FROM registration_inventory_leases AS lease
               WHERE lower(lease.email) = lower(address.email)
@@ -174,6 +182,10 @@ def _available_rows(conn) -> list[Any]:
           ON account.key = 'gpt_account:' || lower(a.email)
         WHERE a.state = 'unused'
           AND a.source = 'generated'
+          AND NOT EXISTS (
+              SELECT 1 FROM settings AS removed
+              WHERE removed.key = 'gpt_removed:' || lower(a.email)
+          )
           AND NOT EXISTS (
               SELECT 1 FROM registration_inventory_leases AS lease
               WHERE lower(lease.email) = lower(a.email)
@@ -318,6 +330,11 @@ def complete_generated_inventory_lease(
             """
             UPDATE addresses SET state = ?, updated_at = ?
             WHERE lower(email) = lower(?)
+              AND state = 'unused'
+              AND NOT EXISTS (
+                  SELECT 1 FROM settings AS removed
+                  WHERE removed.key = 'gpt_removed:' || lower(addresses.email)
+              )
             """,
             (
                 "used" if outcome == "succeeded" else "unused",
