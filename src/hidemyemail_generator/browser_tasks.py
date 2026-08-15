@@ -16,13 +16,21 @@ from urllib.parse import urlsplit
 from .browser_diagnostics import browser_diagnostic_context
 from .inbox import connect_db, mark_address
 from .registration_proxy import RegistrationProxyStore
+from .registration_retry_policy import (
+    RegistrationRetryContext,
+    RegistrationRetryPolicy,
+    build_reliability_report,
+)
 from .roxy_registration import RoxyRegistrationStore
 
 
 EVENT_PREFIX = "HME_BROWSER_EVENT:"
 MAX_LOG_ITEMS = 300
 MAX_GOOGLE_FINGERPRINT_RETRIES = 1
+MAX_WORKER_LAUNCHES = 3
+DEFAULT_FAILURE_CIRCUIT_THRESHOLD = 3
 AccountSaved = Callable[[str], Awaitable[dict[str, Any] | None]]
+RetrySleep = Callable[[float], Awaitable[None]]
 
 
 def utc_now() -> str:
@@ -646,6 +654,9 @@ class BrowserTaskManager:
         registration_proxy_store: RegistrationProxyStore | None = None,
         roxy_registration_store: RoxyRegistrationStore | None = None,
         on_account_saved: AccountSaved | None = None,
+        registration_retry_policy: RegistrationRetryPolicy | None = None,
+        retry_sleep: RetrySleep | None = None,
+        failure_circuit_threshold: int = DEFAULT_FAILURE_CIRCUIT_THRESHOLD,
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.python_executable = (
@@ -662,8 +673,24 @@ class BrowserTaskManager:
         self.registration_proxy_store = registration_proxy_store
         self.roxy_registration_store = roxy_registration_store
         self.on_account_saved = on_account_saved
+        if registration_retry_policy is None:
+            try:
+                configured_retries = int(
+                    os.environ.get("HME_REGISTRATION_TRANSIENT_RETRIES", "2")
+                )
+            except (TypeError, ValueError):
+                configured_retries = 2
+            registration_retry_policy = RegistrationRetryPolicy(
+                max_retries=configured_retries
+            )
+        self.registration_retry_policy = registration_retry_policy
+        self._retry_sleep = retry_sleep or asyncio.sleep
+        self.failure_circuit_threshold = max(
+            1, min(10, int(failure_circuit_threshold))
+        )
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._log_sequence = 0
         self._state: dict[str, Any] = self._idle_state()
 
     @staticmethod
@@ -677,6 +704,15 @@ class BrowserTaskManager:
             "succeeded": 0,
             "failed": 0,
             "skipped": 0,
+            "recovered": 0,
+            "transientRetries": 0,
+            "retriedAccounts": 0,
+            "failureCounts": {},
+            "lastFailureCode": "",
+            "failureStreak": 0,
+            "circuitOpen": False,
+            "circuitReason": "",
+            "reliability": build_reliability_report(0, 0).as_dict(),
             "accounts": [],
             "logs": [],
             "currentStage": "idle",
@@ -726,6 +762,7 @@ class BrowserTaskManager:
     def reset(self) -> dict[str, Any]:
         if self._batch_task and not self._batch_task.done():
             raise RuntimeError("浏览器获取任务正在运行")
+        self._log_sequence = 0
         self._state = self._idle_state()
         return self.snapshot()
 
@@ -849,6 +886,7 @@ class BrowserTaskManager:
                     f"Roxy 可用环境不足：需要 {required_profiles} 个，"
                     f"当前仅分配到 {len(roxy_profile_ids)} 个"
                 )
+        self._log_sequence = 0
         self._state = {
             "id": uuid.uuid4().hex,
             "status": "running",
@@ -863,6 +901,15 @@ class BrowserTaskManager:
             "succeeded": 0,
             "failed": 0,
             "skipped": max(0, int(skipped)),
+            "recovered": 0,
+            "transientRetries": 0,
+            "retriedAccounts": 0,
+            "failureCounts": {},
+            "lastFailureCode": "",
+            "failureStreak": 0,
+            "circuitOpen": False,
+            "circuitReason": "",
+            "reliability": build_reliability_report(0, 0).as_dict(),
             "accounts": [
                 {
                     "email": item["email"],
@@ -883,6 +930,15 @@ class BrowserTaskManager:
                     "_two_factor": item["two_factor"],
                     "_fingerprint_retry_count": 0,
                     "fingerprintRetries": 0,
+                    "_transient_retry_count": 0,
+                    "transientRetries": 0,
+                    "workerAttempts": 0,
+                    "maxWorkerAttempts": MAX_WORKER_LAUNCHES,
+                    "retryState": "idle",
+                    "lastRetryCode": "",
+                    "lastRetryStage": "",
+                    "retryDelayMs": 0,
+                    "retryHistory": [],
                     "phase": "queued",
                     "twoFactorEnabled": bool(item["two_factor"].get("enabled")),
                     "roxyProfileId": (
@@ -924,6 +980,16 @@ class BrowserTaskManager:
             f"浏览器取全部已启动：待处理 {len(deduplicated)}，"
             f"跳过 {skipped}，并发 {concurrency}，"
             f"{'后台隐藏' if headless and selected_browser_engine == 'roxy' else '无头' if headless else '显示浏览器'}"
+        )
+        self._append_log(
+            "启动参数："
+            f"引擎 {'Roxy' if selected_browser_engine == 'roxy' else 'Camoufox'}；"
+            f"账号 {len(deduplicated)} 个；并发 {concurrency}；"
+            f"窗口模式 {'后台隐藏' if headless and selected_browser_engine == 'roxy' else '无头' if headless else '前台显示'}；"
+            f"注册代理 {'已启用' if proxy_active else '未启用'}；"
+            f"需要前台交互 {'是' if foreground_required else '否'}",
+            source="browser_manager",
+            event_type="task_parameters",
         )
         if selected_browser_engine == "roxy":
             self._append_log(
@@ -981,15 +1047,33 @@ class BrowserTaskManager:
         )
         return self.snapshot()
 
-    def _append_log(self, message: str, *, email: str = "") -> None:
+    def _append_log(
+        self,
+        message: str,
+        *,
+        email: str = "",
+        source: str = "browser_manager",
+        event_type: str = "log",
+    ) -> None:
         text = str(message or "").strip()
         if not text:
             return
+        self._log_sequence += 1
+        sequence = self._log_sequence
+        task_id = str(self._state.get("id") or "")
         context = browser_log_context(
             text,
             browser_engine=str(self._state.get("browserEngine") or ""),
         )
         entry = {
+            "sequence": sequence,
+            "seq": sequence,
+            "taskId": task_id,
+            "originTaskId": task_id,
+            "originSequence": sequence,
+            "originSeq": sequence,
+            "source": str(source or "browser_manager")[:80],
+            "eventType": str(event_type or "log")[:80],
             "at": utc_now(),
             "email": email,
             "message": text[:1000],
@@ -1023,6 +1107,77 @@ class BrowserTaskManager:
                 return item
         return None
 
+    def _refresh_reliability(self) -> None:
+        self._state["reliability"] = build_reliability_report(
+            int(self._state.get("succeeded") or 0),
+            int(self._state.get("failed") or 0),
+        ).as_dict()
+
+    def _record_terminal_failure(self, reason_code: str) -> None:
+        code = str(reason_code or "not_retryable")[:80]
+        counts = self._state.setdefault("failureCounts", {})
+        counts[code] = max(0, int(counts.get(code) or 0)) + 1
+        if self._state.get("lastFailureCode") == code:
+            self._state["failureStreak"] = max(
+                0, int(self._state.get("failureStreak") or 0)
+            ) + 1
+        else:
+            self._state["lastFailureCode"] = code
+            self._state["failureStreak"] = 1
+        streak = int(self._state["failureStreak"])
+        circuit_codes = {
+            "browser_closed",
+            "network_interrupted",
+            "navigation_stalled",
+            "temporary_capacity",
+            "worker_exit",
+        }
+        if (
+            code in circuit_codes
+            and streak >= self.failure_circuit_threshold
+            and not self._state.get("circuitOpen")
+        ):
+            self._state["circuitOpen"] = True
+            self._state["circuitReason"] = code
+            self._append_log(
+                "稳定性熔断已开启："
+                f"同类瞬时故障 {code} 连续达到 {streak} 个账号；"
+                "剩余账号保留在队列外，等待运行环境恢复"
+            )
+
+    @staticmethod
+    async def _reap_worker_process(
+        process: asyncio.subprocess.Process | None,
+        stdout_task: asyncio.Task | None,
+        stderr_task: asyncio.Task | None,
+        *,
+        terminate: bool,
+    ) -> None:
+        if terminate and process is not None and process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(process.wait()), timeout=3)
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                await process.wait()
+        readers = [
+            task
+            for task in (stdout_task, stderr_task)
+            if task is not None
+        ]
+        for task in readers:
+            if not task.done():
+                task.cancel()
+        if readers:
+            await asyncio.gather(*readers, return_exceptions=True)
+
     async def _run_batch(self, *, headless: bool, concurrency: int) -> None:
         semaphore = asyncio.Semaphore(concurrency)
         try:
@@ -1055,6 +1210,7 @@ class BrowserTaskManager:
                         for item in accounts
                     )
                 )
+            self._refresh_reliability()
             if self._state["status"] == "cancelling":
                 self._state["status"] = "cancelled"
                 self._append_log("浏览器获取任务已停止")
@@ -1082,6 +1238,21 @@ class BrowserTaskManager:
     ) -> None:
         email = str(item["email"])
         async with semaphore:
+            if self._state.get("status") == "cancelling":
+                item["status"] = "cancelled"
+                item["message"] = "任务已停止"
+                return
+            if self._state.get("circuitOpen"):
+                item["status"] = "skipped"
+                item["phase"] = "circuit_open"
+                item["message"] = (
+                    "稳定性熔断已开启；账号未启动，等待运行环境恢复"
+                )
+                item["terminalReasonCode"] = "circuit_open"
+                self._state["skipped"] += 1
+                self._state["completed"] += 1
+                self._append_log(item["message"], email=email)
+                return
             existing_record = await asyncio.to_thread(
                 load_account_record, self.db_file, email
             )
@@ -1091,10 +1262,6 @@ class BrowserTaskManager:
                 and not account_session(existing_record)
                 and not account_saved_cookies(existing_record)
             )
-            if self._state.get("status") == "cancelling":
-                item["status"] = "cancelled"
-                item["message"] = "任务已停止"
-                return
             item["status"] = "running"
             item["phase"] = "registering_openai"
             browser_name = (
@@ -1113,6 +1280,8 @@ class BrowserTaskManager:
                     item["message"] = "注册代理配置不可用"
                     self._state["failed"] += 1
                     self._state["completed"] += 1
+                    self._record_terminal_failure("proxy_configuration")
+                    self._refresh_reliability()
                     self._append_log(item["message"], email=email)
                     return
                 try:
@@ -1124,6 +1293,8 @@ class BrowserTaskManager:
                     item["message"] = f"注册代理切换失败：{error}"
                     self._state["failed"] += 1
                     self._state["completed"] += 1
+                    self._record_terminal_failure("proxy_assignment")
+                    self._refresh_reliability()
                     self._append_log(item["message"], email=email)
                     return
                 if not proxy_url:
@@ -1131,6 +1302,8 @@ class BrowserTaskManager:
                     item["message"] = "注册动态代理已启用但未配置"
                     self._state["failed"] += 1
                     self._state["completed"] += 1
+                    self._record_terminal_failure("proxy_unavailable")
+                    self._refresh_reliability()
                     self._append_log(item["message"], email=email)
                     return
                 item["proxyCountry"] = str(proxy_state.get("country") or "")
@@ -1234,15 +1407,26 @@ class BrowserTaskManager:
                 creationflags = subprocess.CREATE_NO_WINDOW
 
             return_code = -1
-            for fingerprint_attempt in range(
-                MAX_GOOGLE_FINGERPRINT_RETRIES + 1
-            ):
+            fingerprint_attempt = 0
+            worker_launches = 0
+            while worker_launches < MAX_WORKER_LAUNCHES:
+                if self._state.get("status") == "cancelling":
+                    item["status"] = "cancelled"
+                    item["message"] = "任务已停止"
+                    return
                 env["HME_BROWSER_FINGERPRINT_ATTEMPT"] = str(
                     fingerprint_attempt
                 )
+                env["HME_BROWSER_WORKER_ATTEMPT"] = str(worker_launches)
                 item.pop("_fresh_fingerprint_required", None)
                 item.pop("_fresh_fingerprint_reason", None)
                 item.pop("_error", None)
+                process: asyncio.subprocess.Process | None = None
+                stdout_task: asyncio.Task | None = None
+                stderr_task: asyncio.Task | None = None
+                worker_launches += 1
+                item["workerAttempts"] = worker_launches
+                item["retryState"] = "running"
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *command,
@@ -1265,43 +1449,167 @@ class BrowserTaskManager:
                 except asyncio.CancelledError:
                     item["status"] = "cancelled"
                     item["message"] = "任务已停止"
+                    await self._reap_worker_process(
+                        process,
+                        stdout_task,
+                        stderr_task,
+                        terminate=True,
+                    )
                     raise
                 except Exception as error:
                     return_code = -1
                     item["_error"] = str(error)
+                    await self._reap_worker_process(
+                        process,
+                        stdout_task,
+                        stderr_task,
+                        terminate=True,
+                    )
                 finally:
                     self._processes.pop(email, None)
 
-                if not item.pop("_fresh_fingerprint_required", False):
-                    break
-                reason = str(
-                    item.pop("_fresh_fingerprint_reason", "") or ""
-                ).strip()
-                item.pop("_result", None)
-                if fingerprint_attempt >= MAX_GOOGLE_FINGERPRINT_RETRIES:
-                    item["_error"] = (
-                        "第二个独立指纹仍被要求 Google 登录；"
-                        "已放弃该 Gmail，不再继续注册"
-                    )
+                if self._state.get("status") == "cancelling":
+                    item["status"] = "cancelled"
+                    item["message"] = "任务已停止"
+                    return
+
+                fresh_fingerprint = item.pop(
+                    "_fresh_fingerprint_required", False
+                )
+                if fresh_fingerprint:
+                    reason = str(
+                        item.pop("_fresh_fingerprint_reason", "") or ""
+                    ).strip()
+                    item.pop("_result", None)
+                    if (
+                        fingerprint_attempt >= MAX_GOOGLE_FINGERPRINT_RETRIES
+                        or worker_launches >= MAX_WORKER_LAUNCHES
+                    ):
+                        item["_error"] = (
+                            "第二个独立指纹仍被要求 Google 登录；"
+                            "已放弃该 Gmail，不再继续注册"
+                        )
+                        item["terminalReasonCode"] = "google_login_required"
+                        item["retryState"] = "exhausted"
+                        self._append_log(
+                            "第二次启动仍要求 Google 登录；当前浏览器已关闭，"
+                            "已放弃该 Gmail，不再生成新指纹",
+                            email=email,
+                        )
+                        break
+
+                    fingerprint_attempt += 1
+                    item["_fingerprint_retry_count"] = fingerprint_attempt
+                    item["fingerprintRetries"] = fingerprint_attempt
+                    item["message"] = "正在关闭当前浏览器并生成全新指纹"
                     self._append_log(
-                        "第二次启动仍要求 Google 登录；当前浏览器已关闭，"
-                        "已放弃该 Gmail，不再生成新指纹",
+                        "检测到 Google 登录要求，本轮注册已判定失败；"
+                        "当前浏览器已关闭，正在新建 Camoufox 进程、生成全新指纹并"
+                        f"重新打开注册（{fingerprint_attempt}/"
+                        f"{MAX_GOOGLE_FINGERPRINT_RETRIES}）"
+                        + (f"：{reason}" if reason else ""),
                         email=email,
                     )
+                    continue
+
+                result = item.get("_result")
+                if isinstance(result, dict) and str(
+                    result.get("access_token") or ""
+                ).strip():
                     break
 
-                retry_number = fingerprint_attempt + 1
-                item["_fingerprint_retry_count"] = retry_number
-                item["fingerprintRetries"] = retry_number
-                item["message"] = "正在关闭当前浏览器并生成全新指纹"
-                self._append_log(
-                    "检测到 Google 登录要求，本轮注册已判定失败；"
-                    "当前浏览器已关闭，正在新建 Camoufox 进程、生成全新指纹并"
-                    f"重新打开注册（{retry_number}/"
-                    f"{MAX_GOOGLE_FINGERPRINT_RETRIES}）"
-                    + (f"：{reason}" if reason else ""),
-                    email=email,
+                page_state = item.get("pageState")
+                if not isinstance(page_state, dict):
+                    page_state = {}
+                registration_chain = item.get("registrationChain")
+                if not isinstance(registration_chain, dict):
+                    registration_chain = {}
+                two_factor = item.get("_two_factor")
+                two_factor_enrolled = bool(
+                    isinstance(two_factor, dict)
+                    and str(two_factor.get("status") or "").casefold()
+                    in {"enrolled", "enabled"}
                 )
+                retry_context = RegistrationRetryContext(
+                    error=str(item.get("_error") or ""),
+                    stage=str(page_state.get("stage") or ""),
+                    return_code=return_code,
+                    retry_count=max(
+                        0, int(item.get("_transient_retry_count") or 0)
+                    ),
+                    registration_chain=registration_chain,
+                    page_state=page_state,
+                    manual_otp_entry=bool(item.get("_manual_otp_entry")),
+                    result_received=isinstance(result, dict),
+                    two_factor_enrolled=two_factor_enrolled,
+                )
+                decision = self.registration_retry_policy.decide(retry_context)
+                item["terminalReasonCode"] = decision.reason_code
+                item["terminalRetryDecision"] = decision.explanation
+                if not decision.retryable:
+                    item["retryState"] = (
+                        "exhausted"
+                        if decision.reason_code == "retry_limit"
+                        else "terminal"
+                    )
+                    break
+                if worker_launches >= MAX_WORKER_LAUNCHES:
+                    item["terminalReasonCode"] = "worker_attempt_limit"
+                    item["terminalRetryDecision"] = (
+                        "工作器总启动次数已达到稳定性上限"
+                    )
+                    item["retryState"] = "exhausted"
+                    break
+
+                transient_retry_count = max(
+                    0, int(item.get("_transient_retry_count") or 0)
+                ) + 1
+                item["_transient_retry_count"] = transient_retry_count
+                item["transientRetries"] = transient_retry_count
+                item["lastRetryCode"] = decision.reason_code
+                retry_stage = str(
+                    registration_chain.get("currentCode")
+                    or page_state.get("stage")
+                    or "startup"
+                )[:80]
+                item["lastRetryStage"] = retry_stage
+                item["retryDelayMs"] = round(
+                    max(0.0, decision.delay_seconds) * 1000
+                )
+                item.setdefault("retryHistory", []).append(
+                    {
+                        "attempt": transient_retry_count,
+                        "reasonCode": decision.reason_code,
+                        "stage": retry_stage,
+                        "delayMs": item["retryDelayMs"],
+                        "proxyReused": not decision.rotate_proxy,
+                    }
+                )
+                self._state["transientRetries"] += 1
+                if transient_retry_count == 1:
+                    self._state["retriedAccounts"] += 1
+                item["retryState"] = "waiting"
+                item["message"] = (
+                    "检测到可安全恢复的瞬时故障，正在复用当前账号环境重试"
+                )
+                self._append_log(
+                    "[稳定性] 瞬时故障分类为 "
+                    f"{decision.reason_code}；验证码页前安全重试 "
+                    f"{transient_retry_count}/{self.registration_retry_policy.max_retries}；"
+                    "保持同一代理与浏览器槽位",
+                    email=email,
+                    event_type="transient_retry",
+                )
+                try:
+                    await self._retry_sleep(decision.delay_seconds)
+                except asyncio.CancelledError:
+                    item["status"] = "cancelled"
+                    item["message"] = "任务已停止"
+                    raise
+                if self._state.get("status") == "cancelling":
+                    item["status"] = "cancelled"
+                    item["message"] = "任务已停止"
+                    return
 
             password = str(item.get("_password") or "")
             result = item.get("_result")
@@ -1354,11 +1662,35 @@ class BrowserTaskManager:
                             proxy_state=proxy_state,
                         )
                     )
-                    result_to_save["registration_diagnostics"] = {
-                        "fingerprint_retries": max(
-                            0, int(item.get("_fingerprint_retry_count") or 0)
-                        ),
-                    }
+                    registration_diagnostics = result_to_save.get(
+                        "registration_diagnostics"
+                    )
+                    if not isinstance(registration_diagnostics, dict):
+                        registration_diagnostics = {}
+                    registration_diagnostics.update(
+                        {
+                            "fingerprint_retries": max(
+                                0,
+                                int(item.get("_fingerprint_retry_count") or 0),
+                            ),
+                            "transient_retries": max(
+                                0,
+                                int(item.get("_transient_retry_count") or 0),
+                            ),
+                            "worker_attempts": max(
+                                1, int(item.get("workerAttempts") or 1)
+                            ),
+                            "recovered_after_retry": bool(
+                                item.get("_transient_retry_count")
+                            ),
+                            "last_retry_code": str(
+                                item.get("lastRetryCode") or ""
+                            )[:80],
+                        }
+                    )
+                    result_to_save["registration_diagnostics"] = (
+                        registration_diagnostics
+                    )
                 if proxy_url:
                     result_to_save["registration_proxy_url"] = proxy_url
                     result_to_save["registration_proxy"] = {
@@ -1382,33 +1714,7 @@ class BrowserTaskManager:
                 )
                 if self.on_account_saved is not None:
                     try:
-                        saved_callback_result = await self.on_account_saved(email)
-                        if isinstance(saved_callback_result, dict):
-                            checkout_type = str(
-                                saved_callback_result.get("checkout_id_type") or ""
-                            ).strip().lower()
-                            item["checkoutIdType"] = checkout_type
-                            item["checkoutProbeStatus"] = str(
-                                saved_callback_result.get("status") or ""
-                            )
-                            checkout_labels = {
-                                "oaics": "OAICS",
-                                "cs_live": "CS LIVE",
-                                "cs": "CS",
-                                "other": "OTHER",
-                                "error": "检测失败",
-                            }
-                            self._append_log(
-                                "Checkout 自动验证："
-                                + checkout_labels.get(checkout_type, "待检测")
-                                + (
-                                    f"（第 {int(saved_callback_result.get('attempt_count') or 1)}"
-                                    f"/{int(saved_callback_result.get('max_attempts') or 1)} 次）"
-                                    if int(saved_callback_result.get("attempt_count") or 1) > 1
-                                    else ""
-                                ),
-                                email=email,
-                            )
+                        await self.on_account_saved(email)
                     except Exception as error:
                         self._append_log(
                             f"账号已保存，但同步到远程服务器失败：{str(error)[:300]}",
@@ -1416,6 +1722,13 @@ class BrowserTaskManager:
                         )
                 item["status"] = "success"
                 item["phase"] = "completed"
+                self._state["lastFailureCode"] = ""
+                self._state["failureStreak"] = 0
+                if item.get("_transient_retry_count"):
+                    item["retryState"] = "recovered"
+                    self._state["recovered"] += 1
+                else:
+                    item["retryState"] = "completed"
                 saved_parts = ["Session / AT / Cookie 已保存"]
                 if item.get("_ensure_password") and not password_confirmed:
                     saved_parts.append("OpenAI 免密码注册")
@@ -1456,8 +1769,15 @@ class BrowserTaskManager:
                 item["phase"] = "failed"
                 item["message"] = error[:500]
                 self._state["failed"] += 1
+                failure_code = str(
+                    item.get("lastRetryCode")
+                    or item.get("terminalReasonCode")
+                    or "not_retryable"
+                )
+                self._record_terminal_failure(failure_code)
                 self._append_log(f"失败：{error[:500]}", email=email)
             self._state["completed"] += 1
+            self._refresh_reliability()
 
     async def _read_stdout(
         self, stream: asyncio.StreamReader | None, item: dict[str, Any]
@@ -1470,16 +1790,31 @@ class BrowserTaskManager:
             if not line:
                 continue
             if not line.startswith(EVENT_PREFIX):
-                self._append_log(line[:500], email=email)
+                self._append_log(
+                    line[:500],
+                    email=email,
+                    source="browser_worker_stdout",
+                    event_type="stdout",
+                )
                 continue
             try:
                 event = json.loads(line[len(EVENT_PREFIX) :])
             except (json.JSONDecodeError, TypeError, ValueError):
-                self._append_log("浏览器工作器返回了无效事件", email=email)
+                self._append_log(
+                    "浏览器工作器返回了无效事件",
+                    email=email,
+                    source="browser_worker_stdout",
+                    event_type="invalid_event",
+                )
                 continue
             kind = str(event.get("type") or "")
             if kind == "log":
-                self._append_log(str(event.get("message") or ""), email=email)
+                self._append_log(
+                    str(event.get("message") or ""),
+                    email=email,
+                    source="browser_worker",
+                    event_type="worker_log",
+                )
             elif kind == "result":
                 result = event.get("result")
                 if isinstance(result, dict):
@@ -1547,7 +1882,12 @@ class BrowserTaskManager:
             elif kind == "two_factor_start":
                 item["phase"] = "enabling_2fa"
                 item["message"] = "正在创建 TOTP 2FA"
-                self._append_log("OpenAI 注册成功，开始开启 2FA", email=email)
+                self._append_log(
+                    "OpenAI 注册成功，开始开启 2FA",
+                    email=email,
+                    source="browser_worker",
+                    event_type="two_factor_start",
+                )
             elif kind == "two_factor_enrolled":
                 two_factor = event.get("two_factor")
                 if isinstance(two_factor, dict):
@@ -1567,7 +1907,12 @@ class BrowserTaskManager:
             elif kind == "two_factor_enabled":
                 item["twoFactorEnabled"] = True
                 item["message"] = "2FA 已开启，正在保存账号"
-                self._append_log("TOTP 2FA 已成功开启", email=email)
+                self._append_log(
+                    "TOTP 2FA 已成功开启",
+                    email=email,
+                    source="browser_worker",
+                    event_type="two_factor_enabled",
+                )
             elif kind == "registration_chain":
                 chain_state = event.get("state")
                 if isinstance(chain_state, dict):
@@ -1705,6 +2050,12 @@ class BrowserTaskManager:
                     self._state["pageState"] = {**state, "email": email}
             elif kind == "error":
                 item["_error"] = str(event.get("error") or "浏览器任务失败")
+                self._append_log(
+                    f"工作器错误：{item['_error'][:500]}",
+                    email=email,
+                    source="browser_worker",
+                    event_type="worker_error",
+                )
                 password = str(event.get("password") or "")
                 if password:
                     item["_password"] = password
@@ -1744,7 +2095,12 @@ class BrowserTaskManager:
                     del lines[:-20]
         if lines and not item.get("_error"):
             item["_error"] = "；".join(lines)[-1500:]
-            self._append_log(lines[-1][:500], email=email)
+            self._append_log(
+                lines[-1][:500],
+                email=email,
+                source="browser_worker_stderr",
+                event_type="stderr",
+            )
 
     async def stop(self) -> dict[str, Any]:
         if not self._batch_task or self._batch_task.done():
