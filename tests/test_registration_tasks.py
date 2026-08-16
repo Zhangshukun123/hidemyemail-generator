@@ -1011,8 +1011,9 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             if item["message"].startswith("[界面识别]")
         ]
         self.assertEqual(len(recognition_logs), 1)
-        self.assertEqual(running["currentStage"], "password")
-        self.assertEqual(running["currentLocation"], "OpenAI 密码页")
+        self.assertEqual(running["currentStage"], "email_verification")
+        self.assertEqual(running["currentLocation"], "邮箱验证码页")
+        self.assertEqual(running["currentAction"], "在验证码页选择使用密码继续")
         self.assertIn("点击", running["message"])
 
         browser.release.set()
@@ -1485,6 +1486,77 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["effectiveConcurrency"], 5)
         self.assertEqual(browser.start_options["concurrency"], 5)
         self.assertEqual(len(browser.started_accounts), 12)
+
+    async def test_single_roxy_browser_finalizes_first_account_before_second(self):
+        events = []
+
+        class PerAccountBrowserManager(FakeBrowserManager):
+            async def wait(self):
+                result_accounts = []
+                for account in self.started_accounts:
+                    email = account["email"]
+                    events.append(("registered", email))
+                    await account["_on_finished"](
+                        email,
+                        True,
+                        "Session / AT / Cookie 已保存",
+                    )
+                    result_accounts.append(
+                        {
+                            "email": email,
+                            "status": "success",
+                            "passwordConfirmed": True,
+                            "twoFactorEnabled": True,
+                        }
+                    )
+                self.state.update(
+                    status="completed",
+                    running=False,
+                    succeeded=len(result_accounts),
+                    accounts=result_accounts,
+                )
+                return self.snapshot()
+
+        browser = PerAccountBrowserManager()
+        inventory = ["first@icloud.com", "second@icloud.com"]
+
+        async def acquire(_label):
+            return inventory.pop(0) if inventory else ""
+
+        async def complete(email, success, message):
+            events.append(("completed", email, success, message))
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=acquire,
+            confirm_email=lambda _email: asyncio.sleep(0),
+            complete_email=complete,
+        )
+        manager.start(
+            label="Roxy 单浏览器目标注册",
+            headless=True,
+            concurrency=1,
+            target_count=2,
+            browser_engine="roxy",
+        )
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        self.assertEqual(
+            events,
+            [
+                ("registered", "first@icloud.com"),
+                ("completed", "first@icloud.com", True, "OpenAI 注册成功"),
+                ("registered", "second@icloud.com"),
+                ("completed", "second@icloud.com", True, "OpenAI 注册成功"),
+            ],
+        )
+        self.assertEqual(manager.snapshot()["status"], "completed")
+        completion_logs = [
+            item["message"]
+            for item in manager.snapshot()["logs"]
+            if "已向远端库存回执" in item["message"]
+        ]
+        self.assertEqual(len(completion_logs), 2)
 
     async def test_inventory_shortage_uses_available_minimum(self):
         browser = FakeBrowserManager()

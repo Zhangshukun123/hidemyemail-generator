@@ -93,7 +93,26 @@ _PASSWORD_MARKERS = registration_markers("password")
 _EMAIL_MARKERS = registration_markers("email")
 _ERROR_MARKERS = registration_markers("error")
 
-_PASSWORD_SELECTORS = ('input[type="password"]', 'input[autocomplete="new-password"]')
+_PASSWORD_SELECTORS = (
+    'input[type="password"]',
+    'input[name*="password" i]',
+    'input[id*="password" i]',
+    'input[autocomplete="current-password"]',
+    'input[autocomplete="new-password"]',
+    'input[aria-label*="password" i]',
+    'input[aria-label*="パスワード" i]',
+)
+_PASSWORD_FORM_MARKERS = (
+    "create a password",
+    "enter your password",
+    "创建密码",
+    "输入密码",
+    "建立密碼",
+    "輸入密碼",
+    "パスワードの作成",
+    "パスワードを作成",
+    "パスワードを入力",
+)
 _OTP_SELECTORS = (
     'input[autocomplete="one-time-code"]',
     'input[inputmode="numeric"]',
@@ -283,18 +302,43 @@ def recognize_registration_page(
     elif profile_visible or _contains(combined, _PROFILE_MARKERS) or "about-you" in lowered_route:
         code, label, stage = "profile", "姓名与出生信息页", "profile"
         next_action, mode, confidence = "填写并校验姓名、生日，然后提交一次", "automatic", 96
+    # The password form can replace the email-code form without immediately
+    # changing the /email-verification URL.  Trust the live, visible password
+    # control and explicit password-form copy before a stale route or an old
+    # OTP marker; otherwise the DOM guard blocks the password fill forever.
+    elif (
+        password_visible
+        or _contains(combined, _PASSWORD_FORM_MARKERS)
+        or any(
+            marker in lowered_route
+            for marker in (
+                "/create-account/password",
+                "/sign-up/password",
+                "/log-in/password",
+            )
+        )
+    ):
+        code, label, stage = "password", "OpenAI 密码页", "password"
+        next_action, mode, confidence = "填写已保存的唯一密码并提交一次", "automatic", 97
     elif otp_visible or _contains(combined, _OTP_MARKERS) or "email-verification" in lowered_route:
         code, label, stage = "email_verification", "邮箱验证码页", "email_verification"
         password_done = bool(getattr(worker, "_password_step_submitted", False))
+        password_flow_enabled = bool(
+            getattr(worker, "_hme_password_first_login_enabled", False)
+        )
         manual_otp = bool(getattr(worker, "_hme_manual_otp_entry", False))
         if manual_otp:
             next_action, mode = "等待你在浏览器输入邮箱验证码", "manual"
-        elif not password_done and _contains(combined, _PASSWORD_MARKERS):
+        elif (
+            password_flow_enabled
+            and not password_done
+            and _contains(combined, _PASSWORD_MARKERS)
+        ):
             next_action, mode = "选择“使用密码继续”，先完成密码设置", "automatic"
         else:
             next_action, mode = "读取本轮最新邮箱验证码并提交", "automatic"
         confidence = 98 if otp_visible else 90
-    elif password_visible or "password" in lowered_route or _contains(combined, _PASSWORD_MARKERS):
+    elif "password" in lowered_route or _contains(combined, _PASSWORD_MARKERS):
         code, label, stage = "password", "OpenAI 密码页", "password"
         next_action, mode, confidence = "填写已保存的唯一密码并提交一次", "automatic", 97
     elif email_visible or _contains(combined, _EMAIL_MARKERS) or "auth.openai.com" in lowered_route:

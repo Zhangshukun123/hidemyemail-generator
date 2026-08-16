@@ -469,6 +469,19 @@ def registration_activity_changed(
         ):
             return True, "page"
         return False, ""
+    if signal == "network":
+        # A late stylesheet can fire ``load`` and can change visible DOM counts
+        # even though the user's click never reached the auth application.
+        # Callers using this signal need an actual relevant auth request; they
+        # can supply a separate transition callback for URL/form changes.
+        for key, label in (
+            ("requestCount", "request"),
+            ("responseCount", "response"),
+            ("failedCount", "request_failed"),
+        ):
+            if int(after.get(key) or 0) > int(before.get(key) or 0):
+                return True, label
+        return False, ""
     for key, label in (
         ("requestCount", "request"),
         ("responseCount", "response"),

@@ -653,6 +653,50 @@ class RegistrationTaskManager:
     ) -> None:
         claimed_emails: list[str] = []
         successful_emails: set[str] = set()
+        finalized_emails: set[str] = set()
+        terminal_outcomes: dict[str, tuple[bool, str]] = {}
+
+        async def finalize_account(
+            email: str,
+            success: bool,
+            message: str,
+        ) -> None:
+            target = str(email or "").strip().lower()
+            if not target or target in finalized_emails:
+                return
+            terminal_outcomes[target] = (bool(success), str(message or "")[:500])
+            if success:
+                successful_emails.add(target)
+            if provider == "smsbower" and self.complete_provider_email is not None:
+                if target in self._provider_cancelled_emails:
+                    self._append_log(
+                        f"SMSBower Gmail 验证码超时，激活已取消：{target}"
+                    )
+                    finalized_emails.add(target)
+                    return
+                await self.complete_provider_email(
+                    target,
+                    success,
+                    message or "OpenAI 注册失败",
+                )
+                self._append_log(
+                    f"已向 SMSBower 回执 Gmail 激活状态（{target}）："
+                    f"{'注册成功' if success else '注册未完成'}"
+                )
+            elif provider == "inventory" and self.complete_email is not None:
+                await self.complete_email(
+                    target,
+                    success,
+                    "OpenAI 注册成功" if success else message or "OpenAI 注册失败",
+                )
+                self._append_log(
+                    f"已向远端库存回执（{target}）："
+                    f"{'注册成功，标记已使用' if success else '注册失败，已释放，可再次注册'}"
+                )
+            elif provider == "inventory" and self.release_email is not None:
+                await self.release_email(target)
+            finalized_emails.add(target)
+
         try:
             if provider == "smsbower":
                 email = str(await self.acquire_provider_email(label)).strip().lower()
@@ -769,6 +813,7 @@ class RegistrationTaskManager:
                         "password_first_required": True,
                         "foreground_required": manual_browser_code,
                         "two_factor": saved_two_factor,
+                        "_on_finished": finalize_account,
                     }
                 )
                 if str(saved_two_factor.get("secret") or "").strip():
@@ -1104,45 +1149,19 @@ class RegistrationTaskManager:
                     claimed_emails if provider in {"inventory", "smsbower"} else []
                 )
                 for email in finalization_emails:
+                    if email in finalized_emails:
+                        continue
                     try:
-                        if (
-                            provider == "smsbower"
-                            and self.complete_provider_email is not None
-                        ):
-                            if email in self._provider_cancelled_emails:
-                                self._append_log(
-                                    f"SMSBower Gmail 验证码超时，激活已取消：{email}"
-                                )
-                                continue
-                            success = email in successful_emails
-                            await self.complete_provider_email(
-                                email,
-                                success,
-                                str(self._state.get("message") or "OpenAI 注册失败"),
-                            )
-                            self._append_log(
-                                f"已向 SMSBower 回执 Gmail 激活状态（{email}）："
-                                f"{'注册成功' if success else '注册未完成'}"
-                            )
-                        elif provider == "inventory" and self.complete_email is not None:
-                            success = email in successful_emails
-                            await self.complete_email(
-                                email,
-                                success,
-                                (
-                                    "OpenAI 注册成功"
-                                    if success
-                                    else str(
-                                        self._state.get("message") or "OpenAI 注册失败"
-                                    )
-                                ),
-                            )
-                            self._append_log(
-                                f"已向远端库存回执（{email}）："
-                                f"{'注册成功，标记已使用' if success else '注册失败，已释放，可再次注册'}"
-                            )
-                        elif provider == "inventory" and self.release_email is not None:
-                            await self.release_email(email)
+                        outcome = terminal_outcomes.get(email)
+                        success = (
+                            outcome[0] if outcome is not None else email in successful_emails
+                        )
+                        message = (
+                            outcome[1]
+                            if outcome is not None
+                            else str(self._state.get("message") or "OpenAI 注册失败")
+                        )
+                        await finalize_account(email, success, message)
                     except Exception as error:
                         self._append_log(
                             f"提交{' SMSBower 激活' if provider == 'smsbower' else '库存'}回执失败"

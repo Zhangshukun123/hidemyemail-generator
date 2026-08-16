@@ -7,6 +7,9 @@ from hidemyemail_generator.openai_registration_state import (
     configure_registration_state_recognition,
     recognize_registration_page,
 )
+from hidemyemail_generator.openai_registration_flow import (
+    configure_password_first_login,
+)
 
 
 class _Candidate:
@@ -33,12 +36,13 @@ class _Collection:
 class _StatePage:
     url = "https://auth.openai.com/log-in"
 
-    def __init__(self, state, *, expose_inputs=True):
+    def __init__(self, state, *, expose_inputs=True, body_text=""):
         self.state = state
         self.expose_inputs = expose_inputs
+        self.body_text = body_text
 
     def locator(self, selector):
-        body_text = {
+        body_text = self.body_text or {
             "email": "Log in or sign up Email address Continue",
             "password": "Enter your password Continue",
             "email_verification": "Check your inbox verification code Continue",
@@ -83,6 +87,112 @@ def test_recognition_includes_dom_evidence_for_detailed_logs():
     assert state["domSignals"]["emailInput"] is True
     assert state["domSignals"]["passwordInput"] is False
     assert state["domEvidence"] == ["body-text", "email-input"]
+
+
+def test_passwordless_verification_ignores_optional_password_control():
+    worker = SimpleNamespace(_hme_password_first_login_enabled=False)
+    page = _StatePage(
+        "email_verification",
+        body_text=(
+            "Check your inbox verification code Continue "
+            "Continue with password"
+        ),
+    )
+
+    state = recognize_registration_page(worker, page)
+
+    assert state["code"] == "email_verification"
+    assert state["stage"] == "email_verification"
+    assert state["nextAction"] == "读取本轮最新邮箱验证码并提交"
+
+
+def test_password_required_verification_reports_password_choice_as_next_action():
+    worker = SimpleNamespace(_hme_password_first_login_enabled=True)
+    page = _StatePage(
+        "email_verification",
+        body_text=(
+            "Check your inbox verification code Continue "
+            "Continue with password"
+        ),
+    )
+
+    state = recognize_registration_page(worker, page)
+
+    assert state["code"] == "email_verification"
+    assert state["stage"] == "email_verification"
+    assert state["nextAction"] == "选择“使用密码继续”，先完成密码设置"
+
+
+def test_japanese_password_form_overrides_stale_email_verification_route():
+    class JapanesePasswordPage(_StatePage):
+        url = "https://auth.openai.com/email-verification"
+
+        def locator(self, selector):
+            if selector == "body":
+                return _Collection(
+                    text=(
+                        "パスワードの作成 ChatGPT と他のOpenAI製品へのログイン時に、"
+                        "このパスワードを使用してください。メールアドレス パスワード 続行"
+                    )
+                )
+            if selector == 'input[aria-label*="パスワード" i]':
+                return _Collection([_Candidate()])
+            return _Collection()
+
+    state = recognize_registration_page(
+        SimpleNamespace(_hme_password_first_login_enabled=True),
+        JapanesePasswordPage("password"),
+    )
+
+    assert state["code"] == "password"
+    assert state["stage"] == "password"
+    assert state["currentPage"] == "OpenAI 密码页"
+    assert state["nextAction"] == "填写已保存的唯一密码并提交一次"
+    assert state["domSignals"]["passwordInput"] is True
+    assert state["locale"] == "ja-JP"
+
+
+def test_japanese_password_form_allows_password_fill_on_stale_verification_route():
+    class JapanesePasswordPage(_StatePage):
+        url = "https://auth.openai.com/email-verification"
+
+        def locator(self, selector):
+            if selector == "body":
+                return _Collection(text="パスワードの作成 パスワード 続行")
+            if selector == 'input[type="password"]':
+                return _Collection([_Candidate()])
+            return _Collection()
+
+    class Worker:
+        def __init__(self):
+            self.logs = []
+            self.password_fills = 0
+
+        def log(self, message):
+            self.logs.append(message)
+
+        def _fill_password_step(self, _page):
+            self.password_fills += 1
+
+    worker = Worker()
+    _configure(worker)
+
+    assert worker._fill_password_step(JapanesePasswordPage("password")) is None
+    assert worker.password_fills == 1
+    assert any(
+        "当前=OpenAI 密码页" in line
+        and "必要DOM=passwordInput" in line
+        and "判定=符合" in line
+        for line in worker.logs
+    )
+
+
+def test_disabled_password_first_hook_marks_worker_as_passwordless():
+    worker = SimpleNamespace()
+
+    assert configure_password_first_login(worker, enabled=False) is False
+    assert worker._hme_password_first_login_enabled is False
+    assert worker._hme_password_first_login_required is False
 
 
 def test_matching_dom_executes_action_and_logs_before_and_after_state():

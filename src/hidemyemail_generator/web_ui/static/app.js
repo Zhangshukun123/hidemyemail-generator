@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const localToken = window.__HME_LOCAL_TOKEN__;
   const pageDetails = {
-    overview: ["DASHBOARD", "概览", "集中查看账号、任务与服务状态"],
+    overview: ["CONTROL CENTER", "控制台", "集中查看任务、账号与运行状态"],
     accounts: ["ACCOUNT MANAGEMENT", "账号管理", "集中管理账号资产，并以紧凑流程发起注册任务"],
     "quick-flow": ["ONE-CLICK PIPELINE", "一键注册并提链", "注册后为尚未生成 PayPal 严格 0 链接的账号提链"],
     network: ["NETWORK ROUTING", "代理与线路", "独立管理所有注册方式共用的代理出口"],
@@ -122,6 +122,132 @@
       cancelled: ["已停止", "cancelled", "×"],
     };
     return states[status] || states.idle;
+  }
+
+  function normalizeWorkspaceTaskStatus(task = {}) {
+    const status = String(task.status || task.phase || "").trim().toLowerCase();
+    if (task.running || task.starting || ["running", "active", "cancelling"].includes(status)) {
+      return "running";
+    }
+    if (["queued", "pending", "waiting", "scheduled"].includes(status)) return "queued";
+    if (["completed", "complete", "success", "succeeded", "done"].includes(status)) {
+      return "completed";
+    }
+    if (["failed", "failure", "error"].includes(status)) return "failed";
+    if (["cancelled", "canceled", "stopped", "aborted"].includes(status)) return "stopped";
+    return "idle";
+  }
+
+  function workspaceTaskRows(state) {
+    const rows = [];
+    const numberValue = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+    };
+    const firstNumber = (task, keys, fallback = 0) => {
+      for (const key of keys) {
+        if (task[key] !== undefined && task[key] !== null && task[key] !== "") {
+          return numberValue(task[key], fallback);
+        }
+      }
+      return fallback;
+    };
+    const addTask = ({ kind, name, group, flow, route, task = {}, status, ...overrides }) => {
+      if (!task || typeof task !== "object") return;
+      const normalizedStatus = status || normalizeWorkspaceTaskStatus(task);
+      const id = String(overrides.id || task.processId || task.runId || task.id || task.taskId || "");
+      const hasActivity = normalizedStatus !== "idle" || task.startedAt || task.finishedAt;
+      if (!hasActivity) return;
+      const emails = Array.isArray(task.emails) ? task.emails.filter(Boolean) : [];
+      const email = String(overrides.email || task.email || emails[0] || task.currentEmail || "");
+      const failed = firstNumber(task, ["failed", "failureCount"], normalizedStatus === "failed" ? 1 : 0);
+      const succeeded = firstNumber(task, ["succeeded", "successCount", "generated", "registered"],
+        normalizedStatus === "completed" ? 1 : 0);
+      const completed = firstNumber(task, ["completed", "completedCount", "processed"], succeeded + failed);
+      const totalFallback = emails.length || Math.max(completed, succeeded + failed, 1);
+      const total = firstNumber(task, ["total", "requested", "targetCount", "target_count"], totalFallback);
+      const threads = Math.max(1, firstNumber(task,
+        ["effectiveConcurrency", "concurrency", "runningCount", "workers"], 1));
+      const successRate = completed > 0
+        ? Math.round((succeeded / completed) * 1000) / 10
+        : normalizedStatus === "completed" ? 100 : 0;
+      rows.push({
+        kind,
+        name: String(overrides.name || name),
+        group: String(overrides.group || group),
+        flow: String(overrides.flow || flow),
+        route,
+        id,
+        email,
+        status: normalizedStatus,
+        threads,
+        completed,
+        total,
+        succeeded,
+        failed,
+        successRate,
+        startedAt: String(overrides.startedAt || task.startedAt || ""),
+        finishedAt: String(overrides.finishedAt || task.finishedAt || ""),
+        message: String(overrides.message || task.currentAction || task.message || ""),
+      });
+    };
+    const addTaskGroup = (parent, metadata) => {
+      const tasks = Array.isArray(parent?.tasks) ? parent.tasks : [];
+      if (tasks.length) {
+        tasks.forEach((task, index) => addTask({
+          ...metadata,
+          task,
+          name: task.processLabel || task.name || metadata.name + " · " + (index + 1),
+        }));
+      } else {
+        addTask({ ...metadata, task: parent || {} });
+      }
+    };
+
+    addTaskGroup(state.registrationTask, {
+      kind: "registration", name: "账号批量注册", group: "账号注册",
+      flow: "注册新账号", route: "accounts",
+    });
+    addTaskGroup(state.protocolRegistrationTask, {
+      kind: "protocol", name: "iCloud 协议注册", group: "账号注册",
+      flow: "协议注册", route: "accounts",
+    });
+    addTask({
+      kind: "browser", name: "浏览器账号任务", group: "浏览器",
+      flow: "浏览器自动化", route: "accounts", task: state.browserTask || {},
+    });
+    addTask({
+      kind: "verification", name: "账号验证", group: "验证记录",
+      flow: "账号验证", route: "verification", task: state.verificationTask || {},
+    });
+    const quickFlows = Array.isArray(state.quickFlows) && state.quickFlows.length
+      ? state.quickFlows : state.quickFlow?.runId ? [state.quickFlow] : [];
+    quickFlows.forEach((task, index) => addTask({
+      kind: "pipeline", name: task.name || "注册提链流水线 · " + (index + 1),
+      group: "快速流程", flow: "注册并提链", route: "quick-flow", task,
+    }));
+    (state.registrationTask?.failureRecords || []).forEach((record, index) => addTask({
+      kind: "registration-failure",
+      name: "注册失败记录 · " + (index + 1),
+      group: "账号注册",
+      flow: taskStageLabel(record.failedStage || "failed"),
+      route: "accounts",
+      task: record,
+      status: "failed",
+      id: record.processId || record.taskId || "failure-" + index,
+      email: record.email || (record.emails || [])[0] || "",
+      startedAt: record.startedAt || record.recordedAt || "",
+      finishedAt: record.finishedAt || record.recordedAt || "",
+      message: record.failureReason || record.message || "注册失败",
+    }));
+    const priority = { running: 0, queued: 1, failed: 2, completed: 3, stopped: 4, idle: 5 };
+    return rows.sort((left, right) => {
+      const statusDelta = priority[left.status] - priority[right.status];
+      if (statusDelta) return statusDelta;
+      const leftAt = new Date(left.finishedAt || left.startedAt || 0).getTime() || 0;
+      const rightAt = new Date(right.finishedAt || right.startedAt || 0).getTime() || 0;
+      return rightAt - leftAt;
+    });
   }
 
   function taskStageLabel(stage) {
@@ -310,13 +436,19 @@
       document.querySelectorAll("[data-view]").forEach((view) => {
         view.hidden = view.dataset.view !== target;
       });
-      document.querySelectorAll(".nav-item[data-route]").forEach((button) => {
-        button.classList.toggle("active", button.dataset.route === target);
+      document.querySelectorAll(".nav-item[data-route], .workspace-route-tab[data-route]").forEach((button) => {
+        const active = button.dataset.route === target;
+        button.classList.toggle("active", active);
+        if (button.classList.contains("workspace-route-tab")) {
+          if (active) button.setAttribute("aria-current", "page");
+          else button.removeAttribute("aria-current");
+        }
       });
       const details = pageDetails[target];
       $("viewEyebrow").textContent = details[0];
       $("viewTitle").textContent = details[1];
       $("viewSubtitle").textContent = details[2];
+      $("commandCenterLabel").textContent = "账号工作台 — " + details[1];
       document.title = details[1] + " · 账号工作台";
       this.routes[target]();
     }
@@ -946,7 +1078,10 @@
   }
 
   class WorkspaceRenderer {
-    constructor(store) { this.store = store; }
+    constructor(store) {
+      this.store = store;
+      this.controlTaskFilter = "all";
+    }
 
     paypalPaymentAction(item, state) {
       if (!item?.email || !item?.url) return "";
@@ -979,6 +1114,33 @@
       $("sidebarRuntimeDot").className = available ? "" : "bad";
       $("runtimeLabel").textContent = available ? "运行环境已连接" : "运行环境不可用";
       $("sidebarRuntimeLabel").textContent = available ? "运行环境已连接" : "运行环境不可用";
+      const rows = workspaceTaskRows(state);
+      const counts = {
+        running: rows.filter((item) => item.status === "running").length,
+        queued: rows.filter((item) => item.status === "queued").length,
+        completed: rows.filter((item) => item.status === "completed").length,
+        failed: rows.filter((item) => item.status === "failed").length,
+      };
+      $("sidebarAllTaskCount").textContent = rows.length;
+      $("sidebarRunningTaskCount").textContent = counts.running;
+      $("sidebarCompletedTaskCount").textContent = counts.completed;
+      $("sidebarFailedTaskCount").textContent = counts.failed;
+      $("sidebarAccountResourceCount").textContent = state.accounts.length;
+      $("sidebarProxyResourceCount").textContent = [
+        state.registrationProxy, state.cardLinkProxy,
+      ].filter((item) => item?.configured).length;
+      $("sidebarProfileResourceCount").textContent = (state.roxyRegistration?.profiles || []).length;
+      $("sidebarApiResourceCount").textContent = [
+        state.inbox?.configured, state.smsBower?.configured, state.paypal?.available,
+      ].filter(Boolean).length;
+      $("footerRuntimeDot").className = available ? "ok" : "bad";
+      $("footerRuntimeLabel").textContent = available ? "连接正常" : "运行环境不可用";
+      $("footerRunningCount").textContent = counts.running;
+      $("footerQueuedCount").textContent = counts.queued;
+      $("footerSuccessCount").textContent = counts.completed;
+      $("footerFailedCount").textContent = counts.failed;
+      $("footerApiDot").className = available ? "ok" : "bad";
+      $("footerApiLabel").textContent = available ? "正常" : "异常";
     }
 
     renderOverview(state) {
@@ -1041,6 +1203,69 @@
         '<div class="service-row"><span><i>' + (item[1] ? "✓" : "!") + '</i>' +
         item[0] + "</span><strong>" + item[2] + "</strong></div>"
       ).join("");
+      this.renderControlCenter(state);
+    }
+
+    renderControlCenter(state) {
+      const rows = workspaceTaskRows(state);
+      const statuses = ["running", "queued", "completed", "failed", "stopped"];
+      const counts = Object.fromEntries(statuses.map((status) => [
+        status, rows.filter((item) => item.status === status).length,
+      ]));
+      $("controlTaskCountAll").textContent = rows.length;
+      $("controlTaskCountRunning").textContent = counts.running;
+      $("controlTaskCountQueued").textContent = counts.queued;
+      $("controlTaskCountCompleted").textContent = counts.completed;
+      $("controlTaskCountFailed").textContent = counts.failed;
+      $("controlTaskCountStopped").textContent = counts.stopped;
+      const query = $("controlTaskSearch")?.value.trim().toLocaleLowerCase("zh-CN") || "";
+      const filtered = rows.filter((item) => {
+        const statusMatches = this.controlTaskFilter === "all" || item.status === this.controlTaskFilter;
+        const queryMatches = !query || [
+          item.name, item.group, item.flow, item.email, item.id, item.message,
+        ].join(" ").toLocaleLowerCase("zh-CN").includes(query);
+        return statusMatches && queryMatches;
+      });
+      const statusLabels = {
+        running: "运行中", queued: "排队中", completed: "已完成",
+        failed: "失败", stopped: "已停止", idle: "空闲",
+      };
+      $("controlTaskSummary").textContent = "显示 " + filtered.length + " / " + rows.length +
+        " 个真实任务 · 更新于 " + formatClock(new Date().toISOString());
+      $("controlTaskTableBody").innerHTML = filtered.length ? filtered.map((item) => {
+        const detail = item.email || item.id || item.message || "后端任务状态";
+        const progress = item.completed + " / " + item.total;
+        const duration = formatElapsed(item.startedAt, item.finishedAt);
+        return '<tr><td><div class="control-task-name"><strong>' + escapeHtml(item.name) +
+          '</strong><small title="' + escapeHtml(detail) + '">' + escapeHtml(detail) +
+          '</small></div></td><td>' + escapeHtml(item.group) + '</td><td>' +
+          escapeHtml(item.flow) + '</td><td>' + item.threads + '</td><td>' +
+          escapeHtml(progress) + '</td><td>' + escapeHtml(item.successRate.toFixed(1)) +
+          '%</td><td><span class="control-task-status ' + escapeHtml(item.status) +
+          ' status-' + escapeHtml(item.status) + '">' + escapeHtml(statusLabels[item.status] || "空闲") +
+          '</span></td><td class="control-task-duration">' + escapeHtml(duration) +
+          '</td><td><button class="control-task-action" type="button" data-route="' +
+          escapeHtml(item.route) + '" aria-label="打开' + escapeHtml(item.name) +
+          '">•••</button></td></tr>';
+      }).join("") : '<tr><td colspan="9"><div class="control-task-empty"><strong>暂无匹配任务</strong>' +
+        '<span>启动注册、浏览器、协议、验证或提链流程后，这里会显示真实状态。</span></div></td></tr>';
+    }
+
+    renderTerminalPreview(model) {
+      const logs = (model?.logs || []).slice(-9);
+      $("terminalPreviewTask").textContent = model?.statusLabel || "等待任务";
+      const levelLabels = {
+        error: "ERROR", warning: "WARN", waiting: "WAIT",
+        success: "INFO", active: "INFO", idle: "INFO",
+      };
+      $("terminalPreviewList").innerHTML = logs.length ? logs.map((item) =>
+        '<div class="terminal-preview-row" data-level="' + escapeHtml(item.status || "idle") +
+        '"><time>' + escapeHtml(formatLogTimestamp(item.at)) + '</time><span class="terminal-preview-level">[' +
+        escapeHtml(levelLabels[item.status] || "INFO") + ']</span><span class="terminal-preview-source">[' +
+        escapeHtml(item.sourceLabel || item.source || "WORKSPACE") + ']</span><p>' +
+        escapeHtml(item.message || "（无消息内容）") + '</p></div>'
+      ).join("") : '<div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，' +
+        '日志会显示在这里；详细上下文仍可从右侧运行日志打开。</div>';
     }
 
     filteredAccounts(state) {
@@ -2195,6 +2420,9 @@
       });
       this.commands = new CommandBus((message, type) => this.toast(message, type));
       this.pollTimers = {};
+      this.autoRefreshTimer = 0;
+      this.refreshInFlight = null;
+      this.clockTimer = 0;
       this.bindCommands();
     }
 
@@ -2208,6 +2436,7 @@
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
       this.runtimeLogPresenter.present(state);
+      this.renderer.renderTerminalPreview(this.runtimeLogPresenter.model);
       if (this.router.current === "pp-payment") this.renderer.renderPayPal(state);
       if (this.router.current === "settings") this.renderer.renderSettings(state);
     }
@@ -2234,6 +2463,53 @@
     schedule(name, callback, delay = 1500) {
       clearTimeout(this.pollTimers[name]);
       this.pollTimers[name] = setTimeout(callback, delay);
+    }
+
+    updateWorkspaceClock() {
+      $("workspaceLocalTime").textContent = new Date().toLocaleString("zh-CN", {
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+      }).replaceAll("/", "-");
+    }
+
+    async refreshWorkspaceData() {
+      if (this.refreshInFlight) return this.refreshInFlight;
+      const operation = Promise.allSettled([
+        this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
+        this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(),
+        this.loadRegistrationProxy(), this.loadCardLinkProxy(), this.loadRoxyRegistration(),
+        this.loadSmsBower(), this.loadPayPal(),
+      ]);
+      this.refreshInFlight = operation;
+      try {
+        return await operation;
+      } finally {
+        if (this.refreshInFlight === operation) this.refreshInFlight = null;
+      }
+    }
+
+    scheduleWorkspaceRefresh() {
+      clearTimeout(this.autoRefreshTimer);
+      if (!$("workspaceAutoRefresh").checked) return;
+      const delay = [5000, 10000, 30000].includes(Number($("workspaceRefreshInterval").value))
+        ? Number($("workspaceRefreshInterval").value) : 5000;
+      this.autoRefreshTimer = setTimeout(async () => {
+        await this.refreshWorkspaceData();
+        this.scheduleWorkspaceRefresh();
+      }, delay);
+    }
+
+    setTerminalPreviewCollapsed(collapsed, persist = true) {
+      const panel = $("workbenchTerminalPanel");
+      const button = panel.querySelector('[data-action="toggle-terminal-preview"]');
+      document.documentElement.dataset.terminalCollapsed = collapsed ? "true" : "false";
+      document.body.classList.toggle("terminal-preview-collapsed", collapsed);
+      panel.classList.toggle("is-collapsed", collapsed);
+      button.textContent = collapsed ? "⌃" : "⌄";
+      button.setAttribute("aria-expanded", String(!collapsed));
+      button.setAttribute("aria-label", collapsed ? "展开终端预览" : "折叠终端预览");
+      button.title = collapsed ? "展开终端预览" : "折叠终端预览";
+      if (persist) localStorage.setItem("hme_terminal_preview_collapsed", collapsed ? "1" : "0");
     }
 
     async refreshRuntimeLogStatus() {
@@ -2836,8 +3112,18 @@
         await this.copyText(output);
         return "已复制 " + this.runtimeLogPresenter.visibleLogs.length + " 条详细日志";
       });
+      this.commands.register("toggle-terminal-preview", async () => {
+        const collapsed = !$("workbenchTerminalPanel").classList.contains("is-collapsed");
+        this.setTerminalPreviewCollapsed(collapsed);
+      });
+      this.commands.register("focus-control-task-search", async () => {
+        $("controlTaskSearch").focus();
+      });
       this.commands.register("refresh", async () => {
-        await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal()]);
+        const results = await this.refreshWorkspaceData();
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure) throw failure.reason;
+        this.scheduleWorkspaceRefresh();
         return "数据已刷新";
       });
       this.commands.register("reload-paypal", async () => {
@@ -3517,6 +3803,17 @@
           this.renderer.renderSettings(this.store.state);
           return;
         }
+        const controlTaskFilter = event.target.closest("[data-control-task-filter]");
+        if (controlTaskFilter) {
+          document.querySelectorAll("[data-control-task-filter]").forEach((button) => {
+            const active = button === controlTaskFilter;
+            button.classList.toggle("active", active);
+            button.setAttribute("aria-selected", String(active));
+          });
+          this.renderer.controlTaskFilter = controlTaskFilter.dataset.controlTaskFilter || "all";
+          this.renderer.renderControlCenter(this.store.state);
+          return;
+        }
         const verifyFilter = event.target.closest("[data-verify-filter]");
         if (verifyFilter) {
           document.querySelectorAll("[data-verify-filter]").forEach((button) => button.classList.remove("active"));
@@ -3529,6 +3826,19 @@
       });
       ["accountSearch", "accountPlanFilter", "accountSessionFilter"].forEach((id) => {
         $(id).addEventListener(id === "accountSearch" ? "input" : "change", () => this.renderer.renderAccounts(this.store.state));
+      });
+      $("controlTaskSearch").addEventListener("input", () =>
+        this.renderer.renderControlCenter(this.store.state));
+      $("workspaceAutoRefresh").addEventListener("change", (event) => {
+        localStorage.setItem("hme_workspace_auto_refresh", event.target.checked ? "1" : "0");
+        this.scheduleWorkspaceRefresh();
+      });
+      $("workspaceRefreshInterval").addEventListener("change", (event) => {
+        const value = ["5000", "10000", "30000"].includes(event.target.value)
+          ? event.target.value : "5000";
+        event.target.value = value;
+        localStorage.setItem("hme_workspace_refresh_interval", value);
+        this.scheduleWorkspaceRefresh();
       });
       $("runtimeLogSearch").addEventListener("input", () => this.runtimeLogPresenter.refilter());
       $("runtimeLogLevel").addEventListener("change", () => this.runtimeLogPresenter.refilter());
@@ -3890,6 +4200,18 @@
 
     async start() {
       const savedTheme = localStorage.getItem("hme_theme") || "dark";
+      const savedAutoRefresh = localStorage.getItem("hme_workspace_auto_refresh");
+      $("workspaceAutoRefresh").checked = savedAutoRefresh !== "0";
+      const savedRefreshInterval = localStorage.getItem("hme_workspace_refresh_interval") || "5000";
+      $("workspaceRefreshInterval").value = ["5000", "10000", "30000"].includes(savedRefreshInterval)
+        ? savedRefreshInterval : "5000";
+      this.setTerminalPreviewCollapsed(
+        localStorage.getItem("hme_terminal_preview_collapsed") === "1",
+        false
+      );
+      this.updateWorkspaceClock();
+      clearInterval(this.clockTimer);
+      this.clockTimer = setInterval(() => this.updateWorkspaceClock(), 1000);
       const savedRegistrationMode = localStorage.getItem("hme_registration_mode");
       const registrationMode = ["headless", "headed", "roxy", "protocol"].includes(savedRegistrationMode)
         ? savedRegistrationMode : "headed";
@@ -3934,12 +4256,10 @@
       this.store.subscribe((state) => this.render(state));
       this.bindEvents();
       this.router.start();
-      const results = await Promise.allSettled([
-        this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(), this.loadProtocolRegistrationTask(),
-        this.loadVerificationTask(), this.loadInbox(), this.loadRegistrationProxy(), this.loadCardLinkProxy(), this.loadRoxyRegistration(), this.loadSmsBower(), this.loadPayPal(),
-      ]);
+      const results = await this.refreshWorkspaceData();
       const failure = results.find((result) => result.status === "rejected");
       if (failure) this.toast(failure.reason.message, "error");
+      this.scheduleWorkspaceRefresh();
     }
   }
 

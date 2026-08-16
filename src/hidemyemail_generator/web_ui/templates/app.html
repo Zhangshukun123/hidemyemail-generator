@@ -24,12 +24,21 @@
     <symbol id="i-panel-expand" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m3-12 4 4-4 4"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
     <symbol id="i-logout" viewBox="0 0 24 24"><path d="m10 17 5-5-5-5M15 12H3"/><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"/></symbol>
+    <symbol id="i-plus-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></symbol>
+    <symbol id="i-import" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 14v5h14v-5"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6.5h7l2 2h9v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-11Z"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6.5 7v6l-3 1v-7L4 5Z"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
   </svg>
 
   <header class="workbench-titlebar" aria-label="工作台标题栏">
     <div class="titlebar-brand"><span class="codex-glyph" aria-hidden="true">⌁</span><span>Hide My Email · 账号工作台</span></div>
-    <button class="command-center" type="button" data-route="overview" aria-label="返回账号工作台概览">
-      <svg aria-hidden="true"><use href="#i-dashboard"/></svg><span>账号工作台 — 输入命令或搜索</span><kbd>Ctrl K</kbd>
+    <button class="command-center" type="button" data-route="overview" aria-label="返回账号工作台控制台">
+      <svg aria-hidden="true"><use href="#i-dashboard"/></svg><span id="commandCenterLabel">账号工作台 — 控制台</span><kbd>Ctrl K</kbd>
     </button>
     <div class="header-actions">
       <span class="runtime-pill"><i id="runtimeDot"></i><span id="runtimeLabel">正在连接运行环境</span></span>
@@ -51,40 +60,92 @@
       <button class="nav-item activity-item" type="button" data-route="verification" aria-label="验证记录" title="验证记录"><svg><use href="#i-checklist"/></svg><span class="activity-label">验证记录</span></button>
       <button class="nav-item activity-item" type="button" data-route="settings" aria-label="系统设置" title="系统设置"><svg><use href="#i-settings"/></svg><span class="activity-label">系统设置</span></button>
     </nav>
-    <aside id="workbenchSidebar" class="sidebar" aria-label="主导航">
-      <div class="product-lockup sidebar-brand">
-        <span class="product-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7.2 18.2h10a4.3 4.3 0 0 0 .7-8.5A6 6 0 0 0 6.5 8.1a5.1 5.1 0 0 0 .7 10.1Z"/><path d="m7.5 11.5 4.5 3.2 4.5-3.2"/><rect x="7.5" y="10" width="9" height="6.5" rx="1.5"/></svg></span>
-        <span class="sidebar-brand-copy"><strong>账号工作台</strong><small>ACCOUNT WORKSPACE</small></span>
+    <aside id="workbenchSidebar" class="sidebar" aria-label="资源管理器与主导航">
+      <div class="product-lockup sidebar-brand explorer-title">
+        <span class="sidebar-brand-copy"><strong>资源管理器</strong><small>EXPLORER</small></span>
         <button id="sidebarCollapseButton" class="sidebar-collapse-button" type="button" data-action="toggle-sidebar" aria-controls="workbenchSidebar" aria-expanded="true" aria-label="折叠导航" title="折叠导航"><svg aria-hidden="true"><use href="#i-panel-collapse"/></svg></button>
       </div>
-      <div class="nav-section-title">账号工作区</div>
+      <div class="nav-section-title">账号工作台</div>
       <nav class="nav-list">
-        <button class="nav-item" type="button" data-route="overview"><svg><use href="#i-dashboard"/></svg><span>概览</span></button>
-        <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>账号管理</span><b id="accountNavCount">—</b></button>
-        <button class="nav-item" type="button" data-route="quick-flow"><svg><use href="#i-rocket"/></svg><span>注册并提链</span><b id="quickFlowNavState">NEW</b></button>
-        <button class="nav-item" type="button" data-route="network"><svg><use href="#i-network"/></svg><span>代理与线路</span><b id="networkNavState">—</b></button>
+        <button class="nav-item" type="button" data-route="overview"><svg><use href="#i-dashboard"/></svg><span>控制台</span></button>
+        <button class="nav-item" type="button" data-route="quick-flow"><svg><use href="#i-rocket"/></svg><span>快速流程</span><b id="quickFlowNavState">NEW</b></button>
+        <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>账号库存</span><b id="accountNavCount">—</b></button>
+        <button class="nav-item" type="button" data-route="network"><svg><use href="#i-network"/></svg><span>网络线路</span><b id="networkNavState">—</b></button>
         <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>直卡提链接</span><b id="cardLinkNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="pp-payment"><svg><use href="#i-paypal"/></svg><span>PP 支付</span><b id="paypalNavState">—</b></button>
         <button class="nav-item" type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span>验证记录</span></button>
-        <button class="nav-item" type="button" data-route="settings"><svg><use href="#i-settings"/></svg><span>系统设置</span></button>
+        <button class="nav-item" type="button" data-route="settings"><svg><use href="#i-settings"/></svg><span>设置</span></button>
       </nav>
+      <section class="sidebar-tree-section" aria-labelledby="sidebarTaskGroupTitle">
+        <div class="sidebar-tree-heading"><span id="sidebarTaskGroupTitle">任务分组</span><b aria-hidden="true">＋</b></div>
+        <div class="sidebar-tree-items">
+          <span><svg><use href="#i-folder"/></svg><em>全部任务</em><b id="sidebarAllTaskCount">0</b></span>
+          <span><svg><use href="#i-folder"/></svg><em>运行中</em><b id="sidebarRunningTaskCount">0</b></span>
+          <span><svg><use href="#i-folder"/></svg><em>已完成</em><b id="sidebarCompletedTaskCount">0</b></span>
+          <span><svg><use href="#i-folder"/></svg><em>失败任务</em><b id="sidebarFailedTaskCount">0</b></span>
+        </div>
+      </section>
+      <section class="sidebar-tree-section" aria-labelledby="sidebarResourceTitle">
+        <div class="sidebar-tree-heading"><span id="sidebarResourceTitle">资源</span><b aria-hidden="true">＋</b></div>
+        <div class="sidebar-tree-items">
+          <span><svg><use href="#i-mail"/></svg><em>邮箱账号</em><b id="sidebarAccountResourceCount">0</b></span>
+          <span><svg><use href="#i-network"/></svg><em>代理线路</em><b id="sidebarProxyResourceCount">0</b></span>
+          <span><svg><use href="#i-dashboard"/></svg><em>指纹环境</em><b id="sidebarProfileResourceCount">0</b></span>
+          <span><svg><use href="#i-settings"/></svg><em>API 配置</em><b id="sidebarApiResourceCount">0</b></span>
+        </div>
+      </section>
       <div class="sidebar-status"><span><i id="sidebarRuntimeDot"></i><b id="sidebarRuntimeLabel">正在检查运行环境</b></span><small>版本 1.3.0</small></div>
     </aside>
     <button id="sidebarExpandRail" class="sidebar-expand-rail" type="button" data-action="toggle-sidebar" aria-controls="workbenchSidebar" aria-expanded="false" aria-label="展开导航" title="展开导航" hidden><svg aria-hidden="true"><use href="#i-panel-expand"/></svg></button>
 
     <main class="workspace">
+      <nav class="workspace-route-tabs" aria-label="已打开的工作台视图">
+        <button class="workspace-route-tab" type="button" data-route="overview"><span>控制台</span><b aria-hidden="true">×</b></button>
+        <button class="workspace-route-tab" type="button" data-route="quick-flow"><span>运行任务</span><b aria-hidden="true">×</b></button>
+        <button class="workspace-route-tab" type="button" data-route="accounts"><span>账号库存</span><b aria-hidden="true">×</b></button>
+        <button class="workspace-route-tab" type="button" data-route="network"><span>网络线路</span><b aria-hidden="true">×</b></button>
+        <button class="workspace-route-tab" type="button" data-route="settings"><span>设置</span><b aria-hidden="true">×</b></button>
+        <button class="workspace-route-add" type="button" data-route="quick-flow" aria-label="创建新的快速流程" title="创建新的快速流程">＋</button>
+      </nav>
       <header class="workspace-header">
-        <div class="workspace-title-group"><div class="editor-breadcrumb"><span>账号工作台</span><i>›</i><span id="viewEyebrow" class="eyebrow">ACCOUNT WORKSPACE</span></div><h1 id="viewTitle">概览</h1><p id="viewSubtitle">集中查看账号、任务与服务状态</p></div>
+        <div class="workspace-title-group"><div class="editor-breadcrumb"><span>账号工作台</span><i>›</i><span id="viewEyebrow" class="eyebrow">CONTROL CENTER</span></div><h1 id="viewTitle">控制台</h1><p id="viewSubtitle">集中查看任务、账号与运行状态</p></div>
+        <div class="workspace-header-tools">
+          <span class="workspace-clock">本地时间：<b id="workspaceLocalTime">--:--:--</b></span>
+          <button class="icon-button" type="button" data-action="refresh" aria-label="立即刷新" title="立即刷新"><svg><use href="#i-refresh"/></svg></button>
+          <label class="workspace-auto-refresh"><span>自动刷新</span><input id="workspaceAutoRefresh" type="checkbox" checked><i aria-hidden="true"></i></label>
+          <select id="workspaceRefreshInterval" aria-label="自动刷新间隔"><option value="5000">5 秒</option><option value="10000">10 秒</option><option value="30000">30 秒</option></select>
+        </div>
       </header>
 
-      <section class="view" id="overviewView" data-view="overview">
-        <div id="overviewMetrics" class="metric-grid"></div>
-        <div class="dashboard-grid">
-          <article class="panel span-5"><div class="panel-head"><div><h2>账号状态</h2><p>当前账号分类与可用状态</p></div></div><div id="accountDistribution" class="distribution"></div></article>
-          <article class="panel span-7"><div class="panel-head"><div><h2>注册流程</h2><p>从隐藏邮箱到 2FA 的完成情况</p></div></div><div id="registrationPipeline" class="pipeline"></div></article>
-          <article class="panel span-8"><div class="panel-head"><div><h2>最近账号</h2><p>按最近活动时间排序</p></div><button class="text-button" data-route="accounts">查看全部</button></div><div id="recentAccounts" class="compact-table"></div></article>
-          <article class="panel span-4"><div class="panel-head"><div><h2>服务状态</h2><p>本地运行依赖检查</p></div><span id="serviceStatusBadge" class="badge success">检查中</span></div><div id="serviceStatusList" class="service-list"></div></article>
-        </div>
+      <section class="view control-center-view" id="overviewView" data-view="overview">
+        <section class="control-quick-panel" aria-labelledby="controlQuickTitle">
+          <div class="control-section-title"><div><h2 id="controlQuickTitle">快速操作</h2><p>进入现有配置流程，避免绕过确认直接执行</p></div></div>
+          <div class="control-quick-grid">
+            <button type="button" data-route="quick-flow"><svg><use href="#i-plus-circle"/></svg><span><strong>新建任务</strong><small>创建自动化流程</small></span></button>
+            <button type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span><strong>批量注册</strong><small>配置并注册账号</small></span></button>
+            <button type="button" data-route="accounts"><svg><use href="#i-import"/></svg><span><strong>账号库存</strong><small>查看现有账号</small></span></button>
+            <button type="button" data-route="quick-flow"><svg><use href="#i-play"/></svg><span><strong>启动流程</strong><small>配置后安全启动</small></span></button>
+            <button type="button" data-route="accounts"><svg class="danger"><use href="#i-stop"/></svg><span><strong>停止任务</strong><small>进入任务控制台</small></span></button>
+            <button type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span><strong>验证账号</strong><small>检查失效账号</small></span></button>
+            <button type="button" data-route="settings"><svg><use href="#i-more"/></svg><span><strong>更多操作</strong><small>打开系统设置</small></span></button>
+          </div>
+        </section>
+        <section class="control-task-panel" aria-labelledby="controlTaskTitle">
+          <header class="control-task-header">
+            <div class="control-section-title"><div><h2 id="controlTaskTitle">任务列表</h2><p id="controlTaskSummary">正在汇总真实任务状态</p></div></div>
+            <div class="control-task-tools"><label><svg><use href="#i-list"/></svg><input id="controlTaskSearch" type="search" placeholder="搜索任务名称或账号"></label><button type="button" data-action="focus-control-task-search" aria-label="聚焦任务筛选" title="聚焦任务筛选"><svg><use href="#i-filter"/></svg></button></div>
+          </header>
+          <div class="control-task-filters" role="tablist" aria-label="任务状态筛选">
+            <button class="active" role="tab" aria-selected="true" type="button" data-control-task-filter="all">全部 <b id="controlTaskCountAll">0</b></button>
+            <button role="tab" aria-selected="false" type="button" data-control-task-filter="running">运行中 <b id="controlTaskCountRunning">0</b></button>
+            <button role="tab" aria-selected="false" type="button" data-control-task-filter="queued">排队中 <b id="controlTaskCountQueued">0</b></button>
+            <button role="tab" aria-selected="false" type="button" data-control-task-filter="completed">已完成 <b id="controlTaskCountCompleted">0</b></button>
+            <button role="tab" aria-selected="false" type="button" data-control-task-filter="failed">失败 <b id="controlTaskCountFailed">0</b></button>
+            <button role="tab" aria-selected="false" type="button" data-control-task-filter="stopped">已停止 <b id="controlTaskCountStopped">0</b></button>
+          </div>
+          <div class="control-task-table-scroll"><table class="control-task-table"><thead><tr><th>任务名称</th><th>分组</th><th>流程</th><th>线程</th><th>已完成/总数</th><th>成功率</th><th>状态</th><th>运行时长</th><th>操作</th></tr></thead><tbody id="controlTaskTableBody"></tbody></table></div>
+        </section>
+        <div class="legacy-overview-data" hidden aria-hidden="true"><div id="overviewMetrics"></div><div id="accountDistribution"></div><div id="registrationPipeline"></div><div id="recentAccounts"></div><span id="serviceStatusBadge"></span><div id="serviceStatusList"></div></div>
       </section>
 
       <section class="view account-workspace-view" id="accountsView" data-view="accounts" data-layout="task-first" hidden>
@@ -357,7 +418,20 @@
         <div class="settings-layout"><aside class="panel settings-nav"><button class="active" data-settings-section="imap">邮箱与 IMAP</button><button data-settings-section="browser">浏览器运行</button><button data-settings-section="workbench">工作台集成</button><button data-settings-section="security">安全与访问</button><button data-settings-section="appearance">外观</button></aside><article class="panel settings-content"><div class="panel-head"><div><h2 id="settingsTitle">邮箱与 IMAP</h2><p id="settingsSubtitle">配置验证码收件服务</p></div><span id="settingsStatus" class="badge">尚未检查</span></div><div id="settingsPanel"></div></article></div>
       </section>
     </main>
+    <section id="workbenchTerminalPanel" class="workbench-terminal-panel" aria-labelledby="terminalPreviewTitle">
+      <header class="terminal-preview-header">
+        <nav aria-label="底部面板"><button type="button" disabled>问题</button><button type="button" disabled>输出</button><button type="button" disabled>调试控制台</button><button class="active" type="button" id="terminalPreviewTitle">终端</button><button type="button" disabled>任务日志</button></nav>
+        <div><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="open-runtime-log" aria-controls="runtimeLogDrawer" aria-expanded="false">展开详细日志</button><button type="button" data-action="toggle-terminal-preview" aria-label="折叠终端预览" title="折叠终端预览">⌄</button></div>
+      </header>
+      <div id="terminalPreviewList" class="terminal-preview-list" role="log" aria-live="off"><div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，日志会显示在这里。</div></div>
+    </section>
   </div>
+  <footer class="workbench-footer" aria-label="工作台状态栏">
+    <button type="button" data-action="open-runtime-log" aria-controls="runtimeLogDrawer" aria-expanded="false"><i id="footerRuntimeDot"></i><span id="footerRuntimeLabel">正在连接</span></button>
+    <span>环境：本地</span><span>版本：2.1.0</span>
+    <div class="workbench-footer-spacer"></div>
+    <span>运行中：<b id="footerRunningCount">0</b></span><span>排队中：<b id="footerQueuedCount">0</b></span><span>成功：<b id="footerSuccessCount">0</b></span><span class="footer-failed">失败：<b id="footerFailedCount">0</b></span><span class="footer-api"><i id="footerApiDot"></i>API：<b id="footerApiLabel">检查中</b></span>
+  </footer>
   <div id="runtimeLogBackdrop" class="runtime-log-backdrop" data-action="close-runtime-log" hidden></div>
   <aside id="runtimeLogDrawer" class="runtime-log-drawer" role="dialog" aria-modal="true" aria-labelledby="runtimeLogTitle" aria-describedby="runtimeLogSubtitle" hidden>
     <div id="runtimeLogResizeHandle" class="runtime-log-resize-handle" role="separator" tabindex="0" aria-label="调整运行日志宽度" aria-orientation="vertical" aria-controls="runtimeLogDrawer" aria-valuemin="420" aria-valuemax="1200" aria-valuenow="680" aria-valuetext="680 像素" title="左右拖动调整宽度；方向键微调；双击恢复默认">

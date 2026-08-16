@@ -151,6 +151,19 @@ def browser_log_context(
     stage = "running"
     location = "注册任务"
     action = detail or "处理浏览器任务"
+    contains_password = "密码" in text or "password" in normalized
+    contains_verification = (
+        "验证码" in text or "verification" in normalized or "otp" in normalized
+    )
+    explicit_email_verification_page = any(
+        marker in normalized
+        for marker in (
+            "当前=邮箱验证码页",
+            "当前页面=邮箱验证码页",
+            "当前为邮箱验证页面",
+            "email-verification",
+        )
+    )
 
     google_page_markers = (
         "Google 账号登录页面",
@@ -188,19 +201,22 @@ def browser_log_context(
         stage = "security"
         location = "安全验证页"
         action = "等待手动完成安全验证，完成后自动继续"
-    elif "密码" in text or "password" in normalized:
-        stage = "password"
-        location = "OpenAI 密码页"
-        if "等待" in text or "使用密码继续" in text:
-            action = "等待密码输入页并持续监测"
-        elif any(marker in text for marker in ("已提交", "已设置", "保存唯一密码")):
-            action = "填写并提交账号密码"
-        else:
-            action = "检查并处理密码登录"
-    elif "验证码" in text or "verification" in normalized or "otp" in normalized:
+    elif explicit_email_verification_page or (
+        contains_verification and not contains_password
+    ):
         stage = "email_verification"
         location = "邮箱验证码页"
         if any(
+            marker in text
+            for marker in (
+                "选择“使用密码继续”",
+                "选择使用密码继续",
+                "使用密码继续=可见",
+                "点击“使用密码继续”",
+            )
+        ):
+            action = "在验证码页选择使用密码继续"
+        elif any(
             marker in text
             for marker in (
                 "已点击验证码页面继续按钮",
@@ -246,6 +262,15 @@ def browser_log_context(
             action = "定位验证码输入框并准备写入"
         else:
             action = "核对邮箱验证码页面状态"
+    elif contains_password:
+        stage = "password"
+        location = "OpenAI 密码页"
+        if "等待" in text or "使用密码继续" in text:
+            action = "等待密码输入页并持续监测"
+        elif any(marker in text for marker in ("已提交", "已设置", "保存唯一密码")):
+            action = "填写并提交账号密码"
+        else:
+            action = "检查并处理密码登录"
     elif any(
         marker in text
         for marker in (
@@ -822,6 +847,11 @@ class BrowserTaskManager:
                     "two_factor": account.get("two_factor")
                     if isinstance(account.get("two_factor"), dict)
                     else {},
+                    "on_finished": (
+                        account.get("_on_finished")
+                        if callable(account.get("_on_finished"))
+                        else None
+                    ),
                 }
             )
         if not deduplicated:
@@ -928,6 +958,11 @@ class BrowserTaskManager:
                     "_password_first_required": item["password_first_required"],
                     "_foreground_required": item["foreground_required"],
                     "_two_factor": item["two_factor"],
+                    "_on_finished": (
+                        item.get("on_finished")
+                        if callable(item.get("on_finished"))
+                        else None
+                    ),
                     "_fingerprint_retry_count": 0,
                     "fingerprintRetries": 0,
                     "_transient_retry_count": 0,
@@ -1182,7 +1217,14 @@ class BrowserTaskManager:
         semaphore = asyncio.Semaphore(concurrency)
         try:
             accounts = self._state["accounts"]
-            if (
+            if concurrency == 1:
+                for item in accounts:
+                    await self._run_account(
+                        item,
+                        semaphore=semaphore,
+                        headless=headless,
+                    )
+            elif (
                 self._state.get("browserEngine") == "roxy"
                 and len(accounts) > concurrency
             ):
@@ -1230,6 +1272,40 @@ class BrowserTaskManager:
             self._processes.clear()
 
     async def _run_account(
+        self,
+        item: dict[str, Any],
+        *,
+        semaphore: asyncio.Semaphore,
+        headless: bool,
+    ) -> None:
+        try:
+            await self._run_account_inner(
+                item,
+                semaphore=semaphore,
+                headless=headless,
+            )
+        finally:
+            await self._notify_account_finished(item)
+
+    async def _notify_account_finished(self, item: dict[str, Any]) -> None:
+        callback = item.get("_on_finished")
+        if not callable(callback) or item.get("_finished_callback_completed"):
+            return
+        email = str(item.get("email") or "").strip().lower()
+        success = item.get("status") == "success"
+        message = str(item.get("message") or "")[:500]
+        try:
+            await callback(email, success, message)
+        except Exception as error:
+            self._append_log(
+                f"账号流程已结束，但逐账号完成回调失败：{str(error)[:300]}",
+                email=email,
+                event_type="account_finished_callback_error",
+            )
+            return
+        item["_finished_callback_completed"] = True
+
+    async def _run_account_inner(
         self,
         item: dict[str, Any],
         *,

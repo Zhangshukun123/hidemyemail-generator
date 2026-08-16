@@ -34,6 +34,15 @@ try:
         registration_action_labels,
         registration_action_selectors,
     )
+    from .registration_activity import (
+        CLICK_RESPONSE_SECONDS,
+        MAX_NO_RESPONSE_CLICK_ATTEMPTS,
+        ensure_registration_activity_monitor,
+        registration_activity_snapshot,
+        registration_chain_snapshot,
+        skip_registration_step,
+        wait_for_registration_activity,
+    )
     from . import registration_auth as _registration_auth
 except ImportError:
     from browser_platform import (
@@ -59,6 +68,15 @@ except ImportError:
         registration_action_labels,
         registration_action_selectors,
     )
+    from registration_activity import (
+        CLICK_RESPONSE_SECONDS,
+        MAX_NO_RESPONSE_CLICK_ATTEMPTS,
+        ensure_registration_activity_monitor,
+        registration_activity_snapshot,
+        registration_chain_snapshot,
+        skip_registration_step,
+        wait_for_registration_activity,
+    )
     import registration_auth as _registration_auth
 
 _auth_click_email_submit = _registration_auth.click_email_submit
@@ -74,6 +92,61 @@ _REGISTRATION_CLIPBOARD_LOCK = registration_clipboard_lock()
 _copy_registration_clipboard_text = copy_registration_clipboard_text
 
 PASSWORD_OTP_RESEND_SELECTORS = registration_action_selectors("resend")
+PASSWORD_CHOICE_RESOURCE_TIMEOUT_SECONDS = 15.0
+PASSWORD_CHOICE_STABLE_CHECKS = 5
+PASSWORD_CHOICE_STABLE_INTERVAL_MS = 250
+PASSWORD_DIRECT_PROFILE_SKIPPED_CHAIN_STEPS = (
+    "verification_page",
+    "verification_requested",
+    "verification_code_received",
+    "verification_code_entered",
+    "verification_submitted",
+    "registration_created",
+)
+ABOUT_YOU_AGE_RETRY_TIMEOUT_SECONDS = 20.0
+ABOUT_YOU_AGE_PROMPT_INPUT_SELECTORS = (
+    '[role="dialog"] input[name*="age" i]',
+    '[role="dialog"] input[placeholder*="age" i]',
+    '[role="dialog"] input[aria-label*="age" i]',
+    '[role="dialog"] input[placeholder*="年齢" i]',
+    '[role="dialog"] input[aria-label*="年齢" i]',
+    '[role="dialog"] input[type="number"]',
+    'dialog input[name*="age" i]',
+    'dialog input[placeholder*="年齢" i]',
+    'dialog input[type="number"]',
+    'input[name*="age" i]',
+    'input[placeholder*="age" i]',
+    'input[aria-label*="age" i]',
+    'input[placeholder*="年齢" i]',
+    'input[aria-label*="年齢" i]',
+    'input[placeholder*="年龄" i]',
+    'input[aria-label*="年龄" i]',
+    'input[type="number"]',
+)
+ABOUT_YOU_AGE_PROMPT_OK_SELECTORS = (
+    '[role="dialog"] button:has-text("OK")',
+    '[role="dialog"] [role="button"]:has-text("OK")',
+    '[role="dialog"] button:has-text("確認")',
+    '[role="dialog"] button:has-text("確定")',
+    'dialog button:has-text("OK")',
+    'dialog button:has-text("確認")',
+    'button:has-text("OK")',
+    '[role="button"]:has-text("OK")',
+    'button:has-text("確認")',
+    'button:has-text("確定")',
+)
+ABOUT_YOU_AGE_RETRY_NEXT_SELECTORS = (
+    'button:has-text("次へ")',
+    '[role="button"]:has-text("次へ")',
+    'button:has-text("Next")',
+    '[role="button"]:has-text("Next")',
+    'button:has-text("続行")',
+    'button:has-text("Continue")',
+)
+
+
+class _AboutYouAgeRetryRequired(RuntimeError):
+    """Signal the recoverable age-confirmation branch on the about-you page."""
 
 
 def _detect_verification_language(body_text: str) -> str:
@@ -187,6 +260,139 @@ def _password_snapshot_summary(snapshot: dict) -> str:
         f"{submits.get('enabled', 0)}；"
         f"安全验证={'是' if snapshot.get('securityChallenge') else '否'}"
     )
+
+
+def _reconcile_password_direct_profile_chain(worker, page) -> bool:
+    """Advance only the OTP milestones genuinely bypassed by /about-you."""
+
+    if not getattr(worker, "_hme_request_driven_registration_configured", False):
+        return False
+    try:
+        route = str(urlparse(str(getattr(page, "url", "") or "")).path or "/")
+    except (TypeError, ValueError):
+        return False
+    if route.rstrip("/").casefold() != "/about-you":
+        return False
+
+    snapshot = registration_chain_snapshot(worker, page)
+    next_code = str(snapshot.get("nextCode") or "")
+    if next_code not in PASSWORD_DIRECT_PROFILE_SKIPPED_CHAIN_STEPS:
+        return False
+    skipped: list[str] = []
+    while next_code in PASSWORD_DIRECT_PROFILE_SKIPPED_CHAIN_STEPS:
+        skip_registration_step(
+            worker,
+            next_code,
+            page=page,
+            value="密码验证后直接进入资料页，当前页面未要求邮箱验证码",
+        )
+        skipped.append(next_code)
+        snapshot = registration_chain_snapshot(worker, page)
+        next_code = str(snapshot.get("nextCode") or "")
+    if skipped:
+        worker.log(
+            "[注册链] 密码验证后直接进入姓名/生日页；"
+            "已同步跳过本次未出现的邮箱验证码步骤"
+        )
+        return True
+    return False
+
+
+def _password_choice_readiness_snapshot(page) -> dict:
+    url = str(getattr(page, "url", "") or "")
+    try:
+        hostname = str(urlparse(url).hostname or "").casefold()
+    except (TypeError, ValueError):
+        hostname = ""
+    try:
+        page_state = page.evaluate(
+            """() => ({
+                hmePasswordChoiceReadiness: true,
+                readyState: document.readyState,
+                styleSheetCount: Array.from(document.styleSheets || []).length,
+                loadedStyleLinkCount: Array.from(
+                    document.querySelectorAll('link[rel~="stylesheet"]')
+                ).filter((link) => Boolean(link.sheet)).length
+            })"""
+        )
+    except Exception:
+        page_state = {}
+    if not isinstance(page_state, dict):
+        page_state = {}
+    resource_observed = bool(page_state.get("hmePasswordChoiceReadiness"))
+    ready_state = str(page_state.get("readyState") or "unknown").casefold()
+    style_sheet_count = max(0, int(page_state.get("styleSheetCount") or 0))
+    loaded_style_link_count = max(
+        0,
+        int(page_state.get("loadedStyleLinkCount") or 0),
+    )
+    is_auth_page = hostname == "auth.openai.com" or hostname.endswith(
+        ".auth.openai.com"
+    )
+    document_ready = not resource_observed or ready_state == "complete"
+    css_ready = (
+        not resource_observed
+        or not is_auth_page
+        or style_sheet_count > 0
+        or loaded_style_link_count > 0
+    )
+    controls = _control_metrics(
+        page,
+        PASSWORD_CONTINUE_SELECTORS,
+        require_editable=False,
+    )
+    return {
+        "resourceObserved": resource_observed,
+        "readyState": ready_state,
+        "styleSheetCount": style_sheet_count,
+        "loadedStyleLinkCount": loaded_style_link_count,
+        "documentReady": document_ready,
+        "cssReady": css_ready,
+        "controls": controls,
+        "ready": bool(document_ready and css_ready and controls.get("actionable")),
+    }
+
+
+def _wait_for_stable_password_choice(worker, page) -> bool:
+    initial = _password_choice_readiness_snapshot(page)
+    if not bool((initial.get("controls") or {}).get("actionable")):
+        return False
+    resource_observed = bool(initial.get("resourceObserved"))
+    required_checks = PASSWORD_CHOICE_STABLE_CHECKS if resource_observed else 1
+    deadline = time.monotonic() + PASSWORD_CHOICE_RESOURCE_TIMEOUT_SECONDS
+    stable_checks = 0
+    waiting_logged = False
+    latest = initial
+    while time.monotonic() < deadline:
+        latest = _password_choice_readiness_snapshot(page)
+        if latest.get("ready"):
+            stable_checks += 1
+            if stable_checks >= required_checks:
+                if waiting_logged:
+                    worker.log(
+                        "[认证] 邮箱验证码页 CSS 与使用密码入口已稳定；"
+                        "现在执行点击"
+                    )
+                return True
+        else:
+            stable_checks = 0
+            if not waiting_logged:
+                worker.log(
+                    "[认证] 使用密码继续入口已出现，但页面 CSS/DOM 尚未稳定；"
+                    "等待完整加载后再点击"
+                )
+                waiting_logged = True
+        _page_wait(page, PASSWORD_CHOICE_STABLE_INTERVAL_MS)
+    controls = latest.get("controls") or {}
+    worker.log(
+        "[认证] 使用密码继续入口在样式稳定等待期内仍不可安全点击；"
+        f"readyState={latest.get('readyState') or 'unknown'} "
+        f"CSS={latest.get('styleSheetCount', 0)}/"
+        f"{latest.get('loadedStyleLinkCount', 0)} "
+        f"可见/启用={controls.get('visible', 0)}/{controls.get('enabled', 0)}；"
+        "暂不点击并继续监测"
+    )
+    return False
 
 
 def _save_password_diagnostic_screenshot(page, diagnostics_dir: Path | str) -> str:
@@ -360,6 +566,8 @@ def configure_password_first_login(
 ) -> bool:
     """Choose password on the initial email-code page and submit the saved password."""
 
+    worker._hme_password_first_login_enabled = bool(enabled)
+    worker._hme_password_first_login_required = bool(enabled and required)
     original_has_otp = getattr(worker, "_has_otp_input", None)
     original_has_password = getattr(worker, "_has_visible_password", None)
     original_has_password_auth_error = getattr(
@@ -527,9 +735,63 @@ def configure_password_first_login(
             body_text = str(page.locator("body").inner_text(timeout=800) or "")
         except Exception:
             body_text = ""
-        _activate_visible_registration_page(self, page)
-        if not _click_first_visible(page, PASSWORD_CONTINUE_SELECTORS, timeout=500):
-            return False
+        monitor = ensure_registration_activity_monitor(page)
+        initial_url = str(getattr(page, "url", "") or "")
+        max_attempts = MAX_NO_RESPONSE_CLICK_ATTEMPTS if monitor.available else 1
+        click_accepted = False
+        for attempt in range(1, max_attempts + 1):
+            if not _wait_for_stable_password_choice(self, page):
+                if attempt == 1:
+                    return False
+                break
+            before_activity = registration_activity_snapshot(page)
+            _activate_visible_registration_page(self, page)
+            if not _click_first_visible(
+                page,
+                PASSWORD_CONTINUE_SELECTORS,
+                timeout=500,
+            ):
+                if attempt == 1:
+                    return False
+                break
+            if not monitor.available:
+                click_accepted = True
+                break
+            activity = wait_for_registration_activity(
+                page,
+                before_activity,
+                timeout_seconds=CLICK_RESPONSE_SECONDS,
+                wait=_page_wait,
+                transition=lambda: (
+                    str(getattr(page, "url", "") or "") != initial_url
+                    or bool(
+                        callable(original_has_password)
+                        and original_has_password(page)
+                    )
+                ),
+                signal="network",
+            )
+            if activity.get("changed"):
+                evidence = activity.get("evidence")
+                evidence = evidence if isinstance(evidence, dict) else {}
+                self.log(
+                    f"[请求监测] 第 {attempt} 次点击使用密码继续后检测到"
+                    f"{activity.get('reason') or '请求或页面变化'}；"
+                    f"route={str(evidence.get('route') or 'unknown')[:220]} "
+                    f"status={max(0, int(evidence.get('status') or 0))}；"
+                    "停止重复点击并等待密码页"
+                )
+                click_accepted = True
+                break
+            self.log(
+                f"[请求监测] 第 {attempt} 次点击使用密码继续后 "
+                f"{CLICK_RESPONSE_SECONDS:g} 秒无请求、无响应且页面未变化"
+            )
+        if not click_accepted:
+            raise RuntimeError(
+                f"使用密码继续最多点击 {MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次后"
+                "仍无请求或页面响应"
+            )
         self.log(
             verification_page_recognition(
                 self,
@@ -582,6 +844,8 @@ def configure_password_first_login(
                             route = urlparse(current_url).path or "/"
                         except (TypeError, ValueError):
                             route = "/"
+                        if route.rstrip("/").casefold() == "/about-you":
+                            _reconcile_password_direct_profile_chain(self, page)
                         emit_browser_diagnostic(
                             self.log,
                             BrowserDiagnosticCode.AUTH_PASSWORD_ROUTE_TRANSITION,
@@ -853,9 +1117,10 @@ def configure_email_verification_priority(worker) -> bool:
         return True
 
     def has_password_outside_email_verification(self, page) -> bool:
-        url = str(getattr(page, "url", "") or "").casefold()
-        if "email-verification" in url:
-            return False
+        # OpenAI can replace the OTP DOM with the password-creation form while
+        # leaving /email-verification in the address bar.  The linked worker's
+        # detector only returns True for a visible password input, so the live
+        # DOM must take precedence over this potentially stale URL.
         return bool(original_has_password(page))
 
     original_wait_after_otp_submit = getattr(worker, "_wait_after_otp_submit", None)
@@ -1079,6 +1344,246 @@ def _about_you_profile_values_match(
     return bool(semantic_validator(values, second_kind)), values, second_kind
 
 
+def _about_you_age_retry_required(page) -> bool:
+    """Recognize the localized, recoverable age re-entry response."""
+
+    try:
+        body_text = str(page.locator("body").inner_text(timeout=800) or "")
+    except Exception:
+        return False
+    normalized = re.sub(r"\s+", " ", body_text).strip().casefold()
+    age_context = any(
+        marker in normalized
+        for marker in (
+            "年齢を確認",
+            "生年月日",
+            "confirm your age",
+            "date of birth",
+            "確認您的年齡",
+            "确认您的年龄",
+        )
+    )
+    retryable_error = any(
+        marker in normalized
+        for marker in (
+            "ご入力の情報ではアカウントを作成できません",
+            "we couldn't create an account with the information you entered",
+            "we could not create an account with the information you entered",
+            "无法使用您输入的信息创建账户",
+            "無法使用您輸入的資訊建立帳戶",
+        )
+    )
+    retry_copy = any(
+        marker in normalized
+        for marker in (
+            "もう一度お試しください",
+            "please try again",
+            "请重试",
+            "請再試一次",
+        )
+    )
+    return age_context and retryable_error and retry_copy
+
+
+def _dialog_text(dialog, name: str) -> str:
+    value = getattr(dialog, name, "")
+    try:
+        value = value() if callable(value) else value
+    except Exception:
+        value = ""
+    return str(value or "")
+
+
+def _arm_about_you_age_dialog(worker, page, age: str):
+    state = {"handled": False, "kind": "", "message": ""}
+    once = getattr(page, "once", None)
+    if not callable(once):
+        return state, None
+
+    def accept_age_dialog(dialog) -> None:
+        kind = _dialog_text(dialog, "type").casefold()
+        message = _dialog_text(dialog, "message")
+        try:
+            if kind == "prompt":
+                dialog.accept(str(age))
+            else:
+                dialog.accept()
+        except TypeError:
+            dialog.accept(str(age))
+        state.update({"handled": True, "kind": kind, "message": message[:160]})
+        worker.log(
+            "[基础资料] 已在年龄确认弹框输入年龄并点击 OK"
+            if kind == "prompt"
+            else "[基础资料] 已点击年龄确认弹框 OK"
+        )
+
+    once("dialog", accept_age_dialog)
+    return state, accept_age_dialog
+
+
+def _remove_about_you_dialog_listener(page, handler) -> None:
+    if handler is None:
+        return
+    for method_name in ("remove_listener", "off"):
+        method = getattr(page, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            method("dialog", handler)
+        except Exception:
+            pass
+        return
+
+
+def _fill_about_you_age_prompt(
+    worker,
+    page,
+    age: str,
+    *,
+    recovery_state: dict | None = None,
+) -> bool:
+    state = recovery_state if isinstance(recovery_state, dict) else {}
+    field = _first_visible(page, ABOUT_YOU_AGE_PROMPT_INPUT_SELECTORS, timeout=400)
+    if field is None:
+        return False
+    expected_age = str(age).strip()
+    current_age = str(_registration_input_value(field) or "").strip()
+    if not state.get("age_filled"):
+        try:
+            field.click(timeout=3000, force=True)
+        except TypeError:
+            field.click(timeout=3000)
+        except Exception:
+            pass
+        if current_age != expected_age:
+            try:
+                field.fill(expected_age, timeout=5000, force=True)
+            except TypeError:
+                field.fill(expected_age, timeout=5000)
+            except Exception:
+                try:
+                    field.press("Control+A", timeout=2000)
+                    field.type(expected_age, delay=40, timeout=5000)
+                except Exception:
+                    return False
+        if str(_registration_input_value(field) or "").strip() != expected_age:
+            return False
+        state["age_filled"] = True
+        worker.log("[基础资料] 年龄已输入并回读一致；后续轮询不再重复填写")
+
+    if state.get("submit_clicked"):
+        return True
+    if _click_first_visible(page, ABOUT_YOU_AGE_PROMPT_OK_SELECTORS):
+        state["submit_clicked"] = True
+        worker.log("[基础资料] 已点击年龄确认弹框 OK")
+        return True
+
+    clicked = False
+    finish = getattr(worker, "_click_finish_creating_account", None)
+    if callable(finish):
+        clicked = bool(finish(page))
+    if not clicked:
+        click_by_text = getattr(worker, "_click_button_by_text", None)
+        if callable(click_by_text):
+            clicked = bool(
+                click_by_text(
+                    page,
+                    [
+                        "アカウントの作成を完了する",
+                        "Finish creating account",
+                        "完成账户创建",
+                    ],
+                )
+            )
+    if not clicked:
+        return False
+    state["submit_clicked"] = True
+    worker.log("[基础资料] 年龄回读一致；已再次点击一次完成创建并等待页面响应")
+    return True
+
+
+def _recover_about_you_age_confirmation(
+    worker,
+    page,
+    *,
+    before_url: str,
+    age: str,
+) -> bool:
+    """Replay the user-observed age confirmation sequence exactly once."""
+
+    dialog_state, dialog_handler = _arm_about_you_age_dialog(worker, page, age)
+    try:
+        clicked = False
+        for method_name in (
+            "_click_finish_creating_account",
+            "_click_continue",
+        ):
+            method = getattr(worker, method_name, None)
+            if callable(method) and method(page):
+                clicked = True
+                break
+        if not clicked:
+            click_by_text = getattr(worker, "_click_button_by_text", None)
+            if callable(click_by_text):
+                clicked = bool(
+                    click_by_text(
+                        page,
+                        [
+                            "アカウントの作成を完了する",
+                            "Finish creating account",
+                            "完成账户创建",
+                        ],
+                    )
+                )
+        if not clicked:
+            raise RuntimeError("检测到年龄资料可重试错误，但未找到再次提交按钮")
+        worker.log("[基础资料] 检测到年龄资料可重试错误；已再次点击完成创建")
+
+        prompt_deadline = time.monotonic() + ABOUT_YOU_AGE_RETRY_TIMEOUT_SECONDS
+        prompt_handled = False
+        prompt_state = {"age_filled": False, "submit_clicked": False}
+        submit_done = getattr(worker, "_about_you_submit_done", None)
+        while time.monotonic() < prompt_deadline:
+            if callable(submit_done) and submit_done(page, before_url):
+                return True
+            if bool(dialog_state.get("handled")):
+                prompt_handled = True
+                break
+            if _fill_about_you_age_prompt(
+                worker,
+                page,
+                age,
+                recovery_state=prompt_state,
+            ):
+                prompt_handled = True
+                break
+            _page_wait(page, 250)
+        if not prompt_handled:
+            raise RuntimeError(
+                "再次提交年龄资料后 20 秒内未出现年龄输入或确认弹框"
+            )
+
+        if not bool(dialog_state.get("handled")):
+            _remove_about_you_dialog_listener(page, dialog_handler)
+            dialog_handler = None
+
+        next_deadline = time.monotonic() + ABOUT_YOU_AGE_RETRY_TIMEOUT_SECONDS
+        next_clicked = False
+        while time.monotonic() < next_deadline:
+            if callable(submit_done) and submit_done(page, before_url):
+                return True
+            if not next_clicked and _click_first_visible(
+                page, ABOUT_YOU_AGE_RETRY_NEXT_SELECTORS
+            ):
+                next_clicked = True
+                worker.log("[基础资料] 年龄弹框确认完成；已点击下一步")
+            _page_wait(page, 250)
+        raise RuntimeError("年龄弹框已确认，但点击下一步后页面仍未完成切换")
+    finally:
+        if not bool(dialog_state.get("handled")):
+            _remove_about_you_dialog_listener(page, dialog_handler)
+
+
 def configure_resilient_about_you_input(
     worker,
     *,
@@ -1092,6 +1597,10 @@ def configure_resilient_about_you_input(
     original_keyboard_fill = getattr(worker, "_fill_visible_input_by_keyboard", None)
     original_profile_fill = getattr(worker, "_fill_about_you_inputs", None)
     original_finish_click = getattr(worker, "_click_finish_creating_account", None)
+    original_profile_submit = getattr(worker, "_submit_about_you", None)
+    original_rejection_guard = getattr(
+        worker, "_raise_if_account_creation_rejected", None
+    )
     original_auth_ready = getattr(worker, "_wait_for_auth_page_ready", None)
     dom_profile_fill = getattr(worker, "_fill_about_you_inputs_by_dom", None)
     focus_submit = getattr(worker, "_focus_about_you_submit_or_body", None)
@@ -1155,6 +1664,7 @@ def configure_resilient_about_you_input(
         age: str,
     ):
         activate_page(self, page)
+        self._hme_about_you_recovery_age = str(age or "").strip()
         result = original_profile_fill(page, name, birthdate, birth_year, age)
         matched, values, second_kind = _about_you_profile_values_match(
             self, page, name, birthdate, birth_year, age
@@ -1255,6 +1765,42 @@ def configure_resilient_about_you_input(
 
         worker._click_finish_creating_account = types.MethodType(
             click_finish_after_stable_form,
+            worker,
+        )
+    if callable(original_rejection_guard):
+        def rejection_guard_with_age_retry(self, page):
+            if _about_you_age_retry_required(page):
+                raise _AboutYouAgeRetryRequired(
+                    "年龄资料页面要求重新提交并确认年龄"
+                )
+            return original_rejection_guard(page)
+
+        worker._raise_if_account_creation_rejected = types.MethodType(
+            rejection_guard_with_age_retry,
+            worker,
+        )
+    if callable(original_profile_submit) and callable(original_rejection_guard):
+        def submit_about_you_with_age_recovery(self, page):
+            before_url = str(getattr(page, "url", "") or "")
+            try:
+                return original_profile_submit(page)
+            except _AboutYouAgeRetryRequired:
+                age = str(
+                    getattr(self, "_hme_about_you_recovery_age", "") or ""
+                ).strip()
+                if not age.isdigit():
+                    raise RuntimeError(
+                        "检测到年龄确认恢复界面，但本轮年龄值不可用，已停止提交"
+                    )
+                return _recover_about_you_age_confirmation(
+                    self,
+                    page,
+                    before_url=before_url,
+                    age=age,
+                )
+
+        worker._submit_about_you = types.MethodType(
+            submit_about_you_with_age_recovery,
             worker,
         )
     worker._hme_about_you_input_configured = True

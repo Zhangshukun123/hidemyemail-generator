@@ -142,6 +142,101 @@ def _runtime_state_payloads() -> dict[str, dict]:
     }
 
 
+def test_control_center_renders_real_tasks_footer_and_redacted_terminal_preview():
+    html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
+    payloads = _runtime_state_payloads()
+    page_errors: list[str] = []
+    console_errors: list[str] = []
+    request_methods: list[str] = []
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        context = browser.new_context(viewport={"width": 1586, "height": 992})
+        context.add_init_script(
+            "localStorage.setItem('hme_workspace_auto_refresh', '0');"
+        )
+        page = context.new_page()
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on(
+            "console",
+            lambda message: console_errors.append(message.text)
+            if message.type == "error"
+            else None,
+        )
+
+        def fulfill(route):
+            request_methods.append(route.request.method)
+            path = urlparse(route.request.url).path
+            if path == "/":
+                route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=html,
+                )
+                return
+            route.fulfill(
+                status=200,
+                content_type="application/json; charset=utf-8",
+                body=json.dumps(payloads.get(path, {"ok": True}), ensure_ascii=False),
+            )
+
+        page.route("**/*", fulfill)
+        page.goto("http://hme-control-center.test/#overview", wait_until="domcontentloaded")
+        page.wait_for_function(
+            "document.getElementById('controlTaskCountRunning').textContent === '1' && "
+            "document.querySelectorAll('.terminal-preview-row').length === 9"
+        )
+
+        assert page.title() == "控制台 · 账号工作台"
+        assert page.locator("#viewTitle").inner_text() == "控制台"
+        active_tab = page.locator(".workspace-route-tab.active")
+        assert active_tab.inner_text().startswith("控制台")
+        assert active_tab.get_attribute("aria-current") == "page"
+        assert page.locator("#controlTaskTableBody tr").count() == 2
+        assert "current-run@icloud.com" in page.locator(
+            "#controlTaskTableBody"
+        ).inner_text()
+        assert page.locator(".runtime-log-entry").count() == 0
+
+        terminal_text = page.locator("#terminalPreviewList").inner_text()
+        assert "详细消息 19" in terminal_text
+        for secret in (
+            "SuperSecret", "eyJabc.def.ghi", "raw-cookie", "proxy-user", "proxy-pass",
+            "SecretJson", "ABCDEF", "Sess123", "Tok123", "TwoFA123",
+        ):
+            assert secret not in terminal_text
+        assert page.locator("#footerRuntimeLabel").inner_text() == "连接正常"
+        assert page.locator("#footerRunningCount").inner_text() == "1"
+        assert page.locator("#footerFailedCount").inner_text() == "1"
+
+        page.locator('[data-control-task-filter="failed"]').click()
+        assert page.locator("#controlTaskTableBody tr").count() == 1
+        assert "old-run@icloud.com" in page.locator("#controlTaskTableBody").inner_text()
+        page.locator("#controlTaskSearch").fill("current-run")
+        assert "暂无匹配任务" in page.locator("#controlTaskTableBody").inner_text()
+        page.locator('[data-control-task-filter="all"]').click()
+        assert page.locator("#controlTaskTableBody tr").count() == 1
+
+        toggle = page.locator('[data-action="toggle-terminal-preview"]')
+        toggle.click()
+        assert page.locator("#workbenchTerminalPanel").evaluate(
+            "element => element.classList.contains('is-collapsed')"
+        )
+        collapsed_box = page.locator("#workbenchTerminalPanel").bounding_box()
+        assert collapsed_box is not None and collapsed_box["height"] <= 40
+        toggle.click()
+        expanded_box = page.locator("#workbenchTerminalPanel").bounding_box()
+        assert expanded_box is not None and expanded_box["height"] >= 240
+
+        assert page.evaluate(
+            "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+        ) <= 1
+        assert set(request_methods) == {"GET"}
+        assert page_errors == []
+        assert console_errors == []
+        browser.close()
+
+
 def test_runtime_log_drawer_opens_filters_and_renders_more_than_16_detailed_logs():
     html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
     payloads = _runtime_state_payloads()

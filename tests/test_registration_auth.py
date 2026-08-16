@@ -132,7 +132,15 @@ class RegistrationAuthTests(unittest.TestCase):
         normalized_submits = " ".join(OPENAI_EMAIL_REGISTRATION_SUBMIT_SELECTORS)
 
         self.assertIn('input[placeholder="Email address" i]', normalized_inputs)
+        self.assertIn(
+            '[role="dialog"]:has-text("Sign up or log in")',
+            normalized_inputs,
+        )
         self.assertIn('input[placeholder*="メールアドレス"]', normalized_inputs)
+        self.assertIn(
+            '[role="dialog"]:has-text("ログインまたは新規登録")',
+            normalized_inputs,
+        )
         self.assertIn("aside", normalized_submits)
         self.assertIn('button:text-is("続行")', normalized_submits)
 
@@ -1484,6 +1492,103 @@ class RegistrationAuthTests(unittest.TestCase):
         self.assertEqual(worker.fill_calls, 1)
         self.assertEqual(events, [("goto", "https://chatgpt.com/")])
         self.assertTrue(any("预先打开登录或新注册抽屉" in line for line in worker.logs))
+        self.assertTrue(any("跳过首页注册按钮" in line for line in worker.logs))
+
+    def test_home_waits_for_delayed_auth_drawer_before_searching_signup(self):
+        events = []
+
+        class Page:
+            def __init__(self):
+                self.url = "about:blank"
+                self.email_visible = False
+
+            def goto(self, url, **_kwargs):
+                events.append(("goto", url))
+                self.url = "https://chatgpt.com/"
+                return "response"
+
+        class Worker:
+            existing_login_only = False
+
+            def __init__(self):
+                self.logs = []
+                self.fill_calls = 0
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _register(self, page, _context, **_kwargs):
+                return page.goto("https://chatgpt.com/")
+
+            def _create_openai_signin_url(self, _context):
+                return "https://auth.openai.com/create-account"
+
+            def _create_login_url(self, _context):
+                return "https://auth.openai.com/log-in"
+
+            def _goto_auth_page(self, page, url):
+                return page.goto(url)
+
+            def _fill_email_if_visible(self, page):
+                self.fill_calls += 1
+                page.email_visible = False
+                return True
+
+        worker = Worker()
+        page = Page()
+
+        def first_visible(target_page, selectors, **_kwargs):
+            if (
+                selectors == OPENAI_EMAIL_LOGIN_INPUT_SELECTORS
+                and target_page.email_visible
+            ):
+                return object()
+            return None
+
+        def wait_for_auth_email_entry(target_page, _log, **kwargs):
+            events.append(("monitor", kwargs["timeout_seconds"]))
+            target_page.email_visible = True
+            return object()
+
+        with (
+            patch.object(
+                openai_registration_navigation,
+                "_first_visible",
+                side_effect=first_visible,
+            ),
+            patch.object(
+                openai_registration_navigation._registration_auth,
+                "wait_for_auth_email_entry",
+                side_effect=wait_for_auth_email_entry,
+            ),
+            patch.object(
+                openai_registration_navigation,
+                "_click_chatgpt_home_signup",
+                side_effect=AssertionError(
+                    "delayed auth drawer must skip homepage signup lookup"
+                ),
+            ),
+        ):
+            self.assertTrue(
+                openai_registration_navigation.configure_chatgpt_home_login_entry(
+                    worker,
+                    activate_page=lambda _worker, _page: True,
+                )
+            )
+            self.assertEqual(worker._register(page, object()), "response")
+
+        self.assertEqual(worker.fill_calls, 1)
+        self.assertEqual(
+            events,
+            [
+                ("goto", "https://chatgpt.com/"),
+                (
+                    "monitor",
+                    openai_registration_navigation.HOME_PREOPENED_AUTH_DRAWER_TIMEOUT_SECONDS,
+                ),
+            ],
+        )
+        self.assertTrue(any("优先检查" in line for line in worker.logs))
         self.assertTrue(any("跳过首页注册按钮" in line for line in worker.logs))
 
     def test_home_entry_only_blocks_the_initial_generated_auth_navigation(self):

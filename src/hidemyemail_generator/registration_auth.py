@@ -124,6 +124,18 @@ OPENAI_EMAIL_LOGIN_INPUT_SELECTORS = (
     'input[aria-label*="メールアドレス"]',
     'input[placeholder*="邮箱"]',
     'input[aria-label*="邮箱"]',
+    '[role="dialog"]:has-text("Sign up or log in") '
+    'input:not([type="hidden"]):not([type="password"])',
+    '[role="dialog"]:has-text("Log in or sign up") '
+    'input:not([type="hidden"]):not([type="password"])',
+    '[role="dialog"]:has-text("登录或注册") '
+    'input:not([type="hidden"]):not([type="password"])',
+    '[role="dialog"]:has-text("注册或登录") '
+    'input:not([type="hidden"]):not([type="password"])',
+    '[role="dialog"]:has-text("登入或註冊") '
+    'input:not([type="hidden"]):not([type="password"])',
+    '[role="dialog"]:has-text("ログインまたは新規登録") '
+    'input:not([type="hidden"]):not([type="password"])',
 )
 _EMAIL_INPUT_SCOPE_SELECTOR = (
     'input:is([type="email"], [name="email"], [name="username"], '
@@ -826,8 +838,8 @@ def click_chatgpt_home_login(
             f"准备第 {attempt + 1}/{MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次点击"
         )
     raise RuntimeError(
-        f"ChatGPT 首页{entry_label}最多点击 "
-        f"{MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次后，"
+        f"ChatGPT 首页最多点击 {MAX_NO_RESPONSE_CLICK_ATTEMPTS} 次"
+        f"{entry_label}后，"
         "页面未在限定时间内完成变化且未检测到注册入口响应"
     )
 

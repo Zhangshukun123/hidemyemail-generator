@@ -79,10 +79,15 @@ from hidemyemail_generator.openai_mfa import MfaSetupError
 from hidemyemail_generator.openai_registration_otp import EmailVerificationPageAdvanced
 from hidemyemail_generator.openai_registration_flow import (
     _detect_verification_language,
+    _fill_about_you_age_prompt,
+    _reconcile_password_direct_profile_chain,
     configure_lightweight_registration_resources,
 )
 from hidemyemail_generator.registration_activity import (
+    begin_registration_step,
     ensure_email_verification_code_entered,
+    mark_registration_chain,
+    registration_chain_snapshot,
 )
 from hidemyemail_generator.registration_proxy import RegistrationProxyStore
 
@@ -355,6 +360,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
         worker = SimpleNamespace(
             _password_step_submitted=False,
+            _hme_password_first_login_enabled=True,
             _hme_manual_otp_entry=False,
         )
         state = recognize_registration_page(worker, Page())
@@ -2801,7 +2807,9 @@ class BrowserTaskHelperTests(unittest.TestCase):
             def click(self, **_kwargs):
                 actions.append("password")
                 self.page.state = "password"
-                self.page.url = "https://auth.openai.com/sign-up/password"
+                # The real Japanese auth UI can replace the form while the
+                # address bar still reports the previous verification route.
+                self.page.url = "https://auth.openai.com/email-verification"
 
             def __init__(self, page):
                 self.page = page
@@ -2871,6 +2879,14 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(
             configure_password_first_login(worker, enabled=True, required=True)
         )
+        emitted_states = []
+        self.assertTrue(
+            configure_registration_state_recognition(
+                worker,
+                emit_state=emitted_states.append,
+                diagnostics_dir=".",
+            )
+        )
         worker._continue_chatgpt_registration_complete(page)
 
         self.assertEqual(actions, ["password"])
@@ -2886,6 +2902,16 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertIn("目标邮箱=匹配", recognition)
         self.assertIn("使用密码继续=可见", recognition)
         self.assertIn("决策=点击", recognition)
+
+        self.assertTrue(any(state["code"] == "password" for state in emitted_states))
+        self.assertTrue(
+            any(
+                "当前=OpenAI 密码页" in line
+                and "必要DOM=passwordInput" in line
+                and "判定=符合" in line
+                for line in worker.logs
+            )
+        )
 
         page.state = "post_password_otp"
         worker._continue_chatgpt_registration_complete(page)
@@ -2913,6 +2939,367 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertIn(
             'button:has-text("비밀번호로 계속")',
             PASSWORD_CONTINUE_SELECTORS,
+        )
+
+    def test_password_choice_stops_reclicking_after_request(self):
+        handlers = {}
+        events = []
+
+        class Request:
+            url = "https://auth.openai.com/api/accounts/password/continue"
+            method = "POST"
+            resource_type = "fetch"
+
+        class Candidate:
+            @staticmethod
+            def is_visible(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                events.append("password-choice-click")
+                handlers["request"](Request())
+
+        class Collection:
+            def __init__(self, items=(), text=""):
+                self.items = list(items)
+                self.text = text
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            def __init__(self):
+                self.state = "otp"
+                self.url = "https://auth.openai.com/email-verification"
+                self.wait_calls = 0
+
+            def on(self, name, callback):
+                handlers[name] = callback
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Collection(
+                        text="Check your inbox Continue with password"
+                    )
+                if self.state == "otp" and "Continue with password" in selector:
+                    return Collection([Candidate()])
+                return Collection()
+
+            def evaluate(self, _script):
+                return {
+                    "readyState": "complete",
+                    "password": self.state == "password",
+                    "otp": self.state == "otp",
+                    "inputCount": 1,
+                    "buttonCount": 1,
+                    "busyCount": 0,
+                }
+
+            def wait_for_timeout(self, _milliseconds):
+                self.wait_calls += 1
+                if self.wait_calls >= 2:
+                    self.state = "password"
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            @staticmethod
+            def _continue_chatgpt_registration_complete(_page):
+                return False
+
+            @staticmethod
+            def _has_otp_input(page):
+                return page.state == "otp"
+
+            @staticmethod
+            def _has_visible_password(page):
+                return page.state == "password"
+
+            @staticmethod
+            def _fill_password_step(page):
+                events.append("password-submit")
+                page.state = "post_password_otp"
+
+        worker = Worker()
+        page = Page()
+
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
+        worker._continue_chatgpt_registration_complete(page)
+
+        self.assertEqual(events.count("password-choice-click"), 1)
+        self.assertIn("password-submit", events)
+        self.assertTrue(
+            any(
+                "点击使用密码继续后检测到request" in line
+                and "停止重复点击并等待密码页" in line
+                for line in worker.logs
+            )
+        )
+
+    def test_password_choice_waits_for_css_and_ignores_late_load_event(self):
+        handlers = {}
+        events = []
+
+        class Request:
+            url = "https://auth.openai.com/api/accounts/password/continue"
+            method = "POST"
+            resource_type = "fetch"
+
+        class Candidate:
+            def __init__(self, page):
+                self.page = page
+
+            @staticmethod
+            def is_visible(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                if not self.page.css_ready:
+                    raise AssertionError("password choice clicked before CSS was ready")
+                self.page.click_count += 1
+                events.append(f"password-choice-{self.page.click_count}")
+                if self.page.click_count == 2:
+                    handlers["request"](Request())
+                    self.page.state = "password"
+
+        class Collection:
+            def __init__(self, items=(), text=""):
+                self.items = list(items)
+                self.text = text
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            def __init__(self):
+                self.state = "otp"
+                self.url = "https://auth.openai.com/email-verification"
+                self.css_ready = False
+                self.wait_calls = 0
+                self.click_count = 0
+                self.late_load_sent = False
+
+            def on(self, name, callback):
+                handlers[name] = callback
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Collection(
+                        text=(
+                            "受信箱を確認してください 6桁のコード "
+                            "パスワードで続行"
+                        )
+                    )
+                if self.state == "otp" and "パスワードで続行" in selector:
+                    return Collection([Candidate(self)])
+                if self.state == "password" and selector == 'input[type="password"]':
+                    return Collection([Candidate(self)])
+                return Collection()
+
+            def evaluate(self, script):
+                if "hmePasswordChoiceReadiness" in script:
+                    return {
+                        "hmePasswordChoiceReadiness": True,
+                        "readyState": "complete" if self.css_ready else "loading",
+                        "styleSheetCount": 1 if self.css_ready else 0,
+                        "loadedStyleLinkCount": 1 if self.css_ready else 0,
+                    }
+                return {
+                    "readyState": "complete" if self.css_ready else "loading",
+                    "password": self.state == "password",
+                    "otp": self.state == "otp",
+                    "inputCount": 1,
+                    "buttonCount": 2,
+                    "busyCount": 0,
+                }
+
+            def wait_for_timeout(self, _milliseconds):
+                self.wait_calls += 1
+                if self.click_count == 0 and self.wait_calls >= 2:
+                    self.css_ready = True
+                if self.click_count == 1 and not self.late_load_sent:
+                    self.late_load_sent = True
+                    handlers["load"]()
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            @staticmethod
+            def _continue_chatgpt_registration_complete(_page):
+                return False
+
+            @staticmethod
+            def _has_otp_input(page):
+                return page.state == "otp"
+
+            @staticmethod
+            def _has_visible_password(page):
+                return page.state == "password"
+
+            @staticmethod
+            def _fill_password_step(page):
+                events.append("password-submit")
+                page.state = "post_password_otp"
+
+        worker = Worker()
+        page = Page()
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
+
+        worker._continue_chatgpt_registration_complete(page)
+
+        self.assertEqual(
+            events,
+            ["password-choice-1", "password-choice-2", "password-submit"],
+        )
+        self.assertTrue(page.css_ready)
+        self.assertTrue(
+            any("页面 CSS/DOM 尚未稳定" in line for line in worker.logs)
+        )
+        self.assertTrue(
+            any("CSS 与使用密码入口已稳定" in line for line in worker.logs)
+        )
+        self.assertEqual(
+            sum("无请求、无响应且页面未变化" in line for line in worker.logs),
+            1,
+        )
+        self.assertTrue(
+            any(
+                "第 2 次点击使用密码继续后检测到transition" in line
+                for line in worker.logs
+            )
+        )
+
+    def test_password_choice_retries_only_when_no_request_or_page_change(self):
+        events = []
+
+        class Candidate:
+            @staticmethod
+            def is_visible(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            @staticmethod
+            def click(**_kwargs):
+                events.append("password-choice-click")
+
+        class Collection:
+            def __init__(self, items=(), text=""):
+                self.items = list(items)
+                self.text = text
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            @staticmethod
+            def on(_name, _callback):
+                return None
+
+            @staticmethod
+            def locator(selector):
+                if selector == "body":
+                    return Collection(
+                        text="Check your inbox Continue with password"
+                    )
+                if "Continue with password" in selector:
+                    return Collection([Candidate()])
+                return Collection()
+
+            @staticmethod
+            def evaluate(_script):
+                return {
+                    "readyState": "complete",
+                    "otp": True,
+                    "inputCount": 1,
+                    "buttonCount": 1,
+                    "busyCount": 0,
+                }
+
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        class Worker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            @staticmethod
+            def _continue_chatgpt_registration_complete(_page):
+                return False
+
+            @staticmethod
+            def _has_otp_input(_page):
+                return True
+
+            @staticmethod
+            def _has_visible_password(_page):
+                return False
+
+            @staticmethod
+            def _fill_password_step(_page):
+                raise AssertionError("password page was never reached")
+
+        worker = Worker()
+        self.assertTrue(
+            configure_password_first_login(worker, enabled=True, required=True)
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "使用密码继续最多点击 5 次后仍无请求或页面响应",
+        ):
+            worker._continue_chatgpt_registration_complete(Page())
+
+        self.assertEqual(events.count("password-choice-click"), 5)
+        self.assertEqual(
+            sum("无请求、无响应且页面未变化" in line for line in worker.logs),
+            5,
         )
 
     def test_thai_and_brazilian_portuguese_password_registration_locales(self):
@@ -3439,7 +3826,7 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(worker._has_otp_input(Page()))
         self.assertIn("继续读取邮箱验证码", worker.logs[-1])
 
-    def test_email_verification_route_is_not_treated_as_password_form(self):
+    def test_visible_password_form_overrides_stale_email_verification_route(self):
         class Worker:
             def __init__(self):
                 self.password_checks = 0
@@ -3454,12 +3841,12 @@ class BrowserTaskHelperTests(unittest.TestCase):
         verification_page = SimpleNamespace(
             url="https://auth.openai.com/email-verification"
         )
-        self.assertFalse(worker._has_visible_password(verification_page))
-        self.assertEqual(worker.password_checks, 0)
+        self.assertTrue(worker._has_visible_password(verification_page))
+        self.assertEqual(worker.password_checks, 1)
 
         reset_page = SimpleNamespace(url="https://auth.openai.com/reset-password")
         self.assertTrue(worker._has_visible_password(reset_page))
-        self.assertEqual(worker.password_checks, 1)
+        self.assertEqual(worker.password_checks, 2)
 
     def test_chatgpt_home_otp_is_submitted_before_session_wait(self):
         class Worker:
@@ -3903,6 +4290,169 @@ class BrowserTaskHelperTests(unittest.TestCase):
         self.assertTrue(worker._continue_chatgpt_registration_complete(Page()))
         self.assertTrue(worker._has_otp_input(Page()))
         self.assertEqual(worker.continue_calls, 1)
+
+    def test_password_direct_about_you_skips_only_unseen_verification_chain(self):
+        class Page:
+            url = "https://auth.openai.com/email-verification"
+
+            @staticmethod
+            def on(_name, _callback):
+                return None
+
+            @staticmethod
+            def evaluate(_script):
+                return {}
+
+        worker = SimpleNamespace(
+            _hme_request_driven_registration_configured=True,
+            _hme_chain_require_password=True,
+            _hme_chain_enable_two_factor=True,
+            logs=[],
+        )
+        worker.log = worker.logs.append
+        page = Page()
+        for code in (
+            "site_requested",
+            "site_loaded",
+            "registration_clicked",
+            "registration_entry_ready",
+            "email_entered",
+            "email_submitted",
+            "email_responded",
+        ):
+            begin_registration_step(worker, code, page=page)
+            mark_registration_chain(worker, code, page=page)
+
+        self.assertFalse(_reconcile_password_direct_profile_chain(worker, page))
+        self.assertEqual(
+            registration_chain_snapshot(worker, page)["nextCode"],
+            "verification_page",
+        )
+
+        page.url = "https://auth.openai.com/about-you"
+        self.assertTrue(_reconcile_password_direct_profile_chain(worker, page))
+        snapshot = registration_chain_snapshot(worker, page)
+
+        self.assertEqual(snapshot["nextCode"], "profile_verified")
+        skipped = {
+            item["code"]
+            for item in snapshot["steps"]
+            if item["status"] == "skipped"
+        }
+        self.assertEqual(
+            skipped,
+            {
+                "verification_page",
+                "verification_requested",
+                "verification_code_received",
+                "verification_code_entered",
+                "verification_submitted",
+                "registration_created",
+            },
+        )
+        begin_registration_step(worker, "profile_verified", page=page)
+        mark_registration_chain(worker, "profile_verified", page=page)
+        self.assertEqual(
+            registration_chain_snapshot(worker, page)["nextCode"],
+            "profile_submitted",
+        )
+        self.assertTrue(any("直接进入姓名/生日页" in line for line in worker.logs))
+
+    def test_password_route_transition_invokes_direct_profile_reconciliation(self):
+        class Candidate:
+            def __init__(self, page):
+                self.page = page
+
+            @staticmethod
+            def is_visible(**_kwargs):
+                return True
+
+            @staticmethod
+            def is_enabled(**_kwargs):
+                return True
+
+            @staticmethod
+            def scroll_into_view_if_needed(**_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                self.page.state = "password"
+                self.page.url = "https://auth.openai.com/log-in/password"
+
+        class Collection:
+            def __init__(self, candidates=(), text=""):
+                self.candidates = list(candidates)
+                self.text = text
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+            def inner_text(self, **_kwargs):
+                return self.text
+
+        class Page:
+            def __init__(self):
+                self.state = "otp"
+                self.url = "https://auth.openai.com/email-verification"
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Collection(text="受信箱を確認 パスワードで続行")
+                if self.state == "otp" and "パスワードで続行" in selector:
+                    return Collection([Candidate(self)])
+                return Collection()
+
+            @staticmethod
+            def evaluate(_script):
+                return {}
+
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        class Worker:
+            headless = True
+
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            @staticmethod
+            def _continue_chatgpt_registration_complete(_page):
+                return False
+
+            @staticmethod
+            def _has_otp_input(page):
+                return page.state == "otp"
+
+            @staticmethod
+            def _has_visible_password(page):
+                return page.state == "password"
+
+            @staticmethod
+            def _fill_password_step(page):
+                page.state = "profile"
+                page.url = "https://auth.openai.com/about-you"
+
+        worker = Worker()
+        page = Page()
+        with patch(
+            "hidemyemail_generator.openai_registration_flow."
+            "_reconcile_password_direct_profile_chain",
+            return_value=True,
+        ) as reconcile:
+            self.assertTrue(
+                configure_password_first_login(worker, enabled=True, required=True)
+            )
+            self.assertTrue(worker._continue_chatgpt_registration_complete(page))
+
+        reconcile.assert_called_once_with(worker, page)
+        self.assertEqual(page.url, "https://auth.openai.com/about-you")
 
     def test_registration_profile_name_is_captured_for_account_menu(self):
         backend = SimpleNamespace(
@@ -5926,6 +6476,196 @@ class BrowserTaskHelperTests(unittest.TestCase):
             worker._submit_about_you(Page())
         self.assertEqual(worker.submit_calls, 1)
 
+    def test_about_you_age_error_retries_and_accepts_prompt_before_next(self):
+        events = []
+
+        class Dialog:
+            type = "prompt"
+            message = "年齢を入力してください"
+
+            def __init__(self, page):
+                self.page = page
+
+            def accept(self, value=""):
+                events.append(f"dialog-ok:{value}")
+                self.page.state = "next"
+
+        class Candidate:
+            def __init__(self, page):
+                self.page = page
+
+            def is_visible(self, **_kwargs):
+                return self.page.state == "next"
+
+            def is_enabled(self, **_kwargs):
+                return True
+
+            def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            def click(self, **_kwargs):
+                events.append("next")
+                self.page.state = "complete"
+
+        class Collection:
+            def __init__(self, candidates=()):
+                self.candidates = list(candidates)
+
+            def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Body:
+            def __init__(self, page):
+                self.page = page
+
+            def inner_text(self, **_kwargs):
+                if self.page.state == "error":
+                    return (
+                        "年齢を確認します 生年月日 "
+                        "ご入力の情報ではアカウントを作成できません。"
+                        "もう一度お試しください"
+                    )
+                return ""
+
+        class Page:
+            url = "https://auth.openai.com/about-you"
+
+            def __init__(self):
+                self.state = "error"
+                self.dialog_handler = None
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Body(self)
+                if self.state == "next" and "次へ" in selector:
+                    return Collection([Candidate(self)])
+                return Collection()
+
+            def once(self, event, handler):
+                self.dialog_handler = (event, handler)
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Worker:
+            headless = True
+
+            def __init__(self):
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _fill_visible_input_by_keyboard(self, *_args):
+                return None
+
+            def _fill_about_you_inputs(self, *_args):
+                return None
+
+            def _raise_if_account_creation_rejected(self, _page):
+                return None
+
+            def _submit_about_you(self, page):
+                self._raise_if_account_creation_rejected(page)
+                return False
+
+            def _click_continue(self, page):
+                events.append("retry-finish")
+                event, handler = page.dialog_handler
+                self.assert_dialog_event = event
+                handler(Dialog(page))
+                return True
+
+            def _about_you_submit_done(self, page, _before_url):
+                return page.state == "complete"
+
+        worker = Worker()
+        page = Page()
+        worker._hme_about_you_recovery_age = "26"
+        self.assertTrue(configure_resilient_about_you_input(worker))
+
+        self.assertTrue(worker._submit_about_you(page))
+
+        self.assertEqual(worker.assert_dialog_event, "dialog")
+        self.assertEqual(events, ["retry-finish", "dialog-ok:26", "next"])
+        self.assertTrue(any("已再次点击完成创建" in line for line in worker.logs))
+        self.assertTrue(any("已点击下一步" in line for line in worker.logs))
+
+    def test_about_you_inline_age_is_filled_once_while_submit_becomes_ready(self):
+        class Field:
+            def __init__(self):
+                self.value = ""
+                self.fill_count = 0
+
+            @staticmethod
+            def click(**_kwargs):
+                return None
+
+            def fill(self, value, **_kwargs):
+                self.fill_count += 1
+                self.value = value
+
+            def input_value(self, **_kwargs):
+                return self.value
+
+        class Worker:
+            def __init__(self):
+                self.finish_attempts = 0
+                self.logs = []
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _click_finish_creating_account(self, _page):
+                self.finish_attempts += 1
+                return self.finish_attempts >= 2
+
+        field = Field()
+        worker = Worker()
+        recovery_state = {}
+        with (
+            patch(
+                "hidemyemail_generator.openai_registration_flow._first_visible",
+                return_value=field,
+            ),
+            patch(
+                "hidemyemail_generator.openai_registration_flow._click_first_visible",
+                return_value=False,
+            ),
+        ):
+            self.assertFalse(
+                _fill_about_you_age_prompt(
+                    worker,
+                    object(),
+                    "25",
+                    recovery_state=recovery_state,
+                )
+            )
+            self.assertTrue(
+                _fill_about_you_age_prompt(
+                    worker,
+                    object(),
+                    "25",
+                    recovery_state=recovery_state,
+                )
+            )
+            self.assertTrue(
+                _fill_about_you_age_prompt(
+                    worker,
+                    object(),
+                    "25",
+                    recovery_state=recovery_state,
+                )
+            )
+
+        self.assertEqual(field.fill_count, 1)
+        self.assertEqual(worker.finish_attempts, 2)
+        self.assertEqual(field.value, "25")
+        self.assertTrue(any("不再重复填写" in line for line in worker.logs))
+
     def test_about_you_finish_click_waits_for_stable_values_and_button(self):
         events = []
 
@@ -5995,6 +6735,73 @@ class BrowserTaskHelperTests(unittest.TestCase):
 
 
 class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_concurrency_finishes_one_account_before_starting_next(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            bridge = root / "fake_bridge.py"
+            bridge.write_text("# unused test bridge\n", encoding="utf-8")
+            manager = BrowserTaskManager(
+                target_project_dir=target,
+                service_url="http://127.0.0.1:8765",
+                worker_token="test-token",
+                db_file=root / "hme.db",
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            events = []
+
+            async def account_finished(email, success, message):
+                events.append(("finished", email, success, message))
+                await asyncio.sleep(0)
+
+            async def run_account_inner(item, *, semaphore, headless):
+                del semaphore, headless
+                events.append(("started", item["email"]))
+                item["status"] = "success"
+                item["message"] = "Session / AT / Cookie 已保存"
+
+            manager._run_account_inner = run_account_inner
+            manager.start(
+                [
+                    {
+                        "email": "first@icloud.com",
+                        "_on_finished": account_finished,
+                    },
+                    {
+                        "email": "second@icloud.com",
+                        "_on_finished": account_finished,
+                    },
+                ],
+                headless=True,
+                concurrency=1,
+            )
+            await asyncio.wait_for(manager._batch_task, timeout=5)
+
+            self.assertEqual(
+                events,
+                [
+                    ("started", "first@icloud.com"),
+                    (
+                        "finished",
+                        "first@icloud.com",
+                        True,
+                        "Session / AT / Cookie 已保存",
+                    ),
+                    ("started", "second@icloud.com"),
+                    (
+                        "finished",
+                        "second@icloud.com",
+                        True,
+                        "Session / AT / Cookie 已保存",
+                    ),
+                ],
+            )
+
     def test_browser_log_context_tracks_page_location_and_action(self):
         google = browser_log_context(
             "[认证] 检测到 Google 登录要求；关闭当前浏览器并请求生成全新指纹"
@@ -6036,6 +6843,16 @@ class BrowserTaskManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(waiting["action"], "等待并监测邮箱验证码")
         self.assertEqual(checked["action"], "校验验证码输入并点击继续")
+
+    def test_browser_log_context_keeps_verification_page_when_password_is_next(self):
+        context = browser_log_context(
+            "[DOM检测] 当前=邮箱验证码页；"
+            "下一步=选择“使用密码继续”，先完成密码设置"
+        )
+
+        self.assertEqual(context["stage"], "email_verification")
+        self.assertEqual(context["location"], "邮箱验证码页")
+        self.assertEqual(context["action"], "在验证码页选择使用密码继续")
 
     def test_browser_log_context_keeps_otp_submit_as_completed_step(self):
         clicked = browser_log_context(

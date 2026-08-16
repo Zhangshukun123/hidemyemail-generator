@@ -247,6 +247,34 @@ class RegistrationActivityTests(unittest.TestCase):
             (True, "page"),
         )
 
+    def test_network_signal_ignores_late_load_and_dom_reflow(self):
+        before = {
+            "requestCount": 2,
+            "responseCount": 2,
+            "failedCount": 0,
+            "loadCount": 0,
+            "dom": ("auth.openai.com", "/email-verification", "loading", False),
+        }
+        css_finished = {
+            **before,
+            "loadCount": 1,
+            "dom": ("auth.openai.com", "/email-verification", "complete", False),
+        }
+        auth_requested = {**css_finished, "requestCount": 3}
+
+        self.assertEqual(
+            registration_activity_changed(before, css_finished, signal="network"),
+            (False, ""),
+        )
+        self.assertEqual(
+            registration_activity_changed(
+                css_finished,
+                auth_requested,
+                signal="network",
+            ),
+            (True, "request"),
+        )
+
     def test_step_ledger_blocks_next_step_until_current_is_completed(self):
         emitted = []
         worker = SimpleNamespace(

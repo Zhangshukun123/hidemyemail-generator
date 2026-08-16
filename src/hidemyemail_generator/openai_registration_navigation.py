@@ -43,6 +43,7 @@ _auth_click_chatgpt_home_login = _registration_auth.click_chatgpt_home_login
 _auth_click_chatgpt_home_signup = _registration_auth.click_chatgpt_home_signup
 _auth_is_chatgpt_homepage = _registration_auth.is_chatgpt_homepage
 _auth_is_chatgpt_auth_entry_url = _registration_auth.is_chatgpt_auth_entry_url
+HOME_PREOPENED_AUTH_DRAWER_TIMEOUT_SECONDS = 5.0
 HOME_EMAIL_MODAL_TRANSITION_TIMEOUT_SECONDS = 120.0
 HOME_EMAIL_MODAL_PROGRESS_INTERVAL_SECONDS = 10.0
 HOME_EMAIL_MODAL_PROGRESS_SELECTORS = (
@@ -461,6 +462,30 @@ def configure_chatgpt_home_login_entry(
                     OPENAI_EMAIL_LOGIN_INPUT_SELECTORS,
                     timeout=700,
                 )
+                if email_input is None and (
+                    _is_chatgpt_homepage(current_url) or direct_auth_entry
+                ):
+                    if _is_chatgpt_homepage(current_url):
+                        self.log(
+                            "[界面监听] ChatGPT 首页加载后正在优先检查"
+                            "是否自动打开登录或注册邮箱抽屉"
+                        )
+                    email_input = _registration_auth.wait_for_auth_email_entry(
+                        page,
+                        self.log,
+                        first_visible=_first_visible,
+                        wait=_page_wait,
+                        activate=lambda target_page: activate_page(
+                            self, target_page
+                        ),
+                        timeout_seconds=(
+                            HOME_PREOPENED_AUTH_DRAWER_TIMEOUT_SECONDS
+                            if _is_chatgpt_homepage(current_url)
+                            else _registration_auth.AUTH_EMAIL_ENTRY_MONITOR_TIMEOUT_SECONDS
+                        ),
+                    )
+                    current_url = str(getattr(page, "url", "") or "")
+                    direct_auth_entry = _is_chatgpt_auth_entry_url(current_url)
                 recovered_problem_page = False
                 if email_input is None and _registration_auth.is_auth_problem_page(page):
                     email_input = _registration_auth.wait_for_auth_email_entry(

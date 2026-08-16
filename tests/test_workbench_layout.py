@@ -14,6 +14,10 @@ class WorkbenchLayoutTests(unittest.TestCase):
             'class="activity-bar"',
             'class="sidebar"',
             'class="workspace"',
+            'class="workspace-route-tabs"',
+            'class="control-task-panel"',
+            'class="workbench-terminal-panel"',
+            'class="workbench-footer"',
             'class="runtime-log-drawer"',
         )
         for region in regions:
@@ -64,13 +68,15 @@ class WorkbenchLayoutTests(unittest.TestCase):
 
     def test_codex_palette_and_dense_dimensions_are_bundled(self):
         expected_tokens = (
-            "--workbench-titlebar-height: 35px",
-            "--workbench-activitybar-width: 48px",
-            "--workbench-statusbar-height: 0px",
+            "--workbench-titlebar-height: 44px",
+            "--workbench-activitybar-width: 58px",
+            "--workbench-statusbar-height: 28px",
+            "--workbench-tabbar-height: 42px",
+            "--workbench-terminal-height: clamp(250px, 31vh, 310px)",
             "--canvas: #0d0d0d",
             "--surface: #181818",
             "--blue: #19c37d",
-            "grid-template-rows: var(--workbench-titlebar-height)",
+            "grid-template-rows: minmax(0, 1fr) var(--workbench-terminal-height)",
         )
         for token in expected_tokens:
             self.assertIn(token, self.page)
@@ -163,10 +169,12 @@ class WorkbenchLayoutTests(unittest.TestCase):
             self.page.index('id="workbenchSidebar"') :
             self.page.index('id="sidebarExpandRail"')
         ]
-        self.assertNotIn('class="explorer-title"', sidebar_markup)
-        self.assertNotIn("资源管理器", sidebar_markup)
+        self.assertIn("资源管理器", sidebar_markup)
+        self.assertIn('class="product-lockup sidebar-brand explorer-title"', sidebar_markup)
+        self.assertIn('id="sidebarTaskGroupTitle"', sidebar_markup)
+        self.assertIn('id="sidebarResourceTitle"', sidebar_markup)
         self.assertLess(
-            sidebar_markup.index('class="product-lockup sidebar-brand"'),
+            sidebar_markup.index('class="product-lockup sidebar-brand explorer-title"'),
             sidebar_markup.index('id="sidebarCollapseButton"'),
         )
         self.assertIn('href="#i-panel-expand"', self.page)
@@ -195,6 +203,34 @@ class WorkbenchLayoutTests(unittest.TestCase):
         )
         for marker in expected_styles:
             self.assertIn(marker, self.page)
+
+    def test_control_center_uses_real_task_state_and_redacted_log_preview(self):
+        expected_markup = (
+            'id="controlTaskTableBody"',
+            'id="controlTaskSearch"',
+            'data-control-task-filter="running"',
+            'id="terminalPreviewList"',
+            'data-action="toggle-terminal-preview"',
+            'id="footerRunningCount"',
+            'id="footerApiLabel"',
+        )
+        for marker in expected_markup:
+            self.assertIn(marker, self.page)
+
+        expected_behavior = (
+            "function workspaceTaskRows(state)",
+            "normalizeWorkspaceTaskStatus",
+            "this.renderControlCenter(state)",
+            "renderTerminalPreview(model)",
+            "this.runtimeLogPresenter.model",
+            "redactRuntimeLogText(raw.message)",
+            'this.commands.register("toggle-terminal-preview"',
+            'this.commands.register("focus-control-task-search"',
+            "scheduleWorkspaceRefresh()",
+        )
+        for marker in expected_behavior:
+            self.assertIn(marker, self.page)
+        self.assertIn('<div class="terminal-preview-row" data-level="', self.page)
 
 
 if __name__ == "__main__":
