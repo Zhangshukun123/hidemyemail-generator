@@ -809,9 +809,10 @@ class WebJob:
     phone: str
     country: str = "BR"
     sms_provider: str = "manual"
-    sms_service: str = "ts"
+    sms_service: str = "paypal"
     sms_country: str = ""
     sms_max_price: float = SMSBOWER_DEFAULT_MAX_PRICE
+    sms_virtual: bool = False
     buyer_mode: str = "identity_elevation"
     debug: bool = False
     max_card_attempts: int = 5
@@ -835,6 +836,26 @@ class WebJob:
     traceback_text: str = ""
     generated: dict[str, Any] | None = None
     runtime_schema: dict[str, Any] | None = None
+    phone_validation: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "not_started",
+            "message": "等待获取手机号；被动监测不会发送验证码",
+            "attempt": 0,
+            "format_valid": False,
+            "checked_at": None,
+        }
+    )
+    phone_verification: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "not_started",
+            "message": "尚未进入 PayPal 短信验证阶段",
+            "attempt": 0,
+            "paypal_send_accepted": False,
+            "sms_received": False,
+            "paypal_confirmed": False,
+            "updated_at": None,
+        }
+    )
     awaiting_prompt: str = ""
     challenge_url: str = ""
     logs: list[dict[str, Any]] = field(default_factory=list)
@@ -909,6 +930,82 @@ class WebJob:
             self._sms_activation = activation
             self._sms_activation_finalized = False
             self.phone = activation.phone
+            self.sms_virtual = bool(activation.is_virtual)
+            route_label = "美国（虚拟）PayPal" if self.sms_virtual else "PayPal"
+            self.phone_validation = {
+                "status": "provider_allocated",
+                "message": (
+                    f"SMSBower 已分配{route_label}号码，"
+                    "等待本地格式与区号检查；不会发码"
+                ),
+                "attempt": 0,
+                "format_valid": False,
+                "checked_at": now_ts(),
+            }
+            self.phone_verification = {
+                "status": "not_started",
+                "message": "号码监测不会发码；协议支付进入短信验证阶段后才会发送",
+                "attempt": 0,
+                "paypal_send_accepted": False,
+                "sms_received": False,
+                "paypal_confirmed": False,
+                "updated_at": None,
+            }
+            self.updated_at = now_ts()
+            self._condition.notify_all()
+
+    def set_phone_validation(
+        self,
+        status: str,
+        message: str,
+        *,
+        attempt: int = 0,
+        format_valid: bool | None = None,
+    ) -> None:
+        with self._condition:
+            value = dict(self.phone_validation or {})
+            value.update(
+                {
+                    "status": str(status or "not_started"),
+                    "message": redact_text(message),
+                    "attempt": max(0, int(attempt or 0)),
+                    "checked_at": now_ts(),
+                }
+            )
+            if format_valid is not None:
+                value["format_valid"] = bool(format_valid)
+            self.phone_validation = value
+            self.updated_at = now_ts()
+            self._condition.notify_all()
+
+    def set_phone_verification(
+        self,
+        status: str,
+        message: str,
+        *,
+        attempt: int = 0,
+        paypal_send_accepted: bool | None = None,
+        sms_received: bool | None = None,
+        paypal_confirmed: bool | None = None,
+    ) -> None:
+        with self._condition:
+            value = dict(self.phone_verification or {})
+            value.update(
+                {
+                    "status": str(status or "not_started"),
+                    "message": redact_text(message),
+                    "attempt": max(0, int(attempt or 0)),
+                    "updated_at": now_ts(),
+                }
+            )
+            for key, selected in (
+                ("paypal_send_accepted", paypal_send_accepted),
+                ("sms_received", sms_received),
+                ("paypal_confirmed", paypal_confirmed),
+            ):
+                if selected is not None:
+                    value[key] = bool(selected)
+            self.phone_verification = value
             self.updated_at = now_ts()
             self._condition.notify_all()
 
@@ -1211,7 +1308,10 @@ class WebJob:
                 "sms_country": self.sms_country,
                 "sms_max_price": self.sms_max_price,
                 "sms_auto": self.sms_provider == "smsbower",
+                "sms_virtual": self.sms_virtual,
                 "sms_activation_active": self._sms_activation is not None,
+                "phone_validation": sanitize_payload(self.phone_validation),
+                "phone_verification": sanitize_payload(self.phone_verification),
                 "buyer_mode": self.buyer_mode,
                 "debug": self.debug and ALLOW_DEBUG_LOGS,
                 "max_card_attempts": self.max_card_attempts,
@@ -1555,6 +1655,36 @@ class WebPayPalFlow(PayPalFlow):
         logger.info(prompt)
         return self.job.wait_for_input(prompt)
 
+    def _set_phone_validation(
+        self, status: str, message: str, **details: Any
+    ) -> None:
+        self.job.set_phone_validation(status, message, **details)
+
+    def _set_phone_verification(
+        self, status: str, message: str, **details: Any
+    ) -> None:
+        self.job.set_phone_verification(status, message, **details)
+
+    def _monitor_phone_without_sms(self, phone: str, *, attempt: int = 0) -> None:
+        """Validate country/format locally without making a PayPal request."""
+        try:
+            result = passive_phone_check(phone, self.country)
+            self._update_user_phone(phone)
+        except Exception as error:
+            self._set_phone_validation(
+                "format_invalid",
+                "号码被动监测未通过：" + redact_text(error),
+                attempt=attempt,
+                format_valid=False,
+            )
+            raise
+        self._set_phone_validation(
+            "format_valid",
+            str(result.get("message") or "号码国家区号与格式通过本地监测；未向 PayPal 发码"),
+            attempt=attempt,
+            format_valid=True,
+        )
+
     def _confirm_phone_with_retry(self, token: str, signup_url: str):
         """Web version of the CLI input loop."""
         if self.job.sms_provider == "smsbower":
@@ -1575,8 +1705,35 @@ class WebPayPalFlow(PayPalFlow):
         }.get(self.country, "+12025550123")
         while True:
             try:
-                auth_id, challenge_id = self._initiate_2fa_phone_confirmation(token, signup_url)
+                self._monitor_phone_without_sms(self.user.phone)
             except Exception as e:
+                logger.error("Passive phone check failed for {}: {}", self._masked_phone(), e)
+                while True:
+                    value = self._prompt_operator(
+                        f"手机号格式检查失败。请输入新的手机号（如 {phone_example}）；输入 q 退出。"
+                    )
+                    if value.lower() in {"q", "quit", "exit"}:
+                        raise RuntimeError("OTP confirmation cancelled by user") from e
+                    try:
+                        self._update_user_phone(value)
+                        break
+                    except ValueError as phone_error:
+                        logger.warning("手机号无效：{}。请重新输入。", phone_error)
+                continue
+
+            try:
+                auth_id, challenge_id = self._initiate_2fa_phone_confirmation(token, signup_url)
+                self._set_phone_verification(
+                    "code_sent",
+                    "协议支付已进入 PayPal 短信验证并发送验证码",
+                    paypal_send_accepted=True,
+                )
+            except Exception as e:
+                self._set_phone_verification(
+                    "send_rejected",
+                    "PayPal 未接受该号码的发码请求：" + redact_text(e),
+                    paypal_send_accepted=False,
+                )
                 logger.error("Failed to initiate OTP for {}: {}", self._masked_phone(), e)
                 while True:
                     value = self._prompt_operator(
@@ -1602,6 +1759,11 @@ class WebPayPalFlow(PayPalFlow):
                     raise RuntimeError("OTP confirmation cancelled by user")
 
                 if len(value) == 6 and value.isdigit():
+                    self._set_phone_verification(
+                        "sms_received",
+                        "已收到短信验证码，正在提交 PayPal",
+                        sms_received=True,
+                    )
                     if self._confirm_2fa_phone_confirmation(
                         token,
                         signup_url,
@@ -1609,7 +1771,17 @@ class WebPayPalFlow(PayPalFlow):
                         challenge_id,
                         value,
                     ):
+                        self._set_phone_verification(
+                            "confirmed",
+                            "PayPal 已确认验证码，号码最终验证通过",
+                            paypal_confirmed=True,
+                        )
                         return
+                    self._set_phone_verification(
+                        "confirmation_rejected",
+                        "PayPal 拒绝验证码，号码尚未最终验证",
+                        paypal_confirmed=False,
+                    )
                     logger.warning("验证码验证失败。可以继续输入新的6位验证码，或输入新手机号重新发送验证码。")
                     continue
 
@@ -1636,15 +1808,23 @@ class WebPayPalFlow(PayPalFlow):
                     self.country, max_price=self.job.sms_max_price
                 )
                 self.job.attach_sms_activation(activation)
-                self._update_user_phone(activation.phone)
                 logger.info(
                     "SMSBower replacement number acquired: {}",
                     self._masked_phone(),
                 )
 
+            attempt_stage = "passive_check"
             try:
+                self._monitor_phone_without_sms(activation.phone, attempt=attempt)
+                attempt_stage = "paypal_send"
                 auth_id, challenge_id = self._initiate_2fa_phone_confirmation(
                     token, signup_url
+                )
+                self._set_phone_verification(
+                    "code_sent",
+                    "协议支付已进入 PayPal 短信验证并发送验证码",
+                    attempt=attempt,
+                    paypal_send_accepted=True,
                 )
                 try:
                     SMSBOWER_PHONE_CLIENT.mark_sent(activation)
@@ -1660,14 +1840,22 @@ class WebPayPalFlow(PayPalFlow):
                     "PayPal SMS sent; SMSBower is polling automatically for {}",
                     self._masked_phone(),
                 )
+                attempt_stage = "wait_sms"
                 code = SMSBOWER_PHONE_CLIENT.wait_for_code(
                     activation,
                     cancel_event=self.job._cancel_event,
                     timeout_seconds=SMSBOWER_OTP_TIMEOUT_SECONDS,
                 )
                 self.job.check_cancelled()
+                self._set_phone_verification(
+                    "sms_received",
+                    "已收到 PayPal 短信验证码；准备提交验证",
+                    attempt=attempt,
+                    sms_received=True,
+                )
                 self.job.set_status("running", "SMSBower 已收到验证码，正在提交 PayPal")
                 logger.info("SMSBower returned the PayPal OTP; submitting it automatically")
+                attempt_stage = "confirm"
                 if self._confirm_2fa_phone_confirmation(
                     token,
                     signup_url,
@@ -1675,14 +1863,48 @@ class WebPayPalFlow(PayPalFlow):
                     challenge_id,
                     code,
                 ):
+                    self._set_phone_verification(
+                        "confirmed",
+                        "PayPal 已确认验证码，号码最终验证通过",
+                        attempt=attempt,
+                        paypal_confirmed=True,
+                    )
                     self.job.finalize_sms_activation(success=True)
                     logger.success("SMSBower PayPal phone verification completed")
                     return
                 last_error = "PayPal 拒绝了 SMSBower 返回的验证码"
+                self._set_phone_verification(
+                    "confirmation_rejected",
+                    last_error,
+                    attempt=attempt,
+                    paypal_confirmed=False,
+                )
             except SMSBowerPhoneCancelled as error:
                 raise RuntimeError("Task cancelled") from error
             except Exception as error:
                 last_error = str(error) or type(error).__name__
+                if attempt_stage == "paypal_send":
+                    self._set_phone_verification(
+                        "send_rejected",
+                        "PayPal 未接受该号码的发码请求：" + redact_text(last_error),
+                        attempt=attempt,
+                        paypal_send_accepted=False,
+                    )
+                elif attempt_stage == "wait_sms":
+                    self._set_phone_verification(
+                        "sms_timeout",
+                        "PayPal 已接受发码，但号码未在时限内收到短信",
+                        attempt=attempt,
+                        paypal_send_accepted=True,
+                        sms_received=False,
+                    )
+                elif attempt_stage == "confirm":
+                    self._set_phone_verification(
+                        "confirmation_rejected",
+                        "PayPal 验证码确认失败：" + redact_text(last_error),
+                        attempt=attempt,
+                        paypal_confirmed=False,
+                    )
                 logger.warning(
                     "SMSBower phone attempt {}/{} failed: {}",
                     attempt,
@@ -1774,6 +1996,111 @@ def supported_country_codes() -> set[str]:
 
 VERIFIED_PROTOCOL_COUNTRIES = {"BR", "DE", "GB", "US", "JP", "TH", "ID", "PH", "TW", "MX", "AE", "AU", "CA"}
 
+PASSIVE_PHONE_PATTERNS = {
+    "AE": r"9715[024568]\d{7}",
+    "AU": r"614\d{8}",
+    "BR": r"55\d{8,15}",
+    "CA": r"1[2-9]\d{9}",
+    "DE": r"49\d{6,15}",
+    "GB": r"44\d{9,12}",
+    "ID": r"628\d{8,11}",
+    "JP": r"81\d{9,11}",
+    "MX": r"52\d{10}",
+    "PH": r"639\d{9}",
+    "TH": r"66[689]\d{8}",
+    "TW": r"8869\d{8}",
+    "US": r"1[2-9]\d{9}",
+}
+
+
+def _passive_phone_country_metadata(country: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    country_path = ROOT / "data" / "paypal_supported_countries.json"
+    schema_path = ROOT / "data" / "country_discovery" / "country_field_catalog.json"
+    try:
+        country_payload = json.loads(country_path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise ValueError("国家号码目录暂不可用") from error
+    selected = next(
+        (
+            item
+            for item in country_payload.get("countries") or []
+            if isinstance(item, dict) and str(item.get("code") or "").upper() == country
+        ),
+        None,
+    )
+    if not selected:
+        raise ValueError("请选择受支持的国家")
+    try:
+        schema_payload = json.loads(schema_path.read_text(encoding="utf-8"))
+    except Exception:
+        schema_payload = {}
+    schema = schema_payload.get(country) if isinstance(schema_payload, dict) else {}
+    return selected, schema if isinstance(schema, dict) else {}
+
+
+def passive_phone_check(phone: str, country: str) -> dict[str, Any]:
+    """Check country code and format locally without contacting PayPal or sending SMS."""
+    country = str(country or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        raise ValueError("国家参数不正确")
+    metadata, runtime_schema = _passive_phone_country_metadata(country)
+    calling_code = str(metadata.get("calling_code") or "").strip()
+    calling_digits = re.sub(r"\D", "", calling_code)
+    if not calling_digits:
+        raise ValueError("所选国家缺少可用的国际区号")
+
+    raw = str(phone or "").strip()
+    compact = re.sub(r"[\s().-]+", "", raw)
+    if not compact:
+        raise ValueError("请输入要检测的手机号")
+    if not re.fullmatch(r"(?:\+|00)?\d{6,20}", compact):
+        raise ValueError("手机号只能包含国际区号、数字和常用分隔符")
+
+    explicitly_international = compact.startswith("+") or compact.startswith("00")
+    digits = compact[1:] if compact.startswith("+") else compact
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if explicitly_international and not digits.startswith(calling_digits):
+        raise ValueError(f"号码国际区号与所选国家不一致，应使用 {calling_code}")
+
+    if digits.startswith(calling_digits) and len(digits) > len(calling_digits) + 5:
+        local_digits = digits[len(calling_digits):]
+    else:
+        local_digits = digits
+    if local_digits.startswith("0"):
+        local_digits = local_digits[1:]
+    full_digits = calling_digits + local_digits
+    normalized_phone = "+" + full_digits
+    if not PHONE_RE.fullmatch(normalized_phone) or not 6 <= len(local_digits) <= 15:
+        raise ValueError("手机号长度不正确")
+
+    fixed_pattern = PASSIVE_PHONE_PATTERNS.get(country)
+    validation_level = "country_code_and_length"
+    if fixed_pattern:
+        if not re.fullmatch(fixed_pattern, full_digits):
+            raise ValueError("号码不符合所选国家的手机号格式")
+        validation_level = "country_mobile_pattern"
+    elif runtime_schema.get("phone_pattern"):
+        phone_error = validate_runtime_phone(runtime_schema, local_digits, normalized_phone)
+        if phone_error:
+            raise ValueError("号码不符合所选国家的本地号码格式")
+        validation_level = "country_runtime_pattern"
+
+    return {
+        "valid": True,
+        "status": "format_valid",
+        "country": country,
+        "country_name": str(metadata.get("name_zh") or metadata.get("name_en") or country),
+        "calling_code": calling_code,
+        "phone_masked": mask_phone(normalized_phone),
+        "local_length": len(local_digits),
+        "validation_level": validation_level,
+        "paypal_contacted": False,
+        "sms_sent": False,
+        "message": "被动监测成功：国家区号与号码格式匹配；未访问 PayPal，未发送验证码",
+        "limitation": "该结果不能证明号码已开通、可接收 PayPal 短信或属于当前使用者",
+    }
+
 
 def create_job(
     owner_device_id: str,
@@ -1782,7 +2109,7 @@ def create_job(
     debug: bool,
     max_card_attempts: int,
     sms_provider: str = "manual",
-    sms_service: str = "ts",
+    sms_service: str = "paypal",
     sms_country: str = "",
     sms_max_price: float = SMSBOWER_DEFAULT_MAX_PRICE,
     manual_funding: bool = False,
@@ -1807,7 +2134,9 @@ def create_job(
     sms_provider = str(sms_provider or "manual").strip().lower()
     if sms_provider not in {"manual", "smsbower"}:
         raise ValueError("短信来源参数不正确")
-    sms_service = str(sms_service or "ts").strip().lower()
+    sms_service = str(sms_service or "paypal").strip().lower()
+    if sms_service == "ts":
+        sms_service = "paypal"
     sms_country = str(sms_country or country or "BR").strip().upper()
     try:
         sms_max_price = round(float(sms_max_price), 4)
@@ -1824,8 +2153,8 @@ def create_job(
     if country not in allowed_countries:
         raise ValueError("PayPal 国家参数不正确")
     if sms_provider == "smsbower":
-        if sms_service != "ts":
-            raise ValueError("SMSBower 支付设置当前仅支持 PayPal（ts）")
+        if sms_service != "paypal":
+            raise ValueError("SMSBower 支付设置当前仅支持 PayPal")
         if sms_country != country:
             raise ValueError("验证码国家必须与 PayPal 国家一致")
         if country not in SMSBOWER_COUNTRY_IDS:
@@ -1986,7 +2315,7 @@ def create_job(
         )
         if total_active >= MAX_QUEUED_JOBS:
             raise ValueError("Current protocol-payment queue is full")
-        if user_active >= MAX_ACTIVE_JOBS_PER_DEVICE:
+        if not exclude_public_metrics and user_active >= MAX_ACTIVE_JOBS_PER_DEVICE:
             raise ValueError(f"当前浏览器已有 {user_active} 个未完成任务，请等待完成后再启动")
         if len(JOBS) >= MAX_TOTAL_JOBS:
             raise ValueError("历史任务数量已达上限，请稍后再试")
@@ -2315,6 +2644,23 @@ class WebHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self.validate_post_request():
             return
+        if path == "/api/phone/check":
+            if not self.check_rate_limit("passive_phone_check", limit=120, window_seconds=600):
+                return
+            try:
+                data = self.read_json()
+                result = passive_phone_check(data.get("phone", ""), data.get("country", ""))
+                return self.send_json({"ok": True, "result": result})
+            except ValueError as error:
+                return self.send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    str(error),
+                    code="PHONE_FORMAT_INVALID",
+                    extra={
+                        "paypal_contacted": False,
+                        "sms_sent": False,
+                    },
+                )
         if path == "/api/jobs":
             internal_auto = self.is_internal_auto_channel()
             if not internal_auto and not self.check_rate_limit("job_create", limit=20, window_seconds=600):
@@ -2326,7 +2672,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     ba_token=data.get("ba_token") or data.get("paypal_url", ""),
                     phone=data.get("phone", ""),
                     sms_provider=data.get("sms_provider") or "manual",
-                    sms_service=data.get("sms_service") or "ts",
+                    sms_service=data.get("sms_service") or "paypal",
                     sms_country=data.get("sms_country") or data.get("country") or "BR",
                     sms_max_price=data.get("sms_max_price") or SMSBOWER_DEFAULT_MAX_PRICE,
                     country=data.get("country") or data.get("paypal_country") or "BR",

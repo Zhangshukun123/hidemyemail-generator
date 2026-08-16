@@ -385,13 +385,22 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     email = str(payload.get("email") or "").strip().lower()
     code_url = str(payload.get("code_url") or "").strip()
     proxy_url = str(payload.get("proxy_url") or "").strip()
+    setup_credentials = payload.get("setup_credentials", True) is not False
     fingerprint = _proxy_fingerprint_profile(payload.get("proxy_country"))
     fingerprint_country = fingerprint["country"]
     fingerprint_language = fingerprint["language"]
     fingerprint_timezone = fingerprint["timezone"]
-    password = str(payload.get("existing_password") or "")
-    password_confirmed = bool(payload.get("existing_password_confirmed"))
-    totp_secret = str(payload.get("existing_totp_secret") or "")
+    password = (
+        str(payload.get("existing_password") or "") if setup_credentials else ""
+    )
+    password_confirmed = bool(
+        setup_credentials and payload.get("existing_password_confirmed")
+    )
+    totp_secret = (
+        str(payload.get("existing_totp_secret") or "")
+        if setup_credentials
+        else ""
+    )
     existing_access_token = str(payload.get("existing_access_token") or "").strip()
     existing_session_token = str(payload.get("existing_session_token") or "").strip()
     existing_session = _json_object(payload.get("existing_session_json"))
@@ -422,7 +431,11 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     _emit_event(
         "protocol_auth",
-        "启动 Mail Auth：CSRF → 账号密码注册 → OTP → OAuth callback → Session",
+        (
+            "启动 Mail Auth：CSRF → 账号密码注册 → OTP → OAuth callback → Session"
+            if setup_credentials
+            else "启动 Mail Auth：CSRF → 邮箱 OTP → OAuth callback → Session/Cookie"
+        ),
     )
     _emit_event(
         "network",
@@ -444,6 +457,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
     def password_checkpoint(candidate: str, confirmed: bool) -> None:
         nonlocal password, password_confirmed
+        if not setup_credentials:
+            return
         value = str(candidate or "").strip()
         if len(value) < 12:
             return
@@ -557,9 +572,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             proxy=proxy_url,
             otp_timeout=120,
             impersonate=impersonate,
-            # Request a password, while allowing the server-selected OTP branch
-            # to finish authentication before the same password is added.
-            with_password=True,
+            # Passwordless mode stops after the OTP-authenticated Session.
+            # Credential mode also asks the service to add and verify a password.
+            with_password=setup_credentials,
             password_checkpoint_fn=password_checkpoint,
         )
         raw = bot.register()
@@ -657,6 +672,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "password_login_verified": False,
         "password_login_verification_attempts": 0,
         "recent_auth_login": recent_auth_login_required,
+        "setup_credentials": setup_credentials,
         "transient_init_recovered": bool(transient_init_retries),
         "resumed_from_password_checkpoint": resumed_from_checkpoint,
         "impersonate": impersonate,
@@ -678,6 +694,29 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         "session_acquisition_method": "gptfree_mail_auth",
         "registration_diagnostics": checkpoint_diagnostics,
     }
+    if not setup_credentials:
+        _emit_event(
+            "completed",
+            "Session/Cookie 已保存；已按设置跳过密码和 TOTP 2FA",
+            "success",
+        )
+        return {
+            "status": "success",
+            "email": email,
+            "access_token": access_token,
+            "session_json": json.dumps(session, ensure_ascii=False),
+            "storage_state_json": json.dumps(
+                _storage_state(session_token, device_id), ensure_ascii=False
+            ),
+            "cookies_json": json.dumps(
+                raw.get("session_cookies") or [], ensure_ascii=False
+            ),
+            "session_acquisition_method": "gptfree_mail_auth",
+            "session_token": session_token,
+            "device_id": device_id,
+            "registration_diagnostics": checkpoint_diagnostics,
+        }
+
     def confirm_password_checkpoint() -> None:
         nonlocal password_confirmed
         password_confirmed = True

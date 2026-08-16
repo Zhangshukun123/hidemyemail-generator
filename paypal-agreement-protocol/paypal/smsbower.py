@@ -22,7 +22,8 @@ import httpx
 
 SMSBOWER_API_URL = "https://smsbower.page/stubs/handler_api.php"
 SMSBOWER_API_DOCS_URL = "https://smsbower.app/cn/api?page=client"
-SMSBOWER_PAYPAL_SERVICE = "ts"
+SMSBOWER_PAYPAL_SERVICE = "paypal"
+SMSBOWER_PAYPAL_SERVICE_CODE = "ts"
 SMSBOWER_SETTING_KEY = "smsbower_mail_config_v1"
 DEFAULT_MAX_PRICE = 3.0
 DEFAULT_POLL_INTERVAL_SECONDS = 4.0
@@ -45,6 +46,12 @@ COUNTRY_IDS: dict[str, int] = {
     "AU": 175,
     "CA": 36,
 }
+SMSBOWER_US_VIRTUAL_COUNTRY_ID = 12
+COUNTRY_PURCHASE_IDS: dict[str, tuple[int, ...]] = {
+    # Prefer the inexpensive US virtual pool shown by SMSBower, while keeping
+    # the ordinary United States pool as a bounded fallback.
+    "US": (SMSBOWER_US_VIRTUAL_COUNTRY_ID, COUNTRY_IDS["US"]),
+}
 
 _WAITING_STATUSES = {"STATUS_WAIT_CODE", "STATUS_WAIT_RESEND"}
 _TERMINAL_ERRORS = {"NO_ACTIVATION", "STATUS_CANCEL"}
@@ -65,6 +72,7 @@ class SMSBowerPhoneActivation:
     phone: str
     country: str
     service: str = SMSBOWER_PAYPAL_SERVICE
+    is_virtual: bool = False
 
 
 Requester = Callable[[dict[str, Any]], str]
@@ -209,23 +217,38 @@ class SMSBowerPhoneClient:
         country_id = COUNTRY_IDS.get(normalized_country)
         if country_id is None:
             return {"supported": False, "country": normalized_country, "price": None, "count": 0}
-        body = self._request(
-            "getPrices", service=SMSBOWER_PAYPAL_SERVICE, country=country_id
-        )
-        try:
-            payload = json.loads(body)
-            country_state = payload.get(str(country_id), {})
-            service_state = country_state.get(SMSBOWER_PAYPAL_SERVICE, {})
-            price = float(service_state.get("cost"))
-            count = int(service_state.get("count") or 0)
-        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-            raise self._provider_error(body, action="价格查询") from None
+        routes: list[dict[str, Any]] = []
+        for candidate_id in COUNTRY_PURCHASE_IDS.get(
+            normalized_country, (country_id,)
+        ):
+            body = self._request(
+                "getPrices",
+                service=SMSBOWER_PAYPAL_SERVICE_CODE,
+                country=candidate_id,
+            )
+            try:
+                payload = json.loads(body)
+                country_state = payload.get(str(candidate_id), {})
+                service_state = country_state.get(
+                    SMSBOWER_PAYPAL_SERVICE_CODE, {}
+                )
+                routes.append(
+                    {
+                        "countryId": candidate_id,
+                        "price": round(float(service_state.get("cost")), 4),
+                        "count": max(0, int(service_state.get("count") or 0)),
+                        "virtual": candidate_id == SMSBOWER_US_VIRTUAL_COUNTRY_ID,
+                    }
+                )
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                raise self._provider_error(body, action="价格查询") from None
+        available_routes = [item for item in routes if item["count"] > 0]
+        selected = min(available_routes or routes, key=lambda item: item["price"])
         return {
             "supported": True,
             "country": normalized_country,
-            "countryId": country_id,
-            "price": round(price, 4),
-            "count": max(0, count),
+            **selected,
+            "routes": routes,
         }
 
     def public_status(self, *, country: str = "BR", probe: bool = True) -> dict[str, Any]:
@@ -234,6 +257,7 @@ class SMSBowerPhoneClient:
             "configured": configured,
             "provider": "smsbower",
             "service": SMSBOWER_PAYPAL_SERVICE,
+            "serviceCode": SMSBOWER_PAYPAL_SERVICE_CODE,
             "country": str(country or "BR").strip().upper(),
             "supportedCountries": sorted(COUNTRY_IDS),
             "defaultMaxPrice": DEFAULT_MAX_PRICE,
@@ -268,12 +292,22 @@ class SMSBowerPhoneClient:
             minimum=0.001,
             maximum=50,
         )
-        body = self._request(
-            "getNumber",
-            service=SMSBOWER_PAYPAL_SERVICE,
-            country=country_id,
-            maxPrice=f"{normalized_price:g}",
-        )
+        selected_country_id = country_id
+        body = ""
+        for candidate_id in COUNTRY_PURCHASE_IDS.get(
+            normalized_country, (country_id,)
+        ):
+            selected_country_id = candidate_id
+            body = self._request(
+                "getNumber",
+                service=SMSBOWER_PAYPAL_SERVICE_CODE,
+                country=candidate_id,
+                maxPrice=f"{normalized_price:g}",
+            )
+            if body.startswith("ACCESS_NUMBER:"):
+                break
+            if body.split(":", 1)[0].upper() != "NO_NUMBERS":
+                raise self._provider_error(body, action="取号")
         if not body.startswith("ACCESS_NUMBER:"):
             raise self._provider_error(body, action="取号")
         parts = body.split(":", 2)
@@ -287,6 +321,7 @@ class SMSBowerPhoneClient:
             activation_id=activation_id,
             phone=f"+{phone_digits}",
             country=normalized_country,
+            is_virtual=(selected_country_id == SMSBOWER_US_VIRTUAL_COUNTRY_ID),
         )
 
     def set_status(self, activation: SMSBowerPhoneActivation, status: int) -> str:
@@ -358,10 +393,13 @@ class SMSBowerPhoneClient:
 
 __all__ = [
     "COUNTRY_IDS",
+    "COUNTRY_PURCHASE_IDS",
     "DEFAULT_MAX_PRICE",
     "SMSBOWER_API_DOCS_URL",
     "SMSBOWER_API_URL",
     "SMSBOWER_PAYPAL_SERVICE",
+    "SMSBOWER_PAYPAL_SERVICE_CODE",
+    "SMSBOWER_US_VIRTUAL_COUNTRY_ID",
     "SMSBowerPhoneActivation",
     "SMSBowerPhoneCancelled",
     "SMSBowerPhoneClient",

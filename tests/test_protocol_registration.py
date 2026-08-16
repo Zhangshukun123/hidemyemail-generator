@@ -12,7 +12,6 @@ from hidemyemail_generator.browser_tasks import load_account_record
 from hidemyemail_generator.inbox import connect_db
 from hidemyemail_generator.protocol_credentials import (
     MFA_BASE_URL,
-    PASSWORD_ADD_URL,
     complete_protocol_credentials,
 )
 from hidemyemail_generator.protocol_registration import (
@@ -354,6 +353,62 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
         )
         self.assertEqual(credential_call["impersonate"], "firefox144")
         self.assertEqual(result["password"], "GeneratedPassword!1")
+
+    def test_registration_can_stop_after_passwordless_session(self):
+        constructor = {}
+
+        class FakeRegister:
+            def __init__(self, account, **kwargs):
+                constructor["account"] = dict(account)
+                constructor.update(kwargs)
+                self.password = "ShouldNotBeSaved!1"
+
+            def register(self):
+                return {
+                    "status": "success",
+                    "access_token": "passwordless-access-token",
+                    "session_token": "passwordless-session-token",
+                    "session_json": {"sessionToken": "passwordless-session-token"},
+                    "session_cookies": [
+                        {
+                            "name": "__Secure-next-auth.session-token",
+                            "value": "passwordless-session-token",
+                            "domain": "chatgpt.com",
+                            "path": "/",
+                        }
+                    ],
+                    "device_id": "passwordless-device",
+                    "password": "ShouldNotBeSaved!1",
+                    "password_set": False,
+                }
+
+        module = SimpleNamespace(ChatGPTRegister=FakeRegister)
+        with (
+            patch(
+                "hidemyemail_generator.protocol_registration_worker._load_core",
+                return_value=module,
+            ),
+            patch(
+                "hidemyemail_generator.protocol_credentials.complete_protocol_credentials"
+            ) as complete,
+        ):
+            result = run(
+                {
+                    "email": "session-only@icloud.com",
+                    "code_url": "http://127.0.0.1/code",
+                    "project_root": ".",
+                    "source_root": ".",
+                    "setup_credentials": False,
+                }
+            )
+
+        self.assertFalse(constructor["with_password"])
+        self.assertEqual(constructor["account"]["password"], "")
+        complete.assert_not_called()
+        self.assertEqual(result["access_token"], "passwordless-access-token")
+        self.assertNotIn("password", result)
+        self.assertNotIn("two_factor", result)
+        self.assertFalse(result["registration_diagnostics"]["setup_credentials"])
 
     def test_password_checkpoint_waits_for_login_proof_before_2fa(self):
         events = []
@@ -3106,6 +3161,55 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
         profile = provider._impl._browser_profile("dynamic-import-check")
 
         self.assertEqual(profile.device_id, "dynamic-import-check")
+
+    async def test_session_only_success_does_not_require_or_persist_credentials(self):
+        captured = []
+
+        async def runner(payload, on_event):
+            captured.append(payload)
+            on_event(
+                {
+                    "stage": "session",
+                    "message": "Session/Cookie 已获取",
+                    "status": "success",
+                }
+            )
+            return {
+                "status": "success",
+                "email": payload["email"],
+                "access_token": "header.payload.signature",
+                "session_json": json.dumps(
+                    {
+                        "accessToken": "header.payload.signature",
+                        "sessionToken": "session-only-token",
+                    }
+                ),
+                "storage_state_json": json.dumps({"cookies": [], "origins": []}),
+                "session_acquisition_method": "gptfree_mail_auth",
+            }
+
+        manager = ProtocolRegistrationManager(
+            base_dir=self.base_dir,
+            db_file=self.db_file,
+            worker_runner=runner,
+        )
+        initial = manager.start(
+            emails=["session-only@icloud.com"],
+            base_url="http://127.0.0.1:8080",
+            concurrency=1,
+            setup_credentials=False,
+        )
+        final = await manager.wait()
+
+        self.assertFalse(initial["setupCredentials"])
+        self.assertFalse(captured[0]["setup_credentials"])
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["succeeded"], 1)
+        self.assertIn("Session/Cookie", final["accounts"][0]["message"])
+        record = load_account_record(self.db_file, "session-only@icloud.com")
+        self.assertEqual(record["session"]["sessionToken"], "session-only-token")
+        self.assertNotIn("password", record)
+        self.assertNotIn("two_factor", record)
 
     async def test_success_requires_and_persists_password_two_factor_and_session(self):
         captured = []

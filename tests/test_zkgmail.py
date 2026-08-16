@@ -31,7 +31,7 @@ class ZkgmailConfigTests(unittest.TestCase):
 
 
 class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
-    def test_human_local_part_uses_name_and_short_number(self):
+    def test_human_local_part_uses_alphanumeric_name_and_short_number(self):
         with (
             mock.patch(
                 "hidemyemail_generator.zkgmail.secrets.choice",
@@ -39,12 +39,13 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch(
                 "hidemyemail_generator.zkgmail.secrets.randbelow",
-                side_effect=[1, 0, 17],
+                side_effect=[0, 17],
             ),
         ):
             local_part = _generate_human_local_part()
 
-        self.assertEqual(local_part, "emily.johnson27")
+        self.assertEqual(local_part, "emilyjohnson27")
+        self.assertTrue(local_part.isalnum())
 
     def test_sync_stores_only_openai_code_for_known_zkgmail_alias(self):
         class MailboxStub:
@@ -120,6 +121,71 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             [(target, "123456")],
         )
 
+    def test_sync_refreshes_qq_snapshot_without_opening_message(self):
+        target = "fresh.alias@zkgmail.com"
+        message = EmailMessage()
+        message["To"] = target
+        message["From"] = "noreply@openai.com"
+        message["Subject"] = "OpenAI verification code"
+        message["Date"] = datetime.now(timezone.utc)
+        message.set_content("Your ChatGPT verification code is 654321")
+
+        class DelayedMailboxStub:
+            def __init__(self):
+                self.refreshed = False
+                self.store_calls = []
+
+            def login(self, _username, _password):
+                return "OK", []
+
+            def list(self):
+                return "OK", []
+
+            def select(self, _folder):
+                return "OK", []
+
+            def noop(self):
+                self.refreshed = True
+                return "OK", []
+
+            def uid(self, command, uid, _query):
+                if command == "search":
+                    return "OK", [b"501" if self.refreshed else b""]
+                if command == "store":
+                    self.store_calls.append((uid, _query))
+                    return "OK", []
+                return "OK", [(b"BODY", message.as_bytes())]
+
+            def logout(self):
+                return "BYE", []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            mailbox = DelayedMailboxStub()
+
+            with mock.patch(
+                "hidemyemail_generator.zkgmail._connect_mailbox",
+                return_value=mailbox,
+            ):
+                inserted = _sync_relevant_messages(
+                    store.inbox_config(), db_file, {target}, limit=10
+                )
+
+            conn = connect_db(str(db_file))
+            try:
+                row = conn.execute(
+                    "SELECT hme_address, code FROM messages WHERE uid = '501'"
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(inserted, 1)
+        self.assertTrue(mailbox.refreshed)
+        self.assertEqual(mailbox.store_calls, [])
+        self.assertEqual((row["hme_address"], row["code"]), (target, "654321"))
+
     async def test_generated_address_reads_one_exact_forwarded_code(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "mail.db"
@@ -162,7 +228,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertRegex(
                 email,
-                r"^[a-z]+(?:\.[a-z]+|[a-z]+)\d{2,4}@zkgmail\.com$",
+                r"^[a-z]+\d{2,4}@zkgmail\.com$",
             )
             self.assertEqual(first, "246810")
             self.assertEqual(repeated, "")
@@ -183,7 +249,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
                     ) VALUES (?, '', 'unused', 'zkgmail', '', 1, ?, ?)
                     """,
                     (
-                        "emily.johnson27@zkgmail.com",
+                        "emilyjohnson27@zkgmail.com",
                         datetime.now(timezone.utc).isoformat(),
                         datetime.now(timezone.utc).isoformat(),
                     ),
@@ -194,7 +260,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
 
             with mock.patch(
                 "hidemyemail_generator.zkgmail._generate_human_local_part",
-                side_effect=["emily.johnson27", "danielwilson824"],
+                side_effect=["emilyjohnson27", "danielwilson824"],
             ):
                 email = await client.acquire_email()
 

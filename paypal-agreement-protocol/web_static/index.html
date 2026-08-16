@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · PayPal 协议支付</title>
   <meta name="description" content="独立 PayPal Billing Agreement 协议授权工作台">
-  <link rel="stylesheet" href="/paypal-pay/static/styles.css?v=20260814-auto-handoff01">
+  <link rel="stylesheet" href="/paypal-pay/static/styles.css?v=20260817-phone-check03">
   <link rel="stylesheet" href="/paypal-pay/static/protocol.css?v=20260720-notice01">
 </head>
 <body>
@@ -129,6 +129,20 @@
             <input id="phone" required autocomplete="off" inputmode="tel" placeholder="+55 11 9XXXXXXXX">
           </label>
         </div>
+        <section class="manual-phone-check" aria-labelledby="manualPhoneCheckTitle">
+          <div class="manual-phone-check-heading">
+            <div><span class="section-index">N</span><div><h3 id="manualPhoneCheckTitle">手动号码检测</h3><p>独立本地检测，不创建支付任务，不访问 PayPal，不发送验证码。</p></div></div>
+            <span class="micro-pill">NO SMS</span>
+          </div>
+          <div class="manual-phone-check-grid">
+            <label class="field compact"><span>号码国家</span><select id="phoneCheckCountry" aria-label="号码检测国家"></select></label>
+            <label class="field compact"><span>手机号码</span><input id="phoneCheckInput" autocomplete="off" inputmode="tel" placeholder="+55 11 9XXXXXXXX"></label>
+            <button id="phoneCheckButton" class="secondary-button" type="button">检测号码 · 不发验证码</button>
+          </div>
+          <div id="phoneCheckResult" class="manual-phone-check-result idle" role="status" aria-live="polite">
+            <strong>等待检测</strong><span>结果只能确认国家区号与号码格式，不能确认号码归属或短信可达性。</span>
+          </div>
+        </section>
         <section class="sms-provider-panel" aria-labelledby="smsSettingsTitle">
           <div class="sms-settings-heading">
             <div><span class="section-index">S</span><div><h3 id="smsSettingsTitle">验证码平台设置</h3><p>按任务设置短信平台、支付服务、国家和最高价。</p></div></div>
@@ -141,12 +155,12 @@
             </label>
             <div id="smsbowerControls" class="smsbower-controls" hidden>
               <div class="smsbower-settings-grid">
-                <label class="field compact"><span>支付设置</span><select id="smsbowerPaymentService"><option value="ts">PayPal · ts</option></select></label>
+                <label class="field compact"><span>支付设置</span><select id="smsbowerPaymentService"><option value="paypal">PayPal</option></select></label>
                 <label class="field compact"><span>国家</span><select id="smsbowerCountry" aria-label="SMSBower 国家"></select></label>
                 <label class="field compact"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="50" step="0.001" value="3"></label>
               </div>
               <div class="smsbower-meta-row">
-                <div class="smsbower-state"><span id="smsbowerStatus" class="status-badge idle">正在检查 SMSBower</span><small id="smsbowerPriceHint">PayPal · ts · 读取所选国家库存</small></div>
+                <div class="smsbower-state"><span id="smsbowerStatus" class="status-badge idle">正在检查 SMSBower</span><small id="smsbowerPriceHint">PayPal · 读取所选国家库存</small></div>
                 <div class="smsbower-links"><a class="smsbower-docs" href="https://smsbower.app/cn/cabinet/client/phonehistory" target="_blank" rel="noopener noreferrer">号码记录</a><a class="smsbower-docs" href="https://smsbower.app/cn/api?page=client" target="_blank" rel="noopener noreferrer">API 文档</a></div>
               </div>
             </div>
@@ -199,6 +213,16 @@
           <div class="progress-orbit"><svg viewBox="0 0 120 120"><circle class="orbit-bg" cx="60" cy="60" r="51"></circle><circle id="orbitValue" class="orbit-value" cx="60" cy="60" r="51"></circle></svg><div><strong id="progressValue">0%</strong><span id="progressText">尚未创建任务</span></div></div>
           <div class="progress-track" aria-hidden="true"><i id="progressBar"></i></div>
           <div class="progress-caption"><span>任务进度</span><b id="progressStage">等待开始</b></div>
+          <section id="phoneValidationPanel" class="phone-validation pending" aria-live="polite">
+            <div><span>PASSIVE PHONE CHECK</span><strong id="phoneValidationStatus">等待号码</strong></div>
+            <p id="phoneValidationMessage">仅在本地检查国家区号和号码格式；号码监测不会发送验证码。</p>
+            <small id="phoneValidationAttempt">尚未检查</small>
+          </section>
+          <section id="phoneVerificationPanel" class="phone-verification pending" aria-live="polite">
+            <div><span>PAYPAL SMS VERIFICATION</span><strong id="phoneVerificationStatus">尚未开始</strong></div>
+            <p id="phoneVerificationMessage">这是协议支付的后续验证阶段，与号码被动监测相互独立。</p>
+            <small id="phoneVerificationAttempt">尚未进入短信验证</small>
+          </section>
 
           <section id="otpPanel" class="otp-panel" hidden>
             <div class="otp-title"><span>SMS</span><div><b>等待短信验证码</b><small id="otpPrompt">请输入 6 位验证码，也可填写新手机号重新发送。</small></div></div>
@@ -253,6 +277,6 @@
   <footer><span>PAY.153.INK / PAYPAL</span><p>协议支付任务与提链任务彼此独立；验证码等待期间可随时停止。</p></footer>
   <script src="https://js.braintreegateway.com/web/3.125.0/js/client.min.js"></script>
   <script src="https://js.braintreegateway.com/web/3.125.0/js/paypal-checkout.min.js"></script>
-  <script src="/paypal-pay/static/app.js?v=20260814-auto-handoff01"></script>
+  <script src="/paypal-pay/static/app.js?v=20260817-phone-check03"></script>
 </body>
 </html>

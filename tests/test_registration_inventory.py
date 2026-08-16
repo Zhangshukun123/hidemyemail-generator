@@ -933,7 +933,8 @@ class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertTrue(payload["started"])
-        self.assertIn('provider: "inventory"', html)
+        self.assertEqual(manager.starts[0]["provider"], "inventory")
+        self.assertIn('id="quickRegistrationProvider"', html)
         self.assertEqual(manager.starts[0]["provider"], "inventory")
         self.assertEqual(manager.starts[0]["concurrency"], 3)
 

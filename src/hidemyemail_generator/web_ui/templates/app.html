@@ -53,7 +53,7 @@
     <nav class="activity-bar" aria-label="工作台活动栏">
       <button class="nav-item activity-item" type="button" data-route="overview" aria-label="概览" title="概览"><svg><use href="#i-dashboard"/></svg><span class="activity-label">概览</span></button>
       <button class="nav-item activity-item" type="button" data-route="accounts" aria-label="账号管理" title="账号管理"><svg><use href="#i-mail"/></svg><span class="activity-label">账号管理</span></button>
-      <button class="nav-item activity-item" type="button" data-route="quick-flow" aria-label="注册并提链" title="注册并提链"><svg><use href="#i-rocket"/></svg><span class="activity-label">注册并提链</span></button>
+      <button class="nav-item activity-item" type="button" data-route="quick-flow" aria-label="注册、提链并支付" title="注册、提链并支付"><svg><use href="#i-rocket"/></svg><span class="activity-label">注册并支付</span></button>
       <button class="nav-item activity-item" type="button" data-route="network" aria-label="代理与线路" title="代理与线路"><svg><use href="#i-network"/></svg><span class="activity-label">代理与线路</span></button>
       <button class="nav-item activity-item" type="button" data-route="card-links" aria-label="直卡提链接" title="直卡提链接"><svg><use href="#i-link"/></svg><span class="activity-label">直卡提链接</span></button>
       <button class="nav-item activity-item" type="button" data-route="pp-payment" aria-label="PP 支付" title="PP 支付"><svg><use href="#i-paypal"/></svg><span class="activity-label">PP 支付</span></button>
@@ -175,7 +175,7 @@
                 <label><input type="radio" name="registrationMode" value="headless"><span><b>无头浏览器</b><small>后台自动运行</small></span></label>
                 <label><input type="radio" name="registrationMode" value="headed" checked><span><b>有头浏览器</b><small>显示前台窗口</small></span></label>
                 <label><input type="radio" name="registrationMode" value="roxy"><span><b>Roxy 注册</b><small>随机指纹 · 本地机场</small></span></label>
-                <label><input type="radio" name="registrationMode" value="protocol"><span><b>协议注册</b><small>Mail Auth · 无浏览器 · 先设置密码</small></span></label>
+                <label><input type="radio" name="registrationMode" value="protocol"><span><b>协议注册</b><small>Mail Auth · 默认仅 Session</small></span></label>
               </div>
               <div id="roxyRegistrationControls" class="roxy-registration-controls" hidden>
                 <label class="command-field"><span>Roxy 工作区</span><select id="roxyWorkspace"></select></label>
@@ -224,8 +224,9 @@
         </article>
       <div class="protocol-registration-view account-protocol-panel" id="protocolRegistrationPanel" hidden>
         <article class="panel protocol-registration-toolbar">
-          <div class="protocol-heading"><span class="protocol-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></svg></span><div><h2>Mail Auth 协议注册</h2><p>无浏览器先设置账号密码，再完成邮箱验证、Session 获取与 TOTP 2FA 激活</p></div></div>
+          <div class="protocol-heading"><span class="protocol-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></svg></span><div><h2>Mail Auth 协议注册</h2><p>无浏览器完成邮箱验证并保存 Session/Cookie；密码与 TOTP 2FA 可选</p></div></div>
           <div class="protocol-actions">
+            <label class="switch protocol-credential-toggle"><input id="protocolSetupCredentials" type="checkbox"><span></span>同时设置密码与 2FA</label>
             <button id="stopProtocolButton" class="button danger" type="button" data-action="stop-protocol-registration" disabled>停止</button>
           </div>
         </article>
@@ -234,7 +235,7 @@
           <aside class="panel protocol-task-panel">
             <div class="panel-head"><div><h2>协议任务</h2><p id="protocolTaskMessage">等待开始</p></div><span id="protocolTaskBadge" class="badge">空闲</span></div>
             <div class="protocol-flow" aria-label="协议注册步骤">
-              <span data-protocol-stage="password"><i>1</i>设置密码</span><span data-protocol-stage="email_verification"><i>2</i>邮箱 OTP</span><span data-protocol-stage="session"><i>3</i>保存 Session</span><span data-protocol-stage="two_factor"><i>4</i>激活 2FA</span><span data-protocol-stage="completed"><i>5</i>完成</span>
+              <span data-protocol-stage="email_verification"><i>1</i>邮箱 OTP</span><span data-protocol-stage="session"><i>2</i>保存 Session</span><span data-protocol-stage="password"><i>3</i>密码（可选）</span><span data-protocol-stage="two_factor"><i>4</i>2FA（可选）</span><span data-protocol-stage="completed"><i>5</i>完成</span>
             </div>
             <div class="protocol-current"><small>当前账号</small><strong id="protocolCurrentEmail">尚未开始</strong><span id="protocolCurrentStage">等待任务</span></div>
             <div class="protocol-progress-row"><progress id="protocolTaskProgress" value="0" max="100"></progress><strong id="protocolTaskProgressValue">0 / 0</strong></div>
@@ -250,29 +251,30 @@
         <article class="panel quick-flow-hero">
           <div class="quick-flow-hero-copy">
             <span class="quick-flow-kicker"><i></i>AUTOMATION STUDIO</span>
-            <h2>从邮箱到支付链，交给一条自动化流水线</h2>
-            <p>领取 iCloud 库存、完成账号注册并保存 Session，再为符合条件的账号补齐 PayPal 严格 0 · DE/EUR 链接。</p>
-            <div class="quick-flow-hero-tags"><span>iCloud 库存</span><span>智能跳过 OAICS</span><span>全程状态追踪</span></div>
+            <h2>从邮箱到协议支付，交给一条自动化流水线</h2>
+            <p>领取 iCloud 库存或生成 zkgmail.com 邮箱、完成账号注册并保存 Session，生成所选 PayPal 链接后自动选代理、取手机号并启动协议支付。</p>
+            <div class="quick-flow-hero-tags"><span id="quickFlowSourceTag">iCloud 库存</span><span>自动选择代理</span><span>SMSBower 自动取号</span><span>协议支付</span></div>
           </div>
           <div class="quick-flow-hero-state">
             <div class="quick-flow-state-label"><small>PIPELINE STATUS</small><i aria-hidden="true"></i></div>
             <strong id="quickFlowHeroStatus">等待启动</strong>
-            <span id="quickFlowHeroMeta">注册 → Session → 提链</span>
-            <div class="quick-flow-state-foot"><span>01 注册</span><b>02</b><span>03 提链</span></div>
+            <span id="quickFlowHeroMeta">注册 → Session → 提链 → 协议支付</span>
+            <div class="quick-flow-state-foot"><span>01 注册</span><b>02</b><span>03 协议支付</span></div>
           </div>
         </article>
         <div class="quick-flow-layout">
           <details class="panel quick-flow-config" open>
             <summary class="panel-head quick-flow-panel-head quick-flow-config-summary">
-              <div><span class="quick-flow-panel-kicker">CONFIG</span><h2>任务配置</h2><p>注册与 PayPal 提链配置集中在这里</p></div>
+              <div><span class="quick-flow-panel-kicker">CONFIG</span><h2>任务配置</h2><p>注册、PayPal 提链与自动协议支付集中在这里</p></div>
               <div class="quick-flow-summary-tools"><span id="quickFlowConfigBadge" class="badge blue">iCloud 库存</span><span class="quick-flow-collapse-label"><b class="when-open">收起</b><b class="when-closed">展开</b><i aria-hidden="true">⌃</i></span></div>
             </summary>
             <div class="quick-flow-config-content">
             <div class="quick-flow-form">
               <section class="quick-flow-form-section">
-                <div class="quick-flow-section-title"><i>01</i><div><strong>注册账号</strong><small>领取远端 iCloud 未注册库存并创建账号</small></div><span>ACCOUNT</span></div>
-                <div class="quick-flow-field-grid quick-flow-payment-grid">
-                  <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议（先设置密码）</option></select></label>
+                <div class="quick-flow-section-title"><i>01</i><div><strong>注册账号</strong><small id="quickRegistrationSourceDescription">领取远端 iCloud 未注册库存并创建账号</small></div><span>ACCOUNT</span></div>
+                <div class="quick-flow-field-grid quick-flow-payment-grid quick-flow-registration-grid">
+                  <label class="field-label">邮箱来源<select id="quickRegistrationProvider"><option value="inventory">iCloud 库存邮箱</option><option value="zkgmail">zkgmail.com · QQ 接码</option></select></label>
+                  <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议（仅 Session）</option></select></label>
                   <label class="field-label">并发窗口<input id="quickRegistrationConcurrency" type="number" min="1" max="10" step="1" value="1"></label>
                   <label class="field-label">目标账号数<input id="quickRegistrationTargetCount" type="number" min="1" max="100" step="1" value="1"></label>
                 </div>
@@ -285,17 +287,18 @@
               <section class="quick-flow-form-section">
                 <div class="quick-flow-section-title"><i>02</i><div><strong>PayPal 提链接</strong><small>保存 Session 后生成支付链接，已有同模式链接自动跳过</small></div><span>PAYPAL LINK</span></div>
                 <div class="quick-flow-field-grid quick-flow-extraction-main-grid">
-                  <label class="field-label">提链方式<select id="quickCardLinkMethod"><option value="de_oaics_paypal" data-legacy-label="PayPal / 严格 0 · DE / EUR">PayPal 提链接 · 严格 0 · DE / EUR</option></select></label>
+                  <label class="field-label">提链方式<select id="quickCardLinkMethod"><option value="de_oaics_paypal" data-legacy-label="PayPal / 严格 0 · DE / EUR">PayPal 提链接 · 严格 0 · DE / EUR</option><option value="paypal_us">PayPal / 美国 · USD</option><option value="paypal_gb">PayPal / 英国 · GBP</option></select></label>
                   <label class="field-label">单账号提链次数<input id="quickExtractionCount" type="number" min="1" max="100" step="1" value="1"></label>
                   <label class="field-label">提链代理<select id="quickExtractionProxyMode"></select></label>
                 </div>
                 <div class="quick-flow-field-grid quick-flow-extraction-exit-grid">
                   <label class="field-label">第一代理出口<select id="quickExtractionFirstProxyCountry"></select></label>
                   <label class="field-label">第二代理出口<select id="quickExtractionSecondProxyCountry"></select></label>
-                  <label class="field-label">更新优惠使用 IP<select id="quickPromotionProxyChoice"><option value="first">第一提链 IP</option><option value="second">第二提链 IP</option></select></label>
+                  <label id="quickPromotionProxyChoiceLabel" class="field-label">更新优惠使用 IP<select id="quickPromotionProxyChoice"><option value="first">第一提链 IP</option><option value="second">第二提链 IP</option></select></label>
+                  <label id="quickCardLinkTargetAmountLabel" class="field-label" hidden>目标金额<input id="quickCardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
                 </div>
                 <div class="quick-flow-context-group"><div id="quickCardLinkHint" class="mode-label">返回 cs_live 时自动继续同模式提链，直到单账号次数用完；首次使用第一代理出口，重试切换第二代理出口。</div><div id="quickExtractionProxySummary" class="mode-label">提链代理：请选择模式与两个出口</div></div>
-                <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span></div>
+                <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span><span>✓ 自动协议支付</span></div>
               </section>
             </div>
             <div class="quick-flow-actions"><div><strong>每次点击都会创建独立注册流程</strong><span>流程可并行运行；停止或关闭在下方对应流程卡片中操作</span></div><button id="startQuickFlowButton" class="button primary" type="button" data-action="start-quick-flow"><span>启动新的自动流水线</span><b aria-hidden="true">▶</b></button></div>
@@ -303,27 +306,28 @@
             </div>
           </details>
           <aside class="panel quick-flow-monitor">
-            <div class="panel-head quick-flow-panel-head"><div><span class="quick-flow-panel-kicker">PAYPAL LINK MONITOR</span><h2>账号提链进度</h2><p id="quickFlowMessage">尚未启动流水线</p></div><span id="quickFlowStatusBadge" class="badge">空闲</span></div>
+            <div class="panel-head quick-flow-panel-head"><div><span class="quick-flow-panel-kicker">DIRECT CARD LINK MONITOR</span><h2>直卡提链与协议支付进度</h2><p id="quickFlowMessage">尚未启动流水线</p></div><span id="quickFlowStatusBadge" class="badge">空闲</span></div>
             <div class="quick-flow-monitor-overview">
               <section class="quick-flow-account-board" aria-labelledby="quickFlowAccountBoardTitle">
-                <div class="quick-flow-board-head"><div><span>ACCOUNTS</span><strong id="quickFlowAccountBoardTitle">PayPal 提链接账号</strong></div><b id="quickFlowAccountCount">1 个</b></div>
+                <div class="quick-flow-board-head"><div><span>ACCOUNTS</span><strong id="quickFlowAccountBoardTitle">直卡提链账号</strong></div><b id="quickFlowAccountCount">1 个</b></div>
                 <div id="quickFlowAccountQueue" class="quick-flow-account-queue" aria-live="polite"><div class="quick-flow-account-card idle"><i>01</i><div><strong>等待分配账号</strong><span>启动后显示账号和提链状态</span></div><b>WAIT</b></div></div>
-                <div class="quick-flow-current"><div class="quick-flow-current-icon"><span></span></div><div><small>当前正在提链</small><strong id="quickFlowCurrentAccount">等待任务</strong><span id="quickFlowCurrentAction">点击上方按钮开始</span></div></div>
+                <div class="quick-flow-current"><div class="quick-flow-current-icon"><span></span></div><div><small>当前自动任务</small><strong id="quickFlowCurrentAccount">等待任务</strong><span id="quickFlowCurrentAction">点击上方按钮开始</span></div></div>
               </section>
               <section class="quick-flow-step-board" aria-labelledby="quickFlowStepBoardTitle">
-                <div class="quick-flow-board-head"><div><span>STEPS</span><strong id="quickFlowStepBoardTitle">完成步骤</strong></div><b>5 STEPS</b></div>
-                <ol class="quick-flow-steps" aria-label="一键注册并提链步骤">
+                <div class="quick-flow-board-head"><div><span>STEPS</span><strong id="quickFlowStepBoardTitle">完成步骤</strong></div><b>6 STEPS</b></div>
+                <ol class="quick-flow-steps" aria-label="一键注册、提链并协议支付步骤">
                   <li data-quick-stage="prepare"><i>1</i><span><strong>准备</strong><small>检查库存与线路</small></span></li>
                   <li data-quick-stage="register"><i>2</i><span><strong>注册</strong><small>创建 OpenAI 账号</small></span></li>
                   <li data-quick-stage="session"><i>3</i><span><strong>Session</strong><small>保存登录凭据</small></span></li>
-                  <li data-quick-stage="extract"><i>4</i><span><strong>PayPal 提链</strong><small>生成严格 0 链接</small></span></li>
-                  <li data-quick-stage="complete"><i>5</i><span><strong>完成</strong><small>汇总账号与链接</small></span></li>
+                  <li data-quick-stage="extract"><i>4</i><span><strong>直卡提链</strong><small id="quickFlowExtractStepLabel">生成严格 0 链接</small></span></li>
+                  <li data-quick-stage="payment"><i>5</i><span><strong>协议支付</strong><small>自动代理与取号</small></span></li>
+                  <li data-quick-stage="complete"><i>6</i><span><strong>完成</strong><small>汇总链接与支付任务</small></span></li>
                 </ol>
                 <div class="quick-flow-progress"><div><span>总体进度</span><strong id="quickFlowProgressValue">0%</strong></div><progress id="quickFlowProgress" value="0" max="100"></progress></div>
               </section>
             </div>
-            <div class="quick-flow-counters"><div class="registered"><i>↗</i><span>已注册</span><strong id="quickFlowRegisteredCount">0</strong></div><div class="generated"><i>◆</i><span>已补 OAICS</span><strong id="quickFlowGeneratedCount">0</strong></div><div class="skipped"><i>–</i><span>已跳过</span><strong id="quickFlowSkippedCount">0</strong></div><div class="failed"><i>!</i><span>失败</span><strong id="quickFlowFailedCount">0</strong></div></div>
-            <div class="quick-flow-monitor-details"><section class="quick-flow-console-section"><div class="quick-flow-log-head"><strong>流水线日志</strong><span id="quickFlowLogCount">0 条</span></div><div id="quickFlowLog" class="inline-log quick-flow-log" role="log" aria-live="polite"><div class="task-log-empty">尚无流水线日志</div></div></section><section class="quick-flow-result-section"><div class="quick-flow-log-head"><strong>输出结果</strong><span>账号与 PayPal 链接</span></div><div id="quickFlowResults" class="quick-flow-results"><div class="empty-state compact">完成后在这里显示账号与 PayPal 链接</div></div></section></div>
+            <div class="quick-flow-counters"><div class="registered"><i>↗</i><span>已注册</span><strong id="quickFlowRegisteredCount">0</strong></div><div class="generated"><i>◆</i><span id="quickFlowGeneratedLabel">已补 OAICS</span><strong id="quickFlowGeneratedCount">0</strong></div><div class="payment"><i>P</i><span>已启动支付</span><strong id="quickFlowPaymentCount">0</strong></div><div class="skipped"><i>–</i><span>已跳过</span><strong id="quickFlowSkippedCount">0</strong></div><div class="failed"><i>!</i><span>失败</span><strong id="quickFlowFailedCount">0</strong></div></div>
+            <div class="quick-flow-monitor-details"><section class="quick-flow-console-section"><div class="quick-flow-log-head"><strong>直卡提链日志</strong><span id="quickFlowLogCount">0 条</span></div><div id="quickFlowLog" class="inline-log quick-flow-log" role="log" aria-live="polite"><div class="task-log-empty">尚无流水线日志</div></div></section><section class="quick-flow-result-section"><div class="quick-flow-log-head"><strong>输出结果</strong><span>账号、PayPal 链接与协议任务</span></div><div id="quickFlowResults" class="quick-flow-results"><div class="empty-state compact">完成后在这里显示账号、PayPal 链接与协议支付任务</div></div></section></div>
           </aside>
         </div>
       </section>
@@ -383,8 +387,12 @@
           <article class="panel account-picker"><div id="cardMetrics" class="metric-grid compact"></div><div class="panel-head"><div><h2>选择账号</h2><p id="cardLinkSummary">正在加载…</p></div></div><div class="filter-bar padded"><input id="cardSearch" type="search" placeholder="搜索邮箱账号"><select id="cardStatusFilter"><option value="all">链接：全部</option><option value="generated">已生成</option><option value="cs_live">cs_live 已标注</option><option value="available">可提取</option><option value="unavailable">Session 不可用</option></select></div><div id="cardAccountList" class="select-list"></div></article>
           <aside class="panel extraction-panel">
             <div class="panel-head"><div><h2>提取设置</h2><p id="cardLinkModeSummary">选择账号后生成严格 0 hosted 链接</p></div></div>
-            <label class="field-label">提链方式<select id="cardLinkMethod"><option value="ph_hosted">gpt-link / 菲律宾 · PHP hosted</option><option value="de_oaics_paypal">PayPal / 德国 · EUR</option></select></label>
+            <label class="field-label">提链方式<select id="cardLinkMethod"><option value="paypal_us">PayPal / 美国 · USD</option><option value="paypal_gb">PayPal / 英国 · GBP</option><option value="de_oaics_paypal">PayPal / 德国 · EUR</option><option value="ph_hosted">gpt-link / 菲律宾 · PHP hosted</option></select></label>
             <div id="cardLinkModeLabel" class="mode-label">gpt-link · PH / PHP hosted · 双代理严格 0</div>
+            <div id="cardLinkPaymentOptions" class="card-link-payment-options">
+              <label id="cardLinkTargetAmountLabel" class="field-label">目标金额<input id="cardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
+              <div id="cardLinkBillingCountryState" class="card-link-billing-state"><span>账单国家</span><strong>跟随 IP 地址</strong></div>
+            </div>
             <label class="field-label">提链代理模式<select id="cardLinkProxyMode" aria-label="提链代理模式"></select></label>
             <label id="cardLinkCreateProxyLabel" class="field-label">建单代理国家<select id="cardLinkCreateProxyCountry" aria-label="建单代理国家"></select></label>
             <label id="cardLinkPromotionProxyLabel" class="field-label">优惠代理国家<select id="cardLinkPromotionProxyCountry" aria-label="优惠代理国家"></select></label>
@@ -399,7 +407,7 @@
 
       <section class="view pp-payment-view" id="ppPaymentView" data-view="pp-payment" hidden>
         <article class="panel pp-payment-toolbar">
-          <div class="pp-payment-heading"><span class="pp-mark">P</span><div><h2>PayPal 协议支付</h2><p>提交 BA 链接、手机号与代理，完成协议授权流程</p></div></div>
+          <div class="pp-payment-heading"><span class="pp-mark">P</span><div><h2>PayPal 协议支付</h2><p>接收快速流程生成的 BA 链接，按国家自动选择代理，并由 SMSBower 自动取号、取码和完成协议授权</p></div></div>
           <div class="pp-payment-actions"><span id="paypalServiceStatus" class="badge">正在连接</span><button class="button" type="button" data-action="reload-paypal">刷新支付台</button><a class="button primary" href="/paypal-pay/" target="_blank" rel="noopener">新窗口打开</a></div>
         </article>
         <div class="panel pp-payment-frame-shell">

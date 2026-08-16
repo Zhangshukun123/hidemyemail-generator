@@ -127,6 +127,7 @@ PUBLIC_PATHS = {
 }
 GPT_CODE_CURSOR_PREFIX = "gpt_code_cursor:"
 CARD_LINK_EVENT_PREFIX = "HME_CARD_LINK_EVENT:"
+CARD_LINK_LOG_PREFIX = "HME_CARD_LINK_LOG:"
 ON_DEMAND_INBOX_SUCCESS_COOLDOWN_SECONDS = 15
 OPENAI_CODE_INBOX_SYNC_LIMIT = 3
 OPENAI_CODE_INBOX_WAIT_SECONDS = 7.0
@@ -140,7 +141,30 @@ CARD_LINK_REGIONS = {
     "CA": {"label": "加拿大", "currency": "CAD", "locale": "en-CA"},
     "AU": {"label": "澳大利亚", "currency": "AUD", "locale": "en-AU"},
 }
-CARD_LINK_METHODS = {"standard", "ph_hosted", "de_oaics_paypal"}
+CARD_LINK_METHODS = {
+    "standard",
+    "ph_hosted",
+    "de_oaics_paypal",
+    "paypal_us",
+    "paypal_gb",
+}
+PAYPAL_CARD_LINK_METHODS = {"de_oaics_paypal", "paypal_us", "paypal_gb"}
+SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS = {"paypal_us", "paypal_gb"}
+PAYPAL_US_SMSBOWER_MAX_PRICE = 0.25
+PAYPAL_GB_SMSBOWER_MAX_PRICE = 0.30
+
+
+class CardLinkBridgeError(RuntimeError):
+    def __init__(
+        self,
+        detail: str,
+        *,
+        logs: list[str] | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.logs = list(logs or [])
+        self.retryable = retryable
 
 
 class InboxSyncDeferredError(RuntimeError):
@@ -194,6 +218,7 @@ OPENAI_RUNTIME_SIBLING_NAMES = (
     "openai-register-paylink-ui-dist-20260706-README-deploy",
 )
 PAYPAL_PROTOCOL_PREFIX = "/paypal-pay"
+PAYPAL_AUTO_DEVICE_COOKIE_NAME = "hme_paypal_auto_device_id"
 
 
 def _default_paypal_runtime_dir() -> Path:
@@ -2999,6 +3024,10 @@ def _account_card_link(record: dict) -> dict:
         ).strip(),
         "promotion_applied": bool(value.get("promotion_applied")),
         "promotion_strategy": str(value.get("promotion_strategy") or "").strip(),
+        "link_proxy_country": str(
+            value.get("link_proxy_country") or ""
+        ).strip().upper(),
+        "link_proxy_ip": str(value.get("link_proxy_ip") or "").strip(),
     }
 
 
@@ -3009,7 +3038,7 @@ def _valid_card_link(value: str, method: str = "") -> bool:
         r"https://chatgpt\.com/checkout/[A-Za-z0-9_-]+/(?:cs_|oaics_)[A-Za-z0-9_-]+",
         text,
     )
-    if normalized_method and normalized_method != "de_oaics_paypal":
+    if normalized_method and normalized_method not in PAYPAL_CARD_LINK_METHODS:
         return bool(chatgpt_match)
     try:
         parsed = urlsplit(text)
@@ -3028,7 +3057,7 @@ def _valid_card_link(value: str, method: str = "") -> bool:
         and parsed.path not in {"", "/"}
     )
     provider_link = paypal_approve or stripe_redirect
-    if normalized_method == "de_oaics_paypal":
+    if normalized_method in PAYPAL_CARD_LINK_METHODS:
         return provider_link
     return bool(chatgpt_match) or provider_link
 
@@ -3092,6 +3121,8 @@ def _save_account_card_link(
     amount_verification: str = "",
     promotion_applied: bool = False,
     promotion_strategy: str = "",
+    link_proxy_country: str = "",
+    link_proxy_ip: str = "",
     status: str = "generated",
 ) -> dict:
     target = str(email or "").strip().lower()
@@ -3110,6 +3141,14 @@ def _save_account_card_link(
         url, normalized_method
     ):
         raise RuntimeError("支付链接格式无效")
+    normalized_link_proxy_country = str(link_proxy_country or "").strip().upper()
+    if normalized_link_proxy_country and not re.fullmatch(
+        r"[A-Z]{2}", normalized_link_proxy_country
+    ):
+        raise RuntimeError("提链代理出口国家无效")
+    normalized_link_proxy_ip = str(link_proxy_ip or "").strip()
+    if len(normalized_link_proxy_ip) > 64:
+        raise RuntimeError("提链代理出口 IP 无效")
     now = datetime.now(timezone.utc).isoformat()
     card_link = {
         "url": str(url).strip() if normalized_status == "generated" else "",
@@ -3126,6 +3165,8 @@ def _save_account_card_link(
         "amount_verification": str(amount_verification or "").strip(),
         "promotion_applied": bool(promotion_applied),
         "promotion_strategy": str(promotion_strategy or "").strip(),
+        "link_proxy_country": normalized_link_proxy_country,
+        "link_proxy_ip": normalized_link_proxy_ip,
     }
     record["card_link"] = card_link
     record["updated_at"] = now
@@ -3157,6 +3198,7 @@ async def _run_card_link_bridge(
     account_email: str = "",
     create_proxy_url: str = "",
     promotion_proxy_url: str = "",
+    target_amount: str = "",
 ) -> dict:
     token = str(access_token or "").strip()
     create_proxy = str(create_proxy_url or "").strip()
@@ -3186,6 +3228,8 @@ async def _run_card_link_bridge(
         locale,
         "--account-email",
         str(account_email or "").strip(),
+        "--target-amount",
+        str(target_amount or "").strip(),
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     process = await asyncio.create_subprocess_exec(
@@ -3200,7 +3244,7 @@ async def _run_card_link_bridge(
     try:
         timeout = (
             240
-            if method == "de_oaics_paypal"
+            if method in PAYPAL_CARD_LINK_METHODS
             else 150
             if method == "ph_hosted"
             else 75
@@ -3215,7 +3259,24 @@ async def _run_card_link_bridge(
         raise RuntimeError("生成直卡支付链接超时，请稍后重试") from error
 
     event: dict = {}
+    progress_logs: list[str] = []
     for line in stdout.decode("utf-8", errors="replace").splitlines():
+        if line.startswith(CARD_LINK_LOG_PREFIX):
+            try:
+                progress = json.loads(line[len(CARD_LINK_LOG_PREFIX) :])
+            except json.JSONDecodeError:
+                continue
+            message = str(
+                progress.get("message") if isinstance(progress, dict) else ""
+            ).strip()
+            if message:
+                if token:
+                    message = message.replace(token, "[REDACTED]")
+                for proxy in (create_proxy, promotion_proxy):
+                    if proxy:
+                        message = message.replace(proxy, "[REDACTED_PROXY]")
+                progress_logs.append(message[:500])
+            continue
         if not line.startswith(CARD_LINK_EVENT_PREFIX):
             continue
         try:
@@ -3234,16 +3295,26 @@ async def _run_card_link_bridge(
         for proxy in (create_proxy, promotion_proxy):
             if proxy:
                 detail = detail.replace(proxy, "[REDACTED_PROXY]")
-        raise RuntimeError((detail or "直卡支付链接生成失败")[:1000])
+        raise CardLinkBridgeError(
+            (detail or "直卡支付链接生成失败")[:1000],
+            logs=progress_logs,
+            retryable=(
+                event.get("retryable")
+                if isinstance(event.get("retryable"), bool)
+                else None
+            ),
+        )
     if event_status == "classified":
         if (
             method == "de_oaics_paypal"
             and event.get("classification") == "cs_live"
         ):
+            event["logs"] = progress_logs
             return event
         raise RuntimeError("生成器返回了不支持的 Checkout 分类")
     if not _valid_card_link(str(event.get("url") or ""), method):
         raise RuntimeError("生成器没有返回有效的支付链接")
+    event["logs"] = progress_logs
     return event
 
 
@@ -3622,6 +3693,9 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 ),
                 "cardLinkMethod": str(card_link.get("method") or ""),
                 "cardLinkCountry": str(card_link.get("country") or "US"),
+                "cardLinkProxyCountry": str(
+                    card_link.get("link_proxy_country") or ""
+                ),
                 "cardLinkCurrency": str(card_link.get("currency") or "USD"),
                 "cardLinkGeneratedAt": str(card_link.get("generated_at") or ""),
                 "cardLinkCheckedAt": str(card_link.get("checked_at") or ""),
@@ -5446,7 +5520,16 @@ def create_app(
                 {"ok": False, "error": "优惠更新 IP 只能选择第一 IP 或第二 IP"},
                 status=400,
             )
-        if not email.endswith("@icloud.com") or len(email) > 320:
+        target_amount = str(body.get("target_amount") or "").strip()
+        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS and (
+            len(target_amount) > 12
+            or (target_amount and not re.fullmatch(r"\d+", target_amount))
+        ):
+            return web.json_response(
+                {"ok": False, "error": "目标金额必须是非负整数，留空表示不校验"},
+                status=400,
+            )
+        if not _valid_supported_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -5460,6 +5543,14 @@ def create_app(
         elif method == "de_oaics_paypal":
             country = "DE"
             region = {"currency": "EUR", "locale": "de-DE"}
+            target_amount = "0"
+        elif method == "paypal_us":
+            country = "US"
+            region = {"currency": "USD", "locale": "en-US"}
+        elif method == "paypal_gb":
+            country = "GB"
+            region = {"currency": "GBP", "locale": "en-GB"}
+            target_amount = "0"
         else:
             country = str(body.get("country") or "US").strip().upper()
             region = CARD_LINK_REGIONS.get(country)
@@ -5546,9 +5637,12 @@ def create_app(
                         body.get("create_proxy"),
                     )
                     needs_second_proxy = (
-                        use_secondary_proxy
-                        or promotion_proxy_choice == "second"
-                        or attempt_limit > 1
+                        method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        and (
+                            use_secondary_proxy
+                            or promotion_proxy_choice == "second"
+                            or attempt_limit > 1
+                        )
                     )
                     second_proxy = ""
                     if needs_second_proxy:
@@ -5563,10 +5657,17 @@ def create_app(
                             )
                         if not second_proxy:
                             raise RuntimeError("第二提链代理出口尚未配置")
-                    create_proxy = second_proxy if use_secondary_proxy else first_proxy
+                    create_proxy = (
+                        second_proxy
+                        if use_secondary_proxy
+                        and method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        else first_proxy
+                    )
                     retry_create_proxy = second_proxy or create_proxy
                     promotion_proxy = (
-                        second_proxy
+                        first_proxy
+                        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        else second_proxy
                         if promotion_proxy_choice == "second"
                         else first_proxy
                     )
@@ -5576,7 +5677,9 @@ def create_app(
                         body.get("create_proxy"),
                     )
                     promotion_proxy = (
-                        ""
+                        create_proxy
+                        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        else ""
                         if method == "de_oaics_paypal"
                         else await configured_proxy_for_country(
                             promotion_proxy_country,
@@ -5592,9 +5695,12 @@ def create_app(
                             body.get("create_proxy"),
                         )
                     needs_second_proxy = (
-                        use_secondary_proxy
-                        or promotion_proxy_choice == "second"
-                        or attempt_limit > 1
+                        method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        and (
+                            use_secondary_proxy
+                            or promotion_proxy_choice == "second"
+                            or attempt_limit > 1
+                        )
                     )
                     second_proxy = ""
                     if needs_second_proxy:
@@ -5609,10 +5715,17 @@ def create_app(
                             )
                         if not second_proxy:
                             raise RuntimeError("第二 IP 尚未配置")
-                    create_proxy = second_proxy if use_secondary_proxy else first_proxy
+                    create_proxy = (
+                        second_proxy
+                        if use_secondary_proxy
+                        and method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        else first_proxy
+                    )
                     retry_create_proxy = second_proxy or create_proxy
                     promotion_proxy = (
-                        second_proxy
+                        first_proxy
+                        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        else second_proxy
                         if promotion_proxy_choice == "second"
                         else first_proxy
                     )
@@ -5633,11 +5746,17 @@ def create_app(
                 status=409,
             )
         browser_manager: BrowserTaskManager = app["browser_manager"]
-        if not browser_manager.target_project_dir.is_dir():
+        if (
+            method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+            and not browser_manager.target_project_dir.is_dir()
+        ):
             return web.json_response(
                 {"ok": False, "error": "OpenAI 支付运行目录不存在"}, status=503
             )
-        if not browser_manager.python_executable.is_file():
+        if (
+            method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+            and not browser_manager.python_executable.is_file()
+        ):
             return web.json_response(
                 {"ok": False, "error": "OpenAI 支付运行环境不可用"}, status=503
             )
@@ -5645,24 +5764,77 @@ def create_app(
             async with app["card_link_lock"]:
                 result: dict[str, Any] = {}
                 attempt_count = 0
+                accumulated_logs: list[str] = []
                 for attempt_count in range(1, attempt_limit + 1):
-                    result = await _run_card_link_bridge(
-                        target_project_dir=browser_manager.target_project_dir,
-                        python_executable=browser_manager.python_executable,
-                        bridge_file=app["card_link_bridge_file"],
-                        access_token=access_token,
-                        method=method,
-                        country=country,
-                        currency=str(region["currency"]),
-                        locale=str(region["locale"]),
-                        account_email=email,
-                        create_proxy_url=(
-                            retry_create_proxy
-                            if attempt_count > 1 and retry_create_proxy
-                            else create_proxy
-                        ),
-                        promotion_proxy_url=promotion_proxy,
+                    attempt_create_proxy = (
+                        retry_create_proxy
+                        if attempt_count > 1 and retry_create_proxy
+                        else create_proxy
                     )
+                    attempt_promotion_proxy = promotion_proxy
+                    if (
+                        method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        and attempt_count > 1
+                    ):
+                        if create_proxy_country:
+                            attempt_create_proxy = await configured_proxy_for_country(
+                                create_proxy_country,
+                                body.get("create_proxy"),
+                            )
+                        attempt_promotion_proxy = attempt_create_proxy
+                    try:
+                        result = await _run_card_link_bridge(
+                            target_project_dir=(
+                                app["card_link_bridge_file"].parents[2]
+                                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                                else browser_manager.target_project_dir
+                            ),
+                            python_executable=(
+                                Path(sys.executable)
+                                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                                else browser_manager.python_executable
+                            ),
+                            bridge_file=app["card_link_bridge_file"],
+                            access_token=access_token,
+                            method=method,
+                            country=country,
+                            currency=str(region["currency"]),
+                            locale=str(region["locale"]),
+                            account_email=email,
+                            create_proxy_url=attempt_create_proxy,
+                            promotion_proxy_url=attempt_promotion_proxy,
+                            target_amount=target_amount,
+                        )
+                    except CardLinkBridgeError as error:
+                        accumulated_logs.extend(error.logs)
+                        should_retry = (
+                            method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                            and error.retryable is not False
+                            and attempt_count < attempt_limit
+                        )
+                        if not should_retry:
+                            detail = str(error)
+                            if (
+                                method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                                and attempt_count > 1
+                            ):
+                                detail = (
+                                    f"连续 {attempt_count}/{attempt_limit} 次提链失败，"
+                                    f"最后错误：{detail}"
+                                )
+                            raise CardLinkBridgeError(
+                                detail,
+                                logs=accumulated_logs,
+                                retryable=error.retryable,
+                            ) from error
+                        accumulated_logs.append(
+                            f"[提链重试] 第 {attempt_count}/{attempt_limit} 次失败："
+                            f"{error}；正在刷新 {country} 第一代理后重试"
+                        )
+                        continue
+                    current_logs = list(result.get("logs") or [])
+                    if accumulated_logs:
+                        result["logs"] = [*accumulated_logs, *current_logs]
                     if not (
                         method == "de_oaics_paypal"
                         and result.get("classification") == "cs_live"
@@ -5695,12 +5867,29 @@ def create_app(
                     promotion_strategy=str(
                         result.get("promotion_strategy") or ""
                     ),
+                    link_proxy_country=str(
+                        result.get("link_proxy_country") or ""
+                    ),
+                    link_proxy_ip=str(result.get("link_proxy_ip") or ""),
                     status=(
                         "cs_live"
                         if result.get("classification") == "cs_live"
                         else "generated"
                     ),
                 )
+        except CardLinkBridgeError as error:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": f"生成直卡支付链接失败：{error}",
+                    "logs": error.logs,
+                    "attemptCount": attempt_count,
+                    "attemptLimit": attempt_limit,
+                    "attemptsExhausted": attempt_count >= attempt_limit,
+                    "retryable": error.retryable is not False,
+                },
+                status=502,
+            )
         except RuntimeError as error:
             return web.json_response(
                 {"ok": False, "error": f"生成直卡支付链接失败：{error}"},
@@ -5716,6 +5905,7 @@ def create_app(
                 "attemptsExhausted": (
                     saved["status"] == "cs_live" and attempt_count >= attempt_limit
                 ),
+                "logs": list(result.get("logs") or []),
                 **saved,
             },
             headers={"Cache-Control": "no-store"},
@@ -6058,13 +6248,17 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "协议注册并发必须是 1–5"}, status=400
             )
+        setup_credentials = payload.get(
+            "setup_credentials", payload.get("setupCredentials", False)
+        ) is True
 
         provider = str(payload.get("provider") or "").strip().lower()
-        if provider not in {"", "inventory"}:
+        if provider not in {"", "inventory", "zkgmail"}:
             return web.json_response(
                 {"ok": False, "error": "协议注册暂不支持该邮箱来源"}, status=400
             )
         inventory_email = ""
+        zkgmail_email = ""
         if provider == "inventory":
             try:
                 inventory_email = await acquire_registration_inventory_email(
@@ -6083,44 +6277,80 @@ def create_app(
                     },
                     status=409,
                 )
+        elif provider == "zkgmail":
+            try:
+                zkgmail_email = str(
+                    await app["zkgmail_client"].acquire_email(
+                        "zkgmail.com 协议注册"
+                    )
+                ).strip().lower()
+            except (ValueError, RuntimeError) as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            if not re.fullmatch(
+                rf"[a-z0-9][a-z0-9._-]{{0,62}}@{re.escape(ZKGMAIL_DOMAIN)}",
+                zkgmail_email,
+            ):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "code": "zkgmail_generation_failed",
+                        "error": "未生成有效的 zkgmail.com 注册邮箱",
+                    },
+                    status=409,
+                )
 
-        async def release_inventory_email(message: str) -> None:
-            if not inventory_email:
-                return
-            await complete_registration_inventory_email(
-                inventory_email, False, message
+        acquired_email = inventory_email or zkgmail_email
+
+        async def release_acquired_email(message: str) -> None:
+            if inventory_email:
+                await complete_registration_inventory_email(
+                    inventory_email, False, message
+                )
+            elif zkgmail_email:
+                await app["zkgmail_client"].cancel_email(zkgmail_email, message)
+
+        async def complete_acquired_email(
+            email: str, success: bool, message: str
+        ) -> None:
+            if inventory_email:
+                await complete_registration_inventory_email(email, success, message)
+            elif zkgmail_email:
+                await app["zkgmail_client"].complete_email(
+                    email, success, message
+                )
+
+        accounts_by_email: dict[str, dict[str, Any]] = {}
+        if not acquired_email:
+            try:
+                identities = await active_icloud_identities()
+            except RuntimeError:
+                identities = []
+            items = await asyncio.to_thread(
+                _browser_email_items, app["db_file"], identities
             )
-
-        try:
-            identities = await active_icloud_identities()
-        except RuntimeError:
-            identities = []
-        items = await asyncio.to_thread(
-            _browser_email_items, app["db_file"], identities
-        )
-        accounts_by_email = {
-            str(item.get("email") or "").strip().lower(): item
-            for item in items
-            if str(item.get("email") or "").strip()
-        }
-        # A remote inventory lease may contain only the address payload.  Such
-        # an address is a valid registration input even though it is not yet an
-        # active Apple identity or a stored GPT account, so it will not appear
-        # in ``_browser_email_items`` until registration saves credentials.
-        if inventory_email and inventory_email not in accounts_by_email:
+            accounts_by_email = {
+                str(item.get("email") or "").strip().lower(): item
+                for item in items
+                if str(item.get("email") or "").strip()
+            }
+        # A newly acquired provider address is a valid registration input even
+        # though it is not yet an active Apple identity or a stored GPT account.
+        if acquired_email and acquired_email not in accounts_by_email:
             account = await asyncio.to_thread(
-                load_account_record, app["db_file"], inventory_email
+                load_account_record, app["db_file"], acquired_email
             )
             session = account_session(account)
             access_token = account_session_access_token(account)
-            accounts_by_email[inventory_email] = {
-                "email": inventory_email,
+            accounts_by_email[acquired_email] = {
+                "email": acquired_email,
                 "registrationComplete": bool(session and access_token),
             }
         run_all = bool(payload.get("all"))
         force_recheck = bool(payload.get("force"))
-        if inventory_email:
-            requested = [inventory_email]
+        if acquired_email:
+            requested = [acquired_email]
         elif run_all:
             requested = list(accounts_by_email)
         else:
@@ -6139,7 +6369,7 @@ def create_app(
             or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
         ]
         if invalid:
-            await release_inventory_email("库存邮箱未能导入本地账号列表")
+            await release_acquired_email("注册邮箱未能导入本地账号列表")
             return web.json_response(
                 {
                     "ok": False,
@@ -6151,13 +6381,21 @@ def create_app(
             email
             for email in requested
             if force_recheck
-            or not bool(accounts_by_email[email].get("protocolReady"))
+            or not bool(
+                accounts_by_email[email].get(
+                    "protocolReady" if setup_credentials else "registrationComplete"
+                )
+            )
         ]
         skipped = len(requested) - len(pending)
         if not pending:
-            await release_inventory_email("库存邮箱已完成协议凭据配置")
+            await release_acquired_email("邮箱已完成协议注册")
             message = (
-                "全部账号的密码、Session 与 TOTP 2FA 均已完成"
+                (
+                    "全部账号的密码、Session 与 TOTP 2FA 均已完成"
+                    if setup_credentials
+                    else "全部账号的 Session/Cookie 均已完成"
+                )
                 if requested
                 else "当前没有可协议注册的邮箱账号"
             )
@@ -6169,19 +6407,18 @@ def create_app(
                 "emails": pending,
                 "base_url": f"{request.scheme}://{request.host}",
                 "concurrency": concurrency,
+                "setup_credentials": setup_credentials,
             }
-            if inventory_email:
-                start_options["on_account_finished"] = (
-                    complete_registration_inventory_email
-                )
+            if acquired_email:
+                start_options["on_account_finished"] = complete_acquired_email
             task = app["protocol_registration_manager"].start(**start_options)
         except ValueError as error:
-            await release_inventory_email(str(error))
+            await release_acquired_email(str(error))
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=400
             )
         except RuntimeError as error:
-            await release_inventory_email(str(error))
+            await release_acquired_email(str(error))
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
             )
@@ -6192,7 +6429,7 @@ def create_app(
                 "started": True,
                 "skipped": skipped,
                 "provider": provider or "selected",
-                "email": inventory_email,
+                "email": acquired_email,
                 "task": task,
             }
         )
@@ -7489,6 +7726,45 @@ def create_app(
                 },
                 status=409,
             )
+        link_proxy_country = str(
+            card_link.get("link_proxy_country") or ""
+        ).strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", link_proxy_country):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "当前提链记录缺少真实出口国家，需重新提链后再支付",
+                },
+                status=409,
+            )
+        link_method = str(card_link.get("method") or "").strip().lower()
+        if link_method == "paypal_us" and (
+            link_country != "US" or link_proxy_country != "US"
+        ):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "美国 PayPal 提链记录必须使用 US Checkout 与 US 第一代理，请重新提链",
+                },
+                status=409,
+            )
+        if link_method == "paypal_gb" and (
+            link_country != "GB" or link_proxy_country != "GB"
+        ):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "英国 PayPal 提链记录必须使用 GB Checkout 与 GB 第一代理，请重新提链",
+                },
+                status=409,
+            )
+        protocol_country = (
+            "US"
+            if link_method == "paypal_us"
+            else "GB"
+            if link_method == "paypal_gb"
+            else link_proxy_country
+        )
         cookies = account_saved_cookies(record)
         if not cookies:
             return web.json_response(
@@ -7501,27 +7777,70 @@ def create_app(
                 {"ok": False, "error": "请先在系统设置配置 SMSBower API Key"},
                 status=409,
             )
-        proxy_store: RegistrationProxyStore = app["registration_proxy_store"]
-        proxy_state = proxy_store.public_state()
-        proxy_mode = str(proxy_state.get("mode") or "dynamic")
-        try:
-            proxy_url, _ = proxy_store.proxy_for_country(
-                link_country, mode=proxy_mode
+        proxy_url = ""
+        proxy_mode = ""
+        proxy_source = ""
+        proxy_error = ""
+        proxy_candidates = (
+            ("card_link", app["card_link_proxy_store"]),
+            ("registration", app["registration_proxy_store"]),
+        )
+        for candidate_source, proxy_store in proxy_candidates:
+            proxy_state = proxy_store.public_state()
+            preferred_modes = proxy_state.get("cardLinkModes")
+            preferred_mode = (
+                str(preferred_modes.get(str(card_link.get("method") or "")) or "")
+                if isinstance(preferred_modes, dict)
+                else ""
             )
-        except ValueError as error:
-            return web.json_response(
-                {"ok": False, "error": str(error)}, status=409
+            candidate_mode = preferred_mode or str(
+                proxy_state.get("mode") or "dynamic"
             )
+            try:
+                candidate_url, _ = proxy_store.proxy_for_country(
+                    link_proxy_country, mode=candidate_mode
+                )
+            except ValueError as error:
+                proxy_error = str(error)
+                continue
+            if candidate_url:
+                proxy_url = candidate_url
+                proxy_mode = candidate_mode
+                proxy_source = candidate_source
+                break
         if not proxy_url:
             return web.json_response(
-                {"ok": False, "error": "请先配置通用代理与线路"}, status=409
+                {
+                    "ok": False,
+                    "error": proxy_error or "请先配置提链代理或注册代理线路",
+                },
+                status=409,
             )
-        device_id = secrets.token_hex(16)
+        session_cookie = str(request.cookies.get(SESSION_COOKIE_NAME) or "")
+        device_id = str(
+            request.cookies.get(PAYPAL_AUTO_DEVICE_COOKIE_NAME) or ""
+        ).strip()
+        if not device_id and session_cookie:
+            device_id = hmac.new(
+                str(app["local_token"]).encode("utf-8"),
+                session_cookie.encode("utf-8"),
+                "sha256",
+            ).hexdigest()[:32]
+        if not re.fullmatch(r"[a-f0-9]{32}", device_id):
+            device_id = secrets.token_hex(16)
         protocol_payload = {
             "paypal_url": paypal_url,
-            "country": link_country,
+            "country": protocol_country,
             "sms_provider": "smsbower",
-            "sms_max_price": sms_state.get("maxPrice"),
+            "sms_service": "paypal",
+            "sms_country": protocol_country,
+            "sms_max_price": (
+                PAYPAL_US_SMSBOWER_MAX_PRICE
+                if protocol_country == "US"
+                else PAYPAL_GB_SMSBOWER_MAX_PRICE
+                if protocol_country == "GB"
+                else sms_state.get("maxPrice")
+            ),
             "proxy_pool": [proxy_url],
             "source_account_email": email,
             "account_cookies": cookies,
@@ -7542,10 +7861,18 @@ def create_app(
             {
                 "ok": True,
                 "email": email,
-                "country": link_country,
+                "country": protocol_country,
+                "checkoutCountry": link_country,
+                "linkProxyCountry": link_proxy_country,
                 "cookieCount": len(cookies),
                 "proxyMode": proxy_mode,
+                "proxySource": proxy_source,
                 "smsProvider": "smsbower",
+                "smsService": "paypal",
+                "smsServiceCode": "ts",
+                "smsCountry": protocol_country,
+                "smsMaxPrice": protocol_payload["sms_max_price"],
+                "smsVirtualAllowed": protocol_country == "US",
                 "job": job,
                 "url": "/paypal-pay/",
             },
@@ -7556,6 +7883,14 @@ def create_app(
             "paypal_web_device_id",
             device_id,
             path="/paypal-pay/",
+            max_age=30 * 24 * 60 * 60,
+            httponly=True,
+            samesite="Strict",
+        )
+        response.set_cookie(
+            PAYPAL_AUTO_DEVICE_COOKIE_NAME,
+            device_id,
+            path="/",
             max_age=30 * 24 * 60 * 60,
             httponly=True,
             samesite="Strict",

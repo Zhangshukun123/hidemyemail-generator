@@ -282,6 +282,7 @@ class ProtocolRegistrationManager:
         emails: list[str],
         base_url: str,
         concurrency: int = 1,
+        setup_credentials: bool = True,
         on_account_finished: AccountFinished | None = None,
     ) -> dict[str, Any]:
         if self._task is not None and not self._task.done():
@@ -322,6 +323,7 @@ class ProtocolRegistrationManager:
             "failed": 0,
             "skipped": 0,
             "concurrency": concurrency,
+            "setupCredentials": bool(setup_credentials),
             "currentEmail": "",
             "startedAt": _utc_now(),
             "finishedAt": "",
@@ -338,7 +340,13 @@ class ProtocolRegistrationManager:
         }
         self._append_log(self._state["message"], stage="prepare")
         self._task = asyncio.create_task(
-            self._run(unique, origin, concurrency, on_account_finished),
+            self._run(
+                unique,
+                origin,
+                concurrency,
+                bool(setup_credentials),
+                on_account_finished,
+            ),
             name=f"protocol-registration-{task_id}",
         )
         return self.snapshot()
@@ -371,6 +379,7 @@ class ProtocolRegistrationManager:
         emails: list[str],
         base_url: str,
         concurrency: int,
+        setup_credentials: bool,
         on_account_finished: AccountFinished | None,
     ) -> None:
         semaphore = asyncio.Semaphore(concurrency)
@@ -379,7 +388,12 @@ class ProtocolRegistrationManager:
             async with semaphore:
                 if self._cancel_requested:
                     return
-                await self._run_one(email, base_url, on_account_finished)
+                await self._run_one(
+                    email,
+                    base_url,
+                    setup_credentials,
+                    on_account_finished,
+                )
 
         try:
             await asyncio.gather(*(guarded(email) for email in emails))
@@ -403,8 +417,13 @@ class ProtocolRegistrationManager:
             else:
                 self._state["status"] = "completed"
                 self._state["phase"] = "completed"
+                completion = (
+                    "Session/Cookie、密码和 2FA"
+                    if setup_credentials
+                    else "Session/Cookie"
+                )
                 self._state["message"] = (
-                    f"协议注册完成：{self._state['succeeded']} 个账号均已添加密码和 2FA"
+                    f"协议注册完成：{self._state['succeeded']} 个账号已保存{completion}"
                 )
             self._append_log(
                 self._state["message"],
@@ -416,6 +435,7 @@ class ProtocolRegistrationManager:
         self,
         email: str,
         base_url: str,
+        setup_credentials: bool,
         on_account_finished: AccountFinished | None,
     ) -> None:
         account_state = next(
@@ -500,6 +520,7 @@ class ProtocolRegistrationManager:
                 "existing_session_cookies": existing_cookies,
                 "existing_device_id": existing_device_id,
                 "existing_impersonate": existing_impersonate,
+                "setup_credentials": setup_credentials,
                 "project_root": str(self.gptfree_root),
                 "source_root": str(Path(__file__).resolve().parents[1]),
             }
@@ -558,16 +579,17 @@ class ProtocolRegistrationManager:
             password = str(result.get("password") or "").strip()
             two_factor = result.get("two_factor")
             access_token = str(result.get("access_token") or "").strip()
-            if len(password) < 12:
-                raise RuntimeError("协议注册未返回已确认密码")
             if not access_token:
                 raise RuntimeError("协议注册未返回 Access Token")
-            if not (
-                isinstance(two_factor, dict)
-                and two_factor.get("enabled")
-                and two_factor.get("secret")
-            ):
-                raise RuntimeError("协议注册未确认 TOTP 2FA")
+            if setup_credentials:
+                if len(password) < 12:
+                    raise RuntimeError("协议注册未返回已确认密码")
+                if not (
+                    isinstance(two_factor, dict)
+                    and two_factor.get("enabled")
+                    and two_factor.get("secret")
+                ):
+                    raise RuntimeError("协议注册未确认 TOTP 2FA")
             result = dict(result)
             result["registration_environment"] = build_registration_environment(
                 email,
@@ -580,9 +602,9 @@ class ProtocolRegistrationManager:
                 self.db_file,
                 email,
                 result=result,
-                password=password,
-                password_confirmed=True,
-                two_factor=two_factor,
+                password=password if setup_credentials else "",
+                password_confirmed=True if setup_credentials else None,
+                two_factor=two_factor if setup_credentials else None,
             )
             if self.on_account_saved is not None:
                 try:
@@ -596,7 +618,11 @@ class ProtocolRegistrationManager:
                     )
             account_state["status"] = "success"
             account_state["stage"] = "completed"
-            account_state["message"] = "协议注册完成（密码+2FA）"
+            account_state["message"] = (
+                "协议注册完成（Session/Cookie + 密码 + 2FA）"
+                if setup_credentials
+                else "协议注册完成（仅 Session/Cookie）"
+            )
             completion_success = True
             completion_message = account_state["message"]
             self._state["succeeded"] += 1

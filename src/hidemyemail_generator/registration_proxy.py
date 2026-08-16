@@ -76,8 +76,16 @@ CARD_LINK_PROXY_COUNTRY_DEFAULTS = {
     "phCreate": "US",
     "phPromotion": "TR",
     "de": "DE",
+    "paypalUsCreate": "US",
+    "paypalUsFollowup": "US",
+    "paypalGbCreate": "GB",
 }
-CARD_LINK_PROXY_MODE_KEYS = {"ph_hosted", "de_oaics_paypal"}
+CARD_LINK_PROXY_MODE_KEYS = {
+    "ph_hosted",
+    "de_oaics_paypal",
+    "paypal_us",
+    "paypal_gb",
+}
 
 _STICKY_SUFFIX_RE = re.compile(
     r"-region-[A-Za-z]{2}-sid-[A-Za-z0-9]{4,32}-t-\d+$", re.IGNORECASE

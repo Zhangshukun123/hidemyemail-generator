@@ -63,15 +63,22 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('this.commands.register("one-click-paypal-payment"', page)
         self.assertIn("/api/account/paypal-payment", page)
         self.assertIn('this.api.post("/api/account/paypal-payment", { email })', page)
-        self.assertIn("根据提链记录自动使用国家", page)
+        self.assertIn("根据提链真实出口国家自动生成身份资料", page)
         self.assertNotIn('data-payment-country="1"', page)
         self.assertIn("支付地址</span><strong>自动匹配", page)
-        self.assertIn("当前账号 Cookie、通用代理与 SMSBower", page)
+        self.assertIn("当前账号 Cookie、提链代理与 SMSBower", page)
+        self.assertIn("startQuickFlowPaypalPayment", page)
+        self.assertIn("await this.startQuickFlowPaypalPayment(", page)
+        self.assertIn('phase: "payment"', page)
+        self.assertIn('id="quickFlowPaymentCount"', page)
+        self.assertIn('data-quick-stage="payment"', page)
+        self.assertIn("自动选择代理、获取 SMSBower 手机号并启动协议支付", page)
+        self.assertIn("请先在系统设置配置 SMSBower API Key", page)
         self.assertIn("单账号提链次数", page)
         self.assertIn("返回 cs_live 时自动继续同模式提链", page)
         self.assertIn("attempt_limit:", page)
-        self.assertIn('cardLinkCountries: { de: $("quickExtractionFirstProxyCountry").value }', page)
-        self.assertIn('cardLinkModes: { de_oaics_paypal: $("quickExtractionProxyMode").value }', page)
+        self.assertIn('[methodConfig.createProxyPreference]', page)
+        self.assertIn('cardLinkModes: { [method]: $("quickExtractionProxyMode").value }', page)
         self.assertIn("协议注册", page)
         self.assertIn('id="protocolRegistrationPanel"', page)
         self.assertNotIn('data-route="protocol-registration"', page)
@@ -82,8 +89,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("/api/protocol-registration/start", page)
         self.assertIn("/api/protocol-registration/status", page)
         self.assertIn("renderProtocolRegistration", page)
-        self.assertIn("设置密码", page)
-        self.assertIn("激活 2FA", page)
+        self.assertIn("密码（可选）", page)
+        self.assertIn("2FA（可选）", page)
         self.assertNotIn('badge(checkoutLabel, checkoutKind)', page)
         self.assertNotIn('"重新检测 Checkout"', page)
         self.assertNotIn('this.commands.register("retry-checkout-probe"', page)
@@ -109,16 +116,23 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('name="registrationMode" value="protocol"', page)
         self.assertIn("无头浏览器", page)
         self.assertIn("有头浏览器", page)
-        self.assertIn("Mail Auth · 无浏览器", page)
-        self.assertIn("Mail Auth 协议（先设置密码）", page)
-        self.assertIn("无浏览器先设置账号密码", page)
-        password_step = page.index('data-protocol-stage="password"')
+        self.assertIn("Mail Auth · 默认仅 Session", page)
+        self.assertIn("Mail Auth 协议（仅 Session）", page)
+        self.assertIn("密码与 TOTP 2FA 可选", page)
         otp_step = page.index('data-protocol-stage="email_verification"')
-        self.assertLess(password_step, otp_step)
+        session_step = page.index('data-protocol-stage="session"')
+        password_step = page.index('data-protocol-stage="password"')
+        self.assertLess(otp_step, session_step)
+        self.assertLess(session_step, password_step)
         self.assertIn(
-            'const stageOrder = ["password", "email_verification", "session", "two_factor", "completed"]',
+            '? ["password", "email_verification", "session", "two_factor", "completed"]',
             page,
         )
+        self.assertIn('id="protocolSetupCredentials" type="checkbox"', page)
+        self.assertIn("同时设置密码与 2FA", page)
+        self.assertIn("credentialToggle.disabled = protocolBusy", page)
+        self.assertIn("Session/Cookie 仍待获取", page)
+        self.assertIn("Session 已保存", page)
         self.assertIn('$("protocolRegistrationPanel").hidden = !protocolMode', page)
         self.assertNotIn('$("taskPanel")', page)
         self.assertIn('querySelector(".table-panel")', page)
@@ -136,7 +150,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn('item.checkoutIsOaics', page)
         self.assertNotIn('item.checkoutIdType', page)
 
-    def test_protocol_registration_uses_inventory_entry_without_account_picker(self):
+    def test_protocol_registration_uses_provider_entry_without_account_picker(self):
         page = build_app_page()
 
         self.assertNotIn('id="protocolRuntimeStatus"', page)
@@ -152,7 +166,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn('this.commands.register("start-protocol-all"', page)
         self.assertIn('class="panel protocol-task-panel"', page)
         self.assertIn('this.assertProtocolRuntime()', page)
-        self.assertIn('provider: "inventory"', page)
+        self.assertIn('provider: protocolProvider', page)
         self.assertIn('const options = this.browserOptions();', page)
 
     def test_account_workbench_configures_country_registration_proxy(self):
@@ -242,8 +256,11 @@ class StructuredWebUiTests(unittest.TestCase):
 
         self.assertIn('data-route="quick-flow"', page)
         self.assertIn('id="quickFlowView" data-view="quick-flow"', page)
-        self.assertIn("一键注册并提链", page)
+        self.assertIn("一键注册、提链并支付", page)
         self.assertIn('id="quickRegistrationMode"', page)
+        self.assertIn('id="quickRegistrationProvider"', page)
+        self.assertIn('<option value="inventory">iCloud 库存邮箱</option>', page)
+        self.assertIn('<option value="zkgmail">zkgmail.com · QQ 接码</option>', page)
         self.assertIn('id="quickRegistrationProxyMode"', page)
         self.assertIn('id="quickRegistrationProxyCountry"', page)
         self.assertIn('<option value="direct">本机 IP 直连</option>', page)
@@ -278,16 +295,20 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("第一代理出口", page)
         self.assertIn("第二代理出口", page)
         self.assertIn("reuse_registration_proxy: false", page)
-        self.assertIn("independent_proxy_pair: true", page)
-        self.assertIn("use_secondary_proxy: Boolean(forceRetry)", page)
-        self.assertIn('promotion_proxy_choice: snapshot.promotionProxyChoice', page)
+        self.assertIn("independent_proxy_pair: !singleProxy", page)
+        self.assertIn("use_secondary_proxy: !singleProxy && Boolean(forceRetry)", page)
+        self.assertIn('promotion_proxy_choice: singleProxy', page)
         self.assertIn('localStorage.setItem("hme_quick_registration_proxy_mode", mode)', page)
         self.assertIn('每次点击都会创建独立注册流程', page)
         self.assertIn('停止或关闭在下方对应流程卡片中操作', page)
         self.assertIn('process_id: flow.taskId', page)
         self.assertIn('enabled: Boolean(candidate?.configured)', page)
-        self.assertIn('provider: "inventory"', page)
+        self.assertIn('provider: registrationProvider', page)
+        self.assertIn('registrationProvider === "zkgmail"', page)
+        self.assertIn('localStorage.setItem("hme_quick_registration_provider"', page)
         self.assertIn('class="quick-flow-steps"', page)
+        self.assertIn('data-quick-stage="payment"', page)
+        self.assertIn("SMSBower 自动取号", page)
         self.assertIn(".quick-flow-layout", page)
 
     def test_one_click_pipeline_skips_only_an_existing_generated_paypal_link(self):
@@ -300,22 +321,38 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("更新优惠使用 IP", page)
         self.assertIn("第一提链 IP", page)
         self.assertIn("第二提链 IP", page)
-        self.assertIn('const method = "de_oaics_paypal";', page)
-        self.assertIn('hasGeneratedCardLinkForMethod(account, "de_oaics_paypal")', page)
-        self.assertIn("账号已有 PayPal 链接，已跳过重复创建", page)
+        self.assertIn('const supportedMethods = ["de_oaics_paypal", "paypal_us", "paypal_gb"]', page)
+        self.assertIn('hasGeneratedCardLinkForMethod(account, method)', page)
+        self.assertIn("账号已有同模式 PayPal 链接，已跳过重复创建", page)
         self.assertIn("cs_live 已自动重试", page)
         self.assertIn("提链未完成 · 可重试", page)
         self.assertIn("results.length > 0 && failed === 0", page)
         self.assertIn('id="quickFlowSkippedCount"', page)
-        self.assertIn("未生成同模式链接的账号使用 PayPal 严格 0 · DE/EUR", page)
+        self.assertIn("一键注册、提链并协议支付已启动：使用 ", page)
+        self.assertIn('methodConfig.label', page)
         self.assertIn('id="quickExtractionCount"', page)
         self.assertIn("单账号提链次数必须是 1–100 的整数", page)
         self.assertIn("attempt_limit:", page)
         self.assertIn('localStorage.setItem("hme_quick_extraction_count"', page)
         self.assertIn("返回 cs_live 时自动继续同模式提链", page)
+        self.assertIn("quickFlowFailureExplanation", page)
+        self.assertIn("本次请求被服务端拦截，不代表账号无法提链", page)
+        self.assertIn('class="quick-flow-monitor-details"', page)
+        self.assertIn("直卡提链日志", page)
+        self.assertIn("error.logs = Array.isArray(data.logs) ? data.logs : []", page)
+        self.assertIn('"[直卡提链] " + message', page)
+        self.assertIn(".quick-flow-log .task-log-row.failed span", page)
+        self.assertNotIn(
+            ".quick-flow-counters,\n.quick-flow-monitor-details {",
+            page,
+        )
         quick_flow = page[page.index('id="quickFlowView"'):page.index('id="networkView"')]
         self.assertNotIn('value="ph_hosted"', quick_flow)
         self.assertIn('value="de_oaics_paypal"', quick_flow)
+        self.assertIn('value="paypal_us"', quick_flow)
+        self.assertIn('value="paypal_gb"', quick_flow)
+        self.assertIn('id="quickCardLinkTargetAmount"', quick_flow)
+        self.assertIn('target_amount: config.targetAmount', page)
 
     def test_proxy_module_is_not_disabled_by_registration_mode(self):
         page = build_app_page()
@@ -338,7 +375,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn('$("rotateRegistrationProxyButton").disabled = protocolMode', page)
         self.assertIn('.registration-proxy-credentials[hidden] { display: none; }', page)
 
-    def test_icloud_inventory_can_start_protocol_registration(self):
+    def test_icloud_and_zkgmail_can_start_protocol_registration(self):
         page = build_app_page()
         command_start = page.index('this.commands.register("register-provider"')
         command_end = page.index(
@@ -346,19 +383,31 @@ class StructuredWebUiTests(unittest.TestCase):
         )
         command = page[command_start:command_end]
 
-        self.assertIn('$("registrationEmailProvider").disabled = false', page)
+        self.assertIn("gmailProviderOption.disabled = protocolMode", page)
+        self.assertIn("registrationProviderSelect.disabled = false", page)
         self.assertIn('"开始 iCloud 协议注册"', page)
-        self.assertIn('registrationProvider !== "icloud"', page)
+        self.assertIn('"开始 zkgmail.com 协议注册"', page)
+        self.assertIn('["icloud", "zkgmail"].includes(registrationProvider)', page)
+        self.assertIn('registrationProvider === "zkgmail" && !zkgmail.configured', page)
+        self.assertIn('$("zkgmailControls").hidden = registrationProvider !== "zkgmail"', page)
         self.assertIn('this.store.state.registrationMode === "protocol"', page)
         self.assertIn('this.api.post("/api/protocol-registration/start"', command)
-        self.assertIn('provider: "inventory"', command)
+        self.assertIn(
+            'const protocolProvider = source === "zkgmail" ? "zkgmail" : "inventory"',
+            command,
+        )
+        self.assertIn("provider: protocolProvider", command)
         self.assertIn("已从库存领取 iCloud 邮箱并启动协议注册", command)
+        self.assertIn("已生成 zkgmail.com 邮箱并启动协议注册", command)
         self.assertLess(
             command.index("if (protocolMode)"),
             command.index("const options = this.browserOptions();"),
         )
         self.assertIn(
-            "已切换为协议注册，点击上方按钮即可自动领取 iCloud 邮箱", page
+            "已切换为协议注册，可选择 iCloud 或 zkgmail.com 邮箱", page
+        )
+        self.assertIn(
+            "setup_credentials: setupCredentials", page
         )
 
     def test_app_page_uses_frontend_design_patterns(self):
@@ -825,10 +874,136 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["provider"], "inventory")
         self.assertEqual(payload["email"], email)
         self.assertEqual(manager.options["emails"], [email])
+        self.assertFalse(manager.options["setup_credentials"])
         self.assertTrue(callable(manager.options["on_account_finished"]))
         await manager.options["on_account_finished"](email, True, "registered")
         self.assertEqual(inventory.completed[0][:3], (email, True, "registered"))
         self.assertIsNotNone(inventory.completed[0][3])
+
+    async def test_protocol_registration_can_generate_one_zkgmail_email(self):
+        email = "protocol-zkgmail@zkgmail.com"
+
+        class ZkgmailClientStub:
+            def __init__(self):
+                self.completed = []
+                self.cancelled = []
+
+            async def acquire_email(self, label):
+                self.label = label
+                return email
+
+            async def complete_email(self, completed_email, success, message):
+                self.completed.append((completed_email, success, message))
+
+            async def cancel_email(self, cancelled_email, message):
+                self.cancelled.append((cancelled_email, message))
+
+        class ProtocolManagerStub:
+            def __init__(self):
+                self.options = None
+
+            def start(self, **options):
+                self.options = options
+                return {"status": "running", "running": True}
+
+            async def close(self):
+                return None
+
+        zkgmail = ZkgmailClientStub()
+        manager = ProtocolManagerStub()
+        self.app["zkgmail_client"] = zkgmail
+        self.app["protocol_registration_manager"] = manager
+
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"provider": "zkgmail", "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["provider"], "zkgmail")
+        self.assertEqual(payload["email"], email)
+        self.assertEqual(zkgmail.label, "zkgmail.com 协议注册")
+        self.assertEqual(manager.options["emails"], [email])
+        self.assertFalse(manager.options["setup_credentials"])
+        self.assertTrue(callable(manager.options["on_account_finished"]))
+        await manager.options["on_account_finished"](email, True, "registered")
+        self.assertEqual(zkgmail.completed, [(email, True, "registered")])
+        self.assertEqual(zkgmail.cancelled, [])
+
+    async def test_protocol_registration_cancels_zkgmail_if_task_cannot_start(self):
+        email = "cancelled-protocol@zkgmail.com"
+
+        class ZkgmailClientStub:
+            def __init__(self):
+                self.cancelled = []
+
+            async def acquire_email(self, _label):
+                return email
+
+            async def cancel_email(self, cancelled_email, message):
+                self.cancelled.append((cancelled_email, message))
+
+        class ProtocolManagerStub:
+            def start(self, **_options):
+                raise RuntimeError("协议任务忙碌")
+
+            async def close(self):
+                return None
+
+        zkgmail = ZkgmailClientStub()
+        self.app["zkgmail_client"] = zkgmail
+        self.app["protocol_registration_manager"] = ProtocolManagerStub()
+
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"provider": "zkgmail", "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 409)
+        self.assertEqual(payload["error"], "协议任务忙碌")
+        self.assertEqual(zkgmail.cancelled, [(email, "协议任务忙碌")])
+
+    async def test_protocol_registration_code_polls_zkgmail_forward_mailbox(self):
+        token = "zkgmail-code-token"
+        email = "code-protocol@zkgmail.com"
+
+        class ZkgmailClientStub:
+            def __init__(self):
+                self.polled = []
+
+            async def poll_next_code(self, polled_email):
+                self.polled.append(polled_email)
+                return "246810"
+
+        class ProtocolManagerStub:
+            def valid_code_token(self, candidate):
+                return candidate == token
+
+            def token_record(self, candidate):
+                return (
+                    {"email": email, "since": "2026-08-16T00:00:00+00:00"}
+                    if candidate == token
+                    else None
+                )
+
+            async def close(self):
+                return None
+
+        zkgmail = ZkgmailClientStub()
+        self.app["zkgmail_client"] = zkgmail
+        self.app["protocol_registration_manager"] = ProtocolManagerStub()
+
+        response = await self.client.get(
+            f"/api/protocol-registration/code/{token}"
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.text(), "246810")
+        self.assertEqual(zkgmail.polled, [email])
 
     async def test_protocol_registration_skips_protocol_ready_account(self):
         _save_account_record(
@@ -944,13 +1119,52 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/api/protocol-registration/start",
             headers={"X-Local-Token": self.app["local_token"]},
-            json={"emails": [email], "concurrency": 1},
+            json={"emails": [email], "concurrency": 1, "setup_credentials": True},
         )
         payload = await response.json()
 
         self.assertEqual(response.status, 200)
         self.assertTrue(payload["started"])
         self.assertEqual(manager.options["emails"], [email])
+
+    async def test_protocol_registration_api_defaults_to_session_only(self):
+        email = "api-session-only@icloud.com"
+        _save_account_record(self.app["db_file"], email)
+        captured = []
+
+        async def runner(payload, on_event):
+            captured.append(payload)
+            on_event({"stage": "session", "message": "Session/Cookie 已获取"})
+            return {
+                "status": "success",
+                "email": payload["email"],
+                "access_token": "header.payload.signature",
+                "session_json": json.dumps(
+                    {"accessToken": "header.payload.signature", "sessionToken": "session"}
+                ),
+                "storage_state_json": json.dumps({"cookies": [], "origins": []}),
+                "session_acquisition_method": "gptfree_mail_auth",
+            }
+
+        manager = self.app["protocol_registration_manager"]
+        manager.worker_runner = runner
+        manager._runtime_cache = None
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={"emails": [email], "concurrency": 1},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["started"])
+        final = await manager.wait()
+        self.assertEqual(final["succeeded"], 1)
+        self.assertFalse(captured[0]["setup_credentials"])
+        record = load_account_record(self.app["db_file"], email)
+        self.assertEqual(record["session"]["sessionToken"], "session")
+        self.assertNotIn("password", record)
+        self.assertNotIn("two_factor", record)
 
     async def test_protocol_registration_api_persists_complete_credentials(self):
         email = "api-protocol@icloud.com"
@@ -982,7 +1196,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/api/protocol-registration/start",
             headers={"X-Local-Token": self.app["local_token"]},
-            json={"emails": [email], "concurrency": 1},
+            json={"emails": [email], "concurrency": 1, "setup_credentials": True},
         )
         payload = await response.json()
         self.assertEqual(response.status, 200)

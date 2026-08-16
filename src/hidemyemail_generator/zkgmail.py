@@ -34,7 +34,7 @@ ZKGMAIL_FORWARD_ACCOUNT = "352121354@qq.com"
 ZKGMAIL_IMAP_HOST = "imap.qq.com"
 ZKGMAIL_IMAP_PORT = 993
 ZKGMAIL_FOLDER = "INBOX"
-ZKGMAIL_SYNC_INTERVAL_SECONDS = 3.0
+ZKGMAIL_SYNC_INTERVAL_SECONDS = 1.0
 ZKGMAIL_MESSAGE_LIMIT = 30
 ZKGMAIL_FIRST_NAMES = (
     "james",
@@ -107,15 +107,14 @@ def _utc_now() -> datetime:
 
 
 def _generate_human_local_part() -> str:
-    """Return a natural-looking ASCII name with a short numeric suffix."""
+    """Return an alphanumeric ASCII name with a short numeric suffix."""
 
     first_name = secrets.choice(ZKGMAIL_FIRST_NAMES)
     last_name = secrets.choice(ZKGMAIL_LAST_NAMES)
-    separator = "." if secrets.randbelow(2) else ""
     digit_count = 2 + secrets.randbelow(3)
     minimum = 10 ** (digit_count - 1)
     suffix = minimum + secrets.randbelow(9 * minimum)
-    return f"{first_name}{separator}{last_name}{suffix}"
+    return f"{first_name}{last_name}{suffix}"
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -137,6 +136,26 @@ def _connect_mailbox(config: InboxConfig):
         if config.use_ssl
         else imaplib.IMAP4(config.host, config.port, timeout=DEFAULT_IMAP_TIMEOUT)
     )
+
+
+def _refresh_selected_mailbox(mailbox) -> None:
+    """Ask IMAP to publish pending mailbox changes before searching.
+
+    QQ can briefly keep a newly delivered message out of a selected mailbox's
+    search snapshot.  NOOP is the standard, non-mutating way to request any
+    pending EXISTS/RECENT updates; unlike opening the message, it does not mark
+    mail as read.
+    """
+
+    noop = getattr(mailbox, "noop", None)
+    if not callable(noop):
+        return
+    try:
+        noop()
+    except (imaplib.IMAP4.error, OSError):
+        # SEARCH remains useful even when a provider does not support NOOP
+        # correctly, so a refresh failure must not hide otherwise visible mail.
+        return
 
 
 def _test_imap_connection(config: InboxConfig) -> None:
@@ -196,6 +215,7 @@ def _sync_relevant_messages(
                 if folder == config.folder:
                     raise RuntimeError("QQ 邮箱 INBOX 不可用")
                 continue
+            _refresh_selected_mailbox(mailbox)
             status, data = mailbox.uid("search", None, "ALL")
             if status != "OK":
                 if folder == config.folder:
