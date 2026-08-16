@@ -1313,6 +1313,12 @@
         ? "SMSBower Gmail · 本机取码保留 " + (smsBower.retentionHours || 24) + " 小时"
         : "SMSBower 未配置";
       if (smsBower.maxPrice) $("smsbowerMaxPrice").value = smsBower.maxPrice;
+      const zkgmail = state.zkgmail || {};
+      const zkgmailStatus = $("zkgmailStatus");
+      zkgmailStatus.className = "badge " + (zkgmail.configured ? "success" : "warning");
+      zkgmailStatus.textContent = zkgmail.configured
+        ? "QQ 自动取码已启用 · " + (zkgmail.forwardAccount || "352***4@qq.com")
+        : "QQ 接码未配置";
       const registration = state.registrationTask || {};
       const canStartNextRegistration = registration.canStartNext !== false;
       const activeRegistrationProcesses = Number(registration.runningCount || 0);
@@ -1321,11 +1327,14 @@
       const registrationProvider = $("registrationEmailProvider").value || "icloud";
       $("registrationEmailProvider").disabled = false;
       $("smsbowerControls").hidden = protocolMode || registrationProvider !== "gmail";
+      $("zkgmailControls").hidden = protocolMode || registrationProvider !== "zkgmail";
       $("registerProviderButton").textContent = protocolMode && registrationProvider === "icloud"
         ? (protocolRegistration.starting ? "正在领取 iCloud 库存邮箱…"
           : protocolRegistration.running ? "iCloud 协议注册运行中" : "开始 iCloud 协议注册")
         : registrationProvider === "gmail"
         ? (activeRegistrationProcesses ? "启动下一个 Gmail 注册进程" : "开始 Gmail 注册")
+        : registrationProvider === "zkgmail"
+        ? (activeRegistrationProcesses ? "启动下一个 zkgmail.com 注册进程" : "开始 zkgmail.com 注册")
         : (activeRegistrationProcesses ? "启动下一个 iCloud 注册进程" : "开始 iCloud 注册");
       if (roxyMode && registrationProvider === "icloud") {
         const roxyWindows = Number($("roxyConcurrency").value || 1);
@@ -1338,7 +1347,8 @@
         ? registrationProvider !== "icloud" || protocolBusy
         : !canStartNextRegistration ||
           (roxyMode && activeRegistrationProcesses > 0) ||
-          (registrationProvider === "gmail" && !smsBower.configured);
+          (registrationProvider === "gmail" && !smsBower.configured) ||
+          (registrationProvider === "zkgmail" && !zkgmail.configured);
       $("registrationEmail").disabled = protocolMode;
       $("registerEmailButton").disabled = protocolMode || !canStartNextRegistration;
       $("fetchAllButton").disabled = protocolMode;
@@ -1361,7 +1371,8 @@
       $("stopTaskButton").disabled = !runtimeRunning;
       const codePanel = $("registrationCodePanel");
       const awaitingEmail = (registration.awaitingCodeEmails || [])[0] || registration.email || "";
-      codePanel.hidden = !registration.awaitingCode || registration.provider === "smsbower";
+      codePanel.hidden = !registration.awaitingCode ||
+        ["smsbower", "zkgmail"].includes(registration.provider);
       $("registrationCodeEmail").textContent = registration.awaitingCode
         ? "验证码将用于 " + awaitingEmail
         : "等待注册页面请求验证码";
@@ -2385,6 +2396,7 @@
         cardLinkProxy: { enabled: false, configured: false, country: "DE", countries: [], modes: [] },
         roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
+        zkgmail: { configured: false, domain: "zkgmail.com", forwardAccount: "352***4@qq.com" },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
         inbox: { configured: false, codeCount: 0 },
@@ -2478,7 +2490,7 @@
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
         this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(),
         this.loadRegistrationProxy(), this.loadCardLinkProxy(), this.loadRoxyRegistration(),
-        this.loadSmsBower(), this.loadPayPal(),
+        this.loadSmsBower(), this.loadZkgmail(), this.loadPayPal(),
       ]);
       this.refreshInFlight = operation;
       try {
@@ -2629,6 +2641,11 @@
     async loadSmsBower() {
       const data = await this.api.get("/api/smsbower/status");
       this.store.patch({ smsBower: data });
+    }
+
+    async loadZkgmail() {
+      const data = await this.api.get("/api/zkgmail/status");
+      this.store.patch({ zkgmail: data });
     }
 
     browserOptions() {
@@ -3327,6 +3344,7 @@
       this.commands.register("register-provider", async () => {
         const source = $("registrationEmailProvider").value || "icloud";
         const smsBower = this.store.state.smsBower || {};
+        const zkgmail = this.store.state.zkgmail || {};
         const protocolMode = this.store.state.registrationMode === "protocol";
         if (protocolMode) {
           if (source !== "icloud") {
@@ -3398,9 +3416,15 @@
           const config = await this.api.post("/api/smsbower/config", { maxPrice });
           this.store.patch({ smsBower: { ...smsBower, ...config } });
         }
+        if (source === "zkgmail" && !zkgmail.configured) {
+          throw new Error("请先设置 QQ 邮箱授权码");
+        }
+        const provider = source === "gmail"
+          ? "smsbower" : source === "zkgmail" ? "zkgmail" : "inventory";
         const data = await this.api.post("/api/registration/start", {
-          label: source === "gmail" ? "SMSBower Gmail 注册" : "iCloud 邮箱注册",
-          provider: source === "gmail" ? "smsbower" : "inventory",
+          label: source === "gmail" ? "SMSBower Gmail 注册"
+            : source === "zkgmail" ? "zkgmail.com 邮箱注册" : "iCloud 邮箱注册",
+          provider,
           ...options,
           concurrency: source === "gmail" ? 1 : options.concurrency,
         });
@@ -3408,6 +3432,8 @@
         this.schedule("registration", () => this.loadRegistrationTask(), 500);
         return source === "gmail"
           ? "已启动 SMSBower Gmail 获取与自动注册（" + (options.headless ? "无头" : "前台窗口") + "）"
+          : source === "zkgmail"
+          ? "已启动 zkgmail.com 地址生成与 QQ 邮箱自动取码"
           : "已启动 iCloud 库存邮箱注册";
       });
       this.commands.register("stop-protocol-registration", async () => {
@@ -3427,6 +3453,19 @@
         });
         this.store.patch({ smsBower: data });
         return "SMSBower API 已保存，可获取 Gmail 并自动注册";
+      });
+      this.commands.register("set-zkgmail-auth", async () => {
+        const authorizationCode = prompt(
+          "输入 352121354@qq.com 的 IMAP/SMTP 授权码。授权码只保存在本地数据库，接口和日志不会回传：",
+          "",
+        );
+        if (authorizationCode === null) throw Object.assign(new Error(), { name: "AbortError" });
+        if (!authorizationCode.trim()) throw new Error("QQ 邮箱授权码不能为空");
+        const data = await this.api.post("/api/zkgmail/config", {
+          authorizationCode: authorizationCode.trim(),
+        });
+        this.store.patch({ zkgmail: data });
+        return "QQ 邮箱 IMAP 已连接，zkgmail.com 自动取码可用";
       });
       this.commands.register("submit-registration-code", async () => {
         const task = this.store.state.registrationTask;

@@ -594,6 +594,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="smsbowerMaxPrice"', page)
         self.assertIn('id="registrationEmailProvider"', page)
         self.assertIn('<option value="icloud">iCloud 库存邮箱</option>', page)
+        self.assertIn('<option value="zkgmail">zkgmail.com · QQ 接码</option>', page)
         self.assertIn('<option value="gmail">Gmail · SMSBower</option>', page)
         self.assertIn('id="registerProviderButton"', page)
         self.assertIn("开始 Gmail 注册", page)
@@ -609,8 +610,12 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-action="register-provider"', page)
         self.assertIn("/api/smsbower/status", page)
         self.assertIn("/api/smsbower/config", page)
-        self.assertIn('provider: source === "gmail" ? "smsbower" : "inventory"', page)
-        self.assertIn('registration.provider === "smsbower"', page)
+        self.assertIn('source === "zkgmail" ? "zkgmail" : "inventory"', page)
+        self.assertIn('["smsbower", "zkgmail"].includes(registration.provider)', page)
+        self.assertIn('id="zkgmailStatus"', page)
+        self.assertIn('data-action="set-zkgmail-auth"', page)
+        self.assertIn("/api/zkgmail/status", page)
+        self.assertIn("/api/zkgmail/config", page)
 
     def test_verification_results_keep_every_account_visible(self):
         page = build_app_page()

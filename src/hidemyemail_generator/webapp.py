@@ -108,6 +108,7 @@ from .smsbower import (
     SMSBowerMailClient,
 )
 from .web_ui import build_app_page, build_login_page
+from .zkgmail import ZKGMAIL_DOMAIN, ZkgmailConfigStore, ZkgmailMailClient
 
 
 SESSION_COOKIE_NAME = "hme_session"
@@ -2922,7 +2923,7 @@ def _valid_supported_account_email(email: str) -> bool:
         target,
     ):
         return False
-    return target.rsplit("@", 1)[1] in {"icloud.com", "gmail.com"}
+    return target.rsplit("@", 1)[1] in {"icloud.com", "gmail.com", ZKGMAIL_DOMAIN}
 
 
 def _workbench_import_payload(record: dict, email: str) -> dict:
@@ -3946,6 +3947,8 @@ def create_app(
     app["smsbower_client"] = SMSBowerMailClient(
         app["smsbower_config_store"], base_url=smsbower_api_base_url
     )
+    app["zkgmail_config_store"] = ZkgmailConfigStore(app["db_file"])
+    app["zkgmail_client"] = ZkgmailMailClient(app["zkgmail_config_store"])
     paypal_source = (
         Path(paypal_project_dir).resolve()
         if paypal_project_dir
@@ -4201,6 +4204,11 @@ def create_app(
             poll_provider_next_code=app["smsbower_client"].poll_next_code,
             complete_provider_email=app["smsbower_client"].complete_email,
             cancel_provider_email=app["smsbower_client"].cancel_email,
+            acquire_zkgmail_email=app["zkgmail_client"].acquire_email,
+            poll_zkgmail_code=app["zkgmail_client"].poll_code,
+            poll_zkgmail_next_code=app["zkgmail_client"].poll_next_code,
+            complete_zkgmail_email=app["zkgmail_client"].complete_email,
+            cancel_zkgmail_email=app["zkgmail_client"].cancel_email,
             load_account=load_registration_account,
         )
 
@@ -4937,15 +4945,23 @@ def create_app(
             )
 
         async with app["delete_lock"]:
-            if email.endswith("@gmail.com"):
-                await app["smsbower_client"].forget_email(email)
+            if email.endswith(("@gmail.com", f"@{ZKGMAIL_DOMAIN}")):
+                gmail_account = email.endswith("@gmail.com")
+                if gmail_account:
+                    await app["smsbower_client"].forget_email(email)
+                else:
+                    await app["zkgmail_client"].forget_email(email)
                 await remove_and_sync_deleted_email(email)
                 return web.json_response(
                     {
                         "ok": True,
                         "deleted": True,
                         "deactivated": False,
-                        "message": "Gmail 本地账号凭据及 SMSBower 激活记录已删除",
+                        "message": (
+                            "Gmail 本地账号凭据及 SMSBower 激活记录已删除"
+                            if gmail_account
+                            else "zkgmail.com 本地账号凭据已删除"
+                        ),
                     }
                 )
 
@@ -5066,6 +5082,17 @@ def create_app(
                 return None, message, status
             if not code:
                 return None, "SMSBower Gmail 验证码尚未到达", 404
+            return {
+                "code": code,
+                "receivedAt": datetime.now(timezone.utc).isoformat(),
+            }, "", 200
+        if email.endswith(f"@{ZKGMAIL_DOMAIN}") and len(email) <= 320:
+            try:
+                code = await app["zkgmail_client"].poll_next_code(email)
+            except RuntimeError as error:
+                return None, str(error), 502
+            if not code:
+                return None, "QQ 邮箱中的 zkgmail.com 验证码尚未到达", 404
             return {
                 "code": code,
                 "receivedAt": datetime.now(timezone.utc).isoformat(),
@@ -5835,7 +5862,7 @@ def create_app(
             payload.get("provider")
             or ("manual" if str(payload.get("email") or "").strip() else "inventory")
         ).strip().lower()
-        if provider not in {"manual", "inventory", "smsbower"}:
+        if provider not in {"manual", "inventory", "smsbower", "zkgmail"}:
             return web.json_response(
                 {"ok": False, "error": "不支持的注册邮箱来源"}, status=400
             )
@@ -5958,6 +5985,8 @@ def create_app(
                     "error": (
                         "SMSBower Gmail 验证码尚未到达"
                         if provider == "smsbower"
+                        else "正在从 QQ 邮箱等待 zkgmail.com 验证码"
+                        if provider == "zkgmail"
                         else "等待手动输入验证码"
                     ),
                 },
@@ -6242,6 +6271,36 @@ def create_app(
         except ValueError as error:
             return web.json_response({"ok": False, "error": str(error)}, status=400)
         return web.json_response({"ok": True, **state})
+
+    async def zkgmail_status(_: web.Request) -> web.Response:
+        return web.json_response(
+            {"ok": True, **app["zkgmail_client"].public_state()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def zkgmail_config(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+            state = await app["zkgmail_client"].configure(
+                payload.get("authorizationCode")
+                if "authorizationCode" in payload
+                else None
+            )
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        except RuntimeError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=502)
+        return web.json_response(
+            {"ok": True, **state, "message": "QQ 邮箱 IMAP 登录成功，zkgmail.com 自动取码已启用"}
+        )
 
     async def verification_status(_: web.Request) -> web.Response:
         return web.json_response(
@@ -7650,6 +7709,8 @@ def create_app(
     )
     app.router.add_get("/api/smsbower/status", smsbower_status)
     app.router.add_post("/api/smsbower/config", smsbower_config)
+    app.router.add_get("/api/zkgmail/status", zkgmail_status)
+    app.router.add_post("/api/zkgmail/config", zkgmail_config)
     app.router.add_get(
         "/api/registration-inventory/status", registration_inventory_client_status
     )

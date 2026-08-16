@@ -62,8 +62,14 @@ class RegistrationTaskManager:
         poll_provider_next_code: PollProviderNextCode | None = None,
         complete_provider_email: CompleteProviderEmail | None = None,
         cancel_provider_email: CancelProviderEmail | None = None,
+        acquire_zkgmail_email: AcquireProviderEmail | None = None,
+        poll_zkgmail_code: PollProviderCode | None = None,
+        poll_zkgmail_next_code: PollProviderNextCode | None = None,
+        complete_zkgmail_email: CompleteProviderEmail | None = None,
+        cancel_zkgmail_email: CancelProviderEmail | None = None,
         load_account: LoadAccount | None = None,
         provider_code_timeout_seconds: float = 30.0,
+        zkgmail_code_timeout_seconds: float = 600.0,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.browser_manager = browser_manager
@@ -77,9 +83,17 @@ class RegistrationTaskManager:
         self.poll_provider_next_code = poll_provider_next_code
         self.complete_provider_email = complete_provider_email
         self.cancel_provider_email = cancel_provider_email
+        self.acquire_zkgmail_email = acquire_zkgmail_email
+        self.poll_zkgmail_code = poll_zkgmail_code
+        self.poll_zkgmail_next_code = poll_zkgmail_next_code
+        self.complete_zkgmail_email = complete_zkgmail_email
+        self.cancel_zkgmail_email = cancel_zkgmail_email
         self.load_account = load_account
         self.provider_code_timeout_seconds = max(
             1.0, float(provider_code_timeout_seconds)
+        )
+        self.zkgmail_code_timeout_seconds = max(
+            1.0, float(zkgmail_code_timeout_seconds)
         )
         self._monotonic = monotonic or time.monotonic
         self._task: asyncio.Task | None = None
@@ -142,12 +156,14 @@ class RegistrationTaskManager:
             raise RuntimeError("；".join(runtime.get("errors") or ["浏览器环境不可用"]))
         manual_email = str(email or "").strip().lower()
         provider = str(provider or ("manual" if manual_email else "inventory")).strip().lower()
-        if provider not in {"manual", "inventory", "smsbower"}:
+        if provider not in {"manual", "inventory", "smsbower", "zkgmail"}:
             raise ValueError("不支持的注册邮箱来源")
         if provider == "manual" and not manual_email:
             raise ValueError("手动注册必须提供邮箱地址")
         if provider == "smsbower" and self.acquire_provider_email is None:
             raise RuntimeError("SMSBower Gmail 获取服务未配置")
+        if provider == "zkgmail" and self.acquire_zkgmail_email is None:
+            raise RuntimeError("zkgmail.com 邮箱服务未配置")
         selected_browser_engine = str(browser_engine or "camoufox").strip().lower()
         if selected_browser_engine not in {"camoufox", "roxy"}:
             raise ValueError("不支持的注册浏览器引擎")
@@ -186,6 +202,8 @@ class RegistrationTaskManager:
             "phase": (
                 "purchasing_gmail"
                 if provider == "smsbower"
+                else "generating_zkgmail"
+                if provider == "zkgmail"
                 else "preparing_email"
                 if manual_email
                 else "claiming_inventory"
@@ -204,6 +222,8 @@ class RegistrationTaskManager:
             "message": (
                 "正在通过 SMSBower API 获取 Gmail"
                 if provider == "smsbower"
+                else f"正在生成 {target_count} 个 zkgmail.com 注册邮箱"
+                if provider == "zkgmail"
                 else f"正在准备使用 {manual_email} 注册"
                 if manual_email
                 else f"正在从已生成邮箱库存领取 {target_count} 个账号"
@@ -220,6 +240,11 @@ class RegistrationTaskManager:
         }
         if provider == "smsbower":
             self._append_log("正在向 SMSBower 购买 OpenAI Gmail 激活")
+        elif provider == "zkgmail":
+            self._append_log(
+                f"正在生成 {target_count} 个 zkgmail.com catch-all 地址；"
+                "验证码将从 QQ 转发邮箱自动读取"
+            )
         elif manual_email:
             self._append_log(f"已添加注册邮箱：{manual_email}")
         else:
@@ -482,15 +507,47 @@ class RegistrationTaskManager:
             )
             self._append_log(f"已将手动验证码提交给注册浏览器：{target}")
             return manual_code
-        if self._state.get("provider") != "smsbower":
+        provider = str(self._state.get("provider") or "").strip().lower()
+        if provider not in {"smsbower", "zkgmail"}:
             return self.poll_verification_code(target)
-        if self.poll_provider_code is None:
-            raise RuntimeError("SMSBower Gmail 验证码服务未配置")
-        timeout_seconds = self.provider_code_timeout_seconds
+        zkgmail_provider = provider == "zkgmail"
+        provider_name = "zkgmail.com / QQ 邮箱" if zkgmail_provider else "SMSBower"
+        timeout_provider_name = (
+            "zkgmail.com / QQ 邮箱" if zkgmail_provider else "SMSBower Gmail"
+        )
+        provider_poller = (
+            self.poll_zkgmail_code if zkgmail_provider else self.poll_provider_code
+        )
+        provider_next_poller = (
+            self.poll_zkgmail_next_code
+            if zkgmail_provider
+            else self.poll_provider_next_code
+        )
+        complete_provider = (
+            self.complete_zkgmail_email
+            if zkgmail_provider
+            else self.complete_provider_email
+        )
+        cancel_provider_callback = (
+            self.cancel_zkgmail_email
+            if zkgmail_provider
+            else self.cancel_provider_email
+        )
+        if provider_poller is None:
+            raise RuntimeError(f"{provider_name} 验证码服务未配置")
+        timeout_seconds = (
+            self.zkgmail_code_timeout_seconds
+            if zkgmail_provider
+            else self.provider_code_timeout_seconds
+        )
         timeout_label = f"{timeout_seconds:g}"
         timeout_message = (
-            f"SMSBower Gmail 验证码等待超过 {timeout_label} 秒，"
-            "已取消邮箱激活并判定注册失败"
+            f"{timeout_provider_name} 验证码等待超过 {timeout_label} 秒，"
+            + (
+                "已停止 QQ 邮箱取码并判定注册失败"
+                if zkgmail_provider
+                else "已取消邮箱激活并判定注册失败"
+            )
         )
         if target in self._provider_cancelled_emails:
             raise RuntimeError(timeout_message)
@@ -503,22 +560,22 @@ class RegistrationTaskManager:
         async def cancel_timed_out_activation() -> None:
             if target in self._provider_cancelled_emails:
                 return
-            cancel_provider = self.cancel_provider_email
-            if cancel_provider is None and self.complete_provider_email is not None:
+            cancel_provider = cancel_provider_callback
+            if cancel_provider is None and complete_provider is not None:
 
                 async def cancel_provider(email: str, message: str) -> None:
-                    await self.complete_provider_email(email, False, message)
+                    await complete_provider(email, False, message)
 
             if cancel_provider is None:
                 raise RuntimeError(
-                    timeout_message + "；SMSBower 取消接口未配置"
+                    timeout_message + f"；{provider_name} 终止接口未配置"
                 )
             try:
                 await cancel_provider(target, timeout_message)
             except Exception as error:
                 failure_message = (
-                    f"SMSBower Gmail 验证码等待超过 {timeout_label} 秒，"
-                    f"取消邮箱激活失败：{str(error)[:240]}"
+                    f"{timeout_provider_name} 验证码等待超过 {timeout_label} 秒，"
+                    f"终止取码失败：{str(error)[:240]}"
                 )
                 self._state.update(
                     status="failed",
@@ -543,7 +600,6 @@ class RegistrationTaskManager:
         if self._monotonic() - started_at >= timeout_seconds:
             await cancel_timed_out_activation()
             raise RuntimeError(timeout_message)
-        provider_poller = self.poll_provider_code
         if provider_request_id:
             cache_key = (target, provider_request_id)
             cached_code = self._provider_code_cache.get(cache_key, "")
@@ -554,8 +610,8 @@ class RegistrationTaskManager:
                 request_ids.append(provider_request_id)
                 del request_ids[:-8]
             request_index = request_ids.index(provider_request_id)
-            if request_index > 0 and self.poll_provider_next_code is not None:
-                provider_poller = self.poll_provider_next_code
+            if request_index > 0 and provider_next_poller is not None:
+                provider_poller = provider_next_poller
         code = await provider_poller(target)
         if code:
             self._provider_code_started_at.pop(timeout_key, None)
@@ -573,9 +629,9 @@ class RegistrationTaskManager:
             self._sync_code_state()
             self._state.update(
                 phase="registering_openai",
-                message=f"SMSBower 已返回验证码，继续注册 {target}",
+                message=f"{provider_name} 已返回验证码，继续注册 {target}",
             )
-            self._append_log(f"已从 SMSBower 自动取得 Gmail 验证码：{target}")
+            self._append_log(f"已从 {provider_name} 自动取得验证码：{target}")
             return code
         if self._monotonic() - started_at >= timeout_seconds:
             await cancel_timed_out_activation()
@@ -585,9 +641,9 @@ class RegistrationTaskManager:
             self._sync_code_state()
             self._state.update(
                 phase="awaiting_verification_code",
-                message=f"正在等待 SMSBower 接收 {target} 的 Gmail 验证码",
+                message=f"正在等待 {provider_name} 接收 {target} 的验证码",
             )
-            self._append_log(f"正在通过 SMSBower API 轮询 Gmail 验证码：{target}")
+            self._append_log(f"正在通过 {provider_name} 轮询验证码：{target}")
         return ""
 
     def submit_verification_code(self, email: str, code: str) -> dict[str, Any]:
@@ -683,6 +739,16 @@ class RegistrationTaskManager:
                     f"已向 SMSBower 回执 Gmail 激活状态（{target}）："
                     f"{'注册成功' if success else '注册未完成'}"
                 )
+            elif provider == "zkgmail" and self.complete_zkgmail_email is not None:
+                await self.complete_zkgmail_email(
+                    target,
+                    success,
+                    message or "OpenAI 注册失败",
+                )
+                self._append_log(
+                    f"已完成 zkgmail.com 地址注册状态记录（{target}）："
+                    f"{'注册成功' if success else '注册未完成'}"
+                )
             elif provider == "inventory" and self.complete_email is not None:
                 await self.complete_email(
                     target,
@@ -710,6 +776,27 @@ class RegistrationTaskManager:
                     message=f"SMSBower Gmail 已获取，正在准备注册：{email}",
                 )
                 self._append_log(f"已通过 SMSBower API 获取 Gmail：{email}")
+            elif provider == "zkgmail":
+                for _index in range(target_count):
+                    email = str(
+                        await self.acquire_zkgmail_email(label)
+                    ).strip().lower()
+                    if not email.endswith("@zkgmail.com"):
+                        raise RuntimeError("未生成有效的 zkgmail.com 注册邮箱")
+                    claimed_emails.append(email)
+                    self._state.update(
+                        email=claimed_emails[0],
+                        emails=list(claimed_emails),
+                        claimed=len(claimed_emails),
+                        message=(
+                            f"正在生成 zkgmail.com 注册邮箱："
+                            f"{len(claimed_emails)}/{target_count}"
+                        ),
+                    )
+                    self._append_log(
+                        f"已生成 zkgmail.com catch-all 地址"
+                        f"（{len(claimed_emails)}/{target_count}）：{email}"
+                    )
             elif manual_email:
                 claimed_emails.append(manual_email)
                 self._state.update(
@@ -757,6 +844,11 @@ class RegistrationTaskManager:
                     (
                         f"SMSBower Gmail 已获取，正在准备 OpenAI 注册：{claimed_emails[0]}"
                         if provider == "smsbower"
+                        else (
+                            f"已生成 {effective_concurrency} 个 zkgmail.com 邮箱，"
+                            "验证码将从 QQ 转发邮箱自动读取"
+                        )
+                        if provider == "zkgmail"
                         else (
                             f"自有邮箱已就绪，正在准备 OpenAI 注册：{claimed_emails[0]}；"
                             + (
@@ -864,6 +956,8 @@ class RegistrationTaskManager:
                         else "；自有邮箱不连接 IMAP，验证码由你在浏览器中手动输入"
                     )
                     if provider == "manual"
+                    else "；zkgmail.com 验证码将从 QQ 转发邮箱自动读取"
+                    if provider == "zkgmail"
                     else ""
                 )
             )
@@ -1146,7 +1240,9 @@ class RegistrationTaskManager:
         finally:
             try:
                 finalization_emails = (
-                    claimed_emails if provider in {"inventory", "smsbower"} else []
+                    claimed_emails
+                    if provider in {"inventory", "smsbower", "zkgmail"}
+                    else []
                 )
                 for email in finalization_emails:
                     if email in finalized_emails:
@@ -1164,7 +1260,15 @@ class RegistrationTaskManager:
                         await finalize_account(email, success, message)
                     except Exception as error:
                         self._append_log(
-                            f"提交{' SMSBower 激活' if provider == 'smsbower' else '库存'}回执失败"
+                            "提交"
+                            + (
+                                " SMSBower 激活"
+                                if provider == "smsbower"
+                                else " zkgmail.com 地址"
+                                if provider == "zkgmail"
+                                else "库存"
+                            )
+                            + "回执失败"
                             f"（{email}）：{str(error)[:300]}"
                         )
             finally:

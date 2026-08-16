@@ -157,8 +157,9 @@
             </div>
             <div class="command-block command-source" id="registrationSourceBlock">
               <div class="command-heading"><span>02 · SOURCE</span><strong>注册来源</strong></div>
-              <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="gmail">Gmail · SMSBower</option></select></label>
+              <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="zkgmail">zkgmail.com · QQ 接码</option><option value="gmail">Gmail · SMSBower</option></select></label>
               <div id="smsbowerControls" class="command-subcontrols" hidden><span id="smsbowerStatus" class="badge warning">SMSBower 未配置</span><label class="command-field smsbower-price-field" for="smsbowerMaxPrice"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="10" step="0.001" value="0.05"></label><button class="button" data-action="set-smsbower-key">SMSBower API</button></div>
+              <div id="zkgmailControls" class="command-subcontrols" hidden><span id="zkgmailStatus" class="badge warning">QQ 接码未配置</span><button class="button" data-action="set-zkgmail-auth">QQ 邮箱授权码</button></div>
               <button id="registerProviderButton" class="button primary command-primary" data-action="register-provider"><span aria-hidden="true">▶</span>开始注册</button>
             </div>
             <div class="command-block command-network" id="registrationNetworkBlock">

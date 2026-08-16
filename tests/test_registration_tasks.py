@@ -1117,6 +1117,50 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.snapshot()["awaitingCode"])
         self.assertIn("SMSBower 已返回验证码", manager.snapshot()["message"])
 
+    async def test_zkgmail_provider_generates_concurrent_addresses_and_auto_polls(self):
+        browser = FakeBrowserManager()
+        generated = iter(
+            ["oa20260816010101aaaa000001@zkgmail.com", "oa20260816010101aaaa000002@zkgmail.com"]
+        )
+        polled = []
+
+        async def acquire_zkgmail(_label):
+            return next(generated)
+
+        async def poll_zkgmail(email):
+            polled.append(email)
+            return "135790"
+
+        async def acquire_inventory(_label):
+            raise AssertionError("zkgmail flow must not lease iCloud inventory")
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=acquire_inventory,
+            confirm_email=lambda _email: None,
+            acquire_zkgmail_email=acquire_zkgmail,
+            poll_zkgmail_code=poll_zkgmail,
+        )
+        state = manager.start(
+            label="zkgmail 注册",
+            provider="zkgmail",
+            headless=True,
+            concurrency=2,
+        )
+        self.assertEqual(state["provider"], "zkgmail")
+        self.assertEqual(state["requested"], 2)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        self.assertEqual(len(browser.started_accounts), 2)
+        self.assertTrue(browser.start_options["headless"])
+        manager._state.update(running=True, status="running")
+        code = await manager.poll_verification_code_async(
+            browser.started_accounts[0]["email"], request_id="mail-request"
+        )
+        self.assertEqual(code, "135790")
+        self.assertEqual(polled, [browser.started_accounts[0]["email"]])
+        self.assertIn("QQ 邮箱", manager.snapshot()["message"])
+
     async def test_smsbower_code_timeout_cancels_activation_and_marks_failure(self):
         now = [100.0]
         completions = []
