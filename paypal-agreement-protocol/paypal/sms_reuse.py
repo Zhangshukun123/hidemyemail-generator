@@ -267,8 +267,10 @@ class ReusableSmsActivationModel:
             state = self._require_active(lease.key, lease.reservation_token)
             if float(self._clock()) >= lease.expires_at:
                 return False
-            payment_failures = lease.payment_failures + int(payment_failed)
-            if payment_failures > self.max_payment_failures:
+            payment_failures = (
+                lease.payment_failures + 1 if payment_failed else 0
+            )
+            if payment_failed and payment_failures >= self.max_payment_failures:
                 return False
             state.available = replace(
                 lease,
@@ -544,7 +546,7 @@ class SmsActivationReusePresenter:
             and (success or payment_failed)
             and not abandon_immediately
         )
-        failure_count = lease.payment_failures + int(payment_failed)
+        failure_count = lease.payment_failures + 1 if payment_failed else 0
         if should_recycle:
             try:
                 recycled = self.model.recycle(
@@ -563,15 +565,21 @@ class SmsActivationReusePresenter:
                     self._log(
                         view,
                         "WARNING",
-                        "HeroSMS 手机号已记录支付失败 "
+                        "HeroSMS 手机号已记录连续支付失败 "
                         f"{failure_count}/{self.model.max_payment_failures}，"
                         f"仍保留供下一账号复用（剩余约 {remaining} 秒）",
                     )
                 else:
+                    message = (
+                        "HeroSMS 手机号支付成功，连续失败计数已清零，"
+                        f"保留供下一账号复用（剩余约 {remaining} 秒）"
+                        if lease.payment_failures
+                        else f"HeroSMS 手机号保留供下一账号复用（剩余约 {remaining} 秒）"
+                    )
                     self._log(
                         view,
                         "INFO",
-                        f"HeroSMS 手机号保留供下一账号复用（剩余约 {remaining} 秒）",
+                        message,
                     )
                 return True
 
@@ -584,13 +592,13 @@ class SmsActivationReusePresenter:
         elif (
             payment_failed
             and lease.reusable
-            and failure_count > self.model.max_payment_failures
+            and failure_count >= self.model.max_payment_failures
         ):
             self._log(
                 view,
                 "WARNING",
-                "HeroSMS 手机号累计支付失败 "
-                f"{failure_count} 次，已超过 {self.model.max_payment_failures} 次，"
+                "HeroSMS 手机号连续支付失败 "
+                f"{failure_count} 次，已达到 {self.model.max_payment_failures} 次，"
                 "直接弃用并为下一账号换号",
             )
 

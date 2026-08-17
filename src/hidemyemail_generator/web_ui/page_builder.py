@@ -43,7 +43,15 @@ def build_app_page() -> str:
         PageSpec(
             template="templates/app.html",
             styles=("static/base.css", "static/app.css", "static/workbench.css"),
-            scripts=("static/app.js", "static/plus_exports.js"),
+            scripts=(
+                "static/payment_outcome.js",
+                "static/quick_flow_account_result.js",
+                "static/quick_flow_history.js",
+                "static/terminal_log.js",
+                "static/app.js",
+                "static/plus_exports.js",
+                "static/account_actions.js",
+            ),
         )
     )
 

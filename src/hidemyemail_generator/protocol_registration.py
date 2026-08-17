@@ -34,6 +34,7 @@ WorkerRunner = Callable[
     Awaitable[dict[str, Any]],
 ]
 AccountSaved = Callable[[str], Awaitable[dict[str, Any] | None]]
+AccountPlanVerifier = Callable[[str], Awaitable[dict[str, Any] | None]]
 AccountFinished = Callable[[str, bool, str], Awaitable[None]]
 RecordFailure = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -72,6 +73,7 @@ class ProtocolRegistrationManager:
         python_executable: Path | None = None,
         worker_runner: WorkerRunner | None = None,
         on_account_saved: AccountSaved | None = None,
+        verify_account_plan: AccountPlanVerifier | None = None,
         record_failure: RecordFailure | None = None,
     ) -> None:
         self.base_dir = Path(base_dir).resolve()
@@ -79,6 +81,7 @@ class ProtocolRegistrationManager:
         self.proxy_store = proxy_store
         self.worker_runner = worker_runner
         self.on_account_saved = on_account_saved
+        self.verify_account_plan = verify_account_plan
         self.record_failure = record_failure
         self.worker_script = Path(__file__).with_name(
             "protocol_registration_worker.py"
@@ -597,6 +600,15 @@ class ProtocolRegistrationManager:
                 proxy_url=proxy_url,
                 proxy_state=proxy_state,
             )
+            if proxy_url:
+                result["registration_proxy_url"] = proxy_url
+                result["registration_proxy"] = {
+                    "mode": str(proxy_state.get("mode") or ""),
+                    "country": str(proxy_state.get("country") or ""),
+                    "endpoint": str(proxy_state.get("endpoint") or ""),
+                    "node": str(proxy_state.get("currentNode") or ""),
+                    "saved_at": _utc_now(),
+                }
             await asyncio.to_thread(
                 _save_account_record,
                 self.db_file,
@@ -606,6 +618,39 @@ class ProtocolRegistrationManager:
                 password_confirmed=True if setup_credentials else None,
                 two_factor=two_factor if setup_credentials else None,
             )
+            if self.verify_account_plan is not None:
+                try:
+                    plan_result = await self.verify_account_plan(email)
+                    if isinstance(plan_result, dict):
+                        plan_status = str(plan_result.get("status") or "").lower()
+                        if plan_status in {"plus", "free"}:
+                            account_state["accountType"] = plan_status
+                            account_state["planVerificationSource"] = str(
+                                plan_result.get("source") or "access_token_online"
+                            )
+                            self._append_log(
+                                f"AT 套餐查询完成：{plan_status.title()}",
+                                email=email,
+                                stage="plan_verification",
+                                status="success",
+                            )
+                        else:
+                            self._append_log(
+                                "AT 套餐查询未确认："
+                                + _sanitize_message(
+                                    plan_result.get("detail") or plan_status
+                                ),
+                                email=email,
+                                stage="plan_verification",
+                                status="warning",
+                            )
+                except Exception as error:
+                    self._append_log(
+                        f"账号已保存，但 AT 套餐查询失败：{error}",
+                        email=email,
+                        stage="plan_verification",
+                        status="warning",
+                    )
             if self.on_account_saved is not None:
                 try:
                     await self.on_account_saved(email)
@@ -810,11 +855,13 @@ class ConcurrentProtocolRegistrationManager:
         *,
         process_factory: Callable[[], ProtocolRegistrationManager],
         on_account_saved: AccountSaved | None = None,
+        verify_account_plan: AccountPlanVerifier | None = None,
         max_processes: int = 5,
         history_limit: int = 20,
     ) -> None:
         self.process_factory = process_factory
         self.on_account_saved = on_account_saved
+        self.verify_account_plan = verify_account_plan
         # Keep the single-manager test/integration hooks available while each
         # started flow receives its own isolated manager instance.
         self.worker_runner: WorkerRunner | None = None
@@ -828,6 +875,7 @@ class ConcurrentProtocolRegistrationManager:
     def _new_process(self) -> ProtocolRegistrationManager:
         manager = self.process_factory()
         manager.on_account_saved = self.on_account_saved
+        manager.verify_account_plan = self.verify_account_plan
         manager.worker_runner = self.worker_runner
         manager._runtime_cache = deepcopy(self._runtime_cache)
         return manager

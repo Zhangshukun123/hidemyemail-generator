@@ -1,0 +1,4 @@
+object=quick_flow_run_history
+storage=browser_memory_only
+restart_result=records_missing
+status=volatile

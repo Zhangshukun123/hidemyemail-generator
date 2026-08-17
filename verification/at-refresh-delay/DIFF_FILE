@@ -1,0 +1,18 @@
+--- ORIGINAL_FILE
++++ MODIFIED_FILE
+@@ -1,9 +1,9 @@
+ object=payment_completion_cookie_login
+ branch=protocol_payment_succeeded_to_cookie_login_at_plus_postcheck
+-initial_refresh_delay_seconds=0
+-retry_delay_seconds=2
++initial_refresh_delay_seconds=10
++retry_delay_seconds=10
+ max_attempts=3
+-attempt_timeline_seconds=0,2,4
+-first_visible_attempt=1
+-terminal_failure_detail=raw_error
+-status=immediate_refresh
++attempt_timeline_seconds=10,20,30
++first_visible_attempt=0
++terminal_failure_detail=third_failure_then_stopped
++status=delayed_three_attempts

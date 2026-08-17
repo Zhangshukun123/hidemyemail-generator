@@ -1,0 +1,9 @@
+object=hero_sms_phone_reuse
+branch=payment_terminal_result_to_phone_reuse
+failure_counter=consecutive
+failure_threshold_operator=greater_than_or_equal
+max_payment_failures=2
+replacement_on_failure_number=2
+success_resets_failure_counter=true
+oas_error_replacement=immediate
+status=two_consecutive_payment_failures_replace

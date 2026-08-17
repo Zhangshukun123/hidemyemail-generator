@@ -438,7 +438,7 @@ def test_reused_job_excludes_and_records_codes_consumed_by_previous_jobs(monkeyp
     assert third.finalize_sms_activation(success=False) is True
 
 
-def test_phone_is_reused_after_two_payment_failures_and_abandoned_on_third():
+def test_phone_is_reused_after_first_payment_failure_and_abandoned_on_second():
     model = ReusableSmsActivationModel()
     presenter = SmsActivationReusePresenter(model)
     original = hero_activation("hero-three-strikes", "+447700900123")
@@ -446,7 +446,7 @@ def test_phone_is_reused_after_two_payment_failures_and_abandoned_on_third():
     client = ClientStub([original, replacement])
 
     failure_views = []
-    for failure_count in range(1, 4):
+    for failure_count in range(1, 3):
         view = ViewStub()
         assert acquire(presenter, view, client) == original
         view.lease = view.lease.with_consumed_code(f"11111{failure_count}")
@@ -467,14 +467,60 @@ def test_phone_is_reused_after_two_payment_failures_and_abandoned_on_third():
     ]
     assert [event for event in client.events if event == ("another", "hero-three-strikes")] == [
         ("another", "hero-three-strikes"),
-        ("another", "hero-three-strikes"),
     ]
     assert ("complete", "hero-three-strikes") in client.events
     assert any(
-        event[0] == "log" and "累计支付失败 3 次" in event[2]
+        event[0] == "log" and "连续支付失败 2 次" in event[2]
         for event in failure_views[-1].events
     )
     assert next_account.lease.payment_failures == 0
+    assert presenter.finalize(next_account, client, success=False) is True
+
+
+def test_payment_success_resets_consecutive_failure_count():
+    model = ReusableSmsActivationModel()
+    presenter = SmsActivationReusePresenter(model)
+    original = hero_activation("hero-reset", "+447700900123")
+    replacement = hero_activation("hero-after-reset", "+447700900124")
+    client = ClientStub([original, replacement])
+
+    first_failure = ViewStub()
+    assert acquire(presenter, first_failure, client) == original
+    assert presenter.finalize(
+        first_failure, client, success=False, payment_failed=True
+    ) is True
+
+    successful = ViewStub()
+    assert acquire(presenter, successful, client) == original
+    assert successful.lease.payment_failures == 1
+    assert presenter.finalize(successful, client, success=True) is True
+    assert any(
+        event[0] == "log" and "连续失败计数已清零" in event[2]
+        for event in successful.events
+    )
+
+    after_reset_first_failure = ViewStub()
+    assert acquire(presenter, after_reset_first_failure, client) == original
+    assert after_reset_first_failure.lease.payment_failures == 0
+    assert presenter.finalize(
+        after_reset_first_failure,
+        client,
+        success=False,
+        payment_failed=True,
+    ) is True
+
+    after_reset_second_failure = ViewStub()
+    assert acquire(presenter, after_reset_second_failure, client) == original
+    assert after_reset_second_failure.lease.payment_failures == 1
+    assert presenter.finalize(
+        after_reset_second_failure,
+        client,
+        success=False,
+        payment_failed=True,
+    ) is True
+
+    next_account = ViewStub()
+    assert acquire(presenter, next_account, client) == replacement
     assert presenter.finalize(next_account, client, success=False) is True
 
 

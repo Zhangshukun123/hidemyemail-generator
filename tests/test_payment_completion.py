@@ -7,8 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from hidemyemail_generator.account_plan import AccountPlanResult
 from hidemyemail_generator.browser_tasks import (
     _save_account_record,
+    jwt_account_type,
     load_account_record,
     set_manual_account_type,
 )
@@ -44,12 +46,25 @@ def session_for(email: str, token: str, plan: str) -> dict:
     }
 
 
+class ClaimPlanPresenter:
+    """Deterministic accounts/check stand-in for payment orchestration tests."""
+
+    def check(self, token: str, **_kwargs) -> AccountPlanResult:
+        account_type, raw_plan = jwt_account_type(token)
+        return AccountPlanResult(
+            status=account_type or "unknown",
+            plan_type=raw_plan,
+            detail=f"test accounts/check plan={raw_plan or 'unknown'}",
+        )
+
+
 class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_file = Path(self.temp_dir.name) / "accounts.db"
         self.email = "payment-at@icloud.com"
         self.old_token = token_for(self.email, "free", "old")
+        self.plan_presenter = ClaimPlanPresenter()
         self.cookies = [
             {
                 "name": "__Secure-next-auth.session-token",
@@ -101,7 +116,10 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
             }
 
         presenter = PaymentCompletionPresenter(
-            PaymentCompletionModel(self.db_file), session_refresher=refresher
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
+            initial_delay_seconds=0,
         )
         first, second = await asyncio.gather(
             presenter.confirm(self.job()), presenter.confirm(self.job())
@@ -123,12 +141,56 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(new_token, json.dumps(first))
         replay_refresher = mock.AsyncMock()
         replay = await PaymentCompletionPresenter(
-            PaymentCompletionModel(self.db_file), session_refresher=replay_refresher
+            PaymentCompletionModel(self.db_file),
+            session_refresher=replay_refresher,
+            plan_presenter=self.plan_presenter,
+            initial_delay_seconds=0,
         ).confirm(self.job())
         self.assertEqual(replay, first)
         replay_refresher.assert_not_awaited()
 
-    async def test_non_plus_new_at_fails_payment_without_overwriting_old_label(self):
+    async def test_live_accounts_check_plus_wins_over_stale_free_session_and_jwt(self):
+        calls = []
+
+        class LivePlusPresenter:
+            def check(_self, token, **kwargs):
+                calls.append((token, kwargs))
+                return AccountPlanResult(
+                    status="plus",
+                    plan_type="plus",
+                    detail="accounts/check selected acct-payment-test; plan=plus",
+                    has_active_subscription=True,
+                )
+
+        async def refresher(**_kwargs):
+            return {
+                "access_token": self.old_token,
+                "session_json": json.dumps(
+                    session_for(self.email, self.old_token, "free")
+                ),
+                "cookies_json": json.dumps(self.cookies),
+                "storage_state_json": json.dumps(
+                    {"cookies": self.cookies, "origins": []}
+                ),
+            }
+
+        outcome = await PaymentCompletionPresenter(
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=LivePlusPresenter(),
+            initial_delay_seconds=0,
+        ).confirm(self.job("payment-job-live-plus"))
+
+        self.assertEqual(outcome["status"], "plus")
+        self.assertTrue(outcome["at_refreshed"])
+        self.assertFalse(outcome["at_changed"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], self.old_token)
+        record = load_account_record(self.db_file, self.email)
+        self.assertEqual(record["account_type"], "plus")
+        self.assertIn("accounts/check 实时套餐=plus", record["verification_detail"])
+
+    async def test_non_plus_new_at_keeps_payment_success_without_overwriting_old_label(self):
         set_manual_account_type(self.db_file, self.email, "plus")
         new_token = token_for(self.email, "free", "new-free")
 
@@ -145,19 +207,23 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         presenter = PaymentCompletionPresenter(
             PaymentCompletionModel(self.db_file),
             session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
             max_attempts=1,
+            initial_delay_seconds=0,
         )
         outcome = await presenter.confirm(self.job("payment-job-free"))
 
         self.assertEqual(outcome["status"], "not_plus")
-        self.assertFalse(outcome["payment_succeeded"])
+        self.assertTrue(outcome["protocol_succeeded"])
+        self.assertTrue(outcome["payment_succeeded"])
+        self.assertFalse(outcome["plus_confirmed"])
         self.assertEqual(outcome["account_type"], "free")
         record = load_account_record(self.db_file, self.email)
         self.assertEqual(record["account_type"], "plus")
         self.assertEqual(record["account_type_source"], "manual")
         self.assertEqual(record["access_token"], new_token)
 
-    async def test_refresh_failure_does_not_mark_payment_success_or_leak_secrets(self):
+    async def test_refresh_failure_keeps_payment_success_and_does_not_leak_secrets(self):
         async def refresher(**_kwargs):
             raise RuntimeError(
                 "http://proxy-user:proxy-pass@proxy.test:8080 rejected "
@@ -167,12 +233,16 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         presenter = PaymentCompletionPresenter(
             PaymentCompletionModel(self.db_file),
             session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
             max_attempts=1,
+            initial_delay_seconds=0,
         )
         outcome = await presenter.confirm(self.job("payment-job-error"))
 
         self.assertEqual(outcome["status"], "refresh_failed")
-        self.assertFalse(outcome["payment_succeeded"])
+        self.assertTrue(outcome["protocol_succeeded"])
+        self.assertTrue(outcome["payment_succeeded"])
+        self.assertFalse(outcome["plus_confirmed"])
         self.assertFalse(outcome["at_refreshed"])
         serialized = json.dumps(outcome)
         self.assertNotIn("proxy-user", serialized)
@@ -180,6 +250,69 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.old_token, serialized)
         record = load_account_record(self.db_file, self.email)
         self.assertNotEqual(record.get("account_type_source"), "payment_at_refresh")
+
+    async def test_refresh_waits_ten_seconds_then_retries_every_ten_seconds(self):
+        now = [1000.0]
+        refresh_times = []
+
+        async def refresher(**_kwargs):
+            refresh_times.append(now[0])
+            raise RuntimeError(
+                "Cookie 刷新未返回有效 Session：session 返回 HTTP 403；"
+                "session?refresh=true 返回 HTTP 403"
+            )
+
+        presenter = PaymentCompletionPresenter(
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
+            clock=lambda: now[0],
+        )
+        job = self.job("payment-job-delayed-refresh")
+
+        scheduled = await presenter.confirm(job)
+        self.assertEqual(scheduled["status"], "retrying")
+        self.assertEqual(scheduled["attempt"], 0)
+        self.assertEqual(scheduled["max_attempts"], 3)
+        self.assertEqual(scheduled["retry_after"], 1010.0)
+        self.assertIn("等待 10 秒后进行第 1/3 次", scheduled["detail"])
+        self.assertEqual(refresh_times, [])
+
+        now[0] = 1009.9
+        waiting = await presenter.confirm(job)
+        self.assertEqual(waiting, scheduled)
+        self.assertEqual(refresh_times, [])
+
+        now[0] = 1010.0
+        first = await presenter.confirm(job)
+        self.assertEqual(first["status"], "retrying")
+        self.assertEqual(first["attempt"], 1)
+        self.assertEqual(first["retry_after"], 1020.0)
+        self.assertIn("10 秒后自动进行第 2/3 次", first["detail"])
+
+        now[0] = 1019.9
+        self.assertEqual(await presenter.confirm(job), first)
+        self.assertEqual(refresh_times, [1010.0])
+
+        now[0] = 1020.0
+        second = await presenter.confirm(job)
+        self.assertEqual(second["status"], "retrying")
+        self.assertEqual(second["attempt"], 2)
+        self.assertEqual(second["retry_after"], 1030.0)
+        self.assertIn("10 秒后自动进行第 3/3 次", second["detail"])
+
+        now[0] = 1030.0
+        exhausted = await presenter.confirm(job)
+        self.assertEqual(exhausted["status"], "refresh_failed")
+        self.assertEqual(exhausted["attempt"], 3)
+        self.assertEqual(exhausted["retry_after"], 0)
+        self.assertIn("第 3/3 次 Cookie 登录获取新 AT 失败", exhausted["detail"])
+        self.assertIn("已停止重试", exhausted["detail"])
+        self.assertEqual(refresh_times, [1010.0, 1020.0, 1030.0])
+
+        now[0] = 1040.0
+        self.assertEqual(await presenter.confirm(job), exhausted)
+        self.assertEqual(refresh_times, [1010.0, 1020.0, 1030.0])
 
     async def test_free_plan_is_retried_until_a_newer_at_reports_plus(self):
         tokens = [
@@ -202,13 +335,16 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         presenter = PaymentCompletionPresenter(
             PaymentCompletionModel(self.db_file),
             session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
+            initial_delay_seconds=0,
             retry_delay_seconds=0,
         )
         first = await presenter.confirm(self.job("payment-job-propagation"))
         second = await presenter.confirm(self.job("payment-job-propagation"))
 
         self.assertEqual(first["status"], "retrying")
-        self.assertFalse(first["payment_succeeded"])
+        self.assertTrue(first["payment_succeeded"])
+        self.assertFalse(first["plus_confirmed"])
         self.assertEqual(second["status"], "plus")
         self.assertTrue(second["payment_succeeded"])
         self.assertEqual(second["attempt"], 2)
@@ -216,10 +352,46 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["account_type"], "plus")
         self.assertEqual(record["account_type_source"], "payment_at_refresh")
 
+    async def test_missing_registration_proxy_uses_cookie_login_directly(self):
+        new_token = token_for(self.email, "plus", "direct-cookie-login")
+        refresh_calls = []
+
+        async def refresher(**kwargs):
+            refresh_calls.append(kwargs)
+            return {
+                "access_token": new_token,
+                "session_json": json.dumps(session_for(self.email, new_token, "plus")),
+                "cookies_json": json.dumps(self.cookies),
+                "storage_state_json": json.dumps(
+                    {"cookies": self.cookies, "origins": []}
+                ),
+            }
+
+        presenter = PaymentCompletionPresenter(
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
+            initial_delay_seconds=0,
+        )
+        with mock.patch(
+            "hidemyemail_generator.payment_completion.account_registration_proxy_url",
+            return_value="",
+        ):
+            outcome = await presenter.confirm(self.job("payment-job-direct-refresh"))
+
+        self.assertEqual(outcome["status"], "plus")
+        self.assertTrue(outcome["payment_succeeded"])
+        self.assertTrue(outcome["plus_confirmed"])
+        self.assertIn("accounts/check 实时套餐=plus", outcome["detail"])
+        self.assertEqual(len(refresh_calls), 1)
+        self.assertEqual(refresh_calls[0]["proxy_url"], "")
+
     async def test_non_success_protocol_job_never_refreshes_or_changes_account(self):
         refresher = mock.AsyncMock()
         presenter = PaymentCompletionPresenter(
-            PaymentCompletionModel(self.db_file), session_refresher=refresher
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
         )
         before = load_account_record(self.db_file, self.email)
 
@@ -239,7 +411,9 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_settlement_never_refreshes_or_marks_plus(self):
         refresher = mock.AsyncMock()
         presenter = PaymentCompletionPresenter(
-            PaymentCompletionModel(self.db_file), session_refresher=refresher
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
         )
         before = load_account_record(self.db_file, self.email)
 
@@ -263,7 +437,10 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         missing = "missing-payment@icloud.com"
-        presenter = PaymentCompletionPresenter(PaymentCompletionModel(self.db_file))
+        presenter = PaymentCompletionPresenter(
+            PaymentCompletionModel(self.db_file),
+            plan_presenter=self.plan_presenter,
+        )
 
         outcome = await presenter.confirm(
             {
@@ -317,7 +494,10 @@ class PaymentCompletionPresenterTests(unittest.IsolatedAsyncioTestCase):
 
         reconciled = reconcile_openai_protocol_job(legacy_job)
         outcome = await PaymentCompletionPresenter(
-            PaymentCompletionModel(self.db_file), session_refresher=refresher
+            PaymentCompletionModel(self.db_file),
+            session_refresher=refresher,
+            plan_presenter=self.plan_presenter,
+            initial_delay_seconds=0,
         ).confirm(legacy_job)
 
         self.assertEqual(reconciled["status"], "completed")

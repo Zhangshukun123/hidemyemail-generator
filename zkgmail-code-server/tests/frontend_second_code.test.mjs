@@ -66,9 +66,17 @@ function loadPortal(replies) {
   elements.get("result").hidden = true;
   elements.get("cancelButton").hidden = true;
   const requests = [];
+  let nowMilliseconds = 0;
+
+  class PortalDate extends Date {
+    static now() {
+      return nowMilliseconds;
+    }
+  }
 
   const context = vm.createContext({
     AbortController,
+    Date: PortalDate,
     URLSearchParams,
     console,
     document: {
@@ -79,6 +87,7 @@ function loadPortal(replies) {
     },
     fetch: async (url, options) => {
       requests.push({ url, body: JSON.parse(options.body) });
+      if (typeof replies === "function") return replies();
       assert.ok(replies.length, "unexpected fetch call");
       return replies.shift();
     },
@@ -87,7 +96,8 @@ function loadPortal(replies) {
     navigator: { clipboard: { async writeText() {} } },
     window: {
       clearTimeout() {},
-      setTimeout(callback) {
+      setTimeout(callback, milliseconds = 0) {
+        nowMilliseconds += Number(milliseconds) || 0;
         callback();
         return 1;
       },
@@ -191,4 +201,24 @@ test("cursor remains scoped to the mailbox that produced it", async () => {
   );
 
   assert.deepEqual(requests[1].body, { email: "second@zkgmail.com" });
+});
+
+
+test("lookup keeps polling for three minutes before timing out", async () => {
+  const { elements, requests } = loadPortal(
+    () => response(404, { ok: false, state: "waiting" }),
+  );
+  elements.get("email").value = "slow@zkgmail.com";
+
+  await submit(elements);
+  await eventually(
+    () => elements.get("statusTitle").textContent === "等待超时",
+    "lookup did not reach the three-minute timeout",
+  );
+
+  assert.equal(requests.length, 45);
+  assert.equal(
+    elements.get("statusMessage").textContent,
+    "3 分钟内没有收到验证码，请确认收件地址后重试。",
+  );
 });

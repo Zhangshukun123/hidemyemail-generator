@@ -110,6 +110,8 @@ class WorkbenchLayoutTests(unittest.TestCase):
         expected_markup = (
             'id="workbenchTerminalPanel"',
             'aria-labelledby="terminalPreviewTitle"',
+            'id="terminalSessionSelect"',
+            'aria-label="选择日志会话"',
             'id="terminalPreviewList"',
             'role="log"',
             'aria-live="off"',
@@ -133,8 +135,11 @@ class WorkbenchLayoutTests(unittest.TestCase):
             self.assertNotIn(marker, self.page)
 
         expected_behavior = (
+            "class TerminalSessionModel",
             "class TerminalLogView",
             "class TerminalLogPresenter",
+            "window.HmeTerminalLog.create",
+            '$("terminalSessionSelect").addEventListener("change"',
             "this.terminalLogPresenter.present(state)",
             "setTerminalPreviewCollapsed(",
             'this.commands.register("toggle-terminal-preview"',
@@ -145,6 +150,7 @@ class WorkbenchLayoutTests(unittest.TestCase):
 
         expected_styles = (
             ".workbench-terminal-panel",
+            ".terminal-session-picker select",
             ".terminal-preview-list",
             "overflow: auto",
             ".workbench-terminal-panel.is-collapsed .terminal-preview-list",
@@ -235,7 +241,7 @@ class WorkbenchLayoutTests(unittest.TestCase):
             "normalizeWorkspaceTaskStatus",
             "this.renderControlCenter(state)",
             "this.terminalLogPresenter.present(state)",
-            "redactTerminalLogText(raw.message)",
+            "this.redact(item.message)",
             'this.commands.register("toggle-terminal-preview"',
             'this.commands.register("focus-control-task-search"',
             "scheduleWorkspaceRefresh()",

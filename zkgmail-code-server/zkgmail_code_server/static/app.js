@@ -17,8 +17,11 @@ const elements = {
   toast: document.getElementById("toast"),
 };
 
-const POLL_INTERVAL_MS = 4000;
-const POLL_TIMEOUT_MS = 60000;
+const POLLING_POLICY = Object.freeze({
+  intervalMs: 4000,
+  timeoutMs: 180 * 1000,
+  timeoutLabel: "3 分钟",
+});
 let activeRun = 0;
 let activeController = null;
 let toastTimer = null;
@@ -172,7 +175,7 @@ async function startLookup(email, afterCursor = "") {
   if (activeController) activeController.abort();
   activeController = null;
   const runId = ++activeRun;
-  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  const deadline = Date.now() + POLLING_POLICY.timeoutMs;
   elements.result.hidden = true;
   setBusy(true, Boolean(afterCursor));
 
@@ -210,14 +213,14 @@ async function startLookup(email, afterCursor = "") {
       activeController = null;
       return;
     }
-    await delay(POLL_INTERVAL_MS, runId);
+    await delay(POLLING_POLICY.intervalMs, runId);
   }
 
   if (runId === activeRun) {
     setBusy(false);
     const message = afterCursor
-      ? "一分钟内没有收到下一条验证码，请确认已重新发送后再试。"
-      : "一分钟内没有收到验证码，请确认收件地址后重试。";
+      ? `${POLLING_POLICY.timeoutLabel}内没有收到下一条验证码，请确认已重新发送后再试。`
+      : `${POLLING_POLICY.timeoutLabel}内没有收到验证码，请确认收件地址后重试。`;
     setStatus("error", "等待超时", message);
   }
 }

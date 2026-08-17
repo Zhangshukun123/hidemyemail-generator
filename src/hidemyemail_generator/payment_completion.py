@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .account_plan import AccountPlanPresenter
 from .account_verifier import (
     refresh_session_with_saved_cookies,
     validate_refreshed_session,
@@ -20,7 +21,6 @@ from .browser_tasks import (
     account_registration_proxy_url,
     account_saved_cookies,
     account_session_access_token,
-    jwt_account_type,
     load_account_record,
 )
 from .inbox import connect_db
@@ -28,8 +28,11 @@ from .inbox import connect_db
 
 TERMINAL_CONFIRMATION_STATUSES = {"plus", "not_plus", "refresh_failed"}
 SessionRefresher = Callable[..., Awaitable[dict[str, Any]]]
+Clock = Callable[[], float]
 OPENAI_COMPLETION_HOSTS = {"pay.openai.com", "chatgpt.com", "chat.openai.com"}
 OPENAI_SUCCESS_REDIRECT_STATUSES = {"success", "succeeded"}
+DEFAULT_INITIAL_REFRESH_DELAY_SECONDS = 10.0
+DEFAULT_RETRY_DELAY_SECONDS = 10.0
 
 
 def _openai_completion_url(value: Any) -> bool:
@@ -130,7 +133,7 @@ def _json_object(value: Any) -> dict[str, Any]:
 
 
 def _public_error(error: Exception, *secrets: str) -> str:
-    detail = str(error or "刷新新 AT 失败")
+    detail = str(error or "Cookie 登录获取新 AT 失败")
     for secret in secrets:
         if secret:
             detail = detail.replace(secret, "[REDACTED]")
@@ -179,18 +182,31 @@ class PaymentCompletionModel:
     def refresh_context(self, email: str) -> dict[str, Any]:
         record = load_account_record(self.db_file, email)
         if not record:
-            raise RuntimeError("协议支付账号记录不存在，无法刷新新 AT")
+            raise RuntimeError("协议支付账号记录不存在，无法用 Cookie 登录获取新 AT")
         cookies = account_saved_cookies(record)
         if not cookies:
-            raise RuntimeError("协议支付账号没有可用于刷新新 AT 的 Cookie")
+            raise RuntimeError("协议支付账号没有可用于重新登录的 Cookie")
         proxy_url = account_registration_proxy_url(record)
-        if not proxy_url:
-            raise RuntimeError("协议支付账号未保存原注册代理，无法用 Cookie 刷新新 AT")
+        diagnostics = record.get("registration_diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        device_id = next(
+            (
+                str(cookie.get("value") or "").strip()
+                for cookie in cookies
+                if str(cookie.get("name") or "").strip() == "oai-did"
+            ),
+            "",
+        )
         return {
             "previous_token": account_session_access_token(record),
             "cookies": cookies,
             "proxy_url": proxy_url,
             "storage_state": _json_object(record.get("storage_state_json")),
+            "impersonate": str(diagnostics.get("impersonate") or "firefox144"),
+            "language": str(
+                diagnostics.get("fingerprint_language") or "en-US"
+            ),
+            "device_id": device_id,
         }
 
     def persist(
@@ -206,6 +222,7 @@ class PaymentCompletionModel:
         max_attempts: int,
         retry_after: float = 0,
         refreshed_result: dict[str, Any] | None = None,
+        at_changed: bool = False,
     ) -> dict[str, Any]:
         checked_at = utc_now()
         connection = connect_db(str(self.db_file))
@@ -255,6 +272,7 @@ class PaymentCompletionModel:
                 )
                 record.pop("session_invalid_at", None)
             was_refreshed = bool(previous.get("at_refreshed")) or bool(refreshed_result)
+            token_changed = bool(previous.get("at_changed")) or bool(at_changed)
             outcome = self.public_outcome(
                 {
                     "job_id": job_id,
@@ -262,9 +280,9 @@ class PaymentCompletionModel:
                     "status": status,
                     "protocol_succeeded": True,
                     "plus_confirmed": status == "plus",
-                    "payment_succeeded": status == "plus",
+                    "payment_succeeded": True,
                     "at_refreshed": was_refreshed,
-                    "at_changed": was_refreshed,
+                    "at_changed": token_changed,
                     "account_type": account_type,
                     "plan": plan,
                     "detail": detail,
@@ -313,20 +331,26 @@ class PaymentCompletionModel:
 
 
 class PaymentCompletionPresenter:
-    """Refresh a new AT per payment job and use its plan as final truth."""
+    """Refresh a new AT after payment without rewriting the payment result."""
 
     def __init__(
         self,
         model: PaymentCompletionModel,
         *,
         session_refresher: SessionRefresher = refresh_session_with_saved_cookies,
+        plan_presenter: AccountPlanPresenter | None = None,
         max_attempts: int = 3,
-        retry_delay_seconds: float = 2.0,
+        initial_delay_seconds: float = DEFAULT_INITIAL_REFRESH_DELAY_SECONDS,
+        retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+        clock: Clock = time.time,
     ) -> None:
         self.model = model
         self.session_refresher = session_refresher
+        self.plan_presenter = plan_presenter or AccountPlanPresenter()
         self.max_attempts = max(1, min(int(max_attempts), 5))
+        self.initial_delay_seconds = max(0.0, float(initial_delay_seconds))
         self.retry_delay_seconds = max(0.0, float(retry_delay_seconds))
+        self._clock = clock
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def confirm(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -354,7 +378,7 @@ class PaymentCompletionPresenter:
                     "job_id": job_id,
                     "email": email,
                     "status": "refresh_failed",
-                    "detail": "协议支付任务缺少账号标识，无法用 Cookie 刷新新 AT",
+                    "detail": "协议支付任务缺少账号标识，无法用 Cookie 登录获取新 AT",
                 }
             )
         current = await asyncio.to_thread(self.model.current, email, job_id)
@@ -363,7 +387,7 @@ class PaymentCompletionPresenter:
             and str(current.get("status") or "") in TERMINAL_CONFIRMATION_STATUSES
         ):
             return current
-        if current and float(current.get("retry_after") or 0) > time.time():
+        if current and float(current.get("retry_after") or 0) > self._clock():
             return current
         lock = self._locks.setdefault(email, asyncio.Lock())
         async with lock:
@@ -373,8 +397,34 @@ class PaymentCompletionPresenter:
                 and str(current.get("status") or "") in TERMINAL_CONFIRMATION_STATUSES
             ):
                 return current
-            if current and float(current.get("retry_after") or 0) > time.time():
+            if current and float(current.get("retry_after") or 0) > self._clock():
                 return current
+            if current is None and self.initial_delay_seconds > 0:
+                try:
+                    await asyncio.to_thread(self.model.refresh_context, email)
+                except Exception:
+                    # Missing local account/cookies is deterministic and should
+                    # still surface through the ordinary attempt below.
+                    pass
+                else:
+                    retry_after = self._clock() + self.initial_delay_seconds
+                    delay_label = f"{self.initial_delay_seconds:g}"
+                    return await asyncio.to_thread(
+                        self.model.persist,
+                        email=email,
+                        job_id=job_id,
+                        status="retrying",
+                        account_type="unverified",
+                        plan="",
+                        detail=(
+                            "协议支付成功；等待 "
+                            f"{delay_label} 秒后进行第 1/{self.max_attempts} 次 "
+                            "Cookie 登录获取新 AT"
+                        ),
+                        attempt=0,
+                        max_attempts=self.max_attempts,
+                        retry_after=retry_after,
+                    )
             attempt = int((current or {}).get("attempt") or 0) + 1
             previous_token = ""
             proxy_url = ""
@@ -390,9 +440,11 @@ class PaymentCompletionPresenter:
                     cookies=context["cookies"],
                     proxy_url=proxy_url,
                     storage_state=context["storage_state"],
+                    impersonate=context["impersonate"],
+                    language=context["language"],
                 )
                 if not isinstance(refreshed, dict):
-                    raise RuntimeError("Cookie 刷新新 AT 返回格式无效")
+                    raise RuntimeError("Cookie 登录获取新 AT 返回格式无效")
                 session = _json_object(refreshed.get("session_json"))
                 token = validate_refreshed_session(
                     expected_email=email,
@@ -401,27 +453,55 @@ class PaymentCompletionPresenter:
                 )
                 returned_token = str(refreshed.get("access_token") or "").strip()
                 if returned_token and returned_token != token:
-                    raise RuntimeError("Cookie 刷新结果中的新 AT 与 Session 不一致")
-                account_type, raw_plan = jwt_account_type(token)
-                stored_type = (
-                    account_type if account_type in {"plus", "free"} else "unverified"
+                    raise RuntimeError("Cookie 登录获取的新 AT 与 Session 不一致")
+                plan_result = await asyncio.to_thread(
+                    self.plan_presenter.check,
+                    token,
+                    proxy_url=proxy_url,
+                    device_id=str(context.get("device_id") or ""),
+                    language=str(context.get("language") or "en-US"),
                 )
-                plus_confirmed = account_type == "plus"
+                plan_status = str(plan_result.status or "unknown")
+                raw_plan = str(plan_result.plan_type or "")
+                stored_type = (
+                    plan_status if plan_status in {"plus", "free"} else "unverified"
+                )
+                plus_confirmed = plan_status == "plus"
                 exhausted = attempt >= self.max_attempts
                 status = (
                     "plus"
                     if plus_confirmed
                     else "not_plus"
+                    if exhausted and plan_status == "free"
+                    else "refresh_failed"
                     if exhausted
                     else "retrying"
                 )
-                detail = (
-                    f"支付后 Cookie 已刷新新 AT；JWT chatgpt_plan_type={raw_plan}，已确认 Plus"
-                    if plus_confirmed
-                    else f"第 {attempt}/{self.max_attempts} 次刷新后新 AT 套餐="
-                    f"{raw_plan or '无法识别'}；"
-                    + ("未确认 Plus" if exhausted else "等待套餐传播后重试")
-                )
+                if plus_confirmed:
+                    detail = (
+                        "支付后已用 Cookie 刷新 Session/AT；"
+                        f"accounts/check 实时套餐={raw_plan or 'plus'}，已确认 Plus"
+                    )
+                elif plan_status == "free":
+                    detail = (
+                        f"第 {attempt}/{self.max_attempts} 次实时套餐查询为 "
+                        f"{raw_plan or 'free'}；"
+                        + (
+                            "未确认 Plus"
+                            if exhausted
+                            else f"{self.retry_delay_seconds:g} 秒后重新刷新并查询"
+                        )
+                    )
+                else:
+                    detail = (
+                        f"第 {attempt}/{self.max_attempts} 次 Cookie Session/AT 已刷新，"
+                        f"但实时套餐查询{plan_status}：{plan_result.detail or '结果不确定'}；"
+                        + (
+                            "已停止重试并保留原套餐"
+                            if exhausted
+                            else f"{self.retry_delay_seconds:g} 秒后重新刷新并查询"
+                        )
+                    )
                 refreshed_result = {
                     **refreshed,
                     "access_token": token,
@@ -439,19 +519,27 @@ class PaymentCompletionPresenter:
                     attempt=attempt,
                     max_attempts=self.max_attempts,
                     retry_after=(
-                        time.time() + self.retry_delay_seconds
+                        self._clock() + self.retry_delay_seconds
                         if status == "retrying"
                         else 0
                     ),
                     refreshed_result=refreshed_result,
+                    at_changed=bool(token and token != previous_token),
                 )
             except Exception as error:
                 detail = _public_error(error, previous_token, proxy_url)
                 retrying = context_loaded and attempt < self.max_attempts
                 if retrying:
+                    delay_label = f"{self.retry_delay_seconds:g}"
                     detail = (
-                        f"第 {attempt}/{self.max_attempts} 次 Cookie 刷新新 AT 失败："
-                        f"{detail}；稍后自动重试"
+                        f"第 {attempt}/{self.max_attempts} 次 Cookie 登录获取新 AT 失败："
+                        f"{detail}；{delay_label} 秒后自动进行第 "
+                        f"{attempt + 1}/{self.max_attempts} 次"
+                    )
+                elif context_loaded and attempt >= self.max_attempts:
+                    detail = (
+                        f"第 {attempt}/{self.max_attempts} 次 Cookie 登录获取新 AT 失败："
+                        f"{detail}；已停止重试"
                     )
                 return await asyncio.to_thread(
                     self.model.persist,
@@ -464,12 +552,14 @@ class PaymentCompletionPresenter:
                     attempt=attempt,
                     max_attempts=self.max_attempts,
                     retry_after=(
-                        time.time() + self.retry_delay_seconds if retrying else 0
+                        self._clock() + self.retry_delay_seconds if retrying else 0
                     ),
                 )
 
 
 __all__ = [
+    "DEFAULT_INITIAL_REFRESH_DELAY_SECONDS",
+    "DEFAULT_RETRY_DELAY_SECONDS",
     "PaymentCompletionModel",
     "PaymentCompletionPresenter",
     "reconcile_openai_protocol_job",

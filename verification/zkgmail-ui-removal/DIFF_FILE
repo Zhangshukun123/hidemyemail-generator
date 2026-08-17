@@ -1,0 +1,42 @@
+--- ORIGINAL_INDEX.html
++++ MODIFIED_FILE
+@@ -27,7 +27,6 @@
+       <p class="eyebrow">PRIVATE CODE INBOX</p>
+       <h1 id="page-title">验证码，<span>即到即取。</span></h1>
+-      <p class="hero-copy">输入完整的 <strong>@zkgmail.com</strong> 地址。邮件转发到 QQ 收件箱后，页面会自动获取最新验证码。</p>
+@@ -44,10 +43,6 @@
+         <div class="tool-row" id="addressHelp">
+-          <button class="text-button" id="generateButton" type="button">
+-            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/></svg>
+-            生成新地址
+-          </button>
+@@ -84,15 +79,10 @@
+-    <section class="steps" aria-label="使用步骤">
+-      <article><span>01</span><div><h2>准备地址</h2><p>粘贴已有地址，或随机生成一个新的 zkgmail.com 地址。</p></div></article>
+-      <article><span>02</span><div><h2>QQ 邮箱收件</h2><p>验证码邮件经 catch-all 转发到 QQ 邮箱，平台自动精确匹配地址。</p></div></article>
+-      <article><span>03</span><div><h2>重复接码</h2><p>复制验证码后可继续等待下一条，同一个邮箱支持多次取码。</p></div></article>
+-    </section>
+-  <script src="/assets/app.js?v=1.1.0" defer></script>
++  <script src="/assets/app.js?v=1.1.1" defer></script>
+
+--- ORIGINAL_APP.js
++++ MODIFIED_APP.js
+@@ -4,7 +4,6 @@
+-  generate: document.getElementById("generateButton"),
+@@ -69,13 +68,6 @@
+-function randomAlias() {
+-  const bytes = new Uint8Array(8);
+-  crypto.getRandomValues(bytes);
+-  const random = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+-  return `zk${Date.now().toString(36)}${random}@zkgmail.com`;
+-}
+@@ -179,16 +171,6 @@
+-elements.generate.addEventListener("click", async () => {
+-  if (activeRun && !elements.cancel.hidden) stopLookup("已切换到新的接码地址。");
+-  const email = randomAlias();
+-  elements.email.value = email;
+-  elements.copyAddress.disabled = false;
+-  elements.result.hidden = true;
+-  setStatus("idle", "新地址已生成", "复制此地址完成验证，然后点击“获取验证码”。");
+-  await copyText(email, "新邮箱已复制");
+-});

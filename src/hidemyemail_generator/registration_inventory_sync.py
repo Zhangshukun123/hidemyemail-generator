@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -70,6 +71,114 @@ def _serialize_address(row: Any) -> dict[str, Any]:
     return {field: row[field] for field in ADDRESS_SYNC_FIELDS}
 
 
+class InventoryExportRepository:
+    """Repository that projects only rows needed by an inventory export."""
+
+    _MAX_VALUES_PER_QUERY = 900
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def _select_in(
+        self,
+        query_template: str,
+        values: Iterable[str],
+    ) -> list[sqlite3.Row]:
+        requested = list(dict.fromkeys(values))
+        rows: list[sqlite3.Row] = []
+        for offset in range(0, len(requested), self._MAX_VALUES_PER_QUERY):
+            chunk = requested[offset : offset + self._MAX_VALUES_PER_QUERY]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self._conn.execute(
+                    query_template.format(placeholders=placeholders),
+                    chunk,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _ordered_rows(
+        rows: Iterable[sqlite3.Row],
+        key_field: str,
+        keys: Iterable[str],
+    ) -> list[sqlite3.Row]:
+        by_key = {str(row[key_field]): row for row in rows}
+        return [by_key[key] for key in keys if key in by_key]
+
+    def address_rows(self, requested: set[str] | None) -> list[sqlite3.Row]:
+        columns = ", ".join(ADDRESS_SYNC_FIELDS)
+        if requested is None:
+            return self._conn.execute(f"SELECT {columns} FROM addresses").fetchall()
+
+        matching_emails = [
+            str(row["email"])
+            for row in self._conn.execute("SELECT email FROM addresses")
+            if str(row["email"] or "").strip().lower() in requested
+        ]
+        normalized = [email.strip().lower() for email in matching_emails]
+        if len(set(normalized)) != len(normalized):
+            # Preserve the legacy table-scan overwrite order for malformed
+            # databases containing case-variant duplicate addresses.
+            return [
+                row
+                for row in self._conn.execute(f"SELECT {columns} FROM addresses")
+                if str(row["email"] or "").strip().lower() in requested
+            ]
+        rows = self._select_in(
+            f"SELECT {columns} FROM addresses WHERE email IN ({{placeholders}})",
+            matching_emails,
+        )
+        return self._ordered_rows(rows, "email", matching_emails)
+
+    def setting_rows(
+        self,
+        prefix: str,
+        requested: set[str] | None,
+    ) -> list[sqlite3.Row]:
+        if requested is None:
+            return self._conn.execute(
+                "SELECT key, value FROM settings WHERE key LIKE ?",
+                (f"{prefix}%",),
+            ).fetchall()
+
+        matching_keys = [
+            str(row["key"])
+            for row in self._conn.execute(
+                "SELECT key FROM settings WHERE key LIKE ?",
+                (f"{prefix}%",),
+            )
+            if str(row["key"] or "")
+            .removeprefix(prefix)
+            .strip()
+            .lower()
+            in requested
+        ]
+        normalized = [
+            key.removeprefix(prefix).strip().lower() for key in matching_keys
+        ]
+        if len(set(normalized)) != len(normalized):
+            # Duplicate normalized keys are invalid but older databases may
+            # contain them.  Retain their historical last-row-wins behavior.
+            return [
+                row
+                for row in self._conn.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE ?",
+                    (f"{prefix}%",),
+                )
+                if str(row["key"] or "")
+                .removeprefix(prefix)
+                .strip()
+                .lower()
+                in requested
+            ]
+        rows = self._select_in(
+            "SELECT key, value FROM settings WHERE key IN ({placeholders})",
+            matching_keys,
+        )
+        return self._ordered_rows(rows, "key", matching_keys)
+
+
 def export_inventory_records(
     db_file: Path, *, emails: Iterable[str] | None = None
 ) -> list[dict[str, Any]]:
@@ -87,15 +196,10 @@ def export_inventory_records(
 
     conn = connect_db(str(db_file))
     try:
-        address_rows = conn.execute(
-            f"SELECT {', '.join(ADDRESS_SYNC_FIELDS)} FROM addresses"
-        ).fetchall()
-        account_rows = conn.execute(
-            "SELECT key, value FROM settings WHERE key LIKE 'gpt_account:%'"
-        ).fetchall()
-        removed_rows = conn.execute(
-            "SELECT key, value FROM settings WHERE key LIKE 'gpt_removed:%'"
-        ).fetchall()
+        repository = InventoryExportRepository(conn)
+        address_rows = repository.address_rows(requested)
+        account_rows = repository.setting_rows("gpt_account:", requested)
+        removed_rows = repository.setting_rows("gpt_removed:", requested)
     finally:
         conn.close()
 
@@ -327,6 +431,7 @@ def import_inventory_records(
 
 __all__ = [
     "ADDRESS_SYNC_FIELDS",
+    "InventoryExportRepository",
     "SYNC_SCHEMA_VERSION",
     "export_inventory_record",
     "export_inventory_records",

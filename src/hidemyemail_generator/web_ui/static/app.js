@@ -101,20 +101,93 @@
   }
 
   const cardLinkCountryPolicy = new CardLinkCountryPolicy(cardLinkExtractionModes);
-
-  class PayPalWorkspacePresenter {
-    frameUrl(baseUrl = "/paypal-pay/", jobId = "") {
-      const url = new URL(baseUrl || "/paypal-pay/", location.origin);
-      url.searchParams.set("embedded", "1");
-      url.searchParams.set("theme", document.documentElement.dataset.theme || "dark");
-      if (jobId) url.searchParams.set("job", jobId);
-      else url.searchParams.delete("job");
-      return url.origin === location.origin ? url.pathname + url.search + url.hash : url.href;
+  class PayPalWorkspaceModel {
+    constructor(origin) { this.origin = origin; }
+    frameUrl(baseUrl = "/paypal-pay/", jobId = "", theme = "dark") {
+      const url = new URL(baseUrl || "/paypal-pay/", this.origin);
+      url.searchParams.set("embedded", "1"); url.searchParams.set("theme", theme || "dark");
+      if (jobId) url.searchParams.set("job", jobId); else url.searchParams.delete("job");
+      return url.origin === this.origin ? url.pathname + url.search + url.hash : url.href;
     }
   }
 
-  const paypalWorkspacePresenter = new PayPalWorkspacePresenter();
+  class PayPalWorkspaceView {
+    constructor(frame) {
+      this.frame = frame;
+      this.empty = $("paypalPaymentEmpty");
+      this.status = $("paypalServiceStatus");
+      this.navState = $("paypalNavState");
+    }
+    theme() { return document.documentElement.dataset.theme || "dark"; }
+    lifecycle() {
+      return {
+        loaded: this.frame.dataset.loaded === "1",
+        ready: this.frame.dataset.ready === "1",
+        loadFailed: this.frame.dataset.loadError === "1",
+      };
+    }
+    resetLifecycle() {
+      delete this.frame.dataset.loaded; delete this.frame.dataset.ready; delete this.frame.dataset.loadError;
+    }
+    setEmpty(state, title, detail, hidden = false) {
+      this.empty.hidden = hidden; this.empty.dataset.state = state;
+      this.empty.querySelector("strong").textContent = title;
+      this.empty.querySelector("p").textContent = detail;
+    }
+    showLoading() {
+      this.frame.hidden = false; this.status.className = "badge warning"; this.status.textContent = "正在载入"; this.navState.textContent = "…";
+      this.setEmpty("loading", "正在载入协议支付工作台", "服务已连接，正在等待支付页面完成初始化。");
+    }
+    showReady() {
+      this.status.className = "badge success"; this.status.textContent = "服务已连接"; this.navState.textContent = "在线"; this.empty.hidden = true;
+    }
+    showLoadError() {
+      this.frame.hidden = false; this.status.className = "badge error"; this.status.textContent = "载入失败"; this.navState.textContent = "异常";
+      this.setEmpty("error", "协议支付页面载入失败", "支付页面未在 10 秒内响应，请检查服务后重试。");
+    }
+    showUnavailable(error = "") {
+      const failed = Boolean(error); this.frame.hidden = true;
+      this.status.className = "badge " + (failed ? "error" : "warning"); this.status.textContent = failed ? "启动失败" : "正在启动"; this.navState.textContent = failed ? "异常" : "—";
+      this.setEmpty(failed ? "error" : "loading", failed ? "协议支付服务连接失败" : "正在启动协议支付服务", error || "服务就绪后会自动载入协议支付工作台。");
+    }
+    fallbackUrl() { return this.frame.dataset.src || "/paypal-pay/"; }
+    load(url) { this.frame.src = url; this.frame.dataset.loaded = "1"; }
+  }
 
+  class PayPalWorkspacePresenter {
+    constructor(model, view) { this.model = model; this.view = view; this.readyTimer = 0; this.serviceRunning = false; }
+    mount() {
+      window.addEventListener("message", (event) => {
+        if (!this.serviceRunning || event.origin !== location.origin || event.source !== this.view.frame.contentWindow || event.data?.type !== "paypal-workspace-ready") return;
+        clearTimeout(this.readyTimer); this.view.frame.dataset.ready = "1"; delete this.view.frame.dataset.loadError; this.view.showReady();
+      });
+    }
+    open(baseUrl = "", jobId = "") {
+      this.serviceRunning = true; this.view.resetLifecycle(); this.view.showLoading();
+      clearTimeout(this.readyTimer);
+      this.readyTimer = setTimeout(() => {
+        if (this.view.frame.dataset.ready === "1") return;
+        this.view.frame.dataset.loadError = "1"; this.view.showLoadError();
+      }, 10000);
+      this.view.load(this.model.frameUrl(baseUrl || this.view.fallbackUrl(), jobId, this.view.theme()));
+    }
+    render(service = {}) {
+      if (!service.running) {
+        this.serviceRunning = false; clearTimeout(this.readyTimer); this.view.resetLifecycle(); this.view.showUnavailable(service.error || "");
+        return;
+      }
+      this.serviceRunning = true;
+      const lifecycle = this.view.lifecycle();
+      if (!lifecycle.loaded) { this.open(service.url); return; }
+      if (lifecycle.loadFailed) this.view.showLoadError();
+      else if (lifecycle.ready) this.view.showReady();
+      else this.view.showLoading();
+    }
+  }
+  const paypalWorkspacePresenter = new PayPalWorkspacePresenter(
+    new PayPalWorkspaceModel(location.origin), new PayPalWorkspaceView($("paypalPaymentFrame")),
+  );
+  paypalWorkspacePresenter.mount();
   function cardLinkPaymentPayload(method) {
     const config = cardLinkRuntimeConfig(method);
     return {
@@ -132,18 +205,7 @@
   }
 
   function quickFlowFailureExplanation(item = {}) {
-    const detail = String(item.paymentError || item.error || "").trim();
-    if (!detail) return "未记录到具体错误，请查看下方终端日志";
-    if (/chatgpt approve result:\s*['\"]?blocked/i.test(detail)) {
-      return "ChatGPT Approve 返回 blocked：本次请求被服务端拦截，不代表账号无法提链；可更换请求或线路后重试";
-    }
-    if (/邮箱地址无效/.test(detail)) {
-      return "主程序未接受该邮箱域名，提链尚未真正发起";
-    }
-    if (/session\s*\/\s*at 尚未就绪|尚未保存 session\s*\/\s*at/i.test(detail)) {
-      return "Session / Access Token 尚未准备完成，提链尚未真正发起";
-    }
-    return detail;
+    return window.QuickFlowQuotaEligibilityModel.explainFailure(item);
   }
 
   function redactTerminalLogText(value) {
@@ -155,6 +217,11 @@
         /(["']?)(authorization|password|passwd|pwd|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?(?:token|id)|session|token|cookie|set-cookie|secret|totp|otp|verification[_-]?code|email[_-]?code|one[_-]?time[_-]?(?:code|password)|two(?:[_-]?factor)?[_-]?secret|private[_-]?key|proxy[_-]?password|openai[_-]?key)\1(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
         "$1$2$1$3[REDACTED]"
       )
+      .replace(/\b(cookie|set-cookie)(\s*:\s*)[^\r\n]+/gi, "$1$2[REDACTED]")
+      .replace(/(验证码|校验码|动态码|一次性密码)(\s*(?:为|是)\s*)\d{4,8}/g,
+        "$1$2[REDACTED]")
+      .replace(/\b(verification\s+code|one[- ]time\s+(?:code|password))(\s+is\s+)\d{4,8}\b/gi,
+        "$1$2[REDACTED]")
       .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{6,}\b/gi, "[REDACTED_API_KEY]")
       .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
         "[REDACTED_JWT]");
@@ -973,27 +1040,24 @@
         Number(job.log_sequence || 0),
         ...incoming.map((item) => Number(item.sequence || 0)),
       );
-      const status = String(job.status || "queued");
-      const result = job.result && typeof job.result === "object" ? job.result : {};
-      const confirmation = job.account_confirmation && typeof job.account_confirmation === "object"
-        ? job.account_confirmation : {};
-      const confirmationStatus = String(confirmation.status || "");
-      const protocolSucceeded = status === "completed" && result.status === "success";
-      const protocolTerminal = ["completed", "failed", "cancelled"].includes(status);
-      const confirmationFinished = ["plus", "not_plus", "refresh_failed", "plus_sms_failed"].includes(confirmationStatus);
-      const succeeded = protocolSucceeded && confirmationStatus === "plus" &&
-        confirmation.plus_confirmed === true && confirmation.account_type === "plus";
-      const terminal = protocolTerminal && (!protocolSucceeded || confirmationFinished);
-      const error = protocolTerminal && !protocolSucceeded
-        ? String(job.error || result.error_code || result.error || "协议支付未成功")
-        : terminal && !succeeded ? String(confirmation.detail || "新 AT 未确认 Plus") : "";
+      const outcome = window.PaymentOutcomeModel.classify(job);
+      const {
+        status, result, confirmation, confirmationStatus, protocolSucceeded,
+        paymentSucceeded, terminal, confirmationPending, plusConfirmed,
+        paymentError, confirmationError, deliveryError,
+      } = outcome;
+      const postCheckError = confirmationError || deliveryError;
       const stage = protocolSucceeded
-        ? String(confirmation.detail || "协议已完成，正在用 Cookie 刷新新 AT")
+        ? String(confirmation.detail || (confirmationPending
+          ? "协议支付成功，正在用 Cookie 登录获取新 AT"
+          : plusConfirmed ? "协议支付成功，新 AT 已确认 Plus" : "协议支付成功"))
         : String(job.stage || status);
       if (confirmationStatus && confirmationStatus !== this.previousConfirmationStatus) {
         this.logs = [...this.logs, {
           at: String(confirmation.checked_at || new Date().toISOString()),
-          level: succeeded ? "success" : ["retrying", "plus_sms"].includes(confirmationStatus) ? "info" : "error",
+          level: postCheckError ? "warning"
+            : plusConfirmed ? "success"
+              : ["retrying", "plus_sms"].includes(confirmationStatus) ? "info" : "warning",
           message: String(confirmation.detail || "支付后新 AT 校验状态已更新"),
           source: "payment_at_refresh", eventType: "account_confirmation",
           originTaskId: this.jobId, originSequence: this.logSequence + this.logs.length + 1,
@@ -1016,15 +1080,21 @@
           paymentAtRefreshed: Boolean(confirmation.at_refreshed),
           paymentAccountType: String(confirmation.account_type || ""),
           paymentAtPlan: String(confirmation.plan || ""),
-          paymentSucceeded: succeeded,
-          paymentConfirmed: succeeded,
-          paymentPending: protocolSucceeded && !confirmationFinished,
+          paymentSucceeded,
+          paymentConfirmed: plusConfirmed,
+          paymentPlusConfirmed: plusConfirmed,
+          paymentPending: confirmationPending,
           paymentFinishedAt: job.finished_at || null,
-          paymentError: error,
+          paymentError,
+          paymentConfirmationError: confirmationError,
+          paymentDeliveryError: deliveryError,
+          paymentPostCheckError: postCheckError,
         },
       };
     }
   }
+
+  window.PayPalPaymentJobModel = PayPalPaymentJobModel;
 
   class PayPalPaymentMonitorPresenter {
     constructor(api, intervalMs = 1000) {
@@ -1060,233 +1130,8 @@
     }
   }
 
-  class TerminalLogView {
-    constructor() {
-      this.task = $("terminalPreviewTask");
-      this.list = $("terminalPreviewList");
-      this.scrollFrame = 0;
-    }
-
-    render(model) {
-      const logs = model?.logs || [];
-      const levelLabels = {
-        error: "ERROR", warning: "WARN", waiting: "WAIT",
-        success: "INFO", active: "INFO", idle: "INFO",
-      };
-      this.task.textContent = model?.statusLabel || "等待任务";
-      this.list.innerHTML = logs.length ? logs.map((item) =>
-        '<div class="terminal-preview-row" data-level="' + escapeHtml(item.status || "idle") +
-        '"><time>' + escapeHtml(formatLogTimestamp(item.at)) + '</time><span class="terminal-preview-level">[' +
-        escapeHtml(levelLabels[item.status] || "INFO") + ']</span><span class="terminal-preview-source">[' +
-        escapeHtml(item.sourceLabel || item.source || "WORKSPACE") + ']</span><p>' +
-        escapeHtml(item.message || "（无消息内容）") + '</p></div>'
-      ).join("") : '<div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，' +
-        '完整日志会显示在这里。</div>';
-      cancelAnimationFrame(this.scrollFrame);
-      this.scrollFrame = requestAnimationFrame(() => {
-        this.scrollFrame = 0;
-        this.list.scrollTop = this.list.scrollHeight;
-      });
-    }
-  }
-
-  class TerminalLogPresenter {
-    constructor(view) {
-      this.view = view;
-      this.model = this.buildModel({});
-    }
-
-    candidate(kind, label, task, overrides = {}) {
-      if (!task || typeof task !== "object") return null;
-      const status = String(task.status || (task.running ? "running" : "idle"));
-      const running = Boolean(task.running || task.starting || [
-        "queued", "running", "awaiting_otp", "awaiting_captcha", "cancelling",
-      ].includes(status));
-      const currentLogs = Array.isArray(task.logs) ? task.logs : [];
-      const historyLogs = Array.isArray(task.historyLogs) ? task.historyLogs : [];
-      const logs = Array.isArray(overrides.logs)
-        ? overrides.logs
-        : running ? currentLogs : historyLogs.length ? historyLogs : currentLogs;
-      if (!logs.length && !task.running && ["", "idle"].includes(status)) return null;
-      const id = String(overrides.id || task.processId || task.id || task.taskId || "");
-      const startedAt = String(overrides.startedAt || task.startedAt || "");
-      const finishedAt = String(overrides.finishedAt || task.finishedAt || "");
-      const lastAt = String(logs.at(-1)?.at || finishedAt || startedAt || "");
-      return {
-        kind, label, task, logs, id, startedAt, finishedAt, lastAt,
-        processId: String(overrides.processId || task.processId || ""),
-        processLabel: String(overrides.processLabel || task.processLabel || ""),
-        running,
-        status,
-      };
-    }
-
-    buildModel(state) {
-      const candidates = [];
-      const registration = state.registrationTask || {};
-      const processTasks = Array.isArray(registration.tasks) ? registration.tasks : [];
-      if (processTasks.length) {
-        processTasks.forEach((task, index) => {
-          const item = this.candidate("registration", "注册进程", task, {
-            id: task.processId || task.id,
-            processId: task.processId || task.id,
-            processLabel: task.processLabel || "注册进程 " + (index + 1),
-          });
-          if (item) candidates.push(item);
-        });
-      } else {
-        const item = this.candidate("registration", "注册任务", registration);
-        if (item) candidates.push(item);
-      }
-      const diagnosticLogs = (registration.failureRecords || []).map((record, index) => ({
-        at: record.recordedAt || record.finishedAt || record.startedAt || "",
-        email: record.email || (record.emails || [])[0] || "",
-        message: "[" + (record.category || "未分类失败") + "] " +
-          (record.failureReason || record.message || "注册失败"),
-        stage: record.failedStage || record.currentStage || "failed",
-        location: record.currentLocation || "注册失败诊断",
-        action: record.suggestedAction || "查看下方终端日志中的失败上下文后重新注册",
-        status: "error",
-        diagnosticCode: record.reasonCode || "",
-        source: "registration_diagnostic",
-        eventType: "failure_record",
-        taskId: record.taskId || record.processId || registration.id || "",
-        sequence: record.sequence || index + 1,
-      })).sort((left, right) =>
-        new Date(left.at || 0) - new Date(right.at || 0));
-      if (diagnosticLogs.length) {
-        const item = this.candidate("registration_diagnostic", "注册诊断", {
-          id: registration.id || "registration-diagnostic",
-          status: "failed",
-          running: false,
-          startedAt: diagnosticLogs[0]?.at || "",
-          finishedAt: diagnosticLogs.at(-1)?.at || "",
-          logs: diagnosticLogs,
-          historyLogs: [],
-        }, { id: registration.id || "registration-diagnostic" });
-        if (item) candidates.push(item);
-      }
-      [
-        this.candidate("browser", "浏览器任务", state.browserTask || {}),
-        this.candidate("protocol", "协议注册", state.protocolRegistrationTask || {}),
-        this.candidate("verification", "账号验证", state.verificationTask || {}),
-      ].forEach((item) => { if (item) candidates.push(item); });
-      const quickFlows = Array.isArray(state.quickFlows) && state.quickFlows.length
-        ? state.quickFlows : state.quickFlow?.runId ? [state.quickFlow] : [];
-      quickFlows.forEach((flow, index) => {
-        const item = this.candidate("pipeline", "注册提链流水线", flow, {
-          id: flow.runId || flow.taskId,
-          processId: flow.runId || "",
-          processLabel: "流水线 " + (index + 1),
-        });
-        if (item) candidates.push(item);
-        (flow.results || []).filter((result) => result.paymentJobId).forEach((result) => {
-          const payment = this.candidate("paypal_protocol", "协议支付", {
-            id: result.paymentJobId,
-            status: result.paymentStatus || "queued",
-            startedAt: flow.startedAt,
-            finishedAt: result.paymentFinishedAt,
-            logs: result.paymentLogs || [],
-          }, {
-            id: result.paymentJobId,
-            processId: flow.runId || "",
-            processLabel: result.email || "协议支付",
-          });
-          if (payment) candidates.push(payment);
-        });
-      });
-
-      const active = candidates.filter((item) => item.running);
-      const selected = active.length ? active : [...candidates]
-        .sort((left, right) => new Date(right.lastAt || 0) - new Date(left.lastAt || 0))
-        .slice(0, 1);
-      const seen = new Set();
-      const logs = [];
-      selected.forEach((candidate) => {
-        candidate.logs.forEach((raw, index) => {
-          if (!raw || typeof raw !== "object") return;
-          const message = redactTerminalLogText(raw.message).slice(0, 5000);
-          const at = redactTerminalLogText(raw.at || candidate.startedAt || "");
-          const email = String(raw.email || candidate.task.email || "");
-          const taskId = redactTerminalLogText(raw.originTaskId || raw.taskId || candidate.id || "");
-          const originSequence = Number(raw.originSeq || raw.originSequence ||
-            (raw.originTaskId && raw.originTaskId === raw.taskId
-              ? raw.sequence || raw.seq : 0));
-          const sequence = Number(originSequence || raw.sequence || raw.seq || index + 1);
-          const rawStatus = String(raw.level || raw.status || "").toLowerCase();
-          const normalizedStatus = {
-            debug: "active", info: "active", warn: "warning", fatal: "error",
-          }[rawStatus] || rawStatus;
-          const stableKey = raw.originTaskId && originSequence
-            ? "origin|" + raw.originTaskId + "|" + originSequence
-            : [candidate.kind, candidate.id, raw.source, raw.eventType || raw.event_type,
-              sequence, at, email, message].join("|");
-          if (seen.has(stableKey)) return;
-          seen.add(stableKey);
-          const contextual = inferLogContext({
-            at, email, message,
-            stage: redactTerminalLogText(raw.stage),
-            location: redactTerminalLogText(raw.location),
-            action: redactTerminalLogText(raw.action),
-            status: normalizedStatus,
-          });
-          logs.push({
-            ...contextual,
-            key: stableKey,
-            taskId,
-            sequence: Number.isFinite(sequence) && sequence > 0 ? sequence : index + 1,
-            source: redactTerminalLogText(raw.source || candidate.kind),
-            eventType: redactTerminalLogText(raw.eventType || raw.event_type || "log"),
-            sourceLabel: redactTerminalLogText(candidate.label),
-            processId: redactTerminalLogText(raw.processId || candidate.processId || ""),
-            processLabel: redactTerminalLogText(raw.processLabel || candidate.processLabel || ""),
-            diagnosticCode: redactTerminalLogText(raw.diagnosticCode || raw.reasonCode || ""),
-          });
-        });
-      });
-      logs.sort((left, right) => {
-        const timeDelta = new Date(left.at || 0) - new Date(right.at || 0);
-        return timeDelta || Number(left.sequence || 0) - Number(right.sequence || 0);
-      });
-      const retainedLogs = logs.slice(-1200);
-      const startedAt = selected.map((item) => item.startedAt).filter(Boolean)
-        .sort()[0] || "";
-      const latest = selected[0] || null;
-      const statusLabel = active.length
-        ? active.length + " 个任务运行中"
-        : latest ? "当前无运行任务 · " + taskStatusMeta(latest.status)[0] : "等待任务";
-      const taskIds = selected.map((item) => item.id).filter(Boolean);
-      const taskLabel = taskIds.length
-        ? taskIds.slice(0, 2).map((item) => item.slice(0, 12)).join(" · ") +
-          (taskIds.length > 2 ? " · +" + (taskIds.length - 2) : "")
-        : "—";
-      const sourceLabels = [...new Set(selected.map((item) => item.label))];
-      return {
-        logs: retainedLogs,
-        cursor: retainedLogs.at(-1)?.key || "",
-        runningCount: active.length,
-        statusLabel,
-        taskLabel,
-        startedAt,
-        updatedAt: new Date().toISOString(),
-        subtitle: active.length
-          ? "正在实时跟踪：" + sourceLabels.join("、") + " · 任务状态轮询会自动更新"
-          : latest ? "当前无运行任务，显示最近一次“" + latest.label + "”的完整日志"
-            : "等待注册、浏览器、协议、验证或提链任务启动",
-      };
-    }
-
-    present(state) {
-      this.model = this.buildModel(state);
-      this.view.render(this.model);
-    }
-  }
-
   class WorkspaceRenderer {
-    constructor(store) {
-      this.store = store;
-      this.controlTaskFilter = "all";
-    }
+    constructor(store, presenter) { this.store = store; this.quickFlowAccountResultPresenter = presenter; this.controlTaskFilter = "all"; }
 
     paypalPaymentAction(item, state, flow = null) {
       if (!item?.email || !item?.url) return "";
@@ -1301,24 +1146,30 @@
       const countryItem = countries.find((candidate) => candidate.code === country) || {
         code: country, label: country,
       };
+      const postCheckError = String(
+        item.paymentPostCheckError || item.paymentConfirmationError ||
+        item.paymentDeliveryError || "",
+      );
       if (item.paymentError && flow?.runId) {
-        const atFailure = Boolean(item.paymentProtocolSucceeded);
         return '<div class="quick-flow-result-actions paypal-payment-action">' +
-          '<div class="paypal-payment-auto-country"><span>' + (atFailure ? 'AT 校验失败' : '支付失败') +
-          '</span><strong>' + (atFailure ? '新 AT 未确认 Plus' : '协议支付失败') + ' · ' +
+          '<div class="paypal-payment-auto-country"><span>支付失败</span><strong>协议支付失败 · ' +
           escapeHtml(countryOptionLabel(countryItem)) + '</strong></div>' +
-          (atFailure ? '' : '<button class="button primary small" data-action="retry-quick-payment" data-email="' +
+          '<button class="button primary small" data-action="retry-quick-payment" data-email="' +
           escapeHtml(item.email) + '" data-run-id="' + escapeHtml(flow.runId) + '"' +
-          (flow.status === "running" ? " disabled" : "") + '>重新支付</button>') +
+          (flow.status === "running" ? " disabled" : "") + '>重新支付</button>' +
           '<small>' + escapeHtml(item.paymentError) +
-          (atFailure ? ' · 协议已完成，未重复发起支付' : ' · 点击后将强制重新提链，再启动协议支付') +
-          '</small></div>';
+          ' · 点击后将强制重新提链，再启动协议支付</small></div>';
       }
       if (item.paymentStarted) {
         const status = String(item.paymentStatus || "queued");
-        const paymentLabel = item.paymentSucceeded
-          ? "支付成功 · 新 AT 已确认 Plus"
-          : item.paymentPending ? "协议已完成 · 正在刷新新 AT"
+        const paymentLabel = item.paymentDeliveryError
+          ? "支付成功 · Plus 已确认 · 手机号/Codex 后处理失败"
+          : item.paymentConfirmationError
+            ? "支付成功 · AT/Plus 后置校验失败"
+            : item.paymentPlusConfirmed
+              ? "支付成功 · 新 AT 已确认 Plus"
+              : item.paymentPending ? "支付成功 · 正在用 Cookie 获取新 AT"
+                : item.paymentSucceeded ? "支付成功"
             : status === "failed" ? "协议支付失败"
             : status === "cancelled" ? "协议支付已停止"
               : ["awaiting_otp", "awaiting_captcha"].includes(status)
@@ -1327,7 +1178,7 @@
           '<div class="paypal-payment-auto-country"><span>自动监听</span><strong>' +
           escapeHtml(paymentLabel) + ' · ' +
           escapeHtml(countryOptionLabel(countryItem)) + '</strong></div>' +
-          '<small>' + escapeHtml(item.paymentError || item.paymentStage || "任务状态正在自动更新") +
+          '<small>' + escapeHtml(item.paymentError || postCheckError || item.paymentStage || "任务状态正在自动更新") +
           (item.paymentJobId ? ' · 任务 ' + escapeHtml(String(item.paymentJobId).slice(0, 12)) : '') +
           '</small></div>';
       }
@@ -2264,7 +2115,9 @@
           const emailKey = email.toLowerCase();
           const result = resultByEmail.get(emailKey);
           const active = Boolean(email && currentEmailKey === emailKey && running);
-          const paymentActive = Boolean(result?.paymentStarted && !result.paymentSucceeded && !result.paymentError);
+          const paymentActive = Boolean(result?.paymentPending || (
+            result?.paymentStarted && !result.paymentSucceeded && !result.paymentError
+          ));
           const state = result
             ? (result.ok
               ? (result.paymentError ? "failed" : result.skipped ? "skipped" : paymentActive ? "running" : "done")
@@ -2274,16 +2127,22 @@
             ? (result.ok
               ? (result.paymentError
                 ? "链接已生成 · 协议支付失败"
-                : result.skipped ? "已跳过" : result.paymentSucceeded
-                  ? "支付成功 · 新 AT Plus"
-                  : result.paymentStarted ? (result.paymentStage || "协议支付正在自动执行") : "PayPal 链接已完成")
+                : result.paymentDeliveryError
+                  ? "支付成功 · Plus 已确认 · 后处理失败"
+                  : result.paymentConfirmationError
+                    ? "支付成功 · AT/Plus 后置校验失败"
+                    : result.skipped ? "已跳过" : result.paymentPlusConfirmed
+                      ? "支付成功 · 新 AT Plus"
+                      : result.paymentPending ? "支付成功 · AT/Plus 确认中"
+                        : result.paymentSucceeded ? "支付成功"
+                          : result.paymentStarted ? (result.paymentStage || "协议支付正在自动执行") : "PayPal 链接已完成")
               : "失败原因：" + quickFlowFailureExplanation(result))
             : active ? "正在提取 PayPal 链接" : email ? "等待提链" : "启动后自动分配账号";
           const code = result?.retryable ? "RETRY" : { done: "DONE", skipped: "SKIP", failed: "FAIL", running: "LIVE", queued: "QUEUE", idle: "WAIT" }[state];
           return '<div class="quick-flow-account-card ' + state + '"><i>' +
             String(index + 1).padStart(2, "0") + '</i><div><strong>' +
             escapeHtml(email || "等待分配账号") + '</strong><span title="' +
-            escapeHtml(result?.error || result?.paymentError || label) + '">' + escapeHtml(label) +
+            escapeHtml(result?.error || result?.paymentError || result?.paymentPostCheckError || label) + '">' + escapeHtml(label) +
             '</span></div><b>' + code + "</b></div>";
         },
       ).join("");
@@ -2307,22 +2166,8 @@
       $("quickFlowNavState").textContent = running ? progress + "%" : flow.status === "completed" ? "DONE" : flow.status === "failed" ? "!" : "NEW";
 
       $("quickFlowResults").innerHTML = results.length ? results.map((item) =>
-        '<div class="quick-flow-result ' + (item.ok ? (item.paymentError ? "failed" : item.skipped ? "skipped" : "") : "failed") + '"><strong>' +
-        escapeHtml(item.email) + "</strong><span>" + (item.skipped
-          ? (item.skipLabel || "已有同模式链接 · 已跳过")
-          : item.ok
-            ? (item.paymentError ? "提取链接成功 · 协议支付失败" : item.paymentSucceeded
-              ? "提取链接成功 · 新 AT 已确认 Plus"
-              : item.paymentStarted ? "提取链接成功 · 正在监听协议支付" : "提取链接成功")
-            : item.retrying ? "正在重新提链" : "提链未完成 · 可重试") +
-        "</span><code>" + escapeHtml(item.url || ((!item.ok || item.paymentError)
-          ? "失败原因：" + quickFlowFailureExplanation(item) +
-            (item.error ? " · 原始错误：" + item.error : "")
-          : item.error || "—")) + "</code>" +
-        (item.ok && !item.skipped ? this.paypalPaymentAction(item, state, flow) : "") +
-        (item.retryable ? '<div class="quick-flow-result-actions"><button class="button small" data-action="retry-quick-card-link" data-email="' +
-          escapeHtml(item.email) + '" data-run-id="' + escapeHtml(flow.runId || "") + '"' + (running ? " disabled" : "") + '>重新提链</button></div>' : "") +
-        "</div>"
+        this.quickFlowAccountResultPresenter.render(item, state, flow,
+          this.paypalPaymentAction.bind(this), quickFlowFailureExplanation)
       ).join("") : '<div class="empty-state compact">完成后在这里显示账号与支付链接</div>';
     }
 
@@ -2515,34 +2360,7 @@
     }
 
     renderPayPal(state) {
-      const service = state.paypal || {};
-      const status = $("paypalServiceStatus");
-      const navState = $("paypalNavState");
-      const frame = $("paypalPaymentFrame");
-      const empty = $("paypalPaymentEmpty");
-      if (service.running) {
-        status.className = "badge success";
-        status.textContent = "服务已连接";
-        navState.textContent = "在线";
-        empty.hidden = true;
-        frame.hidden = false;
-        if (!frame.dataset.loaded) {
-          frame.src = paypalWorkspacePresenter.frameUrl(service.url || frame.dataset.src);
-          frame.dataset.loaded = "1";
-        }
-      } else {
-        const failed = Boolean(service.error);
-        status.className = "badge " + (failed ? "error" : "warning");
-        status.textContent = service.error ? "启动失败" : "正在启动";
-        navState.textContent = failed ? "异常" : "—";
-        frame.hidden = true;
-        empty.hidden = false;
-        empty.dataset.state = failed ? "error" : "loading";
-        const title = empty.querySelector("strong");
-        if (title) title.textContent = failed ? "协议支付服务连接失败" : "正在启动协议支付服务";
-        const detail = empty.querySelector("p");
-        if (detail) detail.textContent = service.error || "服务就绪后会自动载入协议支付工作台。";
-      }
+      paypalWorkspacePresenter.render(state.paypal || {});
     }
 
     verificationRows(state) {
@@ -2810,7 +2628,13 @@
         verificationFilter: "all",
         settingsSection: "imap",
       });
-      this.renderer = new WorkspaceRenderer(this.store);
+      this.quickFlowHistoryPresenter = window.HmeQuickFlowHistory.create({
+        api: this.api, store: this.store,
+      });
+      this.quickFlowHistoryLoaded = false;
+      this.accountsRequestSequence = 0;
+      this.quickFlowAccountResultPresenter = new window.QuickFlowAccountResultPresenter(this.api, this.store, { refreshAccounts: () => this.loadAccounts() });
+      this.renderer = new WorkspaceRenderer(this.store, this.quickFlowAccountResultPresenter);
       this.sidebarPresenter = new NavigationSidebarPresenter(new NavigationSidebarView());
       this.registrationConfigPresenter = new RegistrationConfigPresenter(
         new RegistrationConfigModel(),
@@ -2821,7 +2645,10 @@
         new QuickFlowConfigView(),
       );
       this.paypalPaymentMonitorPresenter = new PayPalPaymentMonitorPresenter(this.api);
-      this.terminalLogPresenter = new TerminalLogPresenter(new TerminalLogView());
+      this.terminalLogPresenter = window.HmeTerminalLog.create({
+        lookup: $, escapeHtml, formatLogTimestamp, redactTerminalLogText,
+        inferLogContext, taskStatusMeta,
+      });
       this.router = new HashRouter({
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
@@ -2890,7 +2717,7 @@
     async refreshWorkspaceData() {
       if (this.refreshInFlight) return this.refreshInFlight;
       const operation = Promise.allSettled([
-        this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
+        this.loadQuickFlowHistory(), this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
         this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(),
         this.loadRegistrationProxy(), this.loadCardLinkProxy(), this.loadRoxyRegistration(),
         this.loadSmsBower(), this.loadPaymentSms(), this.loadZkgmail(), this.loadPayPal(),
@@ -2927,8 +2754,27 @@
       if (persist) localStorage.setItem("hme_terminal_preview_collapsed", collapsed ? "1" : "0");
     }
 
+    async loadQuickFlowHistory() {
+      if (this.quickFlowHistoryLoaded) return;
+      const flows = await this.quickFlowHistoryPresenter.restore();
+      this.quickFlowHistoryLoaded = true;
+      flows.filter((flow) => flow.status === "running").forEach((flow) => {
+        if (flow.phase === "register" && flow.taskId) {
+          this.schedule("quick-flow:" + flow.runId, () => this.pollQuickFlow(flow.runId), 600);
+          return;
+        }
+        this.patchQuickFlow(flow.runId, {
+          status: "failed", interrupted: true,
+          currentAction: "页面重新载入后前端流水线已中断",
+          message: "流程记录已恢复；未完成的前端编排需要重新启动",
+        }, "页面重新载入后恢复历史记录；未完成流程已标记为中断");
+      });
+    }
+
     async loadAccounts() {
+      const requestSequence = ++this.accountsRequestSequence;
       const data = await this.api.get("/api/gpt-emails");
+      if (requestSequence !== this.accountsRequestSequence) return;
       const accounts = data.items || [];
       const patch = { accounts };
       if (!this.store.state.selectedCardEmail && data.items?.length) {
@@ -3010,8 +2856,8 @@
     }
 
     async loadPayPal() {
-      const data = await this.api.get("/api/paypal/status");
-      this.store.patch({ paypal: data });
+      try { this.store.patch({ paypal: await this.api.get("/api/paypal/status") }); }
+      catch (error) { this.store.patch({ paypal: {running: false, error: error.message || String(error)} }); throw error; }
     }
 
     async loadRegistrationProxy() {
@@ -3130,13 +2976,14 @@
         email: item.email, headless: $("headless").checked, reset_password: false,
         refresh_with_cookie: true,
       });
+      if (data.task) this.store.patch({ verificationTask: data.task });
       await Promise.all([this.loadAccounts(), this.loadBrowserTask(), this.loadVerificationTask()]);
       if (data.mode === "deleted_invalid") {
         return data.message || "无效邮箱已自动删除；请选择下一个账号继续验证";
       }
       this.schedule("verification", () => this.loadVerificationTask(), 800);
       return data.mode === "refresh_cookie"
-        ? "正在使用保存的 Cookie 刷新 Session 与账号状态"
+        ? "正在使用保存的 Cookie 刷新 Session / AT 并查询实时套餐"
         : "正在获取 Session 并验证套餐";
     }
 
@@ -3193,7 +3040,12 @@
       if (logMessage) {
         logs.push({ at: new Date().toISOString(), message: logMessage });
       }
-      const next = { ...current, ...changes, logs: logs.slice(-120) };
+      const terminal = ["completed", "failed", "cancelled"].includes(changes.status);
+      const lifecycle = changes.status === "running" && current.status !== "running"
+        ? { finishedAt: "", interrupted: false }
+        : terminal && !changes.finishedAt && !current.finishedAt
+          ? { finishedAt: new Date().toISOString() } : {};
+      const next = { ...current, ...changes, ...lifecycle, logs: logs.slice(-120) };
       const nextFlows = [...flows];
       nextFlows[index] = next;
       const activeId = this.store.state.activeQuickFlowId || target;
@@ -3203,6 +3055,9 @@
         activeQuickFlowId: active.runId,
         quickFlow: active,
       });
+      void this.quickFlowHistoryPresenter.persist(next).catch((error) =>
+        this.toast("流程记录保存失败：" + error.message, "error")
+      );
       return next;
     }
 
@@ -3266,21 +3121,30 @@
         result.paymentStage = String(data.job?.stage || "协议支付任务已排队");
         result.paymentSucceeded = false;
         result.paymentConfirmed = false;
+        result.paymentProtocolSucceeded = false;
+        result.paymentPlusConfirmed = false;
         result.paymentPending = false;
         result.paymentAtRefreshStatus = "";
         result.paymentAtRefreshed = false;
         result.paymentAccountType = "";
+        result.paymentConfirmationError = "";
+        result.paymentDeliveryError = "";
+        result.paymentPostCheckError = "";
         result.paymentLogs = [];
         result.paymentLogCount = 0;
         result.paymentCountry = String(data.country || result.country || "").toUpperCase();
         result.paymentProxyMode = String(data.proxyMode || "");
         result.paymentProxySource = String(data.proxySource || "");
+        result.paymentProxyCandidateCount = Number(data.proxyCandidateCount || 0);
+        result.paymentProxyBackupCount = Number(data.proxyBackupCount || 0);
         result.paymentSmsProvider = String(data.smsProviderLabel || data.smsProvider || "接码平台");
         this.patchQuickFlow(runId, {
           results: [...results],
           paymentStarted: results.filter((item) => item.paymentStarted).length,
           currentAction: "协议支付任务已自动启动",
         }, "协议支付已启动：" + email + " · 自动代理 · " +
+          result.paymentProxyCandidateCount + " 个实测出口（" +
+          result.paymentProxyBackupCount + " 备用） · " +
           String(data.smsProviderLabel || data.smsProvider || "接码平台") + " 自动取号" +
           (result.paymentJobId ? " · 任务 " + result.paymentJobId.slice(0, 12) : ""));
         return true;
@@ -3303,11 +3167,16 @@
           Object.assign(result, snapshot.fields || {});
           const currentAction = snapshot.retryError
             ? "协议支付状态读取失败，正在自动重试"
-            : result.paymentSucceeded
-              ? "新 AT 已确认 Plus，协议支付成功"
-              : result.paymentAtRefreshStatus === "retrying"
-                ? "协议已完成，正在用 Cookie 刷新新 AT 并确认 Plus"
-              : result.paymentError ? "协议支付失败" : result.paymentStage;
+            : result.paymentError ? "协议支付失败"
+              : result.paymentDeliveryError
+                ? "支付成功并确认 Plus，但手机号/Codex 后处理失败"
+                : result.paymentConfirmationError
+                  ? "支付成功，但 AT/Plus 后置校验失败"
+                  : result.paymentPlusConfirmed
+                    ? "支付成功，新 AT 已确认 Plus"
+                    : result.paymentPending
+                      ? "支付成功，正在用 Cookie 登录获取新 AT 并确认 Plus"
+                      : result.paymentSucceeded ? "协议支付成功" : result.paymentStage;
           const logMessage = snapshot.retryError
             ? "协议支付状态暂时读取失败，稍后自动重试：" + snapshot.retryError
             : snapshot.stageChanged || snapshot.terminal
@@ -3395,6 +3264,7 @@
         const paymentSucceeded = nextResults.filter((item) => item.paymentSucceeded).length;
         const skipped = nextResults.filter((item) => item.skipped).length;
         const failed = nextResults.filter((item) => !item.ok || item.paymentError).length;
+        const paymentPostCheckFailed = Boolean(nextResult.paymentPostCheckError);
         this.patchQuickFlow(flow.runId, {
           status: failed ? "failed" : "completed",
           phase: classified ? "extract" : paymentReady ? "complete" : "payment",
@@ -3402,20 +3272,29 @@
           currentEmail: "",
           currentAction: classified
             ? "提链次数已用完，仍未获得 OAICS"
-            : paymentReady ? "重新提链并完成协议支付" : "重新提链成功，但协议支付失败",
+            : paymentReady
+              ? paymentPostCheckFailed
+                ? "重新提链并完成协议支付；AT/Plus 后置校验失败"
+                : "重新提链并完成协议支付"
+              : "重新提链成功，但协议支付失败",
           message: classified
             ? "已连续尝试 " + attemptCount + " 次，均返回 cs_live"
             : paymentReady
-              ? "第 " + attemptCount + " 次提链成功，协议支付已完成"
+              ? "第 " + attemptCount + " 次提链成功，协议支付已完成" +
+                (paymentPostCheckFailed ? "；AT/Plus 后置校验失败" : "")
               : "第 " + attemptCount + " 次提链成功，但协议支付失败",
         }, classified
           ? "cs_live 重试次数已用完：" + target
-          : paymentReady ? "重新提链并完成协议支付：" + target : "重新提链成功，协议支付失败：" + target);
+          : paymentReady
+            ? "重新提链并完成协议支付：" + target +
+              (paymentPostCheckFailed ? " · AT/Plus 后置校验失败" : "")
+            : "重新提链成功，协议支付失败：" + target);
         await this.loadAccounts();
         return classified
           ? "已用完 " + attemptCount + " 次提链，结果仍为 cs_live"
           : paymentReady
-            ? "第 " + attemptCount + " 次提链成功并完成协议支付：" + target
+            ? "第 " + attemptCount + " 次提链成功并完成协议支付：" + target +
+              (paymentPostCheckFailed ? "（AT/Plus 后置校验失败）" : "")
             : "第 " + attemptCount + " 次提链成功，但协议支付失败：" + target;
       } catch (error) {
         for (const message of error.logs || []) {
@@ -3577,7 +3456,9 @@
       if (!completedFlow || completedFlow.status !== "running") return;
       await this.loadAccounts();
       const paymentSucceeded = results.filter((item) => item.paymentSucceeded).length;
+      const paymentPlusConfirmed = results.filter((item) => item.paymentPlusConfirmed).length;
       const paymentPending = results.filter((item) => item.paymentPending).length;
+      const paymentPostCheckFailed = results.filter((item) => item.paymentPostCheckError).length;
       failed = results.filter((item) =>
         !item.ok || (item.ok && !item.skipped && !item.paymentSucceeded)
       ).length;
@@ -3591,17 +3472,27 @@
         generated,
         paymentStarted,
         paymentSucceeded,
+        paymentPlusConfirmed,
         paymentPending,
+        paymentPostCheckFailed,
         skipped,
         failed,
         currentEmail: "",
-        currentAction: completed ? "注册、提链与协议支付已全部完成" : "注册或提链成功，但协议支付未全部成功",
+        currentAction: completed
+          ? paymentPostCheckFailed
+            ? "注册、提链与协议支付已完成；AT/Plus 后置校验有异常"
+            : "注册、提链与协议支付已全部完成"
+          : "注册或提链成功，但协议支付未全部成功",
         message: "流水线完成：注册 " + uniqueEmails.length + "，提链调用 " + attempted +
           " 次（单账号上限 " + extractionCount + "），" +
           (method === "de_oaics_paypal" ? "补 OAICS " : "生成链接 ") + generated +
-          "，新 AT 确认 Plus " + paymentSucceeded + "（AT 确认中 " + paymentPending +
+          "，协议支付成功 " + paymentSucceeded + "，新 AT 确认 Plus " + paymentPlusConfirmed +
+          "（AT 确认中 " + paymentPending + "，后置校验异常 " + paymentPostCheckFailed +
           "），跳过 " + skipped + "，失败 " + failed,
-      }, completed ? "一键注册、提链并协议支付完成" : "流水线结束，但提链或协议支付未全部完成");
+      }, completed
+        ? "一键注册、提链并协议支付完成" +
+          (paymentPostCheckFailed ? "；AT/Plus 后置校验有异常" : "")
+        : "流水线结束，但提链或协议支付未全部完成");
     }
 
     async pollQuickFlow(runId) {
@@ -3714,9 +3605,7 @@
         if (!this.store.state.paypal.running) {
           throw new Error(this.store.state.paypal.error || "PP 支付服务尚未就绪");
         }
-        const frame = $("paypalPaymentFrame");
-        frame.src = paypalWorkspacePresenter.frameUrl(this.store.state.paypal.url || frame.dataset.src);
-        frame.dataset.loaded = "1";
+        paypalWorkspacePresenter.open(this.store.state.paypal.url);
         return "PP 支付工作台已刷新";
       });
       this.commands.register("open-paypal-workspace", async ({ element }) => {
@@ -3725,11 +3614,8 @@
           throw new Error(this.store.state.paypal.error || "PP 支付服务尚未就绪");
         }
         this.router.navigate("pp-payment");
-        const frame = $("paypalPaymentFrame");
         const jobId = String(element?.dataset.jobId || "");
-        const baseUrl = this.store.state.paypal.url || frame.dataset.src;
-        frame.src = paypalWorkspacePresenter.frameUrl(baseUrl, jobId);
-        frame.dataset.loaded = "1";
+        paypalWorkspacePresenter.open(this.store.state.paypal.url, jobId);
         return "已打开 PP 协议支付工作台";
       });
       this.commands.register("one-click-paypal-payment", async ({ element }) => {
@@ -3742,12 +3628,12 @@
           const data = await this.api.post("/api/account/paypal-payment", { email });
           await this.loadPayPal();
           this.router.navigate("pp-payment");
-          const frame = $("paypalPaymentFrame");
           const jobId = data.job?.id || "";
-          frame.src = paypalWorkspacePresenter.frameUrl(data.url, jobId);
-          frame.dataset.loaded = "1";
+          paypalWorkspacePresenter.open(data.url, jobId);
           return "协议支付已启动：自动匹配 " + data.country + " · Cookie " + data.cookieCount +
             " 条 · " + (data.proxySource === "card_link" ? "提链代理" : "注册代理") + " · " +
+            Number(data.proxyCandidateCount || 0) + " 个实测出口（" +
+            Number(data.proxyBackupCount || 0) + " 备用） · " +
             String(data.smsProviderLabel || data.smsProvider || "接码平台");
         } finally {
           element.disabled = false;
@@ -3866,6 +3752,7 @@
         const flows = [...this.quickFlowList(), flow];
         this.store.patch({ quickFlows: flows, activeQuickFlowId: runId, quickFlow: flow });
         try {
+          await this.quickFlowHistoryPresenter.persist(flow);
           const data = protocol
             ? await this.api.post("/api/protocol-registration/start", {
                 provider: registrationProvider, concurrency: 1, setup_credentials: false,
@@ -3940,6 +3827,7 @@
       });
       this.commands.register("dismiss-quick-flow-run", async ({ element }) => {
         const runId = String(element.dataset.runId || "");
+        await this.quickFlowHistoryPresenter.remove(runId);
         const flows = this.quickFlowList().filter((item) => item.runId !== runId);
         const active = flows.find((item) => item.runId === this.store.state.activeQuickFlowId) || flows.at(-1) || {
           status: "idle", phase: "prepare", progress: 0, taskId: "", manager: "browser",
@@ -3957,6 +3845,7 @@
       this.commands.register("retry-quick-card-link", async ({ element }) =>
         this.retryQuickCardLink(element.dataset.email, element.dataset.runId)
       );
+      this.commands.register("remove-no-free-quota-account", async ({ element }) => this.quickFlowAccountResultPresenter.remove(element.dataset.email, element.dataset.runId));
       this.commands.register("retry-quick-payment", async ({ element }) =>
         this.retryQuickCardLink(element.dataset.email, element.dataset.runId)
       );
@@ -4222,7 +4111,8 @@
       this.commands.register("fetch-all", async () => {
         const options = this.browserOptions();
         const data = await this.api.post("/api/browser/fetch-all", options);
-        await this.loadBrowserTask();
+        if (data.task) this.store.patch({ browserTask: data.task });
+        this.schedule("browser", () => this.loadBrowserTask(), 500);
         return data.message || (data.started ? "Session 获取任务已启动" : "无需重复获取");
       });
       this.commands.register("stop-task", async () => {
@@ -4513,6 +4403,8 @@
       });
       $("controlTaskSearch").addEventListener("input", () =>
         this.renderer.renderControlCenter(this.store.state));
+      $("terminalSessionSelect").addEventListener("change", (event) =>
+        this.terminalLogPresenter.select(event.target.value));
       $("workspaceAutoRefresh").addEventListener("change", (event) => {
         localStorage.setItem("hme_workspace_auto_refresh", event.target.checked ? "1" : "0");
         this.scheduleWorkspaceRefresh();

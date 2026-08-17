@@ -1,0 +1,56 @@
+OBJECT: C:\Users\29070\.ssh\config
+CHANGED_BRANCH_FIELD: Host cac -> BindAddress 192.168.43.96
+
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\ssh-wlan-binding\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\ssh-wlan-binding\DIFF_FILE
+VERIFICATION_FILE: D:\AI\hidemyemail-generator\verification\ssh-wlan-binding\VERIFICATION.txt
+ROLLBACK_FILE: D:\AI\hidemyemail-generator\verification\ssh-wlan-binding\ROLLBACK.sh
+
+ORIGINAL_FILE: D:\AI\hidemyemail-generator\verification\ssh-wlan-binding\ORIGINAL_FILE
+ORIGINAL_SHA256: 76482bfa12c09e4352f7a26e6cbb2733a8f4ba14270380737df08a9c344b8f88
+MODIFIED_SHA256: 26f66717c5b969f87c780b7ced093e4a555d1180e1b9797123f10041b91d155a
+
+BASELINE
+Command:
+ssh -o BatchMode=yes -o ConnectTimeout=10 cac "printf 'SSH_OK\n'; id -un; hostname"
+Input: Host cac without BindAddress while the Mihomo TUN default route is active
+Literal output:
+Connection closed by 8.208.13.52 port 22
+BASELINE_EXIT_STATUS=255
+Result: failed before a remote command ran.
+
+MODIFIED
+Command:
+ssh -G cac | Select-String -Pattern '^bindaddress '; ssh -o BatchMode=yes -o ConnectTimeout=10 cac "printf 'SSH_OK\n'; id -un; hostname"
+Input: Host cac with BindAddress 192.168.43.96
+Literal output:
+bindaddress 192.168.43.96
+SSH_OK
+root
+iZd7og2iktzubzqp5k8aegZ
+MODIFIED_EXIT_STATUS=0
+Result: the effective SSH configuration binds the WLAN source address and the direct login succeeds.
+
+ROLLBACK
+Command:
+$artifactDir='D:\AI\hidemyemail-generator\verification\ssh-wlan-binding'; $rollbackCopy=Join-Path $artifactDir 'ROLLBACK_COPY'; Copy-Item -LiteralPath (Join-Path $artifactDir 'MODIFIED_FILE') -Destination $rollbackCopy -Force; & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x '/d/AI/hidemyemail-generator/verification/ssh-wlan-binding/ROLLBACK.sh' && test -x '/d/AI/hidemyemail-generator/verification/ssh-wlan-binding/ROLLBACK.sh' && '/d/AI/hidemyemail-generator/verification/ssh-wlan-binding/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/ssh-wlan-binding/ROLLBACK_COPY'"
+Input: a separate copy of MODIFIED_FILE; the active C:\Users\29070\.ssh\config is not the rollback target
+Literal output:
+ROLLBACK_TARGET=/d/AI/hidemyemail-generator/verification/ssh-wlan-binding/ROLLBACK_COPY
+ROLLBACK_SHA256=76482bfa12c09e4352f7a26e6cbb2733a8f4ba14270380737df08a9c344b8f88
+ROLLBACK_RESULT=restored
+ROLLBACK_SCRIPT_EXIT=0
+
+Restored-behavior command:
+$restoredEffective=ssh -F 'D:\AI\hidemyemail-generator\verification\ssh-wlan-binding\ROLLBACK_COPY' -G cac; $restoredHasBind=[bool]($restoredEffective | Select-String -Pattern '^bindaddress '); "RESTORED_BINDADDRESS_PRESENT=$restoredHasBind"
+Literal output:
+RESTORED_BINDADDRESS_PRESENT=False
+RESTORED_BEHAVIOR_EXIT=0
+Restored status: ROLLBACK_COPY exactly matches ORIGINAL_FILE and has no effective BindAddress. MODIFIED_FILE and the active SSH config remain changed.
+
+ACTIVE STATUS
+Command:
+ssh -G cac | Select-String -Pattern '^bindaddress '
+Literal output:
+bindaddress 192.168.43.96
+Exit status: 0

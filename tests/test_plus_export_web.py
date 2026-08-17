@@ -185,16 +185,17 @@ class PlusExportFrontendAssemblyTests(unittest.TestCase):
     def test_page_builder_loads_plus_exports_script(self) -> None:
         source = Path(page_builder.__file__).read_text(encoding="utf-8")
 
-        self.assertIn('scripts=("static/app.js", "static/plus_exports.js")', source)
+        for script in ("static/app.js", "static/plus_exports.js"):
+            self.assertIn(f'"{script}"', source)
         self.assertIn('fetch("/api/plus-accounts/export"', build_app_page())
 
     def test_frontend_javascript_files_stay_below_line_limit(self) -> None:
         static_root = Path(page_builder.__file__).with_name("static")
 
-        for filename in ("app.js", "plus_exports.js"):
-            with self.subTest(filename=filename):
+        for script_path in static_root.glob("*.js"):
+            with self.subTest(filename=script_path.name):
                 line_count = len(
-                    (static_root / filename).read_text(encoding="utf-8").splitlines()
+                    script_path.read_text(encoding="utf-8").splitlines()
                 )
                 self.assertLessEqual(line_count, 5000)
 

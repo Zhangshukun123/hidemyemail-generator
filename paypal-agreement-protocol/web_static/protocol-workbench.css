@@ -375,6 +375,7 @@ html.embedded .status-panel,
 html.embedded .result-panel { padding: 14px; }
 html.embedded .recent-wrap { margin-top: 18px; padding-top: 16px; }
 html.embedded .auto-handoff-mode .shell { padding-top: 10px; }
+html.embedded .auto-handoff-mode .workspace-grid { grid-template-columns: minmax(0, 1fr); max-width: none; }
 .protocol-mode-switch input { width: 1px; min-height: 1px; padding: 0; }
 
 @media (max-width: 1120px) {

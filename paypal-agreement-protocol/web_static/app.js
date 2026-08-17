@@ -1443,4 +1443,5 @@ async function refreshSuccessStats() {
   state.jobsTimer = setInterval(refreshJobs, 5000);
   setInterval(refreshSuccessStats, 15000);
   setInterval(checkHealth, 15000);
+  if (paymentShellPresenter.model.embedded && window.parent !== window) window.parent.postMessage({type: 'paypal-workspace-ready'}, location.origin);
 })();

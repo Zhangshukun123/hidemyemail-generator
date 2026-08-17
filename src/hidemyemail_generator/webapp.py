@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 import aiohttp
 from aiohttp import web
 
+from .account_actions import account_payment_job_is_terminal, setup_account_action_routes
 from .account_deactivation import (
     mark_deactivation_notice_processed,
     pending_deactivation_notices,
@@ -69,6 +70,11 @@ from .payment_completion import (
     PaymentCompletionPresenter,
     reconcile_openai_protocol_job,
 )
+from .payment_proxy_pool import (
+    PaymentProxyPoolError,
+    PaymentProxyPoolPresenter,
+    PaymentProxySource,
+)
 from .payment_sms import PaymentSmsProviderResolver
 from .plus_account_export import AccountExportPresenter
 from .plus_codex import (
@@ -82,6 +88,7 @@ from .protocol_registration import (
     PROTOCOL_CODE_PREFIX,
     ProtocolRegistrationManager,
 )
+from .quick_flow_history import setup_quick_flow_history_routes
 from .registration_inventory import (
     DEFAULT_LEASE_SECONDS,
     available_generated_inventory_count,
@@ -3682,10 +3689,9 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         registration_environment = account.get("registration_environment")
         if not isinstance(registration_environment, dict):
             registration_environment = {}
-        token_expired = bool(access_token) and (
-            access_token_is_expired(access_token)
-            or bool(account.get("session_invalid_at"))
-        )
+        # A failed online plan/liveness check is not the JWT expiry time.  Keep
+        # these states separate so a fresh Session is never labelled “expired”.
+        token_expired = bool(access_token) and access_token_is_expired(access_token)
         account_type = str(account.get("account_type") or "").lower()
         if account_type not in {"plus", "free"}:
             account_type = "unverified"
@@ -3753,6 +3759,7 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                     session and access_token and not token_expired
                 ),
                 "tokenExpired": token_expired,
+                "sessionNeedsRefresh": bool(account.get("session_invalid_at")),
                 "sessionStatus": (
                     "expired"
                     if token_expired
@@ -4076,8 +4083,23 @@ def create_app(
         app["db_file"], setting_key=CARD_LINK_PROXY_SETTING_KEY
     )
     app["card_link_proxy_resolver"] = CardLinkProxyResolver()
+    app["payment_proxy_pool_presenter"] = PaymentProxyPoolPresenter(
+        app["card_link_proxy_resolver"]
+    )
     app["roxy_registration_store"] = RoxyRegistrationStore(app["db_file"])
     app["registration_proxy_tester"] = test_registration_proxy_connection
+
+    async def verify_saved_account_plan(email: str) -> dict[str, Any]:
+        manager = app.get("verification_manager")
+        if manager is None:
+            return {
+                "status": "error",
+                "source": "access_token_online",
+                "detail": "AT 套餐验证器尚未初始化",
+                "saved": False,
+            }
+        return await manager.verify_saved_access_token(email)
+
     def create_protocol_registration_process() -> ProtocolRegistrationManager:
         return ProtocolRegistrationManager(
             base_dir=base_dir,
@@ -4091,6 +4113,7 @@ def create_app(
     app["protocol_registration_manager"] = ConcurrentProtocolRegistrationManager(
         process_factory=create_protocol_registration_process,
         on_account_saved=sync_saved_account_to_remote,
+        verify_account_plan=verify_saved_account_plan,
         max_processes=5,
     )
     app["smsbower_config_store"] = SMSBowerConfigStore(
@@ -4993,6 +5016,15 @@ def create_app(
         items = await asyncio.to_thread(
             _browser_email_items, app["db_file"], identities
         )
+        payment_guard = app.get("account_payment_guard")
+        active_payment_emails = (
+            await payment_guard.active_emails() if payment_guard is not None else set()
+        )
+        for item in items:
+            item["accountPaymentRunning"] = (
+                str(item.get("email") or "").strip().lower()
+                in active_payment_emails
+            )
         return web.json_response(
             {
                 "ok": True,
@@ -5756,9 +5788,16 @@ def create_app(
             if reuse_registration_proxy
             else app["card_link_proxy_store"]
         )
-        proxy_mode = str(body.get("proxy_mode") or "").strip().lower()
+        stored_proxy_state = proxy_store.public_state()
+        requested_proxy_mode = str(body.get("proxy_mode") or "").strip().lower()
+        proxy_mode = str(
+            requested_proxy_mode or stored_proxy_state.get("mode") or ""
+        ).strip().lower()
+        previous_link_exit_ip = str(
+            existing_card_link.get("link_proxy_ip") or ""
+        ).strip()
         country_routing_requested = bool(
-            proxy_mode
+            requested_proxy_mode
             or body.get("create_proxy_country")
             or body.get("promotion_proxy_country")
             or body.get("secondary_proxy_country")
@@ -5774,6 +5813,9 @@ def create_app(
         )
         if not isinstance(registration_environment, dict):
             registration_environment = {}
+        previous_registration_exit_ip = str(
+            registration_environment.get("exit_ip") or ""
+        ).strip()
         secondary_proxy_country = str(
             body.get("secondary_proxy_country")
             or create_proxy_country
@@ -5794,14 +5836,22 @@ def create_app(
             selected_country: str, legacy_value: object
         ) -> str:
             legacy_proxy = _normalize_card_link_proxy_url(str(legacy_value or ""))
+            if (
+                not selected_country
+                and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+            ):
+                selected_country = CardLinkProxyCountryPolicy.for_method(method)
             if selected_country:
 
                 def build_proxy_candidate() -> str:
                     try:
-                        proxy_url, _ = proxy_store.proxy_for_country(
-                            selected_country,
-                            mode=proxy_mode,
-                        )
+                        if proxy_mode == "clash":
+                            proxy_url, _ = proxy_store.next_proxy(force=True)
+                        else:
+                            proxy_url, _ = proxy_store.proxy_for_country(
+                                selected_country,
+                                mode=proxy_mode,
+                            )
                     except ValueError as error:
                         if legacy_proxy:
                             return legacy_proxy
@@ -5812,20 +5862,46 @@ def create_app(
                         raise RuntimeError("请先在“代理与线路”中保存代理配置")
                     return proxy_url
 
-                if (
-                    proxy_mode == "kookeey"
-                    and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-                ):
+                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
+                    if (
+                        proxy_mode == "clash"
+                        and not stored_proxy_state.get("fixedPortsEnabled")
+                    ):
+                        raise RuntimeError(
+                            "Clash 提链换 IP 需要启用独立固定端口，避免候选线路互相覆盖"
+                        )
+                    stored_link_exit_ip = await asyncio.to_thread(
+                        proxy_store.last_card_link_exit_ip
+                    )
                     selection = await asyncio.to_thread(
                         app["card_link_proxy_resolver"].resolve,
                         build_proxy_candidate,
                         selected_country,
+                        excluded_exit_ips={
+                            previous_link_exit_ip,
+                            previous_registration_exit_ip,
+                            stored_link_exit_ip,
+                        },
+                        require_exit_ip=True,
+                    )
+                    await asyncio.to_thread(
+                        proxy_store.remember_card_link_exit,
+                        selection.actual_ip,
+                        selection.actual_country,
                     )
                     if selection.candidates_tested > 1:
                         proxy_candidate_logs.append(
                             f"[提链代理] {selected_country} 真实出口预检丢弃了 "
                             f"{selection.candidates_tested - 1} 个错国或不可用候选；"
                             f"第 {selection.candidates_tested} 个候选已匹配"
+                        )
+                    elif (
+                        previous_link_exit_ip
+                        or previous_registration_exit_ip
+                        or stored_link_exit_ip
+                    ):
+                        proxy_candidate_logs.append(
+                            f"[提链代理] {selected_country} 已切换到不同的真实出口 IP"
                         )
                     return selection.proxy_url
                 return await asyncio.to_thread(build_proxy_candidate)
@@ -5894,12 +5970,21 @@ def create_app(
                     )
                     retry_create_proxy = create_proxy
                 else:
-                    first_proxy = account_registration_proxy_url(record)
-                    if not first_proxy and proxy_mode:
+                    registration_proxy = account_registration_proxy_url(record)
+                    if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
                         first_proxy = await configured_proxy_for_country(
-                            create_proxy_country or secondary_proxy_country,
-                            body.get("create_proxy"),
+                            create_proxy_country
+                            or secondary_proxy_country
+                            or country,
+                            registration_proxy or body.get("create_proxy"),
                         )
+                    else:
+                        first_proxy = registration_proxy
+                        if not first_proxy and proxy_mode:
+                            first_proxy = await configured_proxy_for_country(
+                                create_proxy_country or secondary_proxy_country,
+                                body.get("create_proxy"),
+                            )
                     needs_second_proxy = (
                         method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
                         and (
@@ -6052,6 +6137,16 @@ def create_app(
                         and result.get("classification") == "cs_live"
                     ):
                         break
+                result_link_proxy_ip = str(result.get("link_proxy_ip") or "").strip()
+                result_link_proxy_country = str(
+                    result.get("link_proxy_country") or ""
+                ).strip().upper()
+                if result_link_proxy_ip and result_link_proxy_country:
+                    await asyncio.to_thread(
+                        proxy_store.remember_card_link_exit,
+                        result_link_proxy_ip,
+                        result_link_proxy_country,
+                    )
                 saved = await asyncio.to_thread(
                     _save_account_card_link,
                     app["db_file"],
@@ -6814,7 +6909,7 @@ def create_app(
             emails = []
             for value in raw_emails:
                 email = str(value or "").strip().lower()
-                if not email.endswith("@icloud.com") or len(email) > 320:
+                if not _valid_supported_account_email(email):
                     return web.json_response(
                         {"ok": False, "error": "验证账号列表包含无效邮箱"},
                         status=400,
@@ -6893,8 +6988,8 @@ def create_app(
                     status=409,
                 )
             try:
-                task = app["verification_manager"].start_with_browser(
-                    emails=[email], concurrency=1, force_refresh=True
+                task = app["verification_manager"].start_with_saved_cookies(
+                    emails=[email], concurrency=1
                 )
             except RuntimeError as error:
                 return web.json_response(
@@ -6905,7 +7000,7 @@ def create_app(
                     "ok": True,
                     "started": True,
                     "mode": "refresh_cookie",
-                    "message": "正在使用保存的 Cookie 重新获取 Session 与账号状态",
+                    "message": "正在使用保存的 Cookie 刷新 Session / AT 并查询实时套餐",
                     "task": task,
                 }
             )
@@ -7955,6 +8050,8 @@ def create_app(
             job_id, device_id=device_id, log_offset=log_offset, log_after=log_after
         )
         if status != 200:
+            if status == 404:
+                await app["account_payment_guard"].release(job_id=job_id)
             return web.json_response(
                 {
                     "ok": False,
@@ -7987,6 +8084,11 @@ def create_app(
                 )
                 upstream = {**upstream, "plus_codex": delivery}
             upstream = {**upstream, "account_confirmation": confirmation}
+        if isinstance(upstream, dict) and account_payment_job_is_terminal(upstream):
+            await app["account_payment_guard"].release(
+                email=str(upstream.get("source_account_email") or ""),
+                job_id=job_id,
+            )
         return web.json_response(
             {"ok": True, "job": upstream}, headers={"Cache-Control": "no-store"}
         )
@@ -8010,6 +8112,8 @@ def create_app(
             job_id, device_id=device_id
         )
         if status != 200:
+            if status == 404:
+                await app["account_payment_guard"].release(job_id=job_id)
             return web.json_response(
                 {
                     "ok": False,
@@ -8017,6 +8121,7 @@ def create_app(
                 },
                 status=status if 400 <= status < 600 else 502,
             )
+        await app["account_payment_guard"].release(job_id=job_id)
         job = upstream.get("job") if isinstance(upstream.get("job"), dict) else upstream
         return web.json_response(
             {"ok": True, "job": job}, headers={"Cache-Control": "no-store"}
@@ -8115,11 +8220,9 @@ def create_app(
                 status=409,
             )
         sms_provider = resolved_sms.provider
-        proxy_url = ""
-        proxy_urls: list[str] = []
-        proxy_mode = ""
-        proxy_source = ""
-        proxy_error = ""
+        payment_proxy_sources: list[PaymentProxySource] = []
+        payment_proxy_stores: dict[str, RegistrationProxyStore] = {}
+        excluded_payment_exit_ips = {str(card_link.get("link_proxy_ip") or "")}
         proxy_candidates = (
             ("card_link", app["card_link_proxy_store"]),
             ("registration", app["registration_proxy_store"]),
@@ -8135,32 +8238,82 @@ def create_app(
             candidate_mode = preferred_mode or str(
                 proxy_state.get("mode") or "dynamic"
             )
-            for _ in range(PAYPAL_PROTOCOL_PROXY_CANDIDATES):
-                try:
-                    candidate_url, _ = proxy_store.proxy_for_country(
-                        link_proxy_country, mode=candidate_mode
+            excluded_payment_exit_ips.update(
+                await asyncio.to_thread(proxy_store.last_payment_exit_ips)
+            )
+
+            def build_payment_proxy_candidate(
+                store=proxy_store,
+                mode=candidate_mode,
+            ) -> str:
+                if mode == "clash":
+                    candidate_url, _ = store.next_proxy(force=True)
+                else:
+                    candidate_url, _ = store.proxy_for_country(
+                        link_proxy_country,
+                        mode=mode,
                     )
-                except ValueError as error:
-                    proxy_error = str(error)
-                    break
-                if candidate_url and candidate_url not in proxy_urls:
-                    proxy_urls.append(candidate_url)
-                    if not proxy_url:
-                        proxy_url = candidate_url
-                        proxy_mode = candidate_mode
-                        proxy_source = candidate_source
-                if len(proxy_urls) >= PAYPAL_PROTOCOL_PROXY_CANDIDATES:
-                    break
-            if len(proxy_urls) >= PAYPAL_PROTOCOL_PROXY_CANDIDATES:
-                break
-        if not proxy_url:
+                return candidate_url
+
+            payment_proxy_sources.append(
+                PaymentProxySource(
+                    name=candidate_source,
+                    mode=candidate_mode,
+                    proxy_factory=build_payment_proxy_candidate,
+                    stable_endpoints=(
+                        candidate_mode != "clash"
+                        or bool(proxy_state.get("fixedPortsEnabled"))
+                    ),
+                )
+            )
+            payment_proxy_stores[candidate_source] = proxy_store
+        payment_guard = app["account_payment_guard"]
+        if not await payment_guard.reserve(email):
+            return web.json_response(
+                {"ok": False, "error": "该账号已有提链支付任务正在执行"},
+                status=409,
+            )
+        try:
+            payment_proxy_pool = await asyncio.to_thread(
+                app["payment_proxy_pool_presenter"].build,
+                payment_proxy_sources,
+                link_proxy_country,
+                excluded_exit_ips=tuple(excluded_payment_exit_ips),
+                target_count=PAYPAL_PROTOCOL_PROXY_CANDIDATES,
+                minimum_count=2,
+            )
+        except PaymentProxyPoolError as error:
+            await payment_guard.release(email=email)
             return web.json_response(
                 {
                     "ok": False,
-                    "error": proxy_error or "请先配置提链代理或注册代理线路",
+                    "error": str(error),
                 },
-                status=409,
+                status=502,
             )
+        except Exception:
+            await payment_guard.release(email=email)
+            raise
+        proxy_urls = payment_proxy_pool.proxy_urls
+        primary_proxy = payment_proxy_pool.candidates[0]
+        proxy_mode = primary_proxy.mode
+        proxy_source = primary_proxy.source
+        try:
+            for candidate_source, proxy_store in payment_proxy_stores.items():
+                source_exit_ips = [
+                    candidate.exit_ip
+                    for candidate in payment_proxy_pool.candidates
+                    if candidate.source == candidate_source
+                ]
+                if source_exit_ips:
+                    await asyncio.to_thread(
+                        proxy_store.remember_payment_exits,
+                        source_exit_ips,
+                        link_proxy_country,
+                    )
+        except Exception:
+            await payment_guard.release(email=email)
+            raise
         device_id = paypal_auto_device_id(request, create=True)
         protocol_payload = {
             "paypal_url": paypal_url,
@@ -8180,10 +8333,15 @@ def create_app(
             "account_cookies": cookies,
             "completion_target": "openai_plus",
         }
-        status, upstream = await app["paypal_service"].create_job(
-            protocol_payload, device_id=device_id
-        )
+        try:
+            status, upstream = await app["paypal_service"].create_job(
+                protocol_payload, device_id=device_id
+            )
+        except Exception:
+            await payment_guard.release(email=email)
+            raise
         if status != 201:
+            await payment_guard.release(email=email)
             return web.json_response(
                 {
                     "ok": False,
@@ -8192,6 +8350,13 @@ def create_app(
                 status=status if 400 <= status < 600 else 502,
             )
         job = upstream.get("job") if isinstance(upstream.get("job"), dict) else {}
+        payment_job_id = str(job.get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", payment_job_id):
+            await payment_guard.release(email=email)
+            return web.json_response(
+                {"ok": False, "error": "PP 协议支付任务未返回有效 ID"}, status=502
+            )
+        await payment_guard.started(email, payment_job_id)
         response = web.json_response(
             {
                 "ok": True,
@@ -8203,6 +8368,8 @@ def create_app(
                 "proxyMode": proxy_mode,
                 "proxySource": proxy_source,
                 "proxyCandidateCount": len(proxy_urls),
+                "proxyBackupCount": payment_proxy_pool.backup_count,
+                "proxyExitCount": len(payment_proxy_pool.candidates),
                 "smsProvider": sms_provider,
                 "smsProviderLabel": resolved_sms.label,
                 "smsService": "paypal",
@@ -8427,6 +8594,14 @@ def create_app(
     app.router.add_post("/api/inbox/config", inbox_config)
     app.router.add_get("/api/inbox/codes", inbox_codes)
     app.router.add_post("/api/inbox/sync", inbox_sync)
+    setup_account_action_routes(
+        app,
+        base_url=browser_service_url,
+        token_validator=lambda request: _local_token_valid(request, app),
+    )
+    setup_quick_flow_history_routes(
+        app, token_validator=lambda request: _local_token_valid(request, app)
+    )
     return app
 
 

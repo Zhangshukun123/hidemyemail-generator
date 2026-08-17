@@ -1,0 +1,54 @@
+HeroSMS consecutive payment failure replacement verification
+
+BRANCH=codex/registration-reliability-98
+CHANGED_BRANCH=payment terminal result -> HeroSMS phone reuse
+CHANGED_FIELD=ReusableSmsActivationModel.recycle: payment_failures becomes consecutive; success resets it to 0; discard condition changes from >2 to >=2
+RESTORED_BEHAVIOR=failure counter is cumulative; the first two payment failures retain the phone; the third failure replaces it; success does not reset the counter
+RESTORED_STATUS=three_payment_failures_replace
+
+SOURCE_ORIGINAL_GIT_BLOB_SHA1=148b0c2a0b13957e33c99ddae7432036145d28d8
+SOURCE_MODIFIED_GIT_BLOB_SHA1=c52e83c0066e1267e222b5344906d3fe6d7ac47b
+TEST_ORIGINAL_GIT_BLOB_SHA1=2a3d152cd97076b33076eb451ceade2e3d378ff4
+TEST_MODIFIED_GIT_BLOB_SHA1=33b783e06e09de8170536c985c1060ed6d3e5a25
+ORIGINAL_FIXTURE_SHA256=FDE0106C31A19BC10037120DBA1D98376949FC7A86B5CC3D31F0A0ABF1DBB908
+MODIFIED_FIXTURE_SHA256=368F2B4157A192F5A0ACC75F73CA9475F462BB8D290B2099482B37597CE88FFB
+
+ARTIFACT_MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\phone-consecutive-failures\MODIFIED_FILE
+ARTIFACT_DIFF_FILE=D:\AI\hidemyemail-generator\verification\phone-consecutive-failures\DIFF_FILE
+ARTIFACT_VERIFICATION=D:\AI\hidemyemail-generator\verification\phone-consecutive-failures\VERIFICATION.txt
+ARTIFACT_ROLLBACK=D:\AI\hidemyemail-generator\verification\phone-consecutive-failures\ROLLBACK.sh
+
+BASELINE_COMMAND=..\.venv\Scripts\python.exe -m pytest -q --disable-warnings tests/test_sms_reuse.py
+BASELINE_INPUT=pre-change sms_reuse.py and test_sms_reuse.py at HEAD 85ae0c5e778d6c89445c5d28df4a60403dc72543; cumulative failures; replacement on failure 3
+BASELINE_LITERAL_OUTPUT=.............                                                            [100%]
+BASELINE_LITERAL_RESULT=13 passed in 0.47s
+BASELINE_EXIT_STATUS=0
+
+MODIFIED_COMMAND=..\.venv\Scripts\python.exe -m pytest -q --disable-warnings tests/test_sms_reuse.py
+MODIFIED_INPUT=current worktree; first payment failure retains original phone; second consecutive failure discards it; success between failures resets counter to 0; OAS_ERROR still discards immediately
+MODIFIED_LITERAL_OUTPUT=..............                                                           [100%]
+MODIFIED_LITERAL_RESULT=14 passed in 0.39s
+MODIFIED_EXIT_STATUS=0
+
+EXTENDED_COMMAND=..\.venv\Scripts\python.exe -m pytest -q --disable-warnings tests
+EXTENDED_INPUT=complete paypal-agreement-protocol test suite
+EXTENDED_LITERAL_OUTPUT=........................................................................ [ 84%]
+EXTENDED_LITERAL_OUTPUT=.............                                                            [100%]
+EXTENDED_LITERAL_RESULT=85 passed in 4.32s
+EXTENDED_EXIT_STATUS=0
+
+LINT_COMMAND=..\.venv\Scripts\python.exe -m ruff check paypal/sms_reuse.py tests/test_sms_reuse.py
+LINT_INPUT=MVP HeroSMS activation model/presenter and consecutive-failure tests
+LINT_LITERAL_OUTPUT=All checks passed!
+LINT_EXIT_STATUS=0
+
+ROLLBACK_COMMAND=Copy-Item -LiteralPath verification/phone-consecutive-failures/MODIFIED_FILE -Destination verification/phone-consecutive-failures/ROLLBACK_COPY -Force; & 'C:\Program Files\Git\bin\bash.exe' -lc '/d/AI/hidemyemail-generator/verification/phone-consecutive-failures/ROLLBACK.sh /d/AI/hidemyemail-generator/verification/phone-consecutive-failures/ROLLBACK_COPY'
+ROLLBACK_INPUT=D:\AI\hidemyemail-generator\verification\phone-consecutive-failures\ROLLBACK_COPY containing MODIFIED_FILE bytes
+ROLLBACK_LITERAL_OUTPUT=ROLLBACK_RESULT=restored-original
+ROLLBACK_LITERAL_OUTPUT=RESTORED_FILE=/d/AI/hidemyemail-generator/verification/phone-consecutive-failures/ROLLBACK_COPY
+ROLLBACK_LITERAL_OUTPUT=RESTORED_SHA256=fde0106c31a19bc10037120dba1d98376949fc7a86b5cc3d31f0a0abf1dbb908
+ROLLBACK_LITERAL_OUTPUT=RESTORED_BEHAVIOR=failure_counter=cumulative;replacement_on_failure_number=3;success_resets_failure_counter=false;status=three_payment_failures_replace
+ROLLBACK_EXIT_STATUS=0
+ROLLBACK_HASH_MATCH=true
+ROLLBACK_RESTORED_STATUS=three_payment_failures_replace baseline behavior restored on the rollback copy
+MODIFIED_FILE_LEFT_CHANGED=true

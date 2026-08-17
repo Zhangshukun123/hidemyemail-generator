@@ -586,8 +586,105 @@ def icloud_hme_primary_address(message: EmailMessage) -> str:
     return ""
 
 
+class KnownAddressMatcher:
+    """Match stored aliases while preserving their database priority.
+
+    The fast path indexes syntactically valid addresses extracted from a message.
+    The compatibility fallback retains the previous substring behavior for any
+    unusual legacy value that does not form a complete email token.
+    """
+
+    def __init__(self, addresses: Iterable[str]) -> None:
+        normalized = tuple(str(address or "").lower() for address in addresses)
+        self._addresses = tuple(address for address in normalized if address)
+        self._priority: dict[str, int] = {}
+        for index, address in enumerate(self._addresses):
+            self._priority.setdefault(address, index)
+
+    @classmethod
+    def from_connection(cls, conn: sqlite3.Connection) -> "KnownAddressMatcher":
+        return cls(row["email"] for row in conn.execute("SELECT email FROM addresses"))
+
+    def find(self, haystack: str) -> str:
+        candidates = {match.lower() for match in EMAIL_RE.findall(haystack)}
+        matching_indexes = (
+            self._priority[candidate]
+            for candidate in candidates
+            if candidate in self._priority
+        )
+        best_index = min(matching_indexes, default=None)
+        if best_index is not None:
+            return self._addresses[best_index]
+
+        for address in self._addresses:
+            if address in haystack:
+                return address
+        return ""
+
+    def remember(self, address: str) -> None:
+        """Add an alias discovered while the current synchronization is running."""
+
+        normalized = str(address or "").strip().lower()
+        if not normalized or normalized in self._priority:
+            return
+        self._priority[normalized] = len(self._addresses)
+        self._addresses += (normalized,)
+
+
+class InboxSyncRepository:
+    """Repository for batched reads used by one IMAP folder synchronization."""
+
+    _MAX_UIDS_PER_QUERY = 900
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def address_matcher(self) -> KnownAddressMatcher:
+        return KnownAddressMatcher.from_connection(self._conn)
+
+    def existing_messages(
+        self,
+        config: InboxConfig,
+        uids: Iterable[str],
+    ) -> dict[str, sqlite3.Row]:
+        requested_uids = list(dict.fromkeys(uids))
+        existing: dict[str, sqlite3.Row] = {}
+        for offset in range(0, len(requested_uids), self._MAX_UIDS_PER_QUERY):
+            chunk = requested_uids[offset : offset + self._MAX_UIDS_PER_QUERY]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"""
+                SELECT id, uid, sender, recipients, hme_address, subject, code,
+                       body_preview, received_at
+                FROM messages
+                WHERE account_key = ? AND folder = ? AND uid IN ({placeholders})
+                """,
+                (config.account_key, config.folder, *chunk),
+            )
+            existing.update((str(row["uid"]), row) for row in rows)
+        return existing
+
+    def existing_message(
+        self,
+        config: InboxConfig,
+        uid: str,
+    ) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT id, uid, sender, recipients, hme_address, subject, code,
+                   body_preview, received_at
+            FROM messages
+            WHERE account_key = ? AND folder = ? AND uid = ?
+            """,
+            (config.account_key, config.folder, uid),
+        ).fetchone()
+
+
 def find_hme_address(
-    conn: sqlite3.Connection, message: EmailMessage, body: str
+    conn: sqlite3.Connection,
+    message: EmailMessage,
+    body: str,
+    address_matcher: Optional[KnownAddressMatcher] = None,
 ) -> tuple[str, str]:
     recipient_headers = [
         "To",
@@ -607,11 +704,10 @@ def find_hme_address(
         [message.get(name, "") for name in recipient_headers] + [body]
     ).lower()
 
-    known = conn.execute("SELECT email FROM addresses").fetchall()
-    for row in known:
-        email = row["email"].lower()
-        if email in haystack:
-            return email, ", ".join(recipients)
+    matcher = address_matcher or KnownAddressMatcher.from_connection(conn)
+    known_address = matcher.find(haystack)
+    if known_address:
+        return known_address, ", ".join(recipients)
 
     for email in recipients:
         if email.endswith("@icloud.com"):
@@ -624,12 +720,18 @@ def message_to_record(
     config: InboxConfig,
     uid: str,
     raw_message: bytes,
+    address_matcher: Optional[KnownAddressMatcher] = None,
 ) -> dict:
     message = BytesParser(policy=policy.default).parsebytes(raw_message)
     subject = str(message.get("Subject", ""))
     sender = ", ".join(header_addresses(message, ["From"]))
     body = get_message_body(message)
-    hme_address, recipients = find_hme_address(conn, message, body)
+    hme_address, recipients = find_hme_address(
+        conn,
+        message,
+        body,
+        address_matcher,
+    )
     code = extract_verification_code(subject, body)
     preview = normalize_space(body)[:500]
     received_at = parse_received_at(message)
@@ -781,18 +883,18 @@ def _sync_selected_folder(
     # verification code should not be blocked behind the older backlog.
     uids.reverse()
 
+    uid_pairs = [
+        (raw_uid, raw_uid.decode("ascii", errors="ignore")) for raw_uid in uids
+    ]
+    repository = InboxSyncRepository(conn)
+    existing_messages = repository.existing_messages(
+        config,
+        (uid for _, uid in uid_pairs),
+    )
+    address_matcher: Optional[KnownAddressMatcher] = None
     inserted: list[dict] = []
-    for raw_uid in uids:
-        uid = raw_uid.decode("ascii", errors="ignore")
-        existing = conn.execute(
-            """
-            SELECT id, sender, recipients, hme_address, subject, code,
-                   body_preview, received_at
-            FROM messages
-            WHERE account_key = ? AND folder = ? AND uid = ?
-            """,
-            (config.account_key, config.folder, uid),
-        ).fetchone()
+    for raw_uid, uid in uid_pairs:
+        existing = existing_messages.get(uid)
         if existing and str(existing["hme_address"] or "").strip():
             continue
 
@@ -808,11 +910,26 @@ def _sync_selected_folder(
         if not raw_message:
             continue
 
-        record = message_to_record(conn, config, uid, raw_message)
+        if address_matcher is None:
+            address_matcher = repository.address_matcher()
+        record = message_to_record(
+            conn,
+            config,
+            uid,
+            raw_message,
+            address_matcher,
+        )
+        address_matcher.remember(str(record.get("hme_address") or ""))
         if existing:
             repair_incomplete_message(conn, existing, record)
         elif insert_message(conn, record):
             inserted.append(record)
+        else:
+            # A second process may have inserted the UID after our batched read.
+            # Backfill its incomplete row with this process's parsed fields.
+            concurrent = repository.existing_message(config, uid)
+            if concurrent:
+                repair_incomplete_message(conn, concurrent, record)
     return inserted
 
 

@@ -17,20 +17,32 @@ def test_host_payment_view_uses_compact_accessible_workbench_shell() -> None:
     assert 'class="pp-payment-kicker">PAYPAL AGREEMENT' in page
     assert 'class="pp-payment-empty-copy" role="status" aria-live="polite"' in page
     assert 'class="button pp-payment-retry"' in page
-    assert ".pp-payment-view:not([hidden])" in styles
+    assert ".workspace > .pp-payment-view:not([hidden])" in styles
     assert "grid-template-rows: auto minmax(0, 1fr)" in styles
     assert ".pp-payment-frame-shell { height: auto; min-height: 0;" in styles
+    assert ".pp-payment-empty-copy { width: min(520px, 100%); min-width: 0;" in styles
+    assert "overflow-wrap: anywhere" in styles
+    assert "body:has(.workspace > .pp-payment-view:not([hidden])) .app-shell" in styles
     assert ".pp-payment-frame-shell { height: calc(100vh - 230px); min-height: 620px" not in styles
 
 
 def test_host_presenter_builds_embedded_theme_and_job_urls() -> None:
     script = HOST_JS.read_text(encoding="utf-8")
 
+    assert "class PayPalWorkspaceModel" in script
+    assert "class PayPalWorkspaceView" in script
     assert "class PayPalWorkspacePresenter" in script
     assert 'url.searchParams.set("embedded", "1")' in script
-    assert 'url.searchParams.set("theme", document.documentElement.dataset.theme || "dark")' in script
+    assert 'url.searchParams.set("theme", theme || "dark")' in script
     assert 'url.searchParams.set("job", jobId)' in script
-    assert "paypalWorkspacePresenter.frameUrl(baseUrl, jobId)" in script
+    assert "this.model.frameUrl(baseUrl || this.view.fallbackUrl(), jobId, this.view.theme())" in script
+    assert "paypalWorkspacePresenter.open(this.store.state.paypal.url, jobId)" in script
+    assert 'event.data?.type !== "paypal-workspace-ready"' in script
+    assert 'paypal: {running: false, error: error.message || String(error)}' in script
+    assert 'this.view.frame.dataset.loadError = "1"' in script
+    assert "this.view.resetLifecycle(); this.view.showUnavailable" in script
+    assert "this.serviceRunning = false; clearTimeout(this.readyTimer)" in script
+    assert "paypalWorkspacePresenter.render(state.paypal || {})" in script
     assert '(data.url || "/paypal-pay/") + "?job="' not in script
     assert len(script.splitlines()) <= 5000
 
@@ -46,6 +58,7 @@ def test_protocol_page_loads_adapter_last_and_uses_mvp_shell() -> None:
     assert "new MutationObserver" in script
     assert "event.origin !== location.origin" in script
     assert "window.self !== window.top" in script
+    assert "window.parent.postMessage({type: 'paypal-workspace-ready'}, location.origin)" in script
 
 
 def test_protocol_adapter_matches_host_tokens_and_removes_duplicate_chrome() -> None:
@@ -57,4 +70,5 @@ def test_protocol_adapter_matches_host_tokens_and_removes_duplicate_chrome() -> 
     assert "html.embedded .protocol-hero" in styles
     assert "html.embedded footer" in styles
     assert "html.embedded .workspace-grid" in styles
+    assert "html.embedded .auto-handoff-mode .workspace-grid" in styles
     assert "border-radius: 4px" in styles

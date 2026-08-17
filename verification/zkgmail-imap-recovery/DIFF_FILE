@@ -1,0 +1,58 @@
+--- ORIGINAL_FILE
++++ MODIFIED_FILE
+@@ -5,9 +5,18 @@
+ import re
+ from dataclasses import dataclass
+ 
+ 
++def _environment_value(name: str, default: str | int | float) -> str:
++    """Normalize values from Compose and raw Docker ``--env-file`` inputs."""
++
++    value = str(os.environ.get(name, default)).strip()
++    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
++        return value[1:-1]
++    return value
++
++
+ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+     try:
+-        value = int(os.environ.get(name, default))
++        value = int(_environment_value(name, default))
+     except (TypeError, ValueError):
+         value = default
+     return min(maximum, max(minimum, value))
+@@ -15,14 +24,14 @@
+ 
+ def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+     try:
+-        value = float(os.environ.get(name, default))
++        value = float(_environment_value(name, default))
+     except (TypeError, ValueError):
+         value = default
+     return min(maximum, max(minimum, value))
+ 
+ 
+ def _header_name(name: str, default: str) -> str:
+-    value = str(os.environ.get(name, default)).strip()
++    value = _environment_value(name, default)
+     return value if re.fullmatch(r"[A-Za-z0-9-]{1,64}", value) else default
+@@ -60,11 +69,11 @@
+     @classmethod
+     def from_env(cls) -> "Settings":
+         return cls(
+-            imap_host=str(os.environ.get("ZKGMAIL_IMAP_HOST", "imap.qq.com")).strip(),
++            imap_host=_environment_value("ZKGMAIL_IMAP_HOST", "imap.qq.com"),
+             imap_port=_bounded_int("ZKGMAIL_IMAP_PORT", 993, 1, 65535),
+-            imap_username=str(os.environ.get("ZKGMAIL_IMAP_USERNAME", "")).strip(),
+-            imap_password=str(os.environ.get("ZKGMAIL_IMAP_PASSWORD", "")).strip(),
+-            imap_folder=str(os.environ.get("ZKGMAIL_IMAP_FOLDER", "INBOX")).strip() or "INBOX",
++            imap_username=_environment_value("ZKGMAIL_IMAP_USERNAME", ""),
++            imap_password=_environment_value("ZKGMAIL_IMAP_PASSWORD", ""),
++            imap_folder=_environment_value("ZKGMAIL_IMAP_FOLDER", "INBOX") or "INBOX",
+             imap_timeout_seconds=_bounded_int("ZKGMAIL_IMAP_TIMEOUT_SECONDS", 20, 3, 60),
+@@ -80,7 +89,7 @@
+             imap_max_concurrent_queries=_bounded_int(
+                 "ZKGMAIL_IMAP_MAX_CONCURRENT_QUERIES", 2, 1, 8
+             ),
+-            access_token=str(os.environ.get("ZKGMAIL_ACCESS_TOKEN", "")).strip(),
++            access_token=_environment_value("ZKGMAIL_ACCESS_TOKEN", ""),

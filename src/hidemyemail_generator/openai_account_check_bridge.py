@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hidemyemail_generator.openai_browser_bridge import ensure_tkinter_importable
+from hidemyemail_generator.account_plan import AccountPlanPresenter
 
 
 EVENT_PREFIX = "HME_VERIFY_EVENT:"
@@ -38,42 +38,39 @@ def main() -> int:
         emit({"status": "error", "detail": "Access Token 为空"})
         return 2
 
-    source_dir = Path(args.source_dir).resolve()
-    sys.path.insert(0, str(source_dir))
-    ensure_tkinter_importable()
     try:
-        import app_backend
-    except Exception as error:
-        emit({"status": "error", "detail": f"账号验证模块加载失败：{error}"})
-        return 2
-
-    try:
-        account_type, detail = app_backend.opll_detect_account_type(
-            token, request_locale=args.locale
+        result = AccountPlanPresenter().check(
+            token,
+            proxy_url=str(os.environ.get("HME_OPENAI_PLAN_PROXY_URL") or ""),
+            device_id=str(os.environ.get("HME_OPENAI_PLAN_DEVICE_ID") or ""),
+            language=str(
+                os.environ.get("HME_OPENAI_PLAN_LANGUAGE") or args.locale or "en-US"
+            ),
+            timezone_offset_min=str(
+                os.environ.get("HME_OPENAI_PLAN_TIMEZONE_OFFSET_MIN") or "-"
+            ),
         )
-    except app_backend.OpllAccountPlanUnknownError as error:
-        # An authenticated response without a reliable plan field is not proof
-        # of a Free account. Keep the existing classification so a Plus account
-        # cannot later be deleted after being incorrectly downgraded to Free.
-        emit({"status": "error", "detail": f"套餐不明确，账号已保留：{error}"})
-        return 1
-    except app_backend.OpllAccountInvalidError as error:
-        detail = str(error)
-        # Delete only when both independent account endpoints explicitly report
-        # an unauthenticated (401) token. A 403 can be returned by account-plan
-        # permissions, edge protection, or regional policy for a valid Plus AT.
-        if confirmed_invalid(detail):
-            emit({"status": "invalid", "detail": detail})
-            return 0
-        emit({"status": "error", "detail": f"验证结果不确定，已保留账号：{detail}"})
-        return 1
     except Exception as error:
         emit({"status": "error", "detail": str(error)})
         return 1
 
-    normalized = "plus" if account_type in {"plus", "team", "pro"} else "free"
-    emit({"status": normalized, "detail": str(detail or "在线验证通过")})
-    return 0
+    payload = {
+        "detail": str(result.detail or "AT 在线套餐查询完成"),
+        "source": str(result.source or "accounts_check"),
+        "http_status": result.http_status,
+        "plan_type": str(result.plan_type or ""),
+        "account_id": str(result.account_id or ""),
+        "has_active_subscription": bool(result.has_active_subscription),
+        "plus_trial_eligible": bool(result.plus_trial_eligible),
+    }
+    if result.status in {"plus", "free"}:
+        emit({"status": result.status, **payload})
+        return 0
+    if result.needs_refresh:
+        emit({"status": "invalid", "needs_refresh": True, **payload})
+        return 0
+    emit({"status": "error", "needs_refresh": False, **payload})
+    return 1
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import secrets
 import string
 import threading
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -106,6 +108,13 @@ def _normalize_country(value: Any) -> str:
     if country not in PROXY_COUNTRIES:
         raise ValueError("不支持的代理国家")
     return country
+
+
+def _normalize_exit_ip(value: Any) -> str:
+    try:
+        return ipaddress.ip_address(str(value or "").strip()).compressed
+    except ValueError:
+        return ""
 
 
 class CardLinkProxyCountryPolicy:
@@ -281,6 +290,12 @@ class RegistrationProxyStore:
             "lastExitCountry": "",
             "lastProxyUrl": "",
             "lastSwitchedAt": "",
+            "lastCardLinkExitIp": "",
+            "lastCardLinkExitCountry": "",
+            "lastCardLinkSwitchedAt": "",
+            "lastPaymentExitIps": [],
+            "lastPaymentExitCountry": "",
+            "lastPaymentSwitchedAt": "",
             "updatedAt": "",
             "cardLinkCountries": dict(CARD_LINK_PROXY_COUNTRY_DEFAULTS),
             "cardLinkModes": _normalize_card_link_modes({}),
@@ -328,6 +343,20 @@ class RegistrationProxyStore:
         except (TypeError, ValueError):
             state["rotationCursor"] = 0
         state["enabled"] = bool(state.get("enabled"))
+        state["lastCardLinkExitIp"] = _normalize_exit_ip(
+            state.get("lastCardLinkExitIp")
+        )
+        payment_exit_values = state.get("lastPaymentExitIps")
+        payment_exit_values = (
+            payment_exit_values if isinstance(payment_exit_values, list) else []
+        )
+        state["lastPaymentExitIps"] = list(
+            dict.fromkeys(
+                normalized
+                for value in payment_exit_values[:10]
+                if (normalized := _normalize_exit_ip(value))
+            )
+        )
         state["cardLinkCountries"] = _normalize_card_link_countries(
             state.get("cardLinkCountries")
         )
@@ -451,6 +480,14 @@ class RegistrationProxyStore:
             "exitCountry": str(state.get("lastExitCountry") or ""),
             "exitIpVerified": bool(state.get("lastExitIp")),
             "lastSwitchedAt": str(state.get("lastSwitchedAt") or ""),
+            "cardLinkExitIpVerified": bool(state.get("lastCardLinkExitIp")),
+            "lastCardLinkSwitchedAt": str(
+                state.get("lastCardLinkSwitchedAt") or ""
+            ),
+            "paymentExitCount": len(state.get("lastPaymentExitIps") or []),
+            "lastPaymentSwitchedAt": str(
+                state.get("lastPaymentSwitchedAt") or ""
+            ),
             "updatedAt": str(state.get("updatedAt") or ""),
             "cardLinkCountries": dict(state["cardLinkCountries"]),
             "cardLinkModes": dict(state["cardLinkModes"]),
@@ -479,6 +516,63 @@ class RegistrationProxyStore:
 
     def public_state(self) -> dict[str, Any]:
         return self._public_state_from(self.load())
+
+    def last_card_link_exit_ip(self) -> str:
+        with self._rotation_lock:
+            return str(self.load().get("lastCardLinkExitIp") or "")
+
+    def remember_card_link_exit(self, exit_ip: str, country: str) -> None:
+        normalized_ip = _normalize_exit_ip(exit_ip)
+        if not normalized_ip:
+            raise ValueError("提链代理出口 IP 无效")
+        normalized_country = _normalize_country(country)
+        with self._rotation_lock:
+            state = self.load()
+            state.update(
+                {
+                    "lastCardLinkExitIp": normalized_ip,
+                    "lastCardLinkExitCountry": normalized_country,
+                    "lastCardLinkSwitchedAt": _utc_now(),
+                }
+            )
+            self._save(state)
+
+    def last_payment_exit_ips(self) -> tuple[str, ...]:
+        with self._rotation_lock:
+            values = self.load().get("lastPaymentExitIps") or []
+            return tuple(str(value) for value in values if value)
+
+    def remember_payment_exits(
+        self,
+        exit_ips: Iterable[str],
+        country: str,
+    ) -> None:
+        normalized_ips = list(
+            dict.fromkeys(
+                normalized
+                for value in exit_ips
+                if (normalized := _normalize_exit_ip(value))
+            )
+        )
+        if not normalized_ips:
+            raise ValueError("支付代理出口 IP 无效")
+        normalized_country = _normalize_country(country)
+        with self._rotation_lock:
+            state = self.load()
+            previous_ips = [
+                normalized
+                for value in state.get("lastPaymentExitIps") or []
+                if (normalized := _normalize_exit_ip(value))
+            ]
+            exit_history = list(dict.fromkeys([*normalized_ips, *previous_ips]))
+            state.update(
+                {
+                    "lastPaymentExitIps": exit_history[:10],
+                    "lastPaymentExitCountry": normalized_country,
+                    "lastPaymentSwitchedAt": _utc_now(),
+                }
+            )
+            self._save(state)
 
     def configure(
         self,

@@ -1,0 +1,4 @@
+FROM zkgmail-code-server:1.1.0
+
+COPY MODIFIED_FILE /usr/local/lib/python3.13/site-packages/zkgmail_code_server/static/index.html
+COPY MODIFIED_APP.js /usr/local/lib/python3.13/site-packages/zkgmail_code_server/static/app.js

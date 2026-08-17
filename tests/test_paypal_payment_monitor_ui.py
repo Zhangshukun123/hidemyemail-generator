@@ -8,6 +8,83 @@ from hidemyemail_generator.web_ui import build_app_page
 from tests.test_runtime_log_ui import _runtime_state_payloads
 
 
+def test_payment_outcome_keeps_protocol_success_when_cookie_at_refresh_fails():
+    html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
+    payloads = _runtime_state_payloads()
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+
+        def fulfill(route):
+            path = urlparse(route.request.url).path
+            if path == "/":
+                route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=html,
+                )
+                return
+            route.fulfill(
+                status=200,
+                content_type="application/json; charset=utf-8",
+                body=json.dumps(payloads.get(path, {"ok": True}), ensure_ascii=False),
+            )
+
+        page.route("**/*", fulfill)
+        page.goto("http://hme-payment-outcome.test/#quick-flow", wait_until="domcontentloaded")
+        model = page.evaluate(
+            """() => {
+              const job = {
+                id: "payment-job-refresh-failed",
+                status: "completed",
+                result: {status: "success", settlement_status: "confirmed"},
+                account_confirmation: {
+                  status: "refresh_failed",
+                  protocol_succeeded: true,
+                  payment_succeeded: true,
+                  plus_confirmed: false,
+                  account_type: "unverified",
+                  detail: "协议支付账号未保存原注册代理，无法用 Cookie 刷新新 AT",
+                },
+              };
+              const outcome = window.PaymentOutcomeModel.classify(job);
+              const snapshot = new window.PayPalPaymentJobModel({
+                paymentJobId: job.id,
+              }).apply(job);
+              const item = {
+                ok: true,
+                email: "refresh-failed@icloud.com",
+                url: "https://www.paypal.com/agreements/approve?ba_token=test",
+                paymentStarted: true,
+                ...snapshot.fields,
+              };
+              const presenter = new window.QuickFlowAccountResultPresenter(
+                {}, {state: {}}, {confirmRemoval: () => false},
+              );
+              return {
+                paymentSucceeded: snapshot.fields.paymentSucceeded,
+                plusConfirmed: snapshot.fields.paymentPlusConfirmed,
+                paymentError: snapshot.fields.paymentError,
+                confirmationError: snapshot.fields.paymentConfirmationError,
+                terminal: snapshot.terminal,
+                rendered: presenter.render(item, {}, {runId: "flow-1", status: "completed"},
+                  () => "", () => ""),
+              };
+            }"""
+        )
+
+        assert model["paymentSucceeded"] is True
+        assert model["plusConfirmed"] is False
+        assert model["paymentError"] == ""
+        assert model["terminal"] is True
+        assert "无法用 Cookie 刷新新 AT" in model["confirmationError"]
+        assert "支付成功 · AT/Plus 后置校验失败" in model["rendered"]
+        assert "协议支付失败" not in model["rendered"]
+        assert "支付后状态" in model["rendered"]
+        browser.close()
+
+
 def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation():
     html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
     payloads = _runtime_state_payloads()
@@ -121,7 +198,15 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
                             "emails": [email],
                             "total": 1,
                             "completed": 1,
-                            "logs": [],
+                            "logs": [
+                                {
+                                    "at": "2026-08-17T12:00:00+00:00",
+                                    "message": "注册完成，Session 已保存",
+                                    "status": "success",
+                                    "sequence": 1,
+                                    "taskId": "registration-monitor",
+                                }
+                            ],
                         }
                     ],
                     "logs": [],
@@ -166,14 +251,17 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
                                 "status": "plus" if plus_confirmed else "retrying",
                                 "protocol_succeeded": True,
                                 "plus_confirmed": plus_confirmed,
-                                "payment_succeeded": plus_confirmed,
-                                "at_refreshed": True,
-                                "account_type": "plus" if plus_confirmed else "free",
-                                "plan": "plus" if plus_confirmed else "free",
+                                "payment_succeeded": True,
+                                "at_refreshed": plus_confirmed,
+                                "account_type": "plus" if plus_confirmed else "unverified",
+                                "plan": "plus" if plus_confirmed else "",
+                                "attempt": 1 if plus_confirmed else 0,
+                                "max_attempts": 3,
+                                "retry_after": 0 if plus_confirmed else time.time() + 10,
                                 "detail": (
                                     "支付后 Cookie 已刷新新 AT，已确认 Plus"
                                     if plus_confirmed
-                                    else "新 AT 暂为 Free，等待套餐传播后重试"
+                                    else "协议支付成功；等待 10 秒后进行第 1/3 次 Cookie 登录获取新 AT"
                                 ),
                                 "checked_at": "2026-08-17T12:00:00+00:00",
                             }
@@ -216,6 +304,12 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
         assert page.locator("#quickFlowPaymentCount").inner_text() == "1"
         assert "新 AT 已确认 Plus" in page.locator("#quickFlowResults").inner_text()
         assert "支付后 Cookie 已刷新新 AT" in page.locator("#terminalPreviewList").inner_text()
+        assert "等待 10 秒后进行第 1/3 次" in page.locator(
+            "#terminalPreviewList"
+        ).inner_text()
+        assert page.locator("#terminalPreviewList .terminal-preview-row p").all_inner_texts().count(
+            "注册完成，Session 已保存"
+        ) == 1
         assert "查看 PP 支付" not in page.locator("#quickFlowResults").inner_text()
         assert page.url.endswith("#quick-flow")
         assert page_errors == []

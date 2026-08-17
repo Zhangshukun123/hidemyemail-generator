@@ -26,13 +26,14 @@ def _runtime_state_payloads() -> dict[str, dict]:
     logs[0]["message"] = (
         "详细消息 0：启动参数 password=SuperSecret! Bearer eyJabc.def.ghi "
         "Cookie: session=raw-cookie proxy=http://proxy-user:proxy-pass@proxy.test:8080 "
+        "; cf_clearance=SecondCookieSecret "
         'JSON {"password":"SecretJson","totp":"ABCDEF","session":"Sess123",'
         '"token":"Tok123","twoFactorSecret":"TwoFA123"}'
     )
     logs[1]["message"] = (
         'JSON {"otp":"654321","verificationCode":"123456","sessionId":"SessID",'
         '"authToken":"AuthTok","proxyPassword":"ProxyPw",'
-        '"openaiKey":"sk-proj-abc123"}'
+        '"openaiKey":"sk-proj-abc123"} 验证码为 778899 verification code is 445566'
     )
     registration = {
         "ok": True,
@@ -219,6 +220,10 @@ def test_terminal_is_the_only_log_surface_and_renders_all_redacted_task_logs():
         rows = terminal.locator(".terminal-preview-row")
         assert terminal_panel.is_visible()
         assert page.locator("#terminalPreviewTitle").inner_text() == "终端"
+        assert page.locator("#terminalSessionSelect option").count() == 2
+        assert page.locator("#terminalSessionSelect").input_value() == (
+            "registration:registration-current"
+        )
         assert rows.count() == 20
 
         first_row = rows.first
@@ -263,6 +268,9 @@ def test_terminal_is_the_only_log_surface_and_renders_all_redacted_task_logs():
             "AuthTok",
             "ProxyPw",
             "sk-proj-abc123",
+            "SecondCookieSecret",
+            "778899",
+            "445566",
         ):
             assert secret not in terminal_text
         assert "[REDACTED]" in terminal_text
@@ -294,4 +302,181 @@ def test_terminal_is_the_only_log_surface_and_renders_all_redacted_task_logs():
         assert set(request_methods) == {"GET"}
         assert page_errors == []
         assert console_errors == []
+        browser.close()
+
+
+def test_terminal_keeps_concurrent_protocol_logs_in_selectable_sessions():
+    html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
+    payloads = _runtime_state_payloads()
+    payloads["/api/registration/status"] = {
+        "ok": True,
+        "status": "idle",
+        "running": False,
+        "logs": [],
+        "runtime": {"available": True},
+    }
+    first_logs = [
+        {
+            "at": "2026-08-17T06:30:01.000000+00:00",
+            "email": "first@zkgmail.com",
+            "message": "A_ONLY_LOG_1：第一个流程开始",
+            "status": "active",
+            "sequence": 1,
+            "taskId": "protocol-first",
+        },
+        {
+            "at": "2026-08-17T06:30:02.000000+00:00",
+            "email": "first@zkgmail.com",
+            "message": "A_ONLY_LOG_2：第一个流程等待验证码",
+            "status": "waiting",
+            "sequence": 2,
+            "taskId": "protocol-first",
+        },
+    ]
+    second_logs = [
+        {
+            "at": "2026-08-17T06:31:01.000000+00:00",
+            "email": "second@zkgmail.com",
+            "message": "B_ONLY_LOG_1：第二个流程开始",
+            "status": "active",
+            "sequence": 1,
+            "taskId": "protocol-second",
+        },
+        {
+            "at": "2026-08-17T06:31:02.000000+00:00",
+            "email": "second@zkgmail.com",
+            "message": "B_ONLY_LOG_2：第二个流程保存 Session",
+            "status": "success",
+            "sequence": 2,
+            "taskId": "protocol-second",
+        },
+    ]
+    protocol_state = {
+        "ok": True,
+        "id": "protocol-second",
+        "status": "running",
+        "running": True,
+        "runningCount": 2,
+        "processCount": 2,
+        "startedAt": "2026-08-17T06:30:00.000000+00:00",
+        "logs": [
+            {**entry, "message": "[顶层合并] " + entry["message"]}
+            for entry in [*first_logs, *second_logs]
+        ],
+        "tasks": [
+            {
+                "id": "protocol-first",
+                "processId": "protocol-first",
+                "processLabel": "协议流程 01 · first@zkgmail.com",
+                "status": "running",
+                "running": True,
+                "startedAt": "2026-08-17T06:30:00.000000+00:00",
+                "currentEmail": "first@zkgmail.com",
+                "logs": first_logs,
+            },
+            {
+                "id": "protocol-second",
+                "processId": "protocol-second",
+                "processLabel": "协议流程 02 · second@zkgmail.com",
+                "status": "running",
+                "running": True,
+                "startedAt": "2026-08-17T06:31:00.000000+00:00",
+                "currentEmail": "second@zkgmail.com",
+                "logs": second_logs,
+            },
+        ],
+        "runtime": {"available": True},
+    }
+    payloads["/api/protocol-registration/status"] = protocol_state
+    page_errors: list[str] = []
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        context = browser.new_context(viewport={"width": 1586, "height": 992})
+        context.add_init_script(
+            "localStorage.setItem('hme_workspace_auto_refresh', '0');"
+            "localStorage.setItem('hme_workspace_refresh_interval', '5000');"
+        )
+        page = context.new_page()
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+        def fulfill(route):
+            path = urlparse(route.request.url).path
+            if path == "/":
+                route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=html,
+                )
+                return
+            route.fulfill(
+                status=200,
+                content_type="application/json; charset=utf-8",
+                body=json.dumps(payloads.get(path, {"ok": True}), ensure_ascii=False),
+            )
+
+        page.route("**/*", fulfill)
+        page.goto("http://hme-control-center.test/#overview", wait_until="domcontentloaded")
+        selector = page.locator("#terminalSessionSelect")
+        terminal = page.locator("#terminalPreviewList")
+        page.wait_for_function(
+            "document.querySelectorAll('#terminalSessionSelect option').length === 2 && "
+            "document.querySelectorAll('#terminalPreviewList .terminal-preview-row').length === 2"
+        )
+
+        assert selector.get_attribute("aria-label") == "选择日志会话"
+        assert selector.input_value() == "protocol:protocol-second"
+        assert "协议流程 01 · first@zkgmail.com" in selector.inner_text()
+        assert "协议流程 02 · second@zkgmail.com" in selector.inner_text()
+        assert "B_ONLY_LOG_1" in terminal.inner_text()
+        assert "A_ONLY_LOG_1" not in terminal.inner_text()
+        assert "[顶层合并]" not in terminal.inner_text()
+
+        selector.select_option("protocol:protocol-first")
+        assert terminal.get_attribute("data-session-id") == "protocol:protocol-first"
+        assert "A_ONLY_LOG_1" in terminal.inner_text()
+        assert "B_ONLY_LOG_1" not in terminal.inner_text()
+
+        first_logs.append(
+            {
+                "at": "2026-08-17T06:32:00.000000+00:00",
+                "email": "first@zkgmail.com",
+                "message": "A_ONLY_LOG_3：第一个流程已完成",
+                "status": "success",
+                "sequence": 3,
+                "taskId": "protocol-first",
+            }
+        )
+        second_logs.append(
+            {
+                "at": "2026-08-17T06:32:01.000000+00:00",
+                "email": "second@zkgmail.com",
+                "message": "B_ONLY_LOG_3：第二个流程继续运行",
+                "status": "active",
+                "sequence": 3,
+                "taskId": "protocol-second",
+            }
+        )
+        protocol_state["runningCount"] = 1
+        protocol_state["tasks"][0].update(
+            status="completed",
+            running=False,
+            finishedAt="2026-08-17T06:32:00.000000+00:00",
+        )
+        page.locator("#workspaceAutoRefresh").check()
+        page.wait_for_function(
+            "document.getElementById('terminalPreviewList').textContent.includes('A_ONLY_LOG_3')",
+            timeout=9_000,
+        )
+
+        assert selector.input_value() == "protocol:protocol-first"
+        assert "A_ONLY_LOG_3" in terminal.inner_text()
+        assert "B_ONLY_LOG_3" not in terminal.inner_text()
+        assert "已完成" in selector.locator("option:checked").inner_text()
+        assert selector.locator("option").count() == 2
+
+        selector.select_option("protocol:protocol-second")
+        assert "B_ONLY_LOG_3" in terminal.inner_text()
+        assert "A_ONLY_LOG_3" not in terminal.inner_text()
+        assert page_errors == []
         browser.close()

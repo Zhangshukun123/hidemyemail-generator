@@ -447,7 +447,28 @@ def account_session_token_cookie(record: dict[str, Any]) -> list[dict[str, Any]]
 
 
 def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return reusable browser cookies from current and legacy account fields."""
+    """Merge reusable cookies instead of letting a minimal storage state hide them."""
+
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def merge_cookie_list(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return
+        if not isinstance(value, list):
+            return
+        for raw_cookie in value:
+            if not isinstance(raw_cookie, dict):
+                continue
+            cookie = dict(raw_cookie)
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            domain = str(cookie.get("domain") or "chatgpt.com").strip().lower()
+            path = str(cookie.get("path") or "/").strip() or "/"
+            merged[(name, domain.lstrip("."), path)] = cookie
 
     raw_state = record.get("storage_state_json")
     if isinstance(raw_state, str) and raw_state.strip():
@@ -456,24 +477,13 @@ def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
         except (json.JSONDecodeError, TypeError, ValueError):
             raw_state = {}
     if isinstance(raw_state, dict):
-        cookies = raw_state.get("cookies")
-        if isinstance(cookies, list):
-            normalized = [dict(item) for item in cookies if isinstance(item, dict)]
-            if normalized:
-                return normalized
+        merge_cookie_list(raw_state.get("cookies"))
 
-    for key in ("cookies", "cookies_json"):
-        cookies = record.get(key)
-        if isinstance(cookies, str) and cookies.strip():
-            try:
-                cookies = json.loads(cookies)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-        if isinstance(cookies, list):
-            normalized = [dict(item) for item in cookies if isinstance(item, dict)]
-            if normalized:
-                return normalized
-    return account_session_token_cookie(record)
+    # The protocol flow deliberately keeps a minimal Playwright storage state
+    # and a fuller HTTP cookie jar. Later sources win for duplicate identities.
+    merge_cookie_list(record.get("cookies"))
+    merge_cookie_list(record.get("cookies_json"))
+    return list(merged.values()) or account_session_token_cookie(record)
 
 
 def account_registration_proxy_url(record: dict[str, Any]) -> str:
@@ -563,7 +573,13 @@ def _save_account_record(
                 parsed_session = session_json
             current["session"] = parsed_session
             session_type, raw_plan = session_account_type(parsed_session)
-            if session_type and current.get("account_type_source") != "manual":
+            current_source = str(
+                current.get("account_type_source") or ""
+            ).strip().lower()
+            # Session/JWT plan fields can lag behind a just-completed upgrade.
+            # Keep the last live accounts/check or payment projection until a
+            # later successful online plan query replaces it.
+            if session_type and current_source in {"", "session"}:
                 current["account_type"] = session_type
                 current["account_type_source"] = "session"
                 current["verified_at"] = utc_now()

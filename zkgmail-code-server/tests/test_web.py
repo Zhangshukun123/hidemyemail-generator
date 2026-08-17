@@ -67,7 +67,11 @@ class PortalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('class="steps"', page)
         self.assertNotIn("QQ 邮箱收件", page)
         self.assertNotIn("重复接码", page)
-        self.assertIn("/api/code/latest", await (await self.client.get("/assets/app.js")).text())
+        self.assertIn("/assets/app.js?v=1.3.2", page)
+        script = await (await self.client.get("/assets/app.js")).text()
+        self.assertIn("/api/code/latest", script)
+        self.assertIn("timeoutMs: 180 * 1000", script)
+        self.assertIn('timeoutLabel: "3 分钟"', script)
         self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
 
     async def test_lookup_returns_non_consuming_code_payload(self):

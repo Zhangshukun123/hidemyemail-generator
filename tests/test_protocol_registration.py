@@ -3211,6 +3211,75 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("password", record)
         self.assertNotIn("two_factor", record)
 
+    async def test_protocol_success_queries_plan_with_saved_at_and_persists_proxy(self):
+        checked = []
+
+        class ProxyStore:
+            def next_proxy(self):
+                return "http://127.0.0.1:19011", {
+                    "mode": "clash",
+                    "country": "JP",
+                    "countryLabel": "日本",
+                    "endpoint": "127.0.0.1:19011",
+                }
+
+        async def runner(payload, on_event):
+            del on_event
+            token = "header.fresh-free.signature"
+            return {
+                "status": "success",
+                "email": payload["email"],
+                "access_token": token,
+                "session_json": json.dumps(
+                    {
+                        "accessToken": token,
+                        "sessionToken": "session-token",
+                        "account": {"planType": "free"},
+                    }
+                ),
+                "cookies_json": json.dumps([]),
+                "storage_state_json": json.dumps({"cookies": [], "origins": []}),
+                "session_acquisition_method": "gptfree_mail_auth",
+            }
+
+        async def verify_account_plan(email):
+            record = load_account_record(self.db_file, email)
+            checked.append((email, record["access_token"]))
+            return {
+                "status": "free",
+                "source": "access_token_online",
+                "detail": "AT 在线套餐查询完成",
+            }
+
+        manager = ProtocolRegistrationManager(
+            base_dir=self.base_dir,
+            db_file=self.db_file,
+            proxy_store=ProxyStore(),
+            worker_runner=runner,
+            verify_account_plan=verify_account_plan,
+        )
+        manager.start(
+            emails=["plan-check@icloud.com"],
+            base_url="http://127.0.0.1:8080",
+            concurrency=1,
+            setup_credentials=False,
+        )
+
+        final = await manager.wait()
+
+        self.assertEqual(
+            checked,
+            [("plan-check@icloud.com", "header.fresh-free.signature")],
+        )
+        record = load_account_record(self.db_file, "plan-check@icloud.com")
+        self.assertEqual(
+            record["registration_proxy_url"], "http://127.0.0.1:19011"
+        )
+        self.assertEqual(final["accounts"][0]["accountType"], "free")
+        self.assertTrue(
+            any("AT 套餐查询完成：Free" in item["message"] for item in final["logs"])
+        )
+
     async def test_success_requires_and_persists_password_two_factor_and_session(self):
         captured = []
 

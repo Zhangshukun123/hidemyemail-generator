@@ -1682,6 +1682,40 @@ body {
   align-items: center;
 }
 
+.terminal-session-picker {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.terminal-session-picker select {
+  width: clamp(180px, 26vw, 390px);
+  height: 27px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 25px 2px 8px;
+  color: var(--text-soft);
+  background: var(--surface-raised);
+  font: 10px/1.2 Consolas, "SFMono-Regular", "Microsoft YaHei", monospace;
+  text-overflow: ellipsis;
+}
+
+.terminal-session-picker select:hover:not(:disabled),
+.terminal-session-picker select:focus-visible {
+  border-color: var(--green);
+  outline: none;
+}
+
+.terminal-session-picker select:disabled {
+  color: var(--muted);
+  opacity: .72;
+}
+
 .terminal-preview-header > div > span {
   max-width: 190px;
   overflow: hidden;
@@ -2056,6 +2090,14 @@ html[data-terminal-collapsed="true"] .terminal-preview-list,
   .terminal-preview-header nav button:not(.active),
   .terminal-preview-header > div > span {
     display: none;
+  }
+
+  .terminal-session-picker > span {
+    display: none;
+  }
+
+  .terminal-session-picker select {
+    width: min(52vw, 260px);
   }
 
   .terminal-preview-list {

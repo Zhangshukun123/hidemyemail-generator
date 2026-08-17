@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+
+
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _header_name(name: str, default: str) -> str:
+    value = str(os.environ.get(name, default)).strip()
+    return value if re.fullmatch(r"[A-Za-z0-9-]{1,64}", value) else default
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    imap_host: str
+    imap_port: int
+    imap_username: str
+    imap_password: str
+    imap_folder: str
+    imap_timeout_seconds: int
+    fetch_limit: int
+    lookback_minutes: int
+    cache_ttl_seconds: float
+    rate_limit_requests: int
+    rate_limit_window_seconds: int
+    trusted_recipient_header: str = "X-Original-To"
+    imap_max_concurrent_queries: int = 2
+    access_token: str = ""
+    session_max_age_seconds: int = 7 * 24 * 60 * 60
+    session_max_sessions: int = 4096
+    session_max_per_invite: int = 8
+    access_rate_limit_requests: int = 10
+    access_rate_limit_window_seconds: int = 10 * 60
+    rate_limit_max_keys: int = 4096
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.imap_username and self.imap_password)
+
+    @property
+    def access_protected(self) -> bool:
+        return bool(re.fullmatch(r"[0-9a-fA-F]{64}", self.access_token))
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        return cls(
+            imap_host=str(os.environ.get("ZKGMAIL_IMAP_HOST", "imap.qq.com")).strip(),
+            imap_port=_bounded_int("ZKGMAIL_IMAP_PORT", 993, 1, 65535),
+            imap_username=str(os.environ.get("ZKGMAIL_IMAP_USERNAME", "")).strip(),
+            imap_password=str(os.environ.get("ZKGMAIL_IMAP_PASSWORD", "")).strip(),
+            imap_folder=str(os.environ.get("ZKGMAIL_IMAP_FOLDER", "INBOX")).strip() or "INBOX",
+            imap_timeout_seconds=_bounded_int("ZKGMAIL_IMAP_TIMEOUT_SECONDS", 20, 3, 60),
+            fetch_limit=_bounded_int("ZKGMAIL_FETCH_LIMIT", 50, 5, 200),
+            lookback_minutes=_bounded_int("ZKGMAIL_LOOKBACK_MINUTES", 30, 5, 1440),
+            cache_ttl_seconds=_bounded_float("ZKGMAIL_CACHE_TTL_SECONDS", 2.0, 0.0, 30.0),
+            rate_limit_requests=_bounded_int("ZKGMAIL_RATE_LIMIT_REQUESTS", 30, 5, 300),
+            rate_limit_window_seconds=_bounded_int(
+                "ZKGMAIL_RATE_LIMIT_WINDOW_SECONDS", 60, 10, 3600
+            ),
+            trusted_recipient_header=_header_name(
+                "ZKGMAIL_TRUSTED_RECIPIENT_HEADER",
+                "X-Original-To",
+            ),
+            imap_max_concurrent_queries=_bounded_int(
+                "ZKGMAIL_IMAP_MAX_CONCURRENT_QUERIES", 2, 1, 8
+            ),
+            access_token=str(os.environ.get("ZKGMAIL_ACCESS_TOKEN", "")).strip(),
+            session_max_age_seconds=_bounded_int(
+                "ZKGMAIL_SESSION_MAX_AGE_SECONDS", 7 * 24 * 60 * 60, 300, 30 * 24 * 60 * 60
+            ),
+            session_max_sessions=_bounded_int(
+                "ZKGMAIL_SESSION_MAX_SESSIONS", 4096, 32, 65536
+            ),
+            session_max_per_invite=_bounded_int(
+                "ZKGMAIL_SESSION_MAX_PER_INVITE", 8, 1, 64
+            ),
+            access_rate_limit_requests=_bounded_int(
+                "ZKGMAIL_ACCESS_RATE_LIMIT_REQUESTS", 10, 3, 100
+            ),
+            access_rate_limit_window_seconds=_bounded_int(
+                "ZKGMAIL_ACCESS_RATE_LIMIT_WINDOW_SECONDS", 10 * 60, 60, 24 * 60 * 60
+            ),
+            rate_limit_max_keys=_bounded_int(
+                "ZKGMAIL_RATE_LIMIT_MAX_KEYS", 4096, 32, 65536
+            ),
+        )

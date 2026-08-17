@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07130f">
+  <meta name="description" content="zkgmail.com 验证码接收站">
+  <title>ZKG Mail · 验证码接收站</title>
+  <link rel="stylesheet" href="/assets/app.css?v=1.1.0">
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="ZKG Mail 首页">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M6 9.5 16 17l10-7.5M7.5 7h17A2.5 2.5 0 0 1 27 9.5v13a2.5 2.5 0 0 1-2.5 2.5h-17A2.5 2.5 0 0 1 5 22.5v-13A2.5 2.5 0 0 1 7.5 7Z"/></svg>
+      </span>
+      <span><b>ZKG</b> Mail</span>
+    </a>
+    <div class="service-pill"><span class="pulse"></span>接收服务在线</div>
+  </header>
+
+  <main>
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow">PRIVATE CODE INBOX</p>
+      <h1 id="page-title">验证码，<span>即到即取。</span></h1>
+      <p class="hero-copy">输入完整的 <strong>@zkgmail.com</strong> 地址。邮件转发到 QQ 收件箱后，页面会自动获取最新验证码。</p>
+    </section>
+
+    <section class="lookup-card" aria-label="验证码查询">
+      <form id="lookupForm" novalidate>
+        <label for="email">接码邮箱</label>
+        <div class="address-row">
+          <div class="input-wrap">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m4 7 8 6 8-6M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/></svg>
+            <input id="email" name="email" type="email" inputmode="email" autocomplete="off" spellcheck="false" placeholder="yourname@zkgmail.com" aria-describedby="addressHelp" required autofocus>
+          </div>
+          <button class="primary" id="submitButton" type="submit">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+            <span>获取验证码</span>
+          </button>
+        </div>
+        <div class="tool-row" id="addressHelp">
+          <button class="text-button" id="generateButton" type="button">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/></svg>
+            生成新地址
+          </button>
+          <button class="text-button" id="copyAddressButton" type="button" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+            复制邮箱
+          </button>
+          <span class="privacy-note">完整地址就是查询凭证，请勿公开分享</span>
+        </div>
+      </form>
+
+      <div class="status-panel" id="statusPanel" data-state="idle">
+        <span class="status-icon" aria-hidden="true">
+          <svg class="icon-idle" viewBox="0 0 24 24"><path d="M12 8v4l2.5 2.5M21 12a9 9 0 1 1-9-9 9 9 0 0 1 9 9Z"/></svg>
+          <svg class="icon-loading" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+          <svg class="icon-success" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>
+          <svg class="icon-error" viewBox="0 0 24 24"><path d="M12 8v5M12 17h.01M21 12a9 9 0 1 1-9-9 9 9 0 0 1 9 9Z"/></svg>
+        </span>
+        <div>
+          <strong id="statusTitle">等待查询</strong>
+          <p id="statusMessage" role="status" aria-live="polite">填写接码邮箱后即可获取最新验证码。</p>
+        </div>
+        <button class="cancel-button" id="cancelButton" type="button" hidden>停止等待</button>
+      </div>
+
+      <section class="result" id="result" aria-labelledby="resultTitle" hidden>
+        <div class="result-label" id="resultTitle"><span></span>最新验证码</div>
+        <button class="code-button" id="copyCodeButton" type="button" title="点击复制验证码">
+          <code id="code">000000</code>
+          <span>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+            点击复制
+          </span>
+        </button>
+        <div class="result-meta"><span id="resultEmail"></span><time id="receivedAt"></time></div>
+        <button class="next-code-button" id="nextCodeButton" type="button">等待下一条验证码</button>
+      </section>
+    </section>
+
+    <section class="steps" aria-label="使用步骤">
+      <article><span>01</span><div><h2>准备地址</h2><p>粘贴已有地址，或随机生成一个新的 zkgmail.com 地址。</p></div></article>
+      <article><span>02</span><div><h2>QQ 邮箱收件</h2><p>验证码邮件经 catch-all 转发到 QQ 邮箱，平台自动精确匹配地址。</p></div></article>
+      <article><span>03</span><div><h2>重复接码</h2><p>复制验证码后可继续等待下一条，同一个邮箱支持多次取码。</p></div></article>
+    </section>
+  </main>
+
+  <footer><span>© ZKG Mail</span><span>仅显示指定地址最近收到的验证码</span></footer>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js?v=1.1.0" defer></script>
+</body>
+</html>

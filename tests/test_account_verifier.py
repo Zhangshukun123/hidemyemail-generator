@@ -6,19 +6,18 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from hidemyemail_generator.account_verifier import (
     AccountVerificationManager,
     load_verifiable_accounts,
     remove_invalid_account,
     removed_account_emails,
-    refresh_session_with_saved_cookies,
     save_account_classification,
     validate_refreshed_session,
 )
 from hidemyemail_generator.browser_tasks import (
     _save_account_record,
+    account_saved_cookies,
     load_account_record,
     set_manual_account_type,
 )
@@ -85,98 +84,6 @@ def token_with_identity(
 
 
 class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cookie_refresher_calls_both_session_endpoints_through_proxy(self):
-        email = "proxy-refresh@icloud.com"
-        old_token = token_with_identity(email, "acct-proxy")
-        new_token = token_with_identity(email, "acct-proxy") + "-new"
-        calls = []
-
-        class Headers:
-            def __init__(self, values):
-                self.values = values
-
-            def getall(self, name, default):
-                return self.values if name == "Set-Cookie" else default
-
-        class Response:
-            status = 200
-
-            def __init__(self, payload, set_cookie):
-                self.payload = payload
-                self.headers = Headers([set_cookie])
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return False
-
-            async def json(self, **_kwargs):
-                return self.payload
-
-        class ClientSession:
-            def __init__(self, **_kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return False
-
-            def get(self, url, **kwargs):
-                calls.append((url, kwargs))
-                if len(calls) == 1:
-                    return Response(
-                        {
-                            "accessToken": old_token,
-                            "user": {"email": email},
-                            "account": {"id": "acct-proxy"},
-                        },
-                        "session=intermediate; Path=/; Secure; HttpOnly",
-                    )
-                return Response(
-                    {
-                        "accessToken": new_token,
-                        "user": {"email": email},
-                        "account": {"id": "acct-proxy"},
-                    },
-                    "session=final; Path=/; Secure; HttpOnly",
-                )
-
-        with patch(
-            "hidemyemail_generator.account_verifier.aiohttp.ClientSession",
-            ClientSession,
-        ):
-            result = await refresh_session_with_saved_cookies(
-                email=email,
-                previous_token=old_token,
-                cookies=[
-                    {
-                        "name": "session",
-                        "value": "saved",
-                        "domain": "chatgpt.com",
-                        "path": "/",
-                    }
-                ],
-                proxy_url="http://127.0.0.1:19002",
-                storage_state={"origins": [{"origin": "https://chatgpt.com"}]},
-            )
-
-        self.assertEqual(
-            [call[0] for call in calls],
-            [
-                "https://chatgpt.com/api/auth/session",
-                "https://chatgpt.com/api/auth/session?refresh=true",
-            ],
-        )
-        self.assertTrue(
-            all(call[1]["proxy"] == "http://127.0.0.1:19002" for call in calls)
-        )
-        self.assertIn("session=intermediate", calls[1][1]["headers"]["Cookie"])
-        self.assertEqual(result["access_token"], new_token)
-        self.assertEqual(json.loads(result["cookies_json"])[0]["value"], "final")
-
     async def test_token_invalid_cookie_refresh_is_staged_until_online_recheck(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -214,6 +121,10 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                         {"cookies": old_cookies, "origins": []}
                     ),
                     "registration_proxy_url": "http://127.0.0.1:19001",
+                    "registration_diagnostics": {
+                        "impersonate": "chrome136",
+                        "fingerprint_language": "nl-NL",
+                    },
                 },
             )
             refresh_calls = []
@@ -289,9 +200,102 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["session_acquisition_method"], "cookie_session_refresh")
             self.assertEqual(len(refresh_calls), 1)
             self.assertEqual(refresh_calls[0]["proxy_url"], "http://127.0.0.1:19001")
+            self.assertEqual(refresh_calls[0]["impersonate"], "chrome136")
+            self.assertEqual(refresh_calls[0]["language"], "nl-NL")
             messages = "\n".join(item["message"] for item in snapshot["logs"])
             self.assertIn("401/token_invalid", messages)
             self.assertIn("复验成功", messages)
+
+    async def test_explicit_cookie_refresh_uses_http_gateway_then_online_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text("# test runtime\n", encoding="utf-8")
+            bridge = root / "unused.py"
+            bridge.write_text("# overridden by test\n", encoding="utf-8")
+            db_file = root / "hme.db"
+            email = "cookie-plan@icloud.com"
+            old_token = token_with_identity(email, "acct-cookie", plan="free")
+            new_token = token_with_identity(email, "acct-cookie", plan="plus") + "-new"
+            cookies = [
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": "saved-cookie",
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                }
+            ]
+            _save_account_record(
+                db_file,
+                email,
+                result={
+                    "access_token": old_token,
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": old_token,
+                            "user": {"email": email},
+                            "account": {"id": "acct-cookie", "planType": "free"},
+                        }
+                    ),
+                    "cookies_json": json.dumps(cookies),
+                    "registration_proxy_url": "http://127.0.0.1:19001",
+                },
+            )
+            refresh_calls = []
+
+            async def refresh_candidate(**kwargs):
+                refresh_calls.append(kwargs)
+                return {
+                    "access_token": new_token,
+                    "session_json": json.dumps(
+                        {
+                            "accessToken": new_token,
+                            "user": {"email": email},
+                            "account": {"id": "acct-cookie", "planType": "free"},
+                        }
+                    ),
+                    "cookies_json": json.dumps(cookies),
+                    "storage_state_json": json.dumps(
+                        {"cookies": cookies, "origins": []}
+                    ),
+                }
+
+            class DirectCookieManager(AccountVerificationManager):
+                async def _check_access_token(
+                    self, item, target_email, token, *, force_online=False
+                ):
+                    if token != new_token or not force_online:
+                        raise AssertionError("new AT must be checked online")
+                    return (
+                        0,
+                        {
+                            "status": "plus",
+                            "detail": "accounts/check plan=plus",
+                            "source": "accounts_check",
+                        },
+                        b"",
+                    )
+
+            manager = DirectCookieManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+                cookie_session_refresher=refresh_candidate,
+            )
+            manager.start_with_saved_cookies(emails=[email], concurrency=1)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            record = load_account_record(db_file, email)
+            self.assertEqual(snapshot["plus"], 1)
+            self.assertEqual(snapshot["failed"], 0)
+            self.assertEqual(snapshot["refreshSource"], "cookie_http")
+            self.assertEqual(len(refresh_calls), 1)
+            self.assertEqual(record["access_token"], new_token)
+            self.assertEqual(record["account_type"], "plus")
+            self.assertEqual(record["verification_method"], "accounts_check")
 
     def test_refreshed_token_rejects_mismatched_workspace(self):
         email = "owner@icloud.com"
@@ -309,7 +313,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-    async def test_valid_jwt_plus_is_classified_without_running_online_bridge(self):
+    async def test_valid_jwt_plus_still_runs_online_accounts_check(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -317,9 +321,12 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             (target / "app_backend.py").write_text(
                 "# test runtime\n", encoding="utf-8"
             )
-            bridge = root / "must_not_run.py"
+            marker = root / "online-check-ran.txt"
+            bridge = root / "online_check.py"
             bridge.write_text(
-                "raise AssertionError('online bridge must not run')\n",
+                "import json, pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('called', encoding='utf-8')\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({'status':'plus','detail':'accounts/check plan=plus','source':'accounts_check'}), flush=True)\n",
                 encoding="utf-8",
             )
             db_file = root / "hme.db"
@@ -335,11 +342,13 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
+            self.assertTrue(marker.is_file())
             self.assertEqual(snapshot["plus"], 1)
             self.assertEqual(snapshot["failed"], 0)
             record = load_account_record(db_file, "fast-plus@icloud.com")
             self.assertEqual(record["account_type"], "plus")
-            self.assertIn("本地快速验证", record["verification_detail"])
+            self.assertEqual(record["verification_method"], "accounts_check")
+            self.assertIn("accounts/check", record["verification_detail"])
 
     async def test_jwt_free_still_uses_online_check_to_detect_an_upgrade(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -376,6 +385,135 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                     "verification_detail"
                 ],
             )
+
+    def test_refreshed_token_change_requirement_depends_on_calling_flow(self):
+        email = "same-token@icloud.com"
+        token = token_with_identity(email, "acct-same")
+        session = {
+            "accessToken": token,
+            "user": {"email": email},
+            "account": {"id": "acct-same"},
+        }
+
+        self.assertEqual(
+            validate_refreshed_session(
+                expected_email=email,
+                previous_token=token,
+                session=session,
+            ),
+            token,
+        )
+        with self.assertRaisesRegex(RuntimeError, "仍是旧 Access Token"):
+            validate_refreshed_session(
+                expected_email=email,
+                previous_token=token,
+                session=session,
+                require_changed=True,
+            )
+
+    async def test_fresh_jwt_401_never_falls_back_to_claim_free(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (target / "app_backend.py").write_text(
+                "# test runtime\n", encoding="utf-8"
+            )
+            marker = root / "online-check-ran.txt"
+            bridge = root / "online_check.py"
+            bridge.write_text(
+                "import json, pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('called', encoding='utf-8')\n"
+                "print('HME_VERIFY_EVENT:' + json.dumps({"
+                "'status':'invalid','detail':'both AT endpoints returned 401'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            db_file = root / "hme.db"
+            email = "fresh-free@icloud.com"
+            token = token_with_plan("free")
+            save_record(db_file, email, token)
+            record = load_account_record(db_file, email)
+            record["session_invalid_at"] = "2026-08-17T09:20:45+00:00"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    "UPDATE settings SET value = ? WHERE key = ?",
+                    (json.dumps(record), f"gpt_account:{email}"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            manager = AccountVerificationManager(
+                target_project_dir=target,
+                db_file=db_file,
+                python_executable=Path(sys.executable),
+                bridge_file=bridge,
+            )
+            manager.start(concurrency=1, force_online=True)
+            await asyncio.wait_for(manager._batch_task, timeout=10)
+
+            snapshot = manager.snapshot()
+            saved = load_account_record(db_file, email)
+            self.assertTrue(marker.is_file(), "套餐判断必须实际调用 AT 在线查询")
+            self.assertEqual(snapshot["free"], 0)
+            self.assertEqual(snapshot["expired"], 0)
+            self.assertEqual(snapshot["deleted"], 0)
+            self.assertEqual(snapshot["failed"], 1)
+            self.assertIn("session_invalid_at", saved)
+            self.assertFalse(saved.get("account_type"))
+            items = _browser_email_items(db_file, [])
+            self.assertEqual(items[0]["sessionStatus"], "ready")
+            self.assertFalse(items[0]["tokenExpired"])
+            self.assertTrue(items[0]["sessionNeedsRefresh"])
+
+    def test_saved_cookie_sources_are_merged_for_session_refresh(self):
+        record = {
+            "storage_state_json": json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "__Secure-next-auth.session-token",
+                            "value": "minimal-session",
+                            "domain": "chatgpt.com",
+                            "path": "/",
+                        },
+                        {
+                            "name": "oai-did",
+                            "value": "device-id",
+                            "domain": "chatgpt.com",
+                            "path": "/",
+                        },
+                    ]
+                }
+            ),
+            "cookies_json": json.dumps(
+                [
+                    {
+                        "name": "__Secure-next-auth.session-token",
+                        "value": "full-session",
+                        "domain": "chatgpt.com",
+                        "path": "/",
+                    },
+                    {
+                        "name": "cf_clearance",
+                        "value": "edge-cookie",
+                        "domain": ".chatgpt.com",
+                        "path": "/",
+                    },
+                ]
+            ),
+        }
+
+        cookies = account_saved_cookies(record)
+
+        by_name = {item["name"]: item for item in cookies}
+        self.assertEqual(set(by_name), {
+            "__Secure-next-auth.session-token", "oai-did", "cf_clearance"
+        })
+        self.assertEqual(
+            by_name["__Secure-next-auth.session-token"]["value"], "full-session"
+        )
 
     def test_top_level_token_without_session_is_not_verifiable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -594,7 +732,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([item["email"] for item in items], ["restored@icloud.com"])
             self.assertFalse(items[0]["hasPassword"])
 
-    async def test_classifies_valid_accounts_and_deletes_invalid_credentials(self):
+    async def test_classifies_valid_accounts_and_preserves_401_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -628,7 +766,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["plus"], 1)
             self.assertEqual(snapshot["free"], 1)
             self.assertEqual(snapshot["expired"], 1)
-            self.assertEqual(snapshot["deleted"], 1)
+            self.assertEqual(snapshot["deleted"], 0)
             self.assertNotIn("access_token", json.dumps(snapshot))
             self.assertEqual(
                 load_account_record(db_file, "plus@icloud.com")["account_type"],
@@ -638,15 +776,17 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
                 load_account_record(db_file, "free@icloud.com")["account_type"],
                 "free",
             )
-            self.assertEqual(load_account_record(db_file, "bad@icloud.com"), {})
-            self.assertIn("bad@icloud.com", removed_account_emails(db_file))
+            bad_record = load_account_record(db_file, "bad@icloud.com")
+            self.assertEqual(bad_record["access_token"], "at-bad")
+            self.assertIn("session_invalid_at", bad_record)
+            self.assertNotIn("bad@icloud.com", removed_account_emails(db_file))
             invalid_result = next(
                 item for item in snapshot["accounts"] if item["email"] == "bad@icloud.com"
             )
-            self.assertEqual(invalid_result["status"], "deleted")
+            self.assertEqual(invalid_result["status"], "failed")
             log_text = "\n".join(item["message"] for item in snapshot["historyLogs"])
             self.assertIn("验证响应：status=invalid", log_text)
-            self.assertIn("本地邮箱记录及账号凭据已删除", log_text)
+            self.assertIn("原账号与套餐已保留", log_text)
 
             identities = [
                 {"hme": "plus@icloud.com", "anonymousId": "plus", "isActive": True},
@@ -655,7 +795,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             items = _browser_email_items(db_file, identities)
             self.assertEqual(
                 {item["email"] for item in items},
-                {"plus@icloud.com", "free@icloud.com"},
+                {"plus@icloud.com", "free@icloud.com", "bad@icloud.com"},
             )
 
     async def test_invalid_token_automatically_refreshes_in_headless_browser(self):
@@ -808,12 +948,14 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
 
             snapshot = manager.snapshot()
             self.assertEqual(snapshot["expired"], 1)
-            self.assertEqual(snapshot["deleted"], 1)
+            self.assertEqual(snapshot["deleted"], 0)
             self.assertEqual(len(browser_manager.started), 1)
-            self.assertIn("Token 已确认失效", snapshot["accounts"][0]["message"])
-            self.assertEqual(load_account_record(db_file, "retry-once@icloud.com"), {})
+            self.assertIn("原账号与套餐已保留", snapshot["accounts"][0]["message"])
+            record = load_account_record(db_file, "retry-once@icloud.com")
+            self.assertEqual(record["access_token"], "at-still-invalid")
+            self.assertIn("session_invalid_at", record)
 
-    async def test_deletes_known_plus_account_when_token_is_confirmed_invalid(self):
+    async def test_preserves_known_plus_account_when_plan_check_returns_401(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -843,11 +985,13 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
-            self.assertEqual(snapshot["plus"], 0)
+            self.assertEqual(snapshot["plus"], 1)
             self.assertEqual(snapshot["expired"], 1)
-            self.assertEqual(snapshot["deleted"], 1)
-            self.assertEqual(load_account_record(db_file, "paid@icloud.com"), {})
-            self.assertIn("paid@icloud.com", removed_account_emails(db_file))
+            self.assertEqual(snapshot["deleted"], 0)
+            record = load_account_record(db_file, "paid@icloud.com")
+            self.assertEqual(record["account_type"], "plus")
+            self.assertIn("session_invalid_at", record)
+            self.assertNotIn("paid@icloud.com", removed_account_emails(db_file))
 
     async def test_protocol_relogin_replaces_session_without_browser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1028,7 +1172,7 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             record = load_account_record(db_file, "fallback@icloud.com")
             self.assertEqual(record["access_token"], "at-browser")
 
-    async def test_preserves_fresh_session_plus_when_plan_endpoint_reports_free(self):
+    async def test_live_free_result_replaces_stale_saved_plus(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
@@ -1058,11 +1202,11 @@ class AccountVerificationManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager._batch_task, timeout=10)
 
             snapshot = manager.snapshot()
-            self.assertEqual(snapshot["plus"], 1)
-            self.assertEqual(snapshot["free"], 0)
+            self.assertEqual(snapshot["plus"], 0)
+            self.assertEqual(snapshot["free"], 1)
             record = load_account_record(db_file, "paid@icloud.com")
-            self.assertEqual(record["account_type"], "plus")
-            self.assertIn("已保留 Plus", record["verification_detail"])
+            self.assertEqual(record["account_type"], "free")
+            self.assertIn("has_active_subscription=false", record["verification_detail"])
 
     async def test_can_verify_one_selected_account(self):
         with tempfile.TemporaryDirectory() as temp_dir:

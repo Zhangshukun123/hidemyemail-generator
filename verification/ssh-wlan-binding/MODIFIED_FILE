@@ -1,0 +1,7 @@
+Host cac
+    HostName 8.208.13.52
+    User root
+    Port 22
+    IdentityFile C:\Users\29070\.ssh\cac.pem
+    IdentitiesOnly yes
+    BindAddress 192.168.43.96

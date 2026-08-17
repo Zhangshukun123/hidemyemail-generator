@@ -1,0 +1,7 @@
+object=quick_flow_run_history
+storage=sqlite.settings
+key=quick_flow_history:<runId>
+restart_result=records_restored
+running_restart_status=failed
+interrupted=true
+status=persistent

@@ -7,6 +7,9 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp.test_utils import TestClient, TestServer
+from unittest.mock import patch
+
+import hidemyemail_generator.registration_inventory_sync as inventory_sync
 
 from hidemyemail_generator.browser_tasks import _save_account_record
 from hidemyemail_generator.inbox import connect_db, upsert_address
@@ -30,6 +33,7 @@ from hidemyemail_generator.registration_inventory_client import (
     RemoteRegistrationInventoryClient,
 )
 from hidemyemail_generator.registration_inventory_sync import (
+    export_inventory_record,
     export_inventory_records,
     import_inventory_records,
 )
@@ -37,6 +41,118 @@ from hidemyemail_generator.webapp import create_app
 
 
 class RegistrationInventoryTests(unittest.TestCase):
+    def test_single_record_export_parses_only_the_requested_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.executemany(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    [
+                        (
+                            "gpt_account:target@icloud.com",
+                            json.dumps({"email": "target@icloud.com", "value": 1}),
+                        ),
+                        (
+                            "gpt_account:unrelated@icloud.com",
+                            json.dumps({"email": "unrelated@icloud.com", "value": 2}),
+                        ),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            statements = []
+            original_connect = inventory_sync.connect_db
+
+            def traced_connect(path):
+                traced = original_connect(path)
+                traced.set_trace_callback(statements.append)
+                return traced
+
+            with (
+                patch.object(
+                    inventory_sync,
+                    "_parse_account",
+                    wraps=inventory_sync._parse_account,
+                ) as parse_account,
+                patch.object(
+                    inventory_sync,
+                    "connect_db",
+                    side_effect=traced_connect,
+                ),
+            ):
+                record = export_inventory_record(db_file, "target@icloud.com")
+
+        self.assertEqual(record["account"]["value"], 1)
+        self.assertEqual(parse_account.call_count, 1)
+        normalized = [" ".join(statement.lower().split()) for statement in statements]
+        account_data_reads = [
+            statement
+            for statement in normalized
+            if statement.startswith("select key, value from settings")
+        ]
+        self.assertEqual(len(account_data_reads), 1)
+        self.assertIn("where key in", account_data_reads[0])
+
+    def test_single_record_export_falls_back_to_legacy_key_casing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                upsert_address(conn, "Legacy@iCloud.com")
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:Legacy@iCloud.com",
+                        json.dumps({"email": "Legacy@iCloud.com", "legacy": True}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            record = export_inventory_record(db_file, "legacy@icloud.com")
+
+        self.assertEqual(record["email"], "legacy@icloud.com")
+        self.assertEqual(record["address"]["email"], "Legacy@iCloud.com")
+        self.assertTrue(record["account"]["legacy"])
+
+    def test_single_record_export_uses_python_normalization_for_legacy_keys(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO addresses(
+                        email, state, source, created_at, updated_at
+                    ) VALUES (?, 'unused', 'manual', ?, ?)
+                    """,
+                    (
+                        "  ÜSER@iCloud.com  ",
+                        "2026-08-17T00:00:00+00:00",
+                        "2026-08-17T00:00:00+00:00",
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        "gpt_account:  ÜSER@iCloud.com  ",
+                        json.dumps({"legacy": "unicode-and-whitespace"}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            record = export_inventory_record(db_file, "üser@icloud.com")
+
+        self.assertEqual(record["email"], "üser@icloud.com")
+        self.assertEqual(record["address"]["email"], "  ÜSER@iCloud.com  ")
+        self.assertEqual(record["account"]["legacy"], "unicode-and-whitespace")
+
     def test_inventory_login_password_is_stored_as_salted_hash(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"

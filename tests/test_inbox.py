@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from hidemyemail_generator.inbox import (
     InboxConfig,
+    _sync_selected_folder,
     connect_db,
     count_unread,
     create_batch,
@@ -166,7 +167,9 @@ class InboxSyncTests(unittest.TestCase):
             password="password",
         )
 
-        def record_for_folder(_conn, folder_config, uid, _raw_message):
+        def record_for_folder(
+            _conn, folder_config, uid, _raw_message, _address_matcher=None
+        ):
             return {"folder": folder_config.folder, "uid": uid}
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -211,7 +214,7 @@ class InboxSyncTests(unittest.TestCase):
                 ),
                 patch(
                     "hidemyemail_generator.inbox.message_to_record",
-                    side_effect=lambda _conn, folder, uid, _raw: {
+                    side_effect=lambda _conn, folder, uid, _raw, _matcher=None: {
                         "folder": folder.folder,
                         "uid": uid,
                     },
@@ -347,6 +350,107 @@ class InboxSyncTests(unittest.TestCase):
 
         self.assertEqual(inserted, [])
         self.assertEqual(mailbox.fetched_uids, [])
+
+    def test_sync_batches_database_reads_for_uids_and_known_addresses(self):
+        target = "known.alias@icloud.com"
+        raw_message = (
+            "To: receiver@example.com\r\n"
+            "From: OpenAI <noreply@openai.com>\r\n"
+            "Subject: Your temporary ChatGPT verification code\r\n"
+            "\r\n"
+            f"Alias {target} has verification code 123456.\r\n"
+        ).encode("ascii")
+
+        class BulkMailbox(ExistingMessageFakeMailbox):
+            def uid(self, command, *args):
+                if command == "search":
+                    return "OK", [b"1 2 3"]
+                return super().uid(command, *args)
+
+        config = InboxConfig(
+            host="imap.example.com",
+            port=993,
+            username="user@example.com",
+            password="password",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect_db(str(Path(temp_dir) / "inbox.db"))
+            try:
+                upsert_address(conn, target)
+                statements = []
+                conn.set_trace_callback(statements.append)
+                inserted = _sync_selected_folder(
+                    BulkMailbox(raw_message),
+                    conn,
+                    config,
+                    limit=3,
+                )
+            finally:
+                conn.close()
+
+        normalized = [" ".join(statement.lower().split()) for statement in statements]
+        address_reads = [
+            statement
+            for statement in normalized
+            if statement.startswith("select email from addresses")
+        ]
+        message_reads = [
+            statement
+            for statement in normalized
+            if statement.startswith("select id, uid, sender, recipients, hme_address")
+        ]
+        self.assertEqual(len(inserted), 3)
+        self.assertEqual({item["hme_address"] for item in inserted}, {target})
+        self.assertEqual(len(address_reads), 1)
+        self.assertEqual(len(message_reads), 1)
+
+    def test_sync_matcher_remembers_alias_discovered_earlier_in_same_batch(self):
+        target = "newly.discovered@icloud.com"
+        discovered_message = (
+            "To: receiver@example.com\r\n"
+            f"X-ICLOUD-HME: p={target}; d=; f=user@icloud.com; "
+            "r=to; s=noreply@openai.com\r\n"
+            "Subject: Your temporary ChatGPT verification code\r\n"
+            "\r\nYour verification code is 111111.\r\n"
+        ).encode("ascii")
+        body_only_message = (
+            "To: receiver@example.com\r\n"
+            "Subject: Your temporary ChatGPT verification code\r\n"
+            f"\r\nAlias {target} has verification code 222222.\r\n"
+        ).encode("ascii")
+
+        class DiscoveringMailbox:
+            def select(self, _folder):
+                return "OK", []
+
+            def uid(self, command, *args):
+                if command == "search":
+                    return "OK", [b"1 2"]
+                if command == "fetch":
+                    raw_by_uid = {b"2": discovered_message, b"1": body_only_message}
+                    return "OK", [(b"metadata", raw_by_uid[args[0]])]
+                raise AssertionError(f"Unexpected IMAP command: {command}")
+
+        config = InboxConfig(
+            host="imap.example.com",
+            port=993,
+            username="user@example.com",
+            password="password",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect_db(str(Path(temp_dir) / "inbox.db"))
+            try:
+                inserted = _sync_selected_folder(
+                    DiscoveringMailbox(),
+                    conn,
+                    config,
+                    limit=2,
+                )
+            finally:
+                conn.close()
+
+        self.assertEqual([item["uid"] for item in inserted], ["2", "1"])
+        self.assertEqual([item["hme_address"] for item in inserted], [target, target])
 
 
 class ICloudRecipientParsingTests(unittest.TestCase):

@@ -438,7 +438,7 @@
     <section id="workbenchTerminalPanel" class="workbench-terminal-panel" aria-labelledby="terminalPreviewTitle">
       <header class="terminal-preview-header">
         <nav aria-label="底部面板"><button type="button" disabled>问题</button><button type="button" disabled>输出</button><button type="button" disabled>调试控制台</button><button class="active" type="button" id="terminalPreviewTitle">终端</button><button type="button" disabled>任务日志</button></nav>
-        <div><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="toggle-terminal-preview" aria-label="折叠终端日志" title="折叠终端日志">⌄</button></div>
+        <div><label class="terminal-session-picker" for="terminalSessionSelect"><span>日志会话</span><select id="terminalSessionSelect" aria-label="选择日志会话" disabled><option value="">暂无日志会话</option></select></label><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="toggle-terminal-preview" aria-label="折叠终端日志" title="折叠终端日志">⌄</button></div>
       </header>
       <div id="terminalPreviewList" class="terminal-preview-list" role="log" aria-live="off"><div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，日志会显示在这里。</div></div>
     </section>

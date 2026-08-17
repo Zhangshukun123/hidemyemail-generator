@@ -21,6 +21,35 @@ from aiohttp import ClientHttpProxyError
 
 
 class RegistrationProxyStoreTests(unittest.TestCase):
+    def test_persists_last_link_and_payment_exit_sets_without_exposing_ips(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "hme.db"
+            store = RegistrationProxyStore(db_file)
+            store.remember_card_link_exit("192.0.2.10", "GB")
+            store.remember_payment_exits(
+                ["192.0.2.20", "192.0.2.30", "192.0.2.20"],
+                "GB",
+            )
+            store.remember_payment_exits(
+                ["192.0.2.40", "192.0.2.20"],
+                "GB",
+            )
+
+            reloaded = RegistrationProxyStore(db_file)
+            public = reloaded.public_state()
+            last_link_exit = reloaded.last_card_link_exit_ip()
+            last_payment_exits = reloaded.last_payment_exit_ips()
+
+        self.assertEqual(last_link_exit, "192.0.2.10")
+        self.assertEqual(
+            last_payment_exits,
+            ("192.0.2.40", "192.0.2.20", "192.0.2.30"),
+        )
+        self.assertTrue(public["cardLinkExitIpVerified"])
+        self.assertEqual(public["paymentExitCount"], 3)
+        self.assertNotIn("192.0.2.10", str(public))
+        self.assertNotIn("192.0.2.20", str(public))
+
     def test_registration_and_card_link_proxy_stores_are_independent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "hme.db"

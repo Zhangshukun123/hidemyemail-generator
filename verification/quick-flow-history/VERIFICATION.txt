@@ -1,0 +1,51 @@
+Quick-flow history persistence verification
+
+BRANCH=codex/registration-reliability-98
+CHANGED_BRANCH=server restart recovery
+CHANGED_FIELD=quickFlows[].status: running -> failed; quickFlows[].interrupted: absent -> true
+PERSISTED_FIELD=settings.key: absent -> quick_flow_history:<runId>
+RESTORED_VISIBLE_STATE=all saved terminal records remain visible; pre-restart running records remain visible as failed/interrupted
+
+ORIGINAL_APP_JS_SHA256=D35CB3E5613E2CBDC35244995B75A0D062B2C218889EEEFFECF8E84B0B5544C1
+MODIFIED_APP_JS_SHA256=A8C61E845EBA514194ECC87F905B51C2247B3423FC985247E65B7CE7F773B9BD
+ORIGINAL_FIXTURE_SHA256=734A1BFF7C1F437940B8B65DDBB856707EF25445D86D0C9E3BE44AAC061ED70C
+MODIFIED_FIXTURE_SHA256=6218304B408241903C6405FA8D55E97793F4237838C0D02337C3F39D8BFC2485
+
+ARTIFACT_MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\quick-flow-history\MODIFIED_FILE
+ARTIFACT_DIFF_FILE=D:\AI\hidemyemail-generator\verification\quick-flow-history\DIFF_FILE
+ARTIFACT_VERIFICATION=D:\AI\hidemyemail-generator\verification\quick-flow-history\VERIFICATION.txt
+ARTIFACT_ROLLBACK=D:\AI\hidemyemail-generator\verification\quick-flow-history\ROLLBACK.sh
+
+BASELINE_COMMAND=$env:PYTHONPATH='src'; python -m pytest -q tests/test_web_ui.py::StructuredWebUiTests::test_one_click_registration_and_card_link_is_a_separate_pipeline_module tests/test_web_ui.py::StructuredWebUiTests::test_quick_flow_config_uses_mvp_persistence_and_keeps_start_outside_details tests/test_web_ui.py::StructuredWebUiTests::test_quick_flow_monitors_protocol_payment_to_terminal_state
+BASELINE_INPUT=pre-change quick-flow rendering/config/payment-monitor implementation
+BASELINE_LITERAL_OUTPUT=...                                                                      [100%]
+BASELINE_LITERAL_RESULT=3 passed in 0.97s
+BASELINE_EXIT_STATUS=0
+
+MODIFIED_COMMAND=$env:PYTHONPATH='src'; python -m pytest -q --disable-warnings tests/test_quick_flow_history.py tests/test_web_ui.py::StructuredWebUiTests::test_one_click_registration_and_card_link_is_a_separate_pipeline_module tests/test_web_ui.py::StructuredWebUiTests::test_quick_flow_config_uses_mvp_persistence_and_keeps_start_outside_details tests/test_web_ui.py::StructuredWebUiTests::test_quick_flow_monitors_protocol_payment_to_terminal_state
+MODIFIED_INPUT=SQLite round-trip, two server instance IDs, running run-live fixture, authenticated save/delete API, real Chromium reload/render/delete, and existing quick-flow regressions
+MODIFIED_LITERAL_OUTPUT=.........                                                                [100%]
+MODIFIED_LITERAL_RESULT=9 passed, 1 warning in 9.37s
+MODIFIED_EXIT_STATUS=0
+
+EXTENDED_COMMAND=$env:PYTHONPATH='src'; python -m pytest -q tests/test_web_ui.py
+EXTENDED_INPUT=complete structured workspace UI and create_app route regression suite
+EXTENDED_LITERAL_OUTPUT=.................................................                        [100%]
+EXTENDED_LITERAL_RESULT=49 passed, 1302 warnings in 12.24s
+EXTENDED_EXIT_STATUS=0
+
+LINT_COMMAND=uv run ruff check src/hidemyemail_generator/quick_flow_history.py tests/test_quick_flow_history.py src/hidemyemail_generator/web_ui/page_builder.py src/hidemyemail_generator/webapp.py
+LINT_INPUT=all changed Python integration files
+LINT_LITERAL_OUTPUT=All checks passed!
+LINT_EXIT_STATUS=0
+
+ROLLBACK_COMMAND=Copy-Item -LiteralPath verification/quick-flow-history/MODIFIED_FILE -Destination verification/quick-flow-history/ROLLBACK_COPY -Force; & 'C:\Program Files\Git\bin\bash.exe' -lc '/d/AI/hidemyemail-generator/verification/quick-flow-history/ROLLBACK.sh /d/AI/hidemyemail-generator/verification/quick-flow-history/ROLLBACK_COPY'
+ROLLBACK_INPUT=D:\AI\hidemyemail-generator\verification\quick-flow-history\ROLLBACK_COPY containing MODIFIED_FILE bytes
+ROLLBACK_LITERAL_OUTPUT=ROLLBACK_RESULT=restored-original
+ROLLBACK_LITERAL_OUTPUT=RESTORED_FILE=/d/AI/hidemyemail-generator/verification/quick-flow-history/ROLLBACK_COPY
+ROLLBACK_LITERAL_OUTPUT=RESTORED_SHA256=734a1bff7c1f437940b8b65ddbb856707ef25445d86d0c9e3be44aac061ed70c
+ROLLBACK_LITERAL_OUTPUT=RESTORED_BEHAVIOR=browser_memory_only;restart_result=records_missing;status=volatile
+ROLLBACK_EXIT_STATUS=0
+ROLLBACK_HASH_MATCH=true
+ROLLBACK_RESTORED_STATUS=volatile baseline behavior restored on the rollback copy
+MODIFIED_FILE_LEFT_CHANGED=true

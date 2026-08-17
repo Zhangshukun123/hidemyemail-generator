@@ -8,13 +8,10 @@ import subprocess
 import urllib.request
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
-
-import aiohttp
 
 from .browser_tasks import (
     BrowserTaskManager,
@@ -25,11 +22,11 @@ from .browser_tasks import (
     account_session_access_token,
     access_token_is_expired,
     decode_jwt_payload,
-    jwt_account_type,
     load_account_record,
     session_account_type,
     session_email,
 )
+from .cookie_session import request_cookie_session
 from .inbox import connect_db
 
 
@@ -37,6 +34,46 @@ EVENT_PREFIX = "HME_VERIFY_EVENT:"
 PROTOCOL_EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
 MAX_LOG_ITEMS = 300
 MAX_HISTORY_LOG_ITEMS = 1000
+
+
+@dataclass(frozen=True)
+class AccountPlanPresentation:
+    """Public plan decision produced from online and signed-token evidence."""
+
+    status: str
+    detail: str
+    source: str
+
+
+class AccessTokenPlanPresenter:
+    """MVP presenter that turns AT query results into a stable account view."""
+
+    def present(
+        self,
+        token: str,
+        event: dict[str, Any],
+        *,
+        return_code: int,
+        allow_claim_fallback: bool = True,
+    ) -> AccountPlanPresentation:
+        # Compatibility adapter for bridge-based tests.  Claims are never used
+        # to rescue a failed online request: only accounts/check 2xx evidence
+        # may classify an account.
+        del token, allow_claim_fallback
+        online_status = str(event.get("status") or "error").strip().lower()
+        online_detail = str(event.get("detail") or "").strip()
+        if return_code == 0 and online_status in {"plus", "free"}:
+            return AccountPlanPresentation(
+                status=online_status,
+                detail=online_detail or "AT 在线套餐查询通过",
+                source=str(event.get("source") or "access_token_online"),
+            )
+
+        return AccountPlanPresentation(
+            status=online_status,
+            detail=online_detail,
+            source="access_token_online",
+        )
 
 
 def utc_now() -> str:
@@ -105,7 +142,11 @@ def _session_identities(session: Any) -> set[str]:
 
 
 def validate_refreshed_session(
-    *, expected_email: str, previous_token: str, session: dict[str, Any]
+    *,
+    expected_email: str,
+    previous_token: str,
+    session: dict[str, Any],
+    require_changed: bool = False,
 ) -> str:
     """Validate an untrusted refreshed Session before it may replace saved data."""
 
@@ -113,7 +154,7 @@ def validate_refreshed_session(
     token = str(session.get("accessToken") or session.get("access_token") or "").strip()
     if not token:
         raise RuntimeError("刷新 Session 未返回 Access Token")
-    if previous_token and token == previous_token:
+    if require_changed and previous_token and token == previous_token:
         raise RuntimeError("刷新 Session 返回的仍是旧 Access Token")
     if access_token_is_expired(token):
         raise RuntimeError("刷新 Session 返回的 Access Token 已过期")
@@ -136,56 +177,6 @@ def validate_refreshed_session(
     return token
 
 
-def _merge_response_cookies(
-    cookies: list[dict[str, Any]], set_cookie_headers: list[str]
-) -> list[dict[str, Any]]:
-    merged = {
-        (
-            str(item.get("name") or ""),
-            str(item.get("domain") or "chatgpt.com"),
-            str(item.get("path") or "/"),
-        ): dict(item)
-        for item in cookies
-        if str(item.get("name") or "").strip()
-    }
-    for header in set_cookie_headers:
-        parsed = SimpleCookie()
-        try:
-            parsed.load(header)
-        except Exception:
-            continue
-        for name, morsel in parsed.items():
-            domain = str(morsel["domain"] or "chatgpt.com")
-            path = str(morsel["path"] or "/")
-            expires = -1.0
-            if str(morsel["max-age"] or "").strip():
-                try:
-                    expires = datetime.now(timezone.utc).timestamp() + float(
-                        morsel["max-age"]
-                    )
-                except (TypeError, ValueError):
-                    expires = -1.0
-            elif str(morsel["expires"] or "").strip():
-                try:
-                    expires = parsedate_to_datetime(morsel["expires"]).timestamp()
-                except (TypeError, ValueError, OverflowError):
-                    expires = -1.0
-            same_site = str(morsel["samesite"] or "Lax").title()
-            if same_site not in {"Lax", "Strict", "None"}:
-                same_site = "Lax"
-            merged[(name, domain, path)] = {
-                "name": name,
-                "value": str(morsel.value),
-                "domain": domain,
-                "path": path,
-                "expires": expires,
-                "httpOnly": bool(morsel["httponly"]),
-                "secure": bool(morsel["secure"]),
-                "sameSite": same_site,
-            }
-    return list(merged.values())
-
-
 async def refresh_session_with_saved_cookies(
     *,
     email: str,
@@ -193,90 +184,28 @@ async def refresh_session_with_saved_cookies(
     cookies: list[dict[str, Any]],
     proxy_url: str,
     storage_state: dict[str, Any] | None = None,
+    impersonate: str = "firefox144",
+    language: str = "en-US",
 ) -> dict[str, Any]:
-    """Fetch a candidate Session twice through the account's registration proxy."""
+    """Fetch Session with saved cookies while preserving the browser identity."""
 
-    if not cookies:
-        raise RuntimeError("该账号没有可用于刷新 Session 的 Cookie")
-    if not str(proxy_url or "").strip():
-        raise RuntimeError("该账号未保存原注册代理，无法按原出口刷新 Session")
-
-    headers = {
-        "Accept": "application/json",
-        "Cache-Control": "no-cache, no-store",
-        "Pragma": "no-cache",
-        "Referer": "https://chatgpt.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
-    }
-    sessions: list[dict[str, Any]] = []
-    errors: list[str] = []
-    set_cookie_headers: list[str] = []
-    current_cookies = [dict(cookie) for cookie in cookies]
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as client:
-        for url in (
-            "https://chatgpt.com/api/auth/session",
-            "https://chatgpt.com/api/auth/session?refresh=true",
-        ):
-            try:
-                async with client.get(
-                    url,
-                    proxy=str(proxy_url).strip(),
-                    allow_redirects=False,
-                    headers={
-                        "Cookie": "; ".join(
-                            f"{str(cookie.get('name') or '').strip()}={str(cookie.get('value') or '')}"
-                            for cookie in current_cookies
-                            if str(cookie.get("name") or "").strip()
-                        )
-                    },
-                ) as response:
-                    response_cookie_headers = response.headers.getall("Set-Cookie", [])
-                    set_cookie_headers.extend(response_cookie_headers)
-                    current_cookies = _merge_response_cookies(
-                        current_cookies, response_cookie_headers
-                    )
-                    if response.status != 200:
-                        errors.append(
-                            f"{url.rsplit('/', 1)[-1]} 返回 HTTP {response.status}"
-                        )
-                        continue
-                    payload = await response.json(content_type=None)
-                    if isinstance(payload, dict):
-                        sessions.append(payload)
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-                errors.append(str(error)[:200])
-        candidate = next(
-            (
-                value
-                for value in reversed(sessions)
-                if str(value.get("accessToken") or value.get("access_token") or "").strip()
-            ),
-            None,
-        )
-        if candidate is None:
-            raise RuntimeError("Cookie 刷新未返回有效 Session" + (f"：{'；'.join(errors)}" if errors else ""))
-        token = validate_refreshed_session(
-            expected_email=email,
-            previous_token=previous_token,
-            session=candidate,
-        )
-        refreshed_cookies = _merge_response_cookies(current_cookies, set_cookie_headers)
-
-    if not refreshed_cookies:
-        raise RuntimeError("Cookie 刷新成功但未返回可保存的 Cookie")
-    origins = []
-    if isinstance(storage_state, dict) and isinstance(storage_state.get("origins"), list):
-        origins = list(storage_state["origins"])
-    return {
-        "access_token": token,
-        "session_json": json.dumps(candidate, ensure_ascii=False),
-        "cookies_json": json.dumps(refreshed_cookies, ensure_ascii=False),
-        "storage_state_json": json.dumps(
-            {"cookies": refreshed_cookies, "origins": origins}, ensure_ascii=False
-        ),
-        "session_acquisition_method": "cookie_session_refresh",
-    }
+    result = await request_cookie_session(
+        cookies=cookies,
+        previous_token=previous_token,
+        proxy_url=proxy_url,
+        storage_state=storage_state,
+        impersonate=impersonate,
+        language=language,
+    )
+    candidate = json.loads(str(result.get("session_json") or "{}"))
+    if not isinstance(candidate, dict):
+        raise RuntimeError("Cookie 刷新未返回有效 Session")
+    token = validate_refreshed_session(
+        expected_email=email,
+        previous_token=previous_token,
+        session=candidate,
+    )
+    return {**result, "access_token": token}
 
 
 def load_verifiable_accounts(db_file: Path) -> list[dict[str, Any]]:
@@ -304,7 +233,9 @@ def load_verifiable_accounts(db_file: Path) -> list[dict[str, Any]]:
                 record.get("account_type_source") or ""
             ).strip().lower()
             session_type, raw_session_plan = session_account_type(session)
-            if session_type and account_type_source != "manual":
+            if session_type and (
+                not account_type or account_type_source in {"", "session"}
+            ):
                 account_type = session_type
                 account_type_source = "session"
             accounts.append(
@@ -340,33 +271,62 @@ def removed_account_emails(db_file: Path) -> set[str]:
 
 
 def save_account_classification(
-    db_file: Path, email: str, account_type: str, detail: str
-) -> None:
+    db_file: Path,
+    email: str,
+    account_type: str,
+    detail: str,
+    *,
+    source: str = "verification",
+    expected_access_token: str = "",
+) -> bool:
     target = email.strip().lower()
-    record = load_account_record(db_file, target)
-    if not record:
-        return
-    if record.get("account_type_source") == "manual":
-        record.update(
-            {
-                "verified_at": utc_now(),
-                "verification_detail": (
-                    f"{str(detail or f'自动验证结果为 {account_type.title()}').strip()}；"
-                    "已保留手动设置的账号类型"
-                )[:1000],
-            }
-        )
-    else:
-        record.update(
-            {
-                "account_type": account_type,
-                "account_type_source": "verification",
-                "verified_at": utc_now(),
-                "verification_detail": str(detail or "")[:1000],
-            }
-        )
     conn = connect_db(str(db_file))
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (f"gpt_account:{target}",)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        try:
+            record = json.loads(str(row["value"] or ""))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            conn.rollback()
+            return False
+        if not isinstance(record, dict):
+            conn.rollback()
+            return False
+        expected = str(expected_access_token or "").strip()
+        if expected and account_session_access_token(record) != expected:
+            conn.rollback()
+            return False
+
+        now = utc_now()
+        verification_source = str(source or "verification").strip()[:80]
+        record.pop("session_invalid_at", None)
+        record.pop("session_invalid_reason", None)
+        record["updated_at"] = now
+        record["verification_method"] = verification_source
+        if record.get("account_type_source") == "manual":
+            record.update(
+                {
+                    "verified_at": now,
+                    "verification_detail": (
+                        f"{str(detail or f'自动验证结果为 {account_type.title()}').strip()}；"
+                        "已保留手动设置的账号类型"
+                    )[:1000],
+                }
+            )
+        else:
+            record.update(
+                {
+                    "account_type": account_type,
+                    "account_type_source": "verification",
+                    "verified_at": now,
+                    "verification_detail": str(detail or "")[:1000],
+                }
+            )
         conn.execute(
             """
             INSERT INTO settings(key, value) VALUES (?, ?)
@@ -376,23 +336,50 @@ def save_account_classification(
         )
         conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_removed:{target}",))
         conn.commit()
+        return True
     finally:
         conn.close()
 
 
-def mark_account_session_invalid(db_file: Path, email: str, detail: str) -> None:
+def mark_account_session_invalid(
+    db_file: Path,
+    email: str,
+    detail: str,
+    *,
+    expected_access_token: str = "",
+) -> bool:
     target = email.strip().lower()
-    record = load_account_record(db_file, target)
-    if not record:
-        return
-    record.update(
-        {
-            "session_invalid_at": utc_now(),
-            "verification_detail": str(detail or "Access Token 已失效")[:1000],
-        }
-    )
     conn = connect_db(str(db_file))
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (f"gpt_account:{target}",)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        try:
+            record = json.loads(str(row["value"] or ""))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            conn.rollback()
+            return False
+        if not isinstance(record, dict):
+            conn.rollback()
+            return False
+        expected = str(expected_access_token or "").strip()
+        if expected and account_session_access_token(record) != expected:
+            conn.rollback()
+            return False
+        now = utc_now()
+        invalid_reason = str(detail or "Access Token 已失效")[:1000]
+        record.update(
+            {
+                "session_invalid_at": now,
+                "session_invalid_reason": invalid_reason,
+                "verification_detail": invalid_reason,
+                "updated_at": now,
+            }
+        )
         conn.execute(
             """
             INSERT INTO settings(key, value) VALUES (?, ?)
@@ -402,6 +389,7 @@ def mark_account_session_invalid(db_file: Path, email: str, detail: str) -> None
         )
         conn.execute("DELETE FROM settings WHERE key = ?", (f"gpt_removed:{target}",))
         conn.commit()
+        return True
     finally:
         conn.close()
 
@@ -455,6 +443,7 @@ class AccountVerificationManager:
         delete_invalid_email: Callable[[str, str], Awaitable[str]] | None = None,
         cookie_session_refresher: Callable[..., Awaitable[dict[str, Any]]]
         | None = None,
+        plan_presenter: AccessTokenPlanPresenter | None = None,
     ) -> None:
         self.target_project_dir = target_project_dir.resolve()
         self.db_file = db_file.resolve()
@@ -479,6 +468,7 @@ class AccountVerificationManager:
         self.cookie_session_refresher = (
             cookie_session_refresher or refresh_session_with_saved_cookies
         )
+        self.plan_presenter = plan_presenter or AccessTokenPlanPresenter()
         self._batch_task: asyncio.Task | None = None
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._browser_refresh_lock = asyncio.Lock()
@@ -711,7 +701,9 @@ class AccountVerificationManager:
                 record.get("account_type_source") or ""
             ).strip().lower()
             session_type, raw_session_plan = session_account_type(session)
-            if session_type and account_type_source != "manual":
+            if session_type and (
+                not account_type or account_type_source in {"", "session"}
+            ):
                 account_type = session_type
                 account_type_source = "session"
             saved_two_factor = (
@@ -773,6 +765,125 @@ class AccountVerificationManager:
             self._refresh_sessions_and_verify(concurrency)
         )
         return self.snapshot()
+
+    def start_with_saved_cookies(
+        self,
+        *,
+        emails: list[str] | set[str],
+        concurrency: int = 3,
+    ) -> dict[str, Any]:
+        """Refresh Session/AT through the saved HTTP cookie jar, then check plan."""
+
+        if self._batch_task and not self._batch_task.done():
+            raise RuntimeError("账号验证任务正在运行")
+        runtime = self.availability()
+        if not runtime["available"]:
+            raise RuntimeError("；".join(runtime["errors"]))
+        targets = sorted(
+            {
+                str(value or "").strip().lower()
+                for value in emails
+                if str(value or "").strip()
+            }
+        )
+        if not targets:
+            raise RuntimeError("没有需要验证的账号")
+        concurrency = max(1, min(10, int(concurrency)))
+        accounts: list[dict[str, Any]] = []
+        for email in targets:
+            record = load_account_record(self.db_file, email)
+            cookies = account_saved_cookies(record)
+            if not cookies:
+                raise RuntimeError(f"{email} 尚未保存可用 Cookie")
+            session = account_session(record)
+            account_type = str(record.get("account_type") or "").strip().lower()
+            account_type_source = str(
+                record.get("account_type_source") or ""
+            ).strip().lower()
+            session_type, session_plan = session_account_type(session)
+            if not account_type and session_type:
+                account_type = session_type
+                account_type_source = "session"
+            accounts.append(
+                {
+                    "email": email,
+                    "status": "queued",
+                    "message": "等待使用保存 Cookie 刷新 Session / AT",
+                    "_cookie_refresh_only": True,
+                    "_access_token": account_session_access_token(record),
+                    "_account_type": account_type,
+                    "_account_type_source": account_type_source,
+                    "_session_email": session_email(session),
+                    "_session_plan": session_plan,
+                    "_two_factor": (
+                        record.get("two_factor")
+                        if isinstance(record.get("two_factor"), dict)
+                        else {}
+                    ),
+                }
+            )
+
+        self._state = {
+            "id": uuid.uuid4().hex,
+            "status": "running",
+            "running": True,
+            "headless": True,
+            "refreshSource": "cookie_http",
+            "concurrency": concurrency,
+            "total": len(accounts),
+            "completed": 0,
+            "plus": 0,
+            "free": 0,
+            "expired": 0,
+            "deleted": 0,
+            "failed": 0,
+            "accounts": accounts,
+            "logs": [],
+            "startedAt": utc_now(),
+            "finishedAt": "",
+        }
+        self._append_log(
+            f"Cookie Session 刷新已启动：{len(accounts)} 个账号，并发 {concurrency}"
+        )
+        self._batch_task = asyncio.create_task(
+            self._refresh_saved_cookies_and_verify(concurrency)
+        )
+        return self.snapshot()
+
+    async def _refresh_saved_cookies_and_verify(self, concurrency: int) -> None:
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def refresh_one(item: dict[str, Any]) -> None:
+            async with semaphore:
+                email = str(item["email"])
+                item.update(
+                    status="running",
+                    message="正在用 curl_cffi Cookie Jar 刷新 Session / AT",
+                )
+                self._append_log(item["message"], email=email)
+                refreshed, error = await self._refresh_invalid_token_with_cookie(
+                    item, email
+                )
+                if not refreshed:
+                    self._fail_session_refresh(item, error)
+                    return
+                item.update(
+                    status="queued",
+                    message="Session / AT 已刷新，等待实时套餐查询",
+                    _force_online=True,
+                    _pre_refreshed_with_cookie=True,
+                )
+                self._append_log(item["message"], email=email)
+
+        try:
+            await asyncio.gather(*(refresh_one(item) for item in self._state["accounts"]))
+        except asyncio.CancelledError:
+            self._state["status"] = "cancelled"
+            self._state["running"] = False
+            self._state["finishedAt"] = utc_now()
+            self._append_log("Cookie Session 刷新任务已停止")
+            raise
+        await self._run_batch(concurrency)
 
     @staticmethod
     def _clear_private_item_fields(item: dict[str, Any]) -> None:
@@ -860,7 +971,10 @@ class AccountVerificationManager:
                         )
                         continue
                     session_type, session_plan = session_account_type(session)
-                    if item.get("_account_type_source") != "manual" and session_type:
+                    if session_type and (
+                        not item.get("_account_type")
+                        or item.get("_account_type_source") in {"", "session"}
+                    ):
                         item["_account_type"] = session_type
                         item["_account_type_source"] = "session"
                     item.update(
@@ -967,7 +1081,10 @@ class AccountVerificationManager:
         if owner and owner != email:
             return False, f"浏览器返回的 Session 账号不匹配：{owner}"
         session_type, session_plan = session_account_type(session)
-        if item.get("_account_type_source") != "manual" and session_type:
+        if session_type and (
+            not item.get("_account_type")
+            or item.get("_account_type_source") in {"", "session"}
+        ):
             item["_account_type"] = session_type
             item["_account_type_source"] = "session"
         item["_access_token"] = token
@@ -1006,7 +1123,8 @@ class AccountVerificationManager:
                 proxy_url = fallback_url
                 proxy_label = "当前 Clash 注册代理入口（旧记录未保存当次出口）"
             else:
-                return False, "该账号未保存原注册代理"
+                proxy_url = ""
+                proxy_label = "直连出口（旧记录未保存当次代理）"
         raw_storage_state = record.get("storage_state_json")
         if isinstance(raw_storage_state, str) and raw_storage_state.strip():
             try:
@@ -1014,6 +1132,13 @@ class AccountVerificationManager:
             except (json.JSONDecodeError, TypeError, ValueError):
                 raw_storage_state = {}
         storage_state = raw_storage_state if isinstance(raw_storage_state, dict) else {}
+        diagnostics = record.get("registration_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        impersonate = str(diagnostics.get("impersonate") or "firefox144").strip()
+        language = str(
+            diagnostics.get("fingerprint_language") or "en-US"
+        ).strip()
         previous_token = str(item.get("_access_token") or "").strip()
         try:
             candidate_result = await self.cookie_session_refresher(
@@ -1022,6 +1147,8 @@ class AccountVerificationManager:
                 cookies=cookies,
                 proxy_url=proxy_url,
                 storage_state=storage_state,
+                impersonate=impersonate,
+                language=language,
             )
             if not isinstance(candidate_result, dict):
                 raise RuntimeError("Cookie 刷新返回格式无效")
@@ -1036,6 +1163,7 @@ class AccountVerificationManager:
                 expected_email=email,
                 previous_token=previous_token,
                 session=session,
+                require_changed=True,
             )
             raw_cookies = candidate_result.get("cookies_json")
             parsed_cookies = json.loads(raw_cookies) if isinstance(raw_cookies, str) else raw_cookies
@@ -1045,7 +1173,10 @@ class AccountVerificationManager:
             return False, str(error)[:500]
 
         session_type, session_plan = session_account_type(session)
-        if item.get("_account_type_source") != "manual" and session_type:
+        if (
+            session_type
+            and str(item.get("_account_type_source") or "") in {"", "session"}
+        ):
             item["_account_type"] = session_type
             item["_account_type_source"] = "session"
         candidate_result = {
@@ -1265,7 +1396,10 @@ class AccountVerificationManager:
             },
         )
         session_type, session_plan = session_account_type(session)
-        if item.get("_account_type_source") != "manual" and session_type:
+        if session_type and (
+            not item.get("_account_type")
+            or item.get("_account_type_source") in {"", "session"}
+        ):
             item["_account_type"] = session_type
             item["_account_type_source"] = "session"
         item["_access_token"] = token
@@ -1285,15 +1419,23 @@ class AccountVerificationManager:
     ) -> tuple[int, dict[str, Any], bytes]:
         event: dict[str, Any] = {}
         stderr = b""
-        jwt_type, jwt_plan = jwt_account_type(token)
-        if not force_online and jwt_type == "plus" and not access_token_is_expired(token):
-            event = {
-                "status": "plus",
-                "detail": f"JWT chatgpt_plan_type={jwt_plan}（本地快速验证）",
-            }
-            item["message"] = "JWT 已确认 Plus"
-            self._append_log(item["message"], email=email)
-            return 0, event, stderr
+        del force_online
+
+        record = await asyncio.to_thread(load_account_record, self.db_file, email)
+        diagnostics = record.get("registration_diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        cookies = account_saved_cookies(record)
+        device_id = next(
+            (
+                str(cookie.get("value") or "").strip()
+                for cookie in cookies
+                if str(cookie.get("name") or "").strip() == "oai-did"
+            ),
+            "",
+        )
+        language = str(
+            diagnostics.get("fingerprint_language") or "en-US"
+        ).strip()
 
         env = os.environ.copy()
         env.update(
@@ -1301,6 +1443,9 @@ class AccountVerificationManager:
                 "PYTHONUTF8": "1",
                 "PYTHONIOENCODING": "utf-8",
                 "HME_OPENAI_ACCESS_TOKEN": token,
+                "HME_OPENAI_PLAN_PROXY_URL": account_registration_proxy_url(record),
+                "HME_OPENAI_PLAN_DEVICE_ID": device_id,
+                "HME_OPENAI_PLAN_LANGUAGE": language,
             }
         )
         command = [
@@ -1308,6 +1453,8 @@ class AccountVerificationManager:
             str(self.bridge_file),
             "--source-dir",
             str(self.target_project_dir),
+            "--locale",
+            language,
         ]
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
@@ -1341,6 +1488,58 @@ class AccountVerificationManager:
             if isinstance(candidate, dict):
                 event = candidate
         return return_code, event, stderr
+
+    async def verify_saved_access_token(self, email: str) -> dict[str, Any]:
+        """Query a newly saved AT online and persist a race-safe plan projection."""
+
+        target = str(email or "").strip().lower()
+        record = await asyncio.to_thread(load_account_record, self.db_file, target)
+        session = account_session(record)
+        token = account_session_access_token(record)
+        if not session or not token:
+            return {
+                "status": "error",
+                "source": "access_token_online",
+                "detail": "账号尚未保存可验证的 Session / AT",
+                "saved": False,
+            }
+
+        return_code, event, stderr = await self._check_access_token(
+            {}, target, token, force_online=True
+        )
+        presentation = self.plan_presenter.present(
+            token, event, return_code=return_code
+        )
+        status = presentation.status
+        detail = presentation.detail
+
+        saved = False
+        if status in {"plus", "free"}:
+            saved = await asyncio.to_thread(
+                save_account_classification,
+                self.db_file,
+                target,
+                status,
+                detail,
+                source=presentation.source,
+                expected_access_token=token,
+            )
+            if not saved:
+                return {
+                    "status": "superseded",
+                    "source": presentation.source,
+                    "detail": "AT 查询期间账号凭据已更新，旧查询结果已忽略",
+                    "saved": False,
+                }
+        elif not detail:
+            detail = stderr.decode("utf-8", errors="replace").strip()[:500]
+
+        return {
+            "status": status,
+            "source": presentation.source,
+            "detail": detail,
+            "saved": saved,
+        }
 
     async def _run_account(
         self, item: dict[str, Any], semaphore: asyncio.Semaphore
@@ -1382,15 +1581,16 @@ class AccountVerificationManager:
                     if key.startswith("_"):
                         item.pop(key, None)
                 return
-            automatic_refresh_attempted = False
-            automatic_refresh_succeeded = False
+            automatic_refresh_attempted = bool(item.get("_pre_refreshed_with_cookie"))
+            automatic_refresh_succeeded = bool(item.get("_pre_refreshed_with_cookie"))
             automatic_refresh_error = ""
-            cookie_refresh_attempted = False
+            cookie_refresh_attempted = bool(item.get("_pre_refreshed_with_cookie"))
             result = "error"
             detail = ""
             stderr = b""
             return_code = 0
             token = ""
+            verification_source = "access_token_online"
             for verification_attempt in range(2):
                 item.update(
                     status="running",
@@ -1414,11 +1614,13 @@ class AccountVerificationManager:
                         )
                     ),
                 )
-                result = str(event.get("status") or "error")
-                detail = str(event.get("detail") or "").strip()
-                safe_detail = detail.replace(token, "[REDACTED]") if token else detail
+                raw_result = str(event.get("status") or "error")
+                raw_detail = str(event.get("detail") or "").strip()
+                safe_detail = (
+                    raw_detail.replace(token, "[REDACTED]") if token else raw_detail
+                )
                 response_log = (
-                    f"验证响应：status={result}，exitCode={return_code}"
+                    f"验证响应：status={raw_result}，exitCode={return_code}"
                     + (f"；{safe_detail}" if safe_detail else "；未返回详细说明")
                 )
                 self._append_log(
@@ -1426,12 +1628,31 @@ class AccountVerificationManager:
                     email=email,
                     level=(
                         "success"
-                        if return_code == 0 and result in {"plus", "free"}
+                        if return_code == 0 and raw_result in {"plus", "free"}
                         else "warning"
-                        if return_code == 0 and result == "invalid"
+                        if return_code == 0 and raw_result == "invalid"
                         else "error"
                     ),
                 )
+                presentation = self.plan_presenter.present(
+                    token,
+                    event,
+                    return_code=return_code,
+                    allow_claim_fallback=bool(
+                        item.get("_force_online")
+                        or item.get("_cookie_refresh_only")
+                        or verification_attempt
+                    ),
+                )
+                result = presentation.status
+                detail = presentation.detail
+                verification_source = presentation.source
+                if result != raw_result:
+                    self._append_log(
+                        detail,
+                        email=email,
+                        level="warning",
+                    )
                 session_owner = str(
                     item.get("_session_email") or ""
                 ).strip().lower()
@@ -1495,7 +1716,7 @@ class AccountVerificationManager:
                     ),
                     email=email,
                 )
-            if return_code == 0 and result in {"plus", "free"}:
+            if result in {"plus", "free"}:
                 pending_session_result = item.get("_pending_session_result")
                 if isinstance(pending_session_result, dict):
                     await asyncio.to_thread(
@@ -1519,99 +1740,121 @@ class AccountVerificationManager:
                         f"自动验证结果为 {result.title()}；"
                         "已保留手动设置的账号类型"
                     )
-                elif result == "free" and item.get("_account_type") == "plus":
-                    effective_result = "plus"
-                    detail = (
-                        "套餐接口返回 Free，但已保存的最新登录 Session 明确为 Plus；"
-                        f"已保留 Plus 分类。{detail}"
-                    )
-                await asyncio.to_thread(
+                classification_saved = await asyncio.to_thread(
                     save_account_classification,
                     self.db_file,
                     email,
                     effective_result,
                     detail,
+                    source=verification_source,
+                    expected_access_token=token,
                 )
+                if not classification_saved:
+                    item.update(
+                        status="superseded",
+                        message="AT 查询期间账号凭据已更新，旧查询结果已忽略",
+                    )
+                    self._state["completed"] += 1
+                    self._append_log(item["message"], email=email, level="warning")
+                    self._clear_private_item_fields(item)
+                    return
                 if item.get("_account_type_source") == "manual":
                     item.update(
                         status=effective_result,
                         message=f"已保留手动设置的 {effective_result.title()}",
                     )
-                elif effective_result != result:
-                    item.update(status="plus", message="已保留 Plus（套餐接口返回 Free）")
                 else:
                     item.update(status=result, message=f"已归类为 {result.title()}")
                 self._state[effective_result] += 1
                 self._append_log(item["message"], email=email, level="success")
             elif return_code == 0 and result == "invalid":
+                current_record = await asyncio.to_thread(
+                    load_account_record, self.db_file, email
+                )
+                current_token = account_session_access_token(current_record)
                 if cookie_refresh_attempted and not automatic_refresh_succeeded:
                     invalid_message = (
-                        "旧 Token 已失效，Cookie Session 刷新失败；原 Session、AT 与 Cookie 均未覆盖"
+                        "AT 在线查询返回 401，Cookie Session 刷新失败；"
+                        "原 Session、AT、Cookie 与套餐均已保留"
                     )
                     refresh_detail = str(automatic_refresh_error or "").strip()
                     if refresh_detail:
                         invalid_message += f"：{refresh_detail}"
-                    await asyncio.to_thread(
-                        mark_account_session_invalid,
-                        self.db_file,
-                        email,
-                        invalid_message,
-                    )
-                    item.update(
-                        status="expired",
-                        sessionStatus="expired",
-                        message=invalid_message,
-                    )
-                    self._state["expired"] += 1
-                    self._state["failed"] += 1
-                    self._append_log(item["message"], email=email, level="error")
                 elif automatic_refresh_succeeded:
                     invalid_message = (
-                        "已自动取得候选 Session，但新 Token 复验仍失效，"
-                        "原 Session 已保留"
+                        "已取得候选 Session / AT，但实时套餐接口仍返回 401；"
+                        "候选凭据未覆盖，原账号与套餐已保留"
                     )
                 elif automatic_refresh_attempted:
                     refresh_detail = str(automatic_refresh_error or "").strip()
-                    invalid_message = "Token 已失效，无头浏览器自动提取失败"
+                    invalid_message = "AT 在线查询返回 401，重新登录获取 Session 失败"
                     if refresh_detail:
                         invalid_message += f"：{refresh_detail}"
-                    invalid_message += "；原 Session 已保留"
+                    invalid_message += "；原账号与套餐已保留"
                 else:
-                    invalid_message = "Token 已失效，原 Session 已保留"
-                if not (cookie_refresh_attempted and not automatic_refresh_succeeded):
-                    deletion_reason = f"{invalid_message}；验证详情：{detail or '两个账号接口均返回 401'}"
+                    invalid_message = (
+                        "AT 在线查询返回 401，需要刷新登录态；原账号与套餐已保留"
+                    )
+                invalid_marked = await asyncio.to_thread(
+                    mark_account_session_invalid,
+                    self.db_file,
+                    email,
+                    invalid_message,
+                    expected_access_token=current_token,
+                )
+                if not invalid_marked:
+                    item.update(
+                        status="superseded",
+                        message="AT 校验期间账号凭据已更新，旧 401 结果已忽略",
+                    )
+                    self._state["completed"] += 1
+                    self._append_log(item["message"], email=email, level="warning")
+                    self._clear_private_item_fields(item)
+                    return
+                preserved_type = str(
+                    current_record.get("account_type") or item.get("_account_type") or ""
+                ).strip().lower()
+                jwt_expired = bool(current_token) and access_token_is_expired(current_token)
+                if preserved_type in {"plus", "free"}:
+                    item.update(
+                        status=preserved_type,
+                        sessionStatus="expired" if jwt_expired else "ready",
+                        message=(
+                            f"{invalid_message}；已保留 {preserved_type.title()}"
+                        ),
+                    )
+                    self._state[preserved_type] += 1
+                else:
+                    item.update(
+                        status="failed",
+                        sessionStatus="expired" if jwt_expired else "ready",
+                        message=invalid_message,
+                    )
+                if jwt_expired:
                     self._state["expired"] += 1
-                    try:
-                        deletion_message = await self._delete_confirmed_invalid_email(
-                            email, deletion_reason
-                        )
-                        item.update(
-                            status="deleted",
-                            sessionStatus="expired",
-                            message=f"Token 已确认失效；{deletion_message}",
-                        )
-                        self._state["deleted"] += 1
-                        self._append_log(item["message"], email=email, level="warning")
-                    except Exception as error:
-                        delete_error = str(error or "删除邮箱失败")[:500]
-                        await asyncio.to_thread(
-                            mark_account_session_invalid,
-                            self.db_file,
-                            email,
-                            f"{deletion_reason}；自动删除失败：{delete_error}",
-                        )
-                        item.update(
-                            status="expired",
-                            sessionStatus="expired",
-                            message=f"{invalid_message}；自动删除失败：{delete_error}",
-                        )
-                        self._state["failed"] += 1
-                        self._append_log(item["message"], email=email, level="error")
+                self._state["failed"] += 1
+                self._append_log(item["message"], email=email, level="warning")
             else:
                 error = detail or stderr.decode("utf-8", errors="replace").strip()
                 if token:
                     error = error.replace(token, "[REDACTED]")
-                item.update(status="failed", message=(error or "账号验证失败")[:500])
+                current_record = await asyncio.to_thread(
+                    load_account_record, self.db_file, email
+                )
+                preserved_type = str(
+                    current_record.get("account_type") or item.get("_account_type") or ""
+                ).strip().lower()
+                if preserved_type in {"plus", "free"}:
+                    item.update(
+                        status=preserved_type,
+                        message=(
+                            f"实时套餐查询失败，已保留 {preserved_type.title()}："
+                            f"{error or '结果不确定'}"
+                        )[:500],
+                    )
+                    self._state[preserved_type] += 1
+                else:
+                    item.update(status="failed", message=(error or "账号验证失败")[:500])
                 self._state["failed"] += 1
                 self._append_log(
                     f"验证失败，账号已保留：{item['message']}",
@@ -1653,6 +1896,8 @@ class AccountVerificationManager:
 
 
 __all__ = [
+    "AccessTokenPlanPresenter",
+    "AccountPlanPresentation",
     "AccountVerificationManager",
     "load_verifiable_accounts",
     "mark_account_session_invalid",

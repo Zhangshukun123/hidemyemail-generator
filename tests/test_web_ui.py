@@ -267,6 +267,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-route="quick-flow"', page)
         self.assertIn('id="quickFlowView" data-view="quick-flow"', page)
         self.assertIn("一键注册、提链并支付", page)
+        self.assertIn("paymentProxyBackupCount", page)
+        self.assertIn("个实测出口（", page)
         self.assertIn('id="quickRegistrationMode"', page)
         self.assertIn('id="quickRegistrationProvider"', page)
         self.assertIn('<option value="inventory">iCloud 库存邮箱</option>', page)
@@ -396,6 +398,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertLessEqual(len(app_js.splitlines()), 5000)
 
         for component in (
+            "class PaymentOutcomeModel",
             "class PayPalPaymentJobModel",
             "class PayPalPaymentMonitorPresenter",
             "this.paypalPaymentMonitorPresenter = new PayPalPaymentMonitorPresenter(this.api)",
@@ -404,17 +407,20 @@ class StructuredWebUiTests(unittest.TestCase):
             "await Promise.all(monitorTargets.map",
             "const confirmation = job.account_confirmation",
             "confirmation.plus_confirmed === true",
-            "paymentSucceeded: succeeded",
+            "paymentSucceeded: protocolSucceeded",
+            "paymentPlusConfirmed: plusConfirmed",
+            "paymentConfirmationError: confirmationError",
             "paymentAtRefreshStatus: confirmationStatus",
             'source: "paypal_protocol"',
             'source: "payment_at_refresh"',
-            'this.candidate("paypal_protocol", "协议支付"',
-            "const atFailure = Boolean(item.paymentProtocolSucceeded)",
-            "协议已完成，未重复发起支付",
+            "result.paymentLogs",
+            "window.PaymentOutcomeModel.classify(job)",
+            "支付成功，但 AT/Plus 后置校验失败",
             "新 AT 已确认 Plus",
             "协议支付失败",
         ):
             self.assertIn(component, page)
+        self.assertNotIn("paymentSucceeded: succeeded", page)
         self.assertIn("协议成功", page)
         self.assertNotIn(">查看 PP 支付</button>", page)
         self.assertNotIn(
@@ -450,6 +456,16 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('localStorage.setItem("hme_quick_extraction_count"', page)
         self.assertIn("返回 cs_live 时自动继续同模式提链", page)
         self.assertIn("quickFlowFailureExplanation", page)
+        for component in (
+            "class QuickFlowQuotaEligibilityModel",
+            "class QuickFlowAccountResultView",
+            "class QuickFlowAccountResultPresenter",
+            "活动更新响应未证明优惠已生效",
+            "无免费额度",
+            'data-action="remove-no-free-quota-account"',
+            'local_only: true',
+        ):
+            self.assertIn(component, page)
         self.assertIn("本次请求被服务端拦截，不代表账号无法提链", page)
         self.assertIn('class="quick-flow-monitor-details"', page)
         self.assertNotIn("直卡提链日志", page)
@@ -631,24 +647,25 @@ class StructuredWebUiTests(unittest.TestCase):
             'id="terminalPreviewList" class="terminal-preview-list" role="log"', page
         )
         self.assertIn('data-action="toggle-terminal-preview"', page)
-        self.assertIn('this.candidate("registration", "注册进程"', page)
+        self.assertIn("this.managerCandidates(", page)
+        self.assertIn('"registration", "注册进程"', page)
         self.assertIn('this.candidate("browser", "浏览器任务"', page)
-        self.assertIn('this.candidate("protocol", "协议注册"', page)
+        self.assertIn('"protocol", "Mail Auth 协议注册"', page)
         self.assertIn('this.candidate("verification", "账号验证"', page)
         self.assertIn('this.candidate("pipeline", "注册提链流水线"', page)
-        self.assertIn("raw.originTaskId || raw.taskId", page)
-        self.assertIn("raw.originSeq || raw.originSequence", page)
+        self.assertIn("item.originTaskId || item.taskId", page)
+        self.assertIn("item.originSeq || item.originSequence", page)
         self.assertIn("function redactTerminalLogText", page)
-        self.assertIn("redactTerminalLogText(raw.message)", page)
+        self.assertIn("this.redact(item.message)", page)
         self.assertIn("REDACTED_API_KEY", page)
         self.assertIn("running ? currentLogs : historyLogs.length", page)
         self.assertIn("logs.slice(-1200)", page)
         self.assertIn("formatLogTimestamp", page)
         self.assertIn("item.location", page)
         self.assertIn("item.action", page)
-        self.assertIn("diagnosticCode: redactTerminalLogText", page)
-        self.assertIn('escapeHtml(item.message || "（无消息内容）")', page)
-        self.assertIn("cursor: retainedLogs.at(-1)?.key", page)
+        self.assertIn("diagnosticCode: this.redact", page)
+        self.assertIn('escape(item.message || "（无消息内容）")', page)
+        self.assertIn("cursor: logs.at(-1)?.key", page)
         self.assertNotIn("打开运行日志检查失败上下文后重新注册", page)
 
     def test_account_workspace_uses_compact_registration_launchpad(self):
@@ -744,9 +761,9 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn('id="taskNextAction"', page)
         self.assertNotIn('id="taskRecognitionMeta"', page)
         self.assertNotIn('id="taskStepLedger"', page)
-        self.assertIn("inferLogContext({", page)
-        self.assertIn("location: redactTerminalLogText(raw.location)", page)
-        self.assertIn("action: redactTerminalLogText(raw.action)", page)
+        self.assertIn("this.inferContext({", page)
+        self.assertIn("location: this.redact(item.location)", page)
+        self.assertIn("action: this.redact(item.action)", page)
         self.assertIn(
             'this.schedule("browser", () => this.loadBrowserTask(), 500)', page
         )
@@ -822,6 +839,9 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("Cookie 刷新选中账号", page)
         self.assertIn("refresh_with_cookie: true", page)
         self.assertIn("使用保存的 Cookie 刷新 Session 与账号状态", page)
+        self.assertIn("if (data.task) this.store.patch({ verificationTask: data.task })", page)
+        self.assertIn("if (data.task) this.store.patch({ browserTask: data.task })", page)
+        self.assertIn("requestSequence !== this.accountsRequestSequence", page)
 
     def test_account_without_two_factor_exposes_add_action(self):
         page = build_app_page()

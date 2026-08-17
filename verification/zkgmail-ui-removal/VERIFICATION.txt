@@ -1,0 +1,92 @@
+OBJECT: zkgmail-code-server 1.1.0 production UI static overlay
+CHANGED_BRANCH_FIELD: View index hero-copy/generateButton/steps; app elements.generate/randomAlias/generate click listener
+
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal\MODIFIED_FILE
+MODIFIED_APP: D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal\MODIFIED_APP.js
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal\DIFF_FILE
+VERIFICATION_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal\VERIFICATION.txt
+ROLLBACK_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal\ROLLBACK.sh
+
+ORIGINAL_INDEX_SHA256: 4db2cea0852ed841174ec6a4c028a60eabf97a51a50873045189822a2a628b10
+MODIFIED_INDEX_SHA256: 8acd71e7c8fac4a7105b4377989a291f42e40fd107d6a7b98d4bb3d73a6bb268
+ORIGINAL_APP_SHA256: 880e33ce1e091e3a2ebacb0a3efa4e9ed45c2837775f533d3120f6ff178c1235
+MODIFIED_APP_SHA256: 9cfed453865d17e7e2724a856320f98dd05979e1d4f433b0cde6d19121fb7df1
+
+BASELINE
+Command:
+$page=Invoke-WebRequest -Uri 'https://zkgmail.8-208-13-52.sslip.io/' -TimeoutSec 30; $script=Invoke-WebRequest -Uri 'https://zkgmail.8-208-13-52.sslip.io/assets/app.js?v=1.1.0' -TimeoutSec 30; count QQ, 生成新地址, generateButton, and randomAlias in the response bodies
+Input: public production HTML and JavaScript from image zkgmail-code-server:1.1.0
+Literal output:
+BASELINE_HTTP=200
+BASELINE_QQ_COUNT=3
+BASELINE_GENERATE_TEXT_COUNT=1
+BASELINE_GENERATE_BUTTON_COUNT=1
+BASELINE_RANDOM_ALIAS_COUNT=2
+BASELINE_EXIT_STATUS=0
+Result: the unwanted description, QQ text, address generator control, and generator implementation were present.
+
+MODIFIED
+Command:
+$html=Get-Content -Raw MODIFIED_FILE; $js=Get-Content -Raw MODIFIED_APP.js; count QQ, 生成新地址, generateButton, randomAlias, copyAddressButton, and class="steps"; node --check MODIFIED_APP.js
+Working directory: D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal
+Input: modified HTML and JavaScript overlay
+Literal output:
+MODIFIED_QQ_COUNT=0
+MODIFIED_GENERATE_TEXT_COUNT=0
+MODIFIED_GENERATE_BUTTON_COUNT=0
+MODIFIED_RANDOM_ALIAS_COUNT=0
+MODIFIED_COPY_BUTTON_COUNT=1
+MODIFIED_STEPS_COUNT=0
+NODE_CHECK_EXIT_STATUS=0
+MODIFIED_EXIT_STATUS=0
+Result: all QQ and generation UI/implementation were removed; manual email copying remains.
+
+CANDIDATE
+Command/input: run zkgmail-code-server:1.1.1-ui on 127.0.0.1:18769 and POST codex-ui-probe-20260817@zkgmail.com to /api/code/latest
+Literal output:
+CANDIDATE_QQ_COUNT=0
+CANDIDATE_GENERATE_TEXT_COUNT=0
+CANDIDATE_GENERATE_BUTTON_COUNT=0
+CANDIDATE_RANDOM_ALIAS_COUNT=0
+CANDIDATE_COPY_BUTTON_COUNT=1
+CANDIDATE_SCRIPT_VERSION=True
+CANDIDATE_API_HTTP=404
+CANDIDATE_API_STATE=waiting
+CANDIDATE_EXIT_STATUS=0
+
+PRODUCTION MODIFIED
+Command:
+$page=Invoke-WebRequest -Uri 'https://zkgmail.8-208-13-52.sslip.io/' -TimeoutSec 30; $script=Invoke-WebRequest -Uri 'https://zkgmail.8-208-13-52.sslip.io/assets/app.js?v=1.1.1' -TimeoutSec 30; POST codex-ui-public-probe-20260817@zkgmail.com to /api/code/latest; count removed and retained fields
+Literal output:
+PUBLIC_HTTP=200
+PUBLIC_QQ_COUNT=0
+PUBLIC_GENERATE_TEXT_COUNT=0
+PUBLIC_GENERATE_BUTTON_COUNT=0
+PUBLIC_RANDOM_ALIAS_COUNT=0
+PUBLIC_COPY_BUTTON_COUNT=1
+PUBLIC_SCRIPT_VERSION=True
+PUBLIC_API_HTTP=404
+PUBLIC_API_STATE=waiting
+PUBLIC_EXIT_STATUS=0
+CONTAINER_HEALTH=healthy IMAGE=zkgmail-code-server:1.1.1-ui
+HEALTH_CHECK_EXIT_STATUS=0
+Restored production status: public UI is served by 1.1.1-ui, the lookup path remains healthy, and Chrome DOM contains no QQ description or generate-address control.
+
+ROLLBACK
+Command:
+$d='D:\AI\hidemyemail-generator\verification\zkgmail-ui-removal'; $target=Join-Path $d 'ROLLBACK_COPY'; Copy-Item MODIFIED_FILE $target\index.html -Force; Copy-Item MODIFIED_APP.js $target\app.js -Force; & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x '/d/AI/hidemyemail-generator/verification/zkgmail-ui-removal/ROLLBACK.sh' && test -x '/d/AI/hidemyemail-generator/verification/zkgmail-ui-removal/ROLLBACK.sh' && '/d/AI/hidemyemail-generator/verification/zkgmail-ui-removal/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/zkgmail-ui-removal/ROLLBACK_COPY'"
+Input: separate copies of MODIFIED_FILE and MODIFIED_APP.js; production and modified artifacts are not rollback targets
+Literal output:
+ROLLBACK_TARGET=/d/AI/hidemyemail-generator/verification/zkgmail-ui-removal/ROLLBACK_COPY
+ROLLBACK_INDEX_SHA256=4db2cea0852ed841174ec6a4c028a60eabf97a51a50873045189822a2a628b10
+ROLLBACK_APP_SHA256=880e33ce1e091e3a2ebacb0a3efa4e9ed45c2837775f533d3120f6ff178c1235
+ROLLBACK_RESULT=restored
+RESTORED_QQ_COUNT=3
+RESTORED_GENERATE_TEXT_COUNT=1
+RESTORED_GENERATE_BUTTON_COUNT=1
+RESTORED_RANDOM_ALIAS_COUNT=2
+ROLLBACK_SCRIPT_EXIT=0
+RESTORED_BEHAVIOR_EXIT=0
+Restored status: ROLLBACK_COPY exactly matches both original production assets and exhibits the original UI/behavior. MODIFIED_FILE, MODIFIED_APP.js, and production remain changed.
+
+REMOTE ROLLBACK CONTAINER: zkgmail-code-server.pre-ui-1.1.1-20260817T095102Z (exited, image 1.1.0)

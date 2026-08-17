@@ -1,0 +1,107 @@
+OBJECT: zkgmail-code-server IMAP environment parsing and production container configuration
+CHANGED_BRANCH_FIELD: Settings.from_env -> _environment_value; ZKGMAIL_* values wrapped by literal matching quotes
+
+SOURCE_FILE: D:\AI\hidemyemail-generator\zkgmail-code-server\zkgmail_code_server\settings.py
+TEST_FILE: D:\AI\hidemyemail-generator\zkgmail-code-server\tests\test_settings.py
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery\DIFF_FILE
+VERIFICATION_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery\VERIFICATION.txt
+ROLLBACK_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery\ROLLBACK.sh
+
+ORIGINAL_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery\ORIGINAL_FILE
+ORIGINAL_SHA256: 0652197fc4e09291dca792452e1f3e411e115e1a008feade8a7a49e47a156d0c
+MODIFIED_SHA256: 55dfddf14e7d981cf0481e37f68e7630eeedc932b49aaeb421401dbc004e8c83
+ACTIVE_SOURCE_SHA256: 55dfddf14e7d981cf0481e37f68e7630eeedc932b49aaeb421401dbc004e8c83
+
+BASELINE
+Command:
+$env:ZKGMAIL_IMAP_HOST='"imap.qq.com"'; $env:ZKGMAIL_IMAP_PORT='"993"'; $env:ZKGMAIL_IMAP_USERNAME='"receiver@example.test"'; $env:ZKGMAIL_IMAP_PASSWORD='"test-password"'; $env:ZKGMAIL_IMAP_FOLDER='"INBOX"'; $env:ZKGMAIL_ACCESS_TOKEN='"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'; & '..\.venv\Scripts\python.exe' -c "from zkgmail_code_server.settings import Settings; s=Settings.from_env(); print(f'host={s.imap_host!r} port={s.imap_port} folder={s.imap_folder!r} configured={s.configured} access_protected={s.access_protected}'); raise SystemExit(0 if s.imap_host == 'imap.qq.com' and s.imap_folder == 'INBOX' and s.access_protected else 7)"
+Working directory: D:\AI\hidemyemail-generator\zkgmail-code-server
+Input: quoted dummy host, port, username, password, folder, and 64-hex access token
+Literal output:
+host='"imap.qq.com"' port=993 folder='"INBOX"' configured=True access_protected=False
+EXIT_STATUS=7
+Result: failed; string fields retained literal quotes and the quoted access token was rejected.
+
+MODIFIED
+Command: same command and input as BASELINE, against the modified active source.
+Literal output:
+host='imap.qq.com' port=993 folder='INBOX' configured=True access_protected=True
+EXIT_STATUS=0
+Result: passed; matching outer quotes were removed before string, integer, float, header, and access-token validation.
+
+Command:
+..\.venv\Scripts\python.exe -m pytest -q tests/test_settings.py tests/test_imap_repository.py tests/test_presenter.py tests/test_web.py
+Working directory: D:\AI\hidemyemail-generator\zkgmail-code-server
+Input: two new environment-normalization tests plus the existing repository, Presenter, and web suites
+Literal output:
+..............................                                 [100%]
+30 passed, 10 subtests passed in 0.78s
+Exit status: 0
+
+Command:
+..\.venv\Scripts\python.exe -m ruff check zkgmail_code_server/settings.py tests/test_settings.py
+Literal output:
+All checks passed!
+Exit status: 0
+
+Command:
+node --test tests/frontend_second_code.test.mjs
+Literal result: tests 3; pass 3; fail 0; duration_ms 3881.6961
+Exit status: 0
+
+Command:
+..\.venv\Scripts\python.exe -m pytest -q
+Working directory: D:\AI\hidemyemail-generator\zkgmail-code-server
+Literal output:
+...........................................................    [100%]
+59 passed, 10 subtests passed in 0.82s
+Exit status: 0
+
+ROLLBACK
+Command:
+$artifactDir='D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery'; Copy-Item -LiteralPath (Join-Path $artifactDir 'MODIFIED_FILE') -Destination (Join-Path $artifactDir 'ROLLBACK_COPY') -Force; & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x '/d/AI/hidemyemail-generator/verification/zkgmail-imap-recovery/ROLLBACK.sh' && test -x '/d/AI/hidemyemail-generator/verification/zkgmail-imap-recovery/ROLLBACK.sh' && '/d/AI/hidemyemail-generator/verification/zkgmail-imap-recovery/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/zkgmail-imap-recovery/ROLLBACK_COPY'"
+Working directory: D:\AI\hidemyemail-generator
+Input: a separate copy of MODIFIED_FILE; the active source was not the rollback target
+Literal output:
+ROLLBACK_TARGET=/d/AI/hidemyemail-generator/verification/zkgmail-imap-recovery/ROLLBACK_COPY
+ROLLBACK_SHA256=0652197fc4e09291dca792452e1f3e411e115e1a008feade8a7a49e47a156d0c
+ROLLBACK_RESULT=restored
+ROLLBACK_SCRIPT_EXIT=0
+
+Restored-behavior command:
+.\.venv\Scripts\python.exe -c "import runpy; ns=runpy.run_path(r'D:\AI\hidemyemail-generator\verification\zkgmail-imap-recovery\ROLLBACK_COPY'); s=ns['Settings'].from_env(); print(f'RESTORED_HOST={s.imap_host!r} RESTORED_ACCESS_PROTECTED={s.access_protected}'); raise SystemExit(0 if s.imap_host[0] == s.imap_host[-1] == chr(34) and not s.access_protected else 9)"
+Input: the same quoted dummy values used by BASELINE
+Literal output:
+RESTORED_HOST='"imap.qq.com"' RESTORED_ACCESS_PROTECTED=False
+RESTORED_BEHAVIOR_EXIT=0
+Restored status: ROLLBACK_COPY exactly matches ORIGINAL_FILE and exhibits the original parsing behavior. MODIFIED_FILE and the active source remain changed.
+
+PRODUCTION BASELINE
+Remote settings result:
+host_repr='"imap.qq.com"'
+folder_repr='"INBOX"'
+username_length=18 username_quoted=True
+password_length=18 password_quoted=True
+connection=ERROR gaierror(-2, 'Name or service not known')
+Request input: codex-config-probe-20260817@zkgmail.com
+Literal result: HTTP 502; state=unavailable; message=邮箱服务暂时不可用，请稍后重试; code present=False
+Probe exit status: 0 (the diagnostic caught and reported the expected failure)
+
+PRODUCTION MODIFIED
+Remote .env original SHA256: 2888a6f14a785bd2c13915e110cd530601bf1ffb6e806dc8cb8473f6f2e086ac
+Remote .env modified SHA256: 08f3e4bc2a6c8979b4bf9add701f3c6aeab42521469782889148e39bc2155202
+Remote backup: /opt/zkgmail-code-server/.env.pre-unquote-20260817T091605Z
+Changed field result: all ten ZKGMAIL_* values report quoted=False; QQ IMAP connect/login/select/search report OK.
+Candidate command/input: POST http://127.0.0.1:18769/api/code/latest with codex-config-probe-20260817@zkgmail.com
+Literal result: CANDIDATE_HTTP=404; CANDIDATE_STATE=waiting; CANDIDATE_MESSAGE=暂未收到该邮箱的验证码，请稍后再试; CANDIDATE_CODE_PRESENT=False
+Exit status: 0
+
+Production command/input: POST https://zkgmail.8-208-13-52.sslip.io/api/code/latest with codex-public-probe-20260817@zkgmail.com
+Literal output:
+PUBLIC_HTTP=404
+PUBLIC_STATE=waiting
+PUBLIC_MESSAGE=暂未收到该邮箱的验证码，请稍后再试
+PUBLIC_CODE_PRESENT=False
+COMMAND_EXIT=0
+Restored production status: zkgmail-code-server:1.1.0 is healthy on port 18768; the previous quoted-env container is stopped as zkgmail-code-server.failed-env-quotes-20260817T091735Z.
