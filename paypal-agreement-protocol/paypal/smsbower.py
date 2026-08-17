@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import httpx
 
@@ -403,14 +403,18 @@ class SMSBowerPhoneClient:
         *,
         cancel_event: threading.Event | None = None,
         timeout_seconds: float | None = None,
+        exclude_codes: Iterable[str] | None = None,
     ) -> str:
         timeout = max(1.0, float(timeout_seconds or self.otp_timeout_seconds))
         deadline = time.monotonic() + timeout
+        excluded = {
+            str(code).strip() for code in (exclude_codes or ()) if str(code).strip()
+        }
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
                 raise SMSBowerPhoneCancelled("短信等待已随任务停止")
             code = self.poll_code(activation)
-            if code:
+            if code and code not in excluded:
                 return code
             remaining = max(0.0, deadline - time.monotonic())
             wait_time = min(self.poll_interval_seconds, remaining)

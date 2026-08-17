@@ -135,6 +135,28 @@ def test_wait_for_code_polls_until_status_ok():
     assert len(requester.calls) == 2
 
 
+def test_wait_for_code_ignores_codes_consumed_by_an_earlier_job():
+    requester = ScriptedRequester(
+        {
+            "getStatus": [
+                "STATUS_OK:'111111'",
+                "STATUS_WAIT_RETRY",
+                "STATUS_OK:'222222'",
+            ]
+        }
+    )
+    client = SMSBowerPhoneClient(
+        api_key="test-key",
+        requester=requester,
+        poll_interval_seconds=0.01,
+        otp_timeout_seconds=1,
+    )
+    activation = SMSBowerPhoneActivation("9", "+447700900123", "GB")
+
+    assert client.wait_for_code(activation, exclude_codes={"111111"}) == "222222"
+    assert [call["id"] for call in requester.calls] == ["9", "9", "9"]
+
+
 def test_provider_errors_are_normalized_without_api_key():
     requester = ScriptedRequester({"getNumber": ["NO_BALANCE"]})
     client = SMSBowerPhoneClient(api_key="secret-provider-key", requester=requester)

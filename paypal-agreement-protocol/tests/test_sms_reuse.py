@@ -350,6 +350,179 @@ def test_paypal_send_failure_discards_reused_number_before_getting_new(
     assert ("wait", "hero-new") in client.events
     assert second.phone_verification["status"] == "confirmed"
     assert second.phone == replacement.phone
+    assert second.sms_verification_succeeded() is True
+    assert second.finalize_sms_activation(success=True) is True
+
+
+def test_reused_job_excludes_and_records_codes_consumed_by_previous_jobs(monkeypatch):
+    class StaleCodeClient(ClientStub):
+        def wait_for_code(self, activation, **kwargs):
+            excluded = frozenset(kwargs.get("exclude_codes") or ())
+            self.events.append(("wait", activation.activation_id, excluded))
+            return next(code for code in ("111111", "222222") if code not in excluded)
+
+    model = ReusableSmsActivationModel()
+    presenter = SmsActivationReusePresenter(model)
+    activation = hero_activation("hero-shared-code", "+447700900123")
+    client = StaleCodeClient([activation])
+    monkeypatch.setattr(web, "SMS_ACTIVATION_MODEL", model)
+    monkeypatch.setattr(web, "SMS_ACTIVATION_PRESENTER", presenter)
+    monkeypatch.setattr(web, "HERO_SMS_PHONE_CLIENT", client)
+
+    first = web.WebJob(
+        id="first-code-job",
+        owner_device_id="a" * 32,
+        ba_token="BA-FIRSTCODEJOB",
+        phone="",
+        country="GB",
+        sms_provider="hero-sms",
+        sms_country="GB",
+        sms_max_price=1.5,
+    )
+    web.acquire_job_sms_activation(first, client, country="GB")
+    first.record_sms_code(activation, "111111")
+    assert first.finalize_sms_activation(success=True) is True
+
+    second = web.WebJob(
+        id="second-code-job",
+        owner_device_id="a" * 32,
+        ba_token="BA-SECONDCODEJOB",
+        phone="",
+        country="GB",
+        sms_provider="hero-sms",
+        sms_country="GB",
+        sms_max_price=1.5,
+    )
+    assert web.acquire_job_sms_activation(second, client, country="GB") == activation
+
+    flow = web.WebPayPalFlow.__new__(web.WebPayPalFlow)
+    flow.job = second
+    flow.country = "GB"
+    submitted = []
+    flow._monitor_phone_without_sms = MethodType(
+        lambda _self, _phone, attempt=0: second.set_phone_validation(
+            "format_valid", "ok", attempt=attempt, format_valid=True
+        ),
+        flow,
+    )
+    flow._initiate_2fa_phone_confirmation = MethodType(
+        lambda _self, _token, _url: ("auth", "challenge"), flow
+    )
+
+    def confirm(_self, _token, _url, _auth, _challenge, code):
+        submitted.append(code)
+        return code == "222222"
+
+    flow._confirm_2fa_phone_confirmation = MethodType(confirm, flow)
+    flow._masked_phone = MethodType(lambda _self: "+44******", flow)
+
+    flow._confirm_phone_with_retry("token", "https://paypal.test/signup")
+
+    assert submitted == ["222222"]
+    assert ("wait", "hero-shared-code", frozenset({"111111"})) in client.events
+    assert second.sms_verification_succeeded() is True
+    assert second.finalize_sms_activation(success=True) is True
+
+    third = web.WebJob(
+        id="third-code-job",
+        owner_device_id="a" * 32,
+        ba_token="BA-THIRDCODEJOB",
+        phone="",
+        country="GB",
+        sms_provider="hero-sms",
+        sms_country="GB",
+        sms_max_price=1.5,
+    )
+    web.acquire_job_sms_activation(third, client, country="GB")
+    assert third.sms_consumed_codes(activation) == frozenset({"111111", "222222"})
+    assert third.finalize_sms_activation(success=False) is True
+
+
+def test_phone_is_reused_after_two_payment_failures_and_abandoned_on_third():
+    model = ReusableSmsActivationModel()
+    presenter = SmsActivationReusePresenter(model)
+    original = hero_activation("hero-three-strikes", "+447700900123")
+    replacement = hero_activation("hero-replacement", "+447700900124")
+    client = ClientStub([original, replacement])
+
+    failure_views = []
+    for failure_count in range(1, 4):
+        view = ViewStub()
+        assert acquire(presenter, view, client) == original
+        view.lease = view.lease.with_consumed_code(f"11111{failure_count}")
+        assert presenter.finalize(
+            view,
+            client,
+            success=False,
+            payment_failed=True,
+        ) is True
+        failure_views.append(view)
+
+    next_account = ViewStub()
+    assert acquire(presenter, next_account, client) == replacement
+
+    assert [event[1] for event in client.events if event[0] == "acquire"] == [
+        "hero-three-strikes",
+        "hero-replacement",
+    ]
+    assert [event for event in client.events if event == ("another", "hero-three-strikes")] == [
+        ("another", "hero-three-strikes"),
+        ("another", "hero-three-strikes"),
+    ]
+    assert ("complete", "hero-three-strikes") in client.events
+    assert any(
+        event[0] == "log" and "累计支付失败 3 次" in event[2]
+        for event in failure_views[-1].events
+    )
+    assert next_account.lease.payment_failures == 0
+    assert presenter.finalize(next_account, client, success=False) is True
+
+
+def test_oas_error_abandons_phone_after_first_payment_failure():
+    model = ReusableSmsActivationModel()
+    presenter = SmsActivationReusePresenter(model)
+    rejected = hero_activation("hero-oas-rejected", "+447700900123")
+    replacement = hero_activation("hero-oas-replacement", "+447700900124")
+    client = ClientStub([rejected, replacement])
+    failed = ViewStub()
+
+    assert acquire(presenter, failed, client) == rejected
+    failed.lease = failed.lease.with_consumed_code("123456")
+    assert presenter.finalize(
+        failed,
+        client,
+        success=False,
+        payment_failed=True,
+        terminal_error_code="OAS_ERROR",
+    ) is True
+
+    next_account = ViewStub()
+    assert acquire(presenter, next_account, client) == replacement
+    assert ("another", "hero-oas-rejected") not in client.events
+    assert ("complete", "hero-oas-rejected") in client.events
+    assert any(
+        event[0] == "log" and "OAS_ERROR" in event[2] and "立即弃用" in event[2]
+        for event in failed.events
+    )
+    assert presenter.finalize(next_account, client, success=False) is True
+
+
+def test_web_job_recognizes_sanitized_oas_signup_failure():
+    job = web.WebJob(
+        id="oas-detection-job",
+        owner_device_id="a" * 32,
+        ba_token="BA-OASDETECTION",
+        phone="",
+        country="GB",
+        sms_provider="hero-sms",
+    )
+    job.error = (
+        "Signup failed: no usable access token obtained. Last errors: "
+        '[{"message":"OAS_ERROR","checkpoints":["createMemberAccount"]}]'
+    )
+
+    assert job.payment_failure_contains("OAS_ERROR") is True
+    assert job.payment_failure_contains("CARD_DECLINED") is False
 
 
 def test_transient_cleanup_failure_is_retained_and_retried_before_new_number():

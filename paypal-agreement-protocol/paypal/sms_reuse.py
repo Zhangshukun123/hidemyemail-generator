@@ -22,6 +22,7 @@ from paypal.smsbower import (
 
 REUSABLE_SMS_PROVIDER = "hero-sms"
 HERO_SMS_ACTIVATION_TTL_SECONDS = 20 * 60
+MAX_REUSABLE_PAYMENT_FAILURES = 2
 
 Clock = Callable[[], float]
 
@@ -46,11 +47,21 @@ class SmsActivationLease:
     acquired_at: float
     expires_at: float
     successful_uses: int = 0
+    payment_failures: int = 0
     reused: bool = False
+    consumed_codes: frozenset[str] = frozenset()
 
     @property
     def reusable(self) -> bool:
         return self.key is not None and self.key.provider == REUSABLE_SMS_PROVIDER
+
+    def with_consumed_code(self, code: str) -> "SmsActivationLease":
+        """Return a lease that remembers one code already handed to a job."""
+
+        normalized = str(code or "").strip()
+        if not normalized or normalized in self.consumed_codes:
+            return self
+        return replace(self, consumed_codes=self.consumed_codes | {normalized})
 
     @classmethod
     def unmanaged(
@@ -114,10 +125,12 @@ class ReusableSmsActivationModel:
         self,
         *,
         ttl_seconds: float = HERO_SMS_ACTIVATION_TTL_SECONDS,
+        max_payment_failures: int = MAX_REUSABLE_PAYMENT_FAILURES,
         clock: Clock = time.monotonic,
         wait_interval_seconds: float = 0.1,
     ) -> None:
         self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self.max_payment_failures = max(0, int(max_payment_failures))
         self._clock = clock
         self._wait_interval_seconds = max(0.01, float(wait_interval_seconds))
         self._condition = threading.Condition()
@@ -243,8 +256,10 @@ class ReusableSmsActivationModel:
             expires_at=now + self.ttl_seconds,
         )
 
-    def recycle(self, lease: SmsActivationLease) -> bool:
-        """Return a successful lease to the pool without extending its TTL."""
+    def recycle(
+        self, lease: SmsActivationLease, *, payment_failed: bool = False
+    ) -> bool:
+        """Return a settled lease to the pool without extending its TTL."""
 
         if lease.key is None:
             return False
@@ -252,10 +267,14 @@ class ReusableSmsActivationModel:
             state = self._require_active(lease.key, lease.reservation_token)
             if float(self._clock()) >= lease.expires_at:
                 return False
+            payment_failures = lease.payment_failures + int(payment_failed)
+            if payment_failures > self.max_payment_failures:
+                return False
             state.available = replace(
                 lease,
                 reservation_token="",
-                successful_uses=lease.successful_uses + 1,
+                successful_uses=lease.successful_uses + int(not payment_failed),
+                payment_failures=payment_failures,
                 reused=False,
             )
             state.busy_token = ""
@@ -508,15 +527,29 @@ class SmsActivationReusePresenter:
         client: Any,
         *,
         success: bool,
+        payment_failed: bool = False,
+        terminal_error_code: str = "",
     ) -> bool:
+        if success and payment_failed:
+            raise ValueError("短信号码结果不能同时为支付成功和支付失败")
+        error_code = str(terminal_error_code or "").strip().upper()
+        abandon_immediately = error_code == "OAS_ERROR"
         take = getattr(view, "take_sms_activation_lease", None)
         lease = take() if callable(take) else None
         if lease is None:
             return False
 
-        if success and lease.reusable:
+        should_recycle = (
+            lease.reusable
+            and (success or payment_failed)
+            and not abandon_immediately
+        )
+        failure_count = lease.payment_failures + int(payment_failed)
+        if should_recycle:
             try:
-                recycled = self.model.recycle(lease)
+                recycled = self.model.recycle(
+                    lease, payment_failed=payment_failed
+                )
             except RuntimeError:
                 recycled = False
                 self._log(
@@ -526,19 +559,49 @@ class SmsActivationReusePresenter:
                 )
             if recycled:
                 remaining = self.model.remaining_seconds(lease)
-                self._log(
-                    view,
-                    "INFO",
-                    f"HeroSMS 手机号保留供下一账号复用（剩余约 {remaining} 秒）",
-                )
+                if payment_failed:
+                    self._log(
+                        view,
+                        "WARNING",
+                        "HeroSMS 手机号已记录支付失败 "
+                        f"{failure_count}/{self.model.max_payment_failures}，"
+                        f"仍保留供下一账号复用（剩余约 {remaining} 秒）",
+                    )
+                else:
+                    self._log(
+                        view,
+                        "INFO",
+                        f"HeroSMS 手机号保留供下一账号复用（剩余约 {remaining} 秒）",
+                    )
                 return True
+
+        if abandon_immediately and lease.reusable:
+            self._log(
+                view,
+                "WARNING",
+                "支付返回 OAS_ERROR，HeroSMS 手机号已立即弃用，下一账号将换新号",
+            )
+        elif (
+            payment_failed
+            and lease.reusable
+            and failure_count > self.model.max_payment_failures
+        ):
+            self._log(
+                view,
+                "WARNING",
+                "HeroSMS 手机号累计支付失败 "
+                f"{failure_count} 次，已超过 {self.model.max_payment_failures} 次，"
+                "直接弃用并为下一账号换号",
+            )
 
         try:
             self._finish_provider_lease(
                 view,
                 client,
                 lease,
-                force_complete=bool(success or lease.successful_uses),
+                force_complete=bool(
+                    success or lease.successful_uses or lease.consumed_codes
+                ),
             )
         finally:
             if lease.reusable:
@@ -604,6 +667,7 @@ class SmsActivationReusePresenter:
 
 __all__ = [
     "HERO_SMS_ACTIVATION_TTL_SECONDS",
+    "MAX_REUSABLE_PAYMENT_FAILURES",
     "PendingSmsActivationCleanup",
     "REUSABLE_SMS_PROVIDER",
     "ReusableSmsActivationModel",

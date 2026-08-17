@@ -940,6 +940,7 @@ class WebJob:
     _sms_activation: SMSBowerPhoneActivation | None = field(default=None, repr=False)
     _sms_activation_lease: SmsActivationLease | None = field(default=None, repr=False)
     _sms_activation_finalized: bool = field(default=False, repr=False)
+    _sms_verified: bool = field(default=False, repr=False)
     _slot_held: bool = field(default=False, repr=False)
     _log_sequence: int = field(default=0, repr=False)
 
@@ -1007,6 +1008,7 @@ class WebJob:
             self._sms_activation = activation
             self._sms_activation_lease = lease
             self._sms_activation_finalized = False
+            self._sms_verified = False
             self.phone = activation.phone
             self.sms_virtual = bool(activation.is_virtual)
             route_label = "美国（虚拟）PayPal" if self.sms_virtual else "PayPal"
@@ -1093,6 +1095,70 @@ class WebJob:
         with self._condition:
             return self._sms_activation
 
+    def sms_consumed_codes(
+        self, activation: SMSBowerPhoneActivation
+    ) -> frozenset[str]:
+        """Return codes consumed by earlier jobs on this exact activation."""
+
+        with self._condition:
+            lease = self._sms_activation_lease
+            current = self._sms_activation
+            if lease is None or current is None:
+                raise RuntimeError("短信激活已与当前任务解绑")
+            if current.activation_id != activation.activation_id:
+                raise RuntimeError("短信激活与当前任务不匹配")
+            return lease.consumed_codes
+
+    def record_sms_code(
+        self, activation: SMSBowerPhoneActivation, code: str
+    ) -> None:
+        """Bind a received code to this job before PayPal sees it."""
+
+        normalized = str(code or "").strip()
+        if not normalized:
+            raise ValueError("短信验证码不能为空")
+        with self._condition:
+            lease = self._sms_activation_lease
+            current = self._sms_activation
+            if lease is None or current is None:
+                raise RuntimeError("短信激活已与当前任务解绑")
+            if current.activation_id != activation.activation_id:
+                raise RuntimeError("短信激活与当前任务不匹配")
+            self._sms_activation_lease = lease.with_consumed_code(normalized)
+            self.updated_at = now_ts()
+            self._condition.notify_all()
+
+    def mark_sms_verified(self, activation: SMSBowerPhoneActivation) -> None:
+        """Keep the lease attached until the whole payment reaches a result."""
+
+        with self._condition:
+            current = self._sms_activation
+            if current is None or current.activation_id != activation.activation_id:
+                raise RuntimeError("短信激活与当前任务不匹配")
+            self._sms_verified = True
+            self.updated_at = now_ts()
+            self._condition.notify_all()
+
+    def sms_verification_succeeded(self) -> bool:
+        with self._condition:
+            return bool(self._sms_verified)
+
+    def payment_failure_contains(self, marker: str) -> bool:
+        """Inspect the private terminal state for one normalized provider code."""
+
+        target = str(marker or "").strip().upper()
+        if not target:
+            return False
+        with self._condition:
+            values = [self.error]
+            if isinstance(self.result, dict):
+                values.extend(
+                    str(self.result.get(key) or "")
+                    for key in ("error_code", "error", "message")
+                )
+            values.extend(str(item.get("message") or "") for item in self.logs[-40:])
+        return any(target in str(value).upper() for value in values)
+
     def take_sms_activation_lease(self) -> SmsActivationLease | None:
         """Atomically detach the activation before its provider transition."""
 
@@ -1111,12 +1177,24 @@ class WebJob:
             self._condition.notify_all()
             return lease
 
-    def finalize_sms_activation(self, *, success: bool) -> bool:
+    def finalize_sms_activation(
+        self,
+        *,
+        success: bool,
+        payment_failed: bool = False,
+        terminal_error_code: str = "",
+    ) -> bool:
         with self._condition:
             if self._sms_activation_lease is None or self._sms_activation is None:
                 return False
         client = sms_provider_client(self.sms_provider)
-        return SMS_ACTIVATION_PRESENTER.finalize(self, client, success=success)
+        return SMS_ACTIVATION_PRESENTER.finalize(
+            self,
+            client,
+            success=success,
+            payment_failed=payment_failed,
+            terminal_error_code=terminal_error_code,
+        )
 
     def mark_cancelled(self) -> None:
         with self._condition:
@@ -1412,6 +1490,12 @@ class WebJob:
                 "sms_activation_expires_in": SMS_ACTIVATION_MODEL.remaining_seconds(
                     self._sms_activation_lease
                 ),
+                "sms_activation_payment_failures": (
+                    self._sms_activation_lease.payment_failures
+                    if self._sms_activation_lease
+                    else 0
+                ),
+                "sms_verified": self._sms_verified,
                 "phone_validation": sanitize_payload(self.phone_validation),
                 "phone_verification": sanitize_payload(self.phone_verification),
                 "buyer_mode": self.buyer_mode,
@@ -1947,11 +2031,19 @@ class WebPayPalFlow(PayPalFlow):
                     self._masked_phone(),
                 )
                 attempt_stage = "wait_sms"
+                excluded_codes: frozenset[str] = frozenset()
+                consumed_codes = getattr(self.job, "sms_consumed_codes", None)
+                if callable(consumed_codes):
+                    excluded_codes = frozenset(consumed_codes(activation))
                 code = client.wait_for_code(
                     activation,
                     cancel_event=self.job._cancel_event,
                     timeout_seconds=AUTO_SMS_OTP_TIMEOUT_SECONDS,
+                    exclude_codes=excluded_codes,
                 )
+                record_code = getattr(self.job, "record_sms_code", None)
+                if callable(record_code):
+                    record_code(activation, code)
                 self.job.check_cancelled()
                 self._set_phone_verification(
                     "sms_received",
@@ -1980,7 +2072,13 @@ class WebPayPalFlow(PayPalFlow):
                         attempt=attempt,
                         paypal_confirmed=True,
                     )
-                    self.job.finalize_sms_activation(success=True)
+                    mark_verified = getattr(self.job, "mark_sms_verified", None)
+                    if callable(mark_verified):
+                        mark_verified(activation)
+                    else:
+                        # Compatibility for integrations that implement the
+                        # former job view but do not own the full payment lifecycle.
+                        self.job.finalize_sms_activation(success=True)
                     logger.success("{} PayPal phone verification completed", provider_label)
                     return
                 last_error = f"PayPal 拒绝了 {provider_label} 返回的验证码"
@@ -2620,7 +2718,24 @@ def run_job(job: WebJob) -> None:
                 logger.error("Protocol payment job failed: {}", redact_text(exc))
                 job.fail(exc)
         finally:
-            job.finalize_sms_activation(success=False)
+            payment_succeeded = bool(
+                job.status == "completed"
+                and isinstance(job.result, dict)
+                and job.result.get("status") == "success"
+            )
+            payment_failed = bool(
+                job.status == "failed"
+                and job.sms_verification_succeeded()
+                and not payment_succeeded
+            )
+            terminal_error_code = (
+                "OAS_ERROR" if job.payment_failure_contains("OAS_ERROR") else ""
+            )
+            job.finalize_sms_activation(
+                success=payment_succeeded,
+                payment_failed=payment_failed,
+                terminal_error_code=terminal_error_code,
+            )
             try:
                 record_protocol_metric(job)
             except Exception as metric_error:

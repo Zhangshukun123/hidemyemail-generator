@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Protocol, runtime_checkable
 
 from paypal.smsbower import SMSBowerPhoneActivation
@@ -32,6 +32,7 @@ class PhoneProviderStrategy(Protocol):
         *,
         cancel_event: threading.Event | None = None,
         timeout_seconds: float | None = None,
+        exclude_codes: Iterable[str] | None = None,
     ) -> str: ...
 
     def complete(self, activation: SMSBowerPhoneActivation) -> None: ...
