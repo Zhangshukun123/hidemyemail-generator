@@ -8,7 +8,7 @@
     accounts: ["ACCOUNT MANAGEMENT", "账号管理", "集中管理账号资产，并以紧凑流程发起注册任务"],
     "quick-flow": ["ONE-CLICK PIPELINE", "一键注册、提链并支付", "生成所选 PayPal 链接后自动选择代理与手机号并启动协议支付"],
     network: ["NETWORK ROUTING", "代理与线路", "独立管理所有注册方式共用的代理出口"],
-    "card-links": ["CHECKOUT WORKSPACE", "直卡提链接", "提取 gpt-link 严格 0 链接或 PayPal DE/EUR OAICS 授权链接"],
+    "card-links": ["CHECKOUT WORKSPACE", "提连中心", "提取 gpt-link 严格 0 链接或 PayPal DE/EUR OAICS 授权链接"],
     "pp-payment": ["PAYPAL WORKSPACE", "PP 支付", "PayPal BA 协议授权与支付任务"],
     verification: ["VERIFICATION WORKSPACE", "验证记录", "批量验证账号、套餐与 Session 状态"],
     settings: ["SYSTEM SETTINGS", "系统设置", "管理邮箱、浏览器、集成与安全配置"],
@@ -531,7 +531,7 @@
 
     async request(path, options = {}) {
       const headers = { ...(options.headers || {}) };
-      if (options.method && options.method !== "GET") headers["X-Local-Token"] = this.token;
+      if (this.token) headers["X-Local-Token"] = this.token;
       if (options.body) headers["Content-Type"] = "application/json";
       let response;
       try {
@@ -544,7 +544,7 @@
         location.replace("/login");
         throw new Error("登录已过期");
       }
-      if (response.status === 403) {
+      if (response.status === 403 && data.error === "本地请求令牌无效") {
         setTimeout(() => location.reload(), 120);
         throw new Error(data.error || "服务已更新，正在刷新页面");
       }
@@ -795,7 +795,7 @@
         extractionFirstCountry: "hme_quick_extraction_first_country",
         extractionSecondCountry: "hme_quick_extraction_second_country",
         promotionProxyChoice: "hme_quick_promotion_proxy_choice",
-        targetAmount: "hme_quick_paypal_us_target_amount",
+        targetAmount: "hme_quick_paypal_us_target_amount", postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
       };
     }
 
@@ -816,6 +816,8 @@
           ? parsed : fallback);
       };
       const textValue = (value, fallback = "") => String(value ?? fallback).trim();
+      const booleanValue = (value, fallback = false) => value === null || value === undefined || value === "" ? Boolean(fallback)
+        : typeof value === "boolean" ? value : ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
       const roxyTargetCount = integerValue(
         candidate.roxyTargetCount ?? candidate.targetCount,
         1,
@@ -837,6 +839,7 @@
         extractionSecondCountry: textValue(candidate.extractionSecondCountry, "DE") || "DE",
         promotionProxyChoice: enumValue(candidate.promotionProxyChoice, ["first", "second"], "first"),
         targetAmount: textValue(candidate.targetAmount),
+        postPaymentPhoneBinding: booleanValue(candidate.postPaymentPhoneBinding, false),
         savedAt: textValue(candidate.savedAt),
         collapsed: Boolean(candidate.collapsed),
       };
@@ -895,7 +898,7 @@
     constructor() {
       this.details = $("quickFlowConfigDetails");
       this.savedState = $("quickFlowSavedConfigState");
-      this.savedSummary = $("quickFlowSavedConfigSummary");
+      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding");
       this.fields = {
         registrationProvider: $("quickRegistrationProvider"),
         registrationMode: $("quickRegistrationMode"),
@@ -915,9 +918,8 @@
 
     read() {
       return {
-        ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) =>
-          [field, element.value]
-        )),
+        ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) => [field, element.value])),
+        postPaymentPhoneBinding: Boolean(this.postPaymentPhoneBinding.checked),
         collapsed: !this.details.open,
       };
     }
@@ -929,6 +931,7 @@
           element.value = value;
         }
       });
+      this.postPaymentPhoneBinding.checked = snapshot.postPaymentPhoneBinding === true;
       this.details.open = !snapshot.collapsed;
     }
 
@@ -945,6 +948,7 @@
         "并发 " + current.concurrency + " / 目标 " + current.targetCount,
         this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
         "每号 " + current.extractionCount + " 次",
+        current.postPaymentPhoneBinding ? "确认 Plus 后接码" : "确认 Plus 即结束",
         this.selectedLabel("registrationProxyMode", current.registrationProxyMode),
         this.selectedLabel("extractionProxyMode", current.extractionProxyMode),
       ].join(" · ");
@@ -956,9 +960,7 @@
     }
 
     bind(onChange, onToggle) {
-      this.details.addEventListener("change", (event) => {
-        if (Object.values(this.fields).includes(event.target)) onChange();
-      });
+      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.postPaymentPhoneBinding) onChange(); });
       this.details.addEventListener("toggle", () => onToggle(!this.details.open));
     }
   }
@@ -1214,18 +1216,6 @@
         completed: rows.filter((item) => item.status === "completed").length,
         failed: rows.filter((item) => item.status === "failed").length,
       };
-      $("sidebarAllTaskCount").textContent = rows.length;
-      $("sidebarRunningTaskCount").textContent = counts.running;
-      $("sidebarCompletedTaskCount").textContent = counts.completed;
-      $("sidebarFailedTaskCount").textContent = counts.failed;
-      $("sidebarAccountResourceCount").textContent = state.accounts.length;
-      $("sidebarProxyResourceCount").textContent = [
-        state.registrationProxy, state.cardLinkProxy,
-      ].filter((item) => item?.configured).length;
-      $("sidebarProfileResourceCount").textContent = (state.roxyRegistration?.profiles || []).length;
-      $("sidebarApiResourceCount").textContent = [
-        state.inbox?.configured, state.smsBower?.configured, state.paypal?.available,
-      ].filter(Boolean).length;
       $("footerRuntimeDot").className = available ? "ok" : "bad";
       $("footerRuntimeLabel").textContent = available ? "连接正常" : "运行环境不可用";
       $("footerRunningCount").textContent = counts.running;
@@ -1347,11 +1337,12 @@
     filteredAccounts(state) {
       const query = $("accountSearch")?.value.trim().toLowerCase() || "";
       const plan = $("accountPlanFilter")?.value || "all";
-      const session = $("accountSessionFilter")?.value || "all";
+      const session = $("accountSessionFilter")?.value || "all", liandong = $("accountLiandongFilter")?.value || "all";
       return state.accounts.filter((item) =>
         (!query || item.email.toLowerCase().includes(query)) &&
         (plan === "all" || item.accountType === plan) &&
-        (session === "all" || item.sessionStatus === session)
+        (session === "all" || item.sessionStatus === session) &&
+        (liandong === "all" || (liandong === "uploaded") === Boolean(item.liandongShopUploaded))
       );
     }
 
@@ -1454,8 +1445,8 @@
         ? (processCount > 1 ? processCount + " 个注册进程运行中" : statusMeta[0])
         : (hasRegistration ? "最近任务：" + statusMeta[0] : "当前无运行任务");
       $("registrationRuntimeMessage").textContent = runtimeRunning
-        ? "页面、动作与诊断详情正在实时写入下方终端日志"
-        : "运行详情请查看下方终端日志";
+        ? "页面、动作与诊断详情正在实时写入下方任务日志"
+        : "运行详情请查看下方任务日志";
       $("stopTaskButton").disabled = !runtimeRunning;
       const codePanel = $("registrationCodePanel");
       const awaitingEmail = (registration.awaitingCodeEmails || [])[0] || registration.email || "";
@@ -1469,7 +1460,7 @@
       $("accountSummary").textContent = "显示 " + items.length + " / " + total + " 个账号";
       $("accountTableBody").innerHTML = items.length ? items.map((item) =>
         this.accountRows(item, state.selectedAccountEmail === item.email)
-      ).join("") : '<tr><td colspan="6"><div class="empty-state compact">没有匹配的账号</div></td></tr>';
+      ).join("") : '<tr><td colspan="7"><div class="empty-state compact">没有匹配的账号</div></td></tr>';
     }
 
     renderNetwork(state) {
@@ -1677,6 +1668,9 @@
       const registered = item.hasPassword || item.hasSession;
       const planKind = item.accountType === "plus" ? "plus" : item.accountType === "free" ? "" : "warning";
       const sessionKind = item.sessionStatus === "ready" ? "success" : item.sessionStatus === "expired" ? "error" : "warning";
+      const liandongUploaded = Boolean(item.liandongShopUploaded);
+      const liandongEligible = item.accountType === "plus" && item.hasPassword && item.hasTwoFactor;
+      const liandongLabel = liandongUploaded && item.liandongShopGoodsLabel ? "已上传 · " + item.liandongShopGoodsLabel : liandongUploaded ? "已上传" : "未上传";
       const main = '<tr data-selectable data-action="select-account" data-email="' + escapeHtml(item.email) +
         '" class="' + (selected ? "selected" : "") + '"><td><div class="identity-cell"><span class="avatar">' +
         initials(item.email) + '</span><span class="identity-copy"><strong>' + escapeHtml(item.email) +
@@ -1684,19 +1678,21 @@
         '</small></span></div></td><td>' + badge(registered ? "已注册" : "未注册", registered ? "success" : "warning") +
         '</td><td>' + badge(planName(item.accountType), planKind) + '</td><td>' +
         badge(sessionName(item.sessionStatus), sessionKind) + '</td><td>' +
+        badge(liandongLabel, liandongUploaded ? "success" : "warning") + '</td><td>' +
         formatDate(item.lastActivity || item.createdAt) + '</td><td><div class="row-actions"><button class="row-action" data-action="copy-email" data-email="' +
-        escapeHtml(item.email) + '">复制邮箱</button><button class="row-action" data-action="select-account" data-email="' +
+        escapeHtml(item.email) + '">复制邮箱</button><button class="row-action" data-action="upload-liandong-shop" data-email="' + escapeHtml(item.email) + '" title="' + (liandongUploaded ? "该账号已经上传过" : liandongEligible ? "自动按接码状态添加到对应商品库存" : "需要 Plus、已确认密码和 2FA 密钥") + '"' + (liandongUploaded || !liandongEligible ? " disabled" : "") + '>' + (liandongUploaded ? "已上传" : "上传到小铺") + '</button><button class="row-action" data-action="select-account" data-email="' +
         escapeHtml(item.email) + '">' + (selected ? "收起" : "更多") + "</button></div></td></tr>";
       if (!selected) return main;
       const twoFactorPrimaryAction = item.hasTwoFactor
         ? this.credentialButton("复制 2FA 密钥", "copy-credential", item, "totp_secret")
         : this.credentialButton("添加 2FA", "enable-2fa", item, "", !item.hasPassword, "primary");
-      return main + '<tr class="account-detail-row"><td colspan="6"><div class="account-detail"><div class="credential-summary">' +
+      return main + '<tr class="account-detail-row"><td colspan="7"><div class="account-detail"><div class="credential-summary">' +
         '<span><b>账号</b><code>' + escapeHtml(item.email) + '</code></span><span><b>密码</b><code>' +
         (item.hasPassword ? "••••••••••••" : "尚未保存") + '</code></span><span><b>2FA</b><code>' +
         (item.hasTwoFactor ? "已开启" : "未开启") + '</code></span><span><b>注册方式</b><code>' +
         escapeHtml(item.registrationMode || "未记录") + '</code></span><span><b>注册出口</b><code>' +
         escapeHtml([item.registrationProxyMode, item.registrationProxyCountry, item.registrationProxyEndpoint, item.registrationExitIp].filter(Boolean).join(" · ") || "直连/未记录") +
+        '</code></span><span><b>联动小铺</b><code>' + (liandongUploaded ? liandongLabel + " · " + formatDate(item.liandongShopUploadedAt) : "未上传") +
         '</code></span><span><b>Plus 接码</b><code>' + (item.plusExportReady ? "已完成 · 可导出" : item.plusCodexStatus || "尚未完成") +
         '</code></span></div><div class="credential-actions">' +
         this.credentialButton("复制密码", "copy-credential", item, "password", !item.hasPassword) +
@@ -1949,9 +1945,10 @@
         targetAmountInput.dataset.method = method;
       }
       $("quickPromotionProxyChoiceLabel").hidden = method !== "de_oaics_paypal";
-      $("quickCardLinkChecks").innerHTML = [...config.checks, "✓ 自动协议支付", `✓ ${paymentSmsLabel} 自动取号`].map((item) =>
-        "<span>" + escapeHtml(item) + "</span>"
-      ).join("");
+      const postPaymentPhoneBinding = Boolean($("quickPostPaymentPhoneBinding")?.checked);
+      $("quickCardLinkChecks").innerHTML = [...config.checks, "✓ 自动协议支付", `✓ ${paymentSmsLabel} 自动取号`,
+        postPaymentPhoneBinding ? "✓ Plus 确认后继续接码" : "✓ Plus 确认后直接结束",
+      ].map((item) => "<span>" + escapeHtml(item) + "</span>").join("");
       $("quickCardLinkHint").textContent = !paymentSmsReady
         ? "自动协议支付需要接码 API Key，请打开 PP 支付中的“接码配置”。"
         : extractionProxyReady
@@ -2049,11 +2046,7 @@
         const meta = runStatus[item.status || "idle"] || runStatus.idle;
         const selected = item.runId === activeRunId;
         const current = item.currentEmail || item.message || "等待任务";
-        const action = item.status === "running"
-          ? '<button class="button danger small" data-action="stop-quick-flow-run" data-run-id="' +
-            escapeHtml(item.runId) + '">停止流程</button>'
-          : '<button class="button small" data-action="dismiss-quick-flow-run" data-run-id="' +
-            escapeHtml(item.runId) + '">关闭记录</button>';
+        const action = window.HmeQuickFlowHistory.runActions(item, escapeHtml);
         return '<article class="quick-flow-run ' + (selected ? "selected" : "") + '">' +
           '<button class="quick-flow-run-select" data-action="select-quick-flow" data-run-id="' +
           escapeHtml(item.runId) + '"><span>流程 ' + String(index + 1).padStart(2, "0") +
@@ -2083,7 +2076,21 @@
       $("quickFlowFailedCount").textContent = Number(flow.failed || 0);
       $("quickFlowCurrentAccount").textContent = flow.currentEmail || "等待任务";
       $("quickFlowCurrentAction").textContent = flow.currentAction || "点击上方按钮开始";
-      const results = flow.results || [];
+      const storedResults = flow.results || [];
+      const interruptedEmail = String(flow.currentEmail || "").trim().toLowerCase();
+      const needsInterruptedRetry = flow.status === "failed" && flow.phase === "extract" &&
+        interruptedEmail && !storedResults.some((item) =>
+          String(item.email || "").trim().toLowerCase() === interruptedEmail
+        );
+      const results = needsInterruptedRetry
+        ? [...storedResults, {
+            ok: false,
+            retryable: true,
+            interrupted: true,
+            email: interruptedEmail,
+            error: flow.message || flow.currentAction || "提链未完成，可重新提链",
+          }]
+        : storedResults;
       const failedResult = results.find((item) => !item.ok || item.paymentError);
       const failureExplanation = failedResult ? quickFlowFailureExplanation(failedResult) : "";
       $("quickFlowMessage").textContent = flow.status === "failed" && failureExplanation
@@ -2139,11 +2146,16 @@
               : "失败原因：" + quickFlowFailureExplanation(result))
             : active ? "正在提取 PayPal 链接" : email ? "等待提链" : "启动后自动分配账号";
           const code = result?.retryable ? "RETRY" : { done: "DONE", skipped: "SKIP", failed: "FAIL", running: "LIVE", queued: "QUEUE", idle: "WAIT" }[state];
+          const accountAction = result?.retryable && email && flow.runId
+            ? '<button class="button small quick-flow-account-retry" data-action="retry-quick-card-link" data-email="' +
+              escapeHtml(email) + '" data-run-id="' + escapeHtml(flow.runId) + '"' +
+              (running ? " disabled" : "") + '>重新提链</button>'
+            : "<b>" + code + "</b>";
           return '<div class="quick-flow-account-card ' + state + '"><i>' +
             String(index + 1).padStart(2, "0") + '</i><div><strong>' +
             escapeHtml(email || "等待分配账号") + '</strong><span title="' +
             escapeHtml(result?.error || result?.paymentError || result?.paymentPostCheckError || label) + '">' + escapeHtml(label) +
-            '</span></div><b>' + code + "</b></div>";
+            '</span></div>' + accountAction + "</div>";
         },
       ).join("");
       const statusMeta = {
@@ -2502,6 +2514,7 @@
       const section = state.settingsSection;
       const copy = {
         imap: ["邮箱与 IMAP", "配置验证码收件服务"],
+        sms: ["接码配置", "统一管理绑定手机号与 PayPal 的平台、价格和国家"],
         browser: ["浏览器运行", "设置 Camoufox 与任务并发"],
         workbench: ["工作台集成", "管理账号导入工作台的连接"],
         security: ["安全与访问", "查看本地访问与敏感信息策略"],
@@ -2513,12 +2526,12 @@
         button.classList.toggle("active", button.dataset.settingsSection === section);
       });
       if (section === "imap") this.renderImapSettings(state);
+      else if (section === "sms") window.HmeSmsSettings.render(state);
       else if (section === "browser") this.renderBrowserSettings(state);
       else if (section === "workbench") this.renderWorkbenchSettings();
       else if (section === "security") this.renderSecuritySettings();
       else this.renderAppearanceSettings();
     }
-
     renderImapSettings(state) {
       const inbox = state.inbox;
       const lastSync = inbox.lastBackgroundSync
@@ -2546,7 +2559,6 @@
         (inbox.codeCount || 0) + '</span><span>收件模式：' + escapeHtml(syncStatus) +
         '</span>' + errorDetail + '</div></section><div class="settings-actions"><button class="button" type="button" data-action="sync-inbox">立即同步</button><button class="button primary" type="button" data-action="save-imap">保存并测试</button></div></form>';
     }
-
     renderBrowserSettings(state) {
       const runtime = state.browserTask.runtime || {};
       const mode = ["headless", "headed", "roxy", "protocol"].includes(state.registrationMode)
@@ -2608,7 +2620,7 @@
         cardLinkProxy: { enabled: false, configured: false, country: "DE", countries: [], modes: [] },
         roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
-        paymentSms: { configured: false, provider: "", label: "", timeoutSeconds: 60 },
+        paymentSms: { configured: false, provider: "", label: "", timeoutSeconds: 60, routing: {} },
         zkgmail: { configured: false, domain: "zkgmail.com", forwardAccount: "352***4@qq.com" },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
@@ -2628,8 +2640,12 @@
         verificationFilter: "all",
         settingsSection: "imap",
       });
-      this.quickFlowHistoryPresenter = window.HmeQuickFlowHistory.create({
-        api: this.api, store: this.store,
+      this.quickFlowHistoryPresenter = window.HmeQuickFlowHistory.create({ api: this.api, store: this.store });
+      this.quickFlowResumePresenter = window.HmeQuickFlowHistory.createResume({
+        api: this.api, flowById: (runId) => this.quickFlowById(runId),
+        patchFlow: (...args) => this.patchQuickFlow(...args), startPayment: (...args) => this.startQuickFlowPaypalPayment(...args),
+        monitorPayment: (...args) => this.monitorQuickFlowPaypalPayment(...args), retryCardLink: (...args) => this.retryQuickCardLink(...args),
+        reloadAccounts: () => this.loadAccounts(),
       });
       this.quickFlowHistoryLoaded = false;
       this.accountsRequestSequence = 0;
@@ -2640,10 +2656,7 @@
         new RegistrationConfigModel(),
         new RegistrationConfigView(),
       );
-      this.quickFlowConfigPresenter = new QuickFlowConfigPresenter(
-        new QuickFlowConfigModel(),
-        new QuickFlowConfigView(),
-      );
+      this.quickFlowConfigPresenter = new QuickFlowConfigPresenter(new QuickFlowConfigModel(), new QuickFlowConfigView());
       this.paypalPaymentMonitorPresenter = new PayPalPaymentMonitorPresenter(this.api);
       this.terminalLogPresenter = window.HmeTerminalLog.create({
         lookup: $, escapeHtml, formatLogTimestamp, redactTerminalLogText,
@@ -2749,8 +2762,8 @@
       panel.classList.toggle("is-collapsed", collapsed);
       button.textContent = collapsed ? "⌃" : "⌄";
       button.setAttribute("aria-expanded", String(!collapsed));
-      button.setAttribute("aria-label", collapsed ? "展开终端日志" : "折叠终端日志");
-      button.title = collapsed ? "展开终端日志" : "折叠终端日志";
+      button.setAttribute("aria-label", collapsed ? "展开任务日志" : "折叠任务日志");
+      button.title = collapsed ? "展开任务日志" : "折叠任务日志";
       if (persist) localStorage.setItem("hme_terminal_preview_collapsed", collapsed ? "1" : "0");
     }
 
@@ -3101,9 +3114,73 @@
       };
     }
 
+    async requestQuickFlowCardLink(runId, payload) {
+      const progressId = "cardlink-" + this.createQuickFlowId().replace(/[^A-Za-z0-9_-]/g, "");
+      const liveMessageCounts = new Map();
+      let logSequence = 0;
+      let stopping = false;
+
+      const appendMessage = (value) => {
+        const message = String(value || "").trim();
+        if (!message) return;
+        liveMessageCounts.set(message, Number(liveMessageCounts.get(message) || 0) + 1);
+        this.patchQuickFlow(runId, {}, "[直卡提链] " + message);
+      };
+      const pollOnce = async () => {
+        const data = await this.api.get(
+          "/api/account/card-link/progress/" + encodeURIComponent(progressId) +
+          "?log_after=" + logSequence,
+        );
+        for (const item of data.logs || []) {
+          const sequence = Number(item.sequence || 0);
+          if (sequence > logSequence) {
+            appendMessage(item.message);
+            logSequence = sequence;
+          }
+        }
+        logSequence = Math.max(logSequence, Number(data.logSequence || 0));
+      };
+      const monitor = (async () => {
+        while (!stopping) {
+          try { await pollOnce(); } catch (_) { /* progress may not exist yet */ }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      })();
+
+      let data = null;
+      let requestError = null;
+      try {
+        data = await this.api.post("/api/account/card-link", {
+          ...payload,
+          progress_id: progressId,
+        });
+      } catch (error) {
+        requestError = error;
+      } finally {
+        stopping = true;
+        await monitor;
+        try { await pollOnce(); } catch (_) { /* final response remains fallback */ }
+      }
+
+      const finalLogs = requestError?.logs || data?.logs || [];
+      const remainingLiveCounts = new Map(liveMessageCounts);
+      for (const value of finalLogs) {
+        const message = String(value || "").trim();
+        const remaining = Number(remainingLiveCounts.get(message) || 0);
+        if (remaining > 0) {
+          remainingLiveCounts.set(message, remaining - 1);
+        } else {
+          appendMessage(message);
+        }
+      }
+      if (requestError) throw requestError;
+      return data;
+    }
+
     async startQuickFlowPaypalPayment(runId, result, results, progress = 96) {
       const email = String(result?.email || "").trim().toLowerCase();
       if (!email || !result?.url) throw new Error("协议支付缺少账号或 PayPal 链接");
+      const postPaymentPhoneBinding = this.quickFlowById(runId)?.postPaymentPhoneBinding === true;
       this.patchQuickFlow(runId, {
         phase: "payment",
         progress: Math.max(0, Math.min(99, Number(progress || 96))),
@@ -3112,7 +3189,7 @@
         results: [...results],
       }, "PayPal 链接已生成，自动启动协议支付：" + email);
       try {
-        const data = await this.api.post("/api/account/paypal-payment", { email });
+        const data = await this.api.post("/api/account/paypal-payment", { email, post_payment_phone_binding: postPaymentPhoneBinding });
         result.paymentStarted = true;
         result.paymentError = "";
         result.paymentJobId = String(data.job?.id || "");
@@ -3138,6 +3215,7 @@
         result.paymentProxyCandidateCount = Number(data.proxyCandidateCount || 0);
         result.paymentProxyBackupCount = Number(data.proxyBackupCount || 0);
         result.paymentSmsProvider = String(data.smsProviderLabel || data.smsProvider || "接码平台");
+        result.postPaymentPhoneBinding = data.postPaymentPhoneBinding === true;
         this.patchQuickFlow(runId, {
           results: [...results],
           paymentStarted: results.filter((item) => item.paymentStarted).length,
@@ -3146,6 +3224,7 @@
           result.paymentProxyCandidateCount + " 个实测出口（" +
           result.paymentProxyBackupCount + " 备用） · " +
           String(data.smsProviderLabel || data.smsProvider || "接码平台") + " 自动取号" +
+          (result.postPaymentPhoneBinding ? " · Plus 确认后继续接码" : " · Plus 确认后直接结束") +
           (result.paymentJobId ? " · 任务 " + result.paymentJobId.slice(0, 12) : ""));
         return true;
       } catch (error) {
@@ -3170,8 +3249,10 @@
             : result.paymentError ? "协议支付失败"
               : result.paymentDeliveryError
                 ? "支付成功并确认 Plus，但手机号/Codex 后处理失败"
-                : result.paymentConfirmationError
+              : result.paymentConfirmationError
                   ? "支付成功，但 AT/Plus 后置校验失败"
+                  : result.paymentAtRefreshStatus === "plus_sms"
+                    ? (result.paymentStage || "Plus 已确认，正在进行手机号/Codex 后处理")
                   : result.paymentPlusConfirmed
                     ? "支付成功，新 AT 已确认 Plus"
                     : result.paymentPending
@@ -3180,7 +3261,8 @@
           const logMessage = snapshot.retryError
             ? "协议支付状态暂时读取失败，稍后自动重试：" + snapshot.retryError
             : snapshot.stageChanged || snapshot.terminal
-              ? "[协议支付] " + email + " · " + currentAction : "";
+              ? "[协议支付] " + email + " · " +
+                (result.paymentDeliveryError || currentAction) : "";
           this.patchQuickFlow(runId, {
             phase: "payment", progress: 99, results: [...results],
             paymentSucceeded: results.filter((item) => item.paymentSucceeded).length,
@@ -3224,13 +3306,31 @@
         await this.loadAccounts();
         const account = this.selectedAccount(target);
         if (!account) throw new Error("账号不存在，请刷新后重试");
-        if (account.sessionStatus !== "ready") throw new Error("该账号 Session / AT 尚未就绪");
-        const data = await this.api.post(
-          "/api/account/card-link", this.quickCardLinkPayload(target, true, flow),
-        );
-        for (const message of data.logs || []) {
-          this.patchQuickFlow(flow.runId, {}, "[直卡提链] " + message);
+        if (account.accountType === "plus") {
+          const skippedResult = {
+            ok: true,
+            skipped: true,
+            retryable: false,
+            retrying: false,
+            email: target,
+            reason: "already_plus",
+          };
+          const nextResults = previousResults.map((item) =>
+            String(item.email || "").trim().toLowerCase() === target ? skippedResult : item
+          );
+          this.patchQuickFlow(flow.runId, {
+            status: "completed", phase: "complete", progress: 100, results: nextResults,
+            skipped: nextResults.filter((item) => item.skipped).length,
+            failed: nextResults.filter((item) => !item.ok).length,
+            currentEmail: "", currentAction: "账号已是 Plus，已跳过提链支付",
+            message: "该账号已确认 Plus，无需重新提链或支付",
+          }, "账号已是 Plus 套餐，重新提链已跳过：" + target);
+          return "该账号已是 Plus 套餐，无需重新提链支付：" + target;
         }
+        if (account.sessionStatus !== "ready") throw new Error("该账号 Session / AT 尚未就绪");
+        const data = await this.requestQuickFlowCardLink(
+          flow.runId, this.quickCardLinkPayload(target, true, flow),
+        );
         const classified = data.cardLinkStatus === "cs_live";
         const attemptCount = Number(data.attemptCount || 1);
         const attemptLimit = Number(data.attemptLimit || flow.extractionCount || 1);
@@ -3297,9 +3397,6 @@
               (paymentPostCheckFailed ? "（AT/Plus 后置校验失败）" : "")
             : "第 " + attemptCount + " 次提链成功，但协议支付失败：" + target;
       } catch (error) {
-        for (const message of error.logs || []) {
-          this.patchQuickFlow(flow.runId, {}, "[直卡提链] " + message);
-        }
         const nextResult = {
           ok: false, skipped: false, retryable: error.retryable !== false, retrying: false,
           email: target, error: error.message || "重新提链失败",
@@ -3352,6 +3449,21 @@
             (index + 1) + "/" + uniqueEmails.length + "）",
           results: [...results], generated, paymentStarted, skipped, failed,
         }, "检查已有 PayPal 链接：" + email);
+        if (account?.accountType === "plus") {
+          skipped += 1;
+          results.push({
+            ok: true,
+            skipped: true,
+            email,
+            reason: "already_plus",
+          });
+          this.patchQuickFlow(
+            runId,
+            { results: [...results], generated, paymentStarted, skipped, failed },
+            "账号已是 Plus 套餐，已跳过提链支付：" + email,
+          );
+          continue;
+        }
         if (hasGeneratedCardLinkForMethod(account, method)) {
           skipped += 1;
           results.push({
@@ -3378,12 +3490,9 @@
           continue;
         }
         try {
-          const data = await this.api.post(
-            "/api/account/card-link", this.quickCardLinkPayload(email, false, activeFlow),
+          const data = await this.requestQuickFlowCardLink(
+            runId, this.quickCardLinkPayload(email, false, activeFlow),
           );
-          for (const message of data.logs || []) {
-            this.patchQuickFlow(runId, {}, "[直卡提链] " + message);
-          }
           const accountAttempts = Number(data.attemptCount || 1);
           attempted += accountAttempts;
           const classified = data.cardLinkStatus === "cs_live";
@@ -3421,9 +3530,6 @@
                 : "第 " + accountAttempts + " 次生成支付链接，但协议支付启动失败：" + email,
           );
         } catch (error) {
-          for (const message of error.logs || []) {
-            this.patchQuickFlow(runId, {}, "[直卡提链] " + message);
-          }
           const failedAttempts = Math.max(1, Number(error.attemptCount || 1));
           attempted += failedAttempts;
           failed += 1;
@@ -3463,6 +3569,9 @@
         !item.ok || (item.ok && !item.skipped && !item.paymentSucceeded)
       ).length;
       const completed = results.length > 0 && failed === 0;
+      const allAlreadyPlus = results.length > 0 && results.every(
+        (item) => item.reason === "already_plus",
+      );
       const paymentFailed = results.some((item) => Boolean(item.paymentError));
       this.patchQuickFlow(runId, {
         status: completed ? "completed" : "failed",
@@ -3478,7 +3587,9 @@
         skipped,
         failed,
         currentEmail: "",
-        currentAction: completed
+        currentAction: allAlreadyPlus
+          ? "账号均已是 Plus，已跳过提链支付"
+          : completed
           ? paymentPostCheckFailed
             ? "注册、提链与协议支付已完成；AT/Plus 后置校验有异常"
             : "注册、提链与协议支付已全部完成"
@@ -3489,7 +3600,9 @@
           "，协议支付成功 " + paymentSucceeded + "，新 AT 确认 Plus " + paymentPlusConfirmed +
           "（AT 确认中 " + paymentPending + "，后置校验异常 " + paymentPostCheckFailed +
           "），跳过 " + skipped + "，失败 " + failed,
-      }, completed
+      }, allAlreadyPlus
+        ? "账号均已是 Plus，无需提链支付"
+        : completed
         ? "一键注册、提链并协议支付完成" +
           (paymentPostCheckFailed ? "；AT/Plus 后置校验有异常" : "")
         : "流水线结束，但提链或协议支付未全部完成");
@@ -3732,6 +3845,7 @@
           status: "running", phase: "prepare", progress: 5, taskId: "",
           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
           registrationProvider, targetAmount,
+          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true,
           registrationMode: mode,
           registrationProxyMode: configSnapshot.registrationProxyMode,
           registrationProxyCountry: configSnapshot.registrationProxyCountry,
@@ -3842,6 +3956,9 @@
         });
         return "已关闭该流程记录";
       });
+      this.commands.register("resume-interrupted-quick-flow", async ({ element }) =>
+        this.quickFlowResumePresenter.resume(element.dataset.runId)
+      );
       this.commands.register("retry-quick-card-link", async ({ element }) =>
         this.retryQuickCardLink(element.dataset.email, element.dataset.runId)
       );
@@ -4361,8 +4478,9 @@
         this.store.patch({ registrationMode: mode });
         return "账号注册方式已更新";
       });
+      window.HmeSmsSettings.register(this);
+      window.HmeLiandongShop.register(this);
     }
-
     bindEvents() {
       document.addEventListener("click", (event) => {
         const route = event.target.closest("[data-route]");
@@ -4398,7 +4516,7 @@
         const command = event.target.closest("[data-action]");
         if (command) this.commands.execute(command.dataset.action, { element: command, event });
       });
-      ["accountSearch", "accountPlanFilter", "accountSessionFilter"].forEach((id) => {
+      ["accountSearch", "accountPlanFilter", "accountSessionFilter", "accountLiandongFilter"].forEach((id) => {
         $(id).addEventListener(id === "accountSearch" ? "input" : "change", () => this.renderer.renderAccounts(this.store.state));
       });
       $("controlTaskSearch").addEventListener("input", () =>
@@ -4862,7 +4980,6 @@
       this.sidebarPresenter.restore();
       this.registrationConfigPresenter.restore();
       this.store.patch({ registrationMode });
-      $("accountsView").insertBefore($("protocolRegistrationPanel"), $("accountsView").querySelector(".table-panel"));
       this.store.subscribe((state) => this.render(state));
       this.bindEvents();
       this.quickFlowConfigPresenter.bind();

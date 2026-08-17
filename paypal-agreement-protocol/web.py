@@ -894,6 +894,7 @@ class WebJob:
     source_account_email: str = ""
     account_cookie_count: int = 0
     completion_target: str = "auto"
+    post_payment_phone_binding: bool = False
     created_at: float = field(default_factory=now_ts)
     updated_at: float = field(default_factory=now_ts)
     started_at: float | None = None
@@ -1476,6 +1477,7 @@ class WebJob:
                 "source_account_email": self.source_account_email,
                 "account_cookie_count": self.account_cookie_count,
                 "completion_target": self.completion_target,
+                "post_payment_phone_binding": self.post_payment_phone_binding,
                 "sms_provider": self.sms_provider,
                 "sms_service": self.sms_service,
                 "sms_country": self.sms_country,
@@ -2339,6 +2341,7 @@ def create_job(
     source_account_email: str = "",
     account_cookies: Any = None,
     completion_target: str = "auto",
+    post_payment_phone_binding: bool = False,
 ) -> WebJob:
     ba_token = extract_ba_token(ba_token)
     require_oaics = bool(require_oaics)
@@ -2348,6 +2351,16 @@ def create_job(
         validate_oaics_checkout(checkout_reference)
         require_oaics = True
         oaics_verified = True
+    country = str(country or "BR").strip().upper()
+    global_sms_policy = SMS_SETTINGS_MODEL.routing_policy()
+    if global_sms_policy:
+        if country not in global_sms_policy["countries"]:
+            raise ValueError(
+                f"PayPal 国家 {country} 未在全局接码配置中启用"
+            )
+        sms_provider = str(global_sms_policy["provider"])
+        sms_max_price = float(global_sms_policy["maxPrice"])
+        sms_country = country
     sms_provider = str(sms_provider or "manual").strip().lower()
     if sms_provider != "manual" and sms_provider not in SMS_PROVIDER_REGISTRY:
         raise ValueError("短信来源参数不正确")
@@ -2363,7 +2376,6 @@ def create_job(
     if not 0.001 <= sms_max_price <= 50:
         raise ValueError("接码平台 PayPal 最高价必须在 0.001–50 美元之间")
     phone = re.sub(r"[\s().-]+", "", (phone or "").strip())
-    country = str(country or "BR").strip().upper()
     buyer_mode = str(buyer_mode or "identity_elevation").strip().lower()
     if buyer_mode not in {"original", "identity_elevation"}:
         raise ValueError("Buyer 模式参数不正确")
@@ -2496,6 +2508,7 @@ def create_job(
         source_account_email=source_account_email,
         account_cookie_count=len(normalized_account_cookies),
         completion_target=completion_target,
+        post_payment_phone_binding=bool(post_payment_phone_binding),
         _proxy_config=proxy_config,
         _proxy_pool=list(proxy_entries),
         _account_cookies=normalized_account_cookies,
@@ -2969,6 +2982,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
             try:
                 data = self.read_json()
+                post_payment_phone_binding = data.get(
+                    "post_payment_phone_binding", False
+                )
+                if not isinstance(post_payment_phone_binding, bool):
+                    raise ValueError("支付后接码选项必须是布尔值")
                 job = create_job(
                     owner_device_id=self.get_device_id(),
                     ba_token=data.get("ba_token") or data.get("paypal_url", ""),
@@ -2995,6 +3013,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     source_account_email=data.get("source_account_email", ""),
                     account_cookies=data.get("account_cookies"),
                     completion_target=data.get("completion_target") or "auto",
+                    post_payment_phone_binding=post_payment_phone_binding,
                 )
                 return self.send_json({"job": job.to_dict(include_logs=False)}, status=HTTPStatus.CREATED)
             except Exception as exc:

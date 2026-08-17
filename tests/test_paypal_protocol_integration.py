@@ -13,6 +13,7 @@ class PayPalProtocolProxyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.upstream_calls = []
+        self.disable_phone_binding = False
         project_dir = Path(self.temp_dir.name) / "paypal-agreement-protocol"
         project_dir.mkdir()
         (project_dir / "web.py").write_text("# proxy fixture\n", encoding="utf-8")
@@ -30,6 +31,7 @@ class PayPalProtocolProxyTests(unittest.IsolatedAsyncioTestCase):
                         "stage": "最终授权失败",
                         "error": "BRAINTREE_VAULT_FAILED",
                         "source_account_email": "payment-at@icloud.com",
+                        "post_payment_phone_binding": not self.disable_phone_binding,
                         "result": {
                             "status": "error",
                             "error_code": "BRAINTREE_VAULT_FAILED",
@@ -61,6 +63,7 @@ class PayPalProtocolProxyTests(unittest.IsolatedAsyncioTestCase):
                         "status": "completed",
                         "stage": "已完成",
                         "source_account_email": "payment-at@icloud.com",
+                        "post_payment_phone_binding": not self.disable_phone_binding,
                         "result": {
                             "status": "success",
                             "settlement_status": "confirmed",
@@ -180,6 +183,23 @@ class PayPalProtocolProxyTests(unittest.IsolatedAsyncioTestCase):
             self.upstream_calls[-1],
             {"cookie": "a" * 32, "log_offset": "0", "log_after": "7"},
         )
+
+    async def test_plus_confirmation_finishes_without_optional_phone_binding(self):
+        self.disable_phone_binding = True
+        response = await self.client.get(
+            "/api/account/paypal-payment/job-12345678?log_offset=0&log_after=7",
+            cookies={"hme_paypal_auto_device_id": "a" * 32},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200, payload)
+        job = payload["job"]
+        self.assertFalse(job["post_payment_phone_binding"])
+        self.assertEqual(job["account_confirmation"]["status"], "plus")
+        self.assertFalse(
+            job["account_confirmation"]["post_payment_phone_binding"]
+        )
+        self.plus_codex_presenter.ensure.assert_not_awaited()
 
     async def test_job_status_requires_the_automatic_payment_session(self):
         response = await self.client.get("/api/account/paypal-payment/job-12345678")

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -138,6 +139,7 @@ class CardLinkBridgeView(Protocol):
         payload: dict[str, str],
         *,
         timeout_seconds: float,
+        on_log: Callable[[str], None] | None = None,
     ) -> CardLinkBridgeResult: ...
 
     async def abort(self) -> None: ...
@@ -277,6 +279,7 @@ class CardLinkBridgeProcessView:
         payload: dict[str, str],
         *,
         timeout_seconds: float,
+        on_log: Callable[[str], None] | None = None,
     ) -> CardLinkBridgeResult:
         await self.start()
         process = self._process
@@ -310,6 +313,11 @@ class CardLinkBridgeProcessView:
                     detail = _redact(message.get("message"), secrets)
                     if detail and len(logs) < MAX_PROGRESS_LOGS:
                         logs.append(detail[:500])
+                        if on_log is not None:
+                            try:
+                                on_log(detail[:500])
+                            except Exception:
+                                pass
                     continue
                 if message_type == "error":
                     detail = _redact(message.get("detail"), secrets)
@@ -407,7 +415,12 @@ class SharedCardLinkBridgePresenter:
     def spawn_count(self) -> int:
         return self._view.spawn_count
 
-    async def generate(self, command: CardLinkBridgeCommand) -> CardLinkBridgeResult:
+    async def generate(
+        self,
+        command: CardLinkBridgeCommand,
+        *,
+        on_log: Callable[[str], None] | None = None,
+    ) -> CardLinkBridgeResult:
         if self._closed:
             raise CardLinkBridgeServiceError(
                 "共享提链服务已关闭",
@@ -433,6 +446,7 @@ class SharedCardLinkBridgePresenter:
                     request_id,
                     payload,
                     timeout_seconds=self.request_timeout_seconds,
+                    on_log=on_log,
                 )
             except _WorkerRemoteError as error:
                 raise CardLinkBridgeServiceError(

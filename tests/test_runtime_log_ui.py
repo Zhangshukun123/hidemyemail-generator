@@ -219,7 +219,7 @@ def test_terminal_is_the_only_log_surface_and_renders_all_redacted_task_logs():
         terminal = page.locator("#terminalPreviewList")
         rows = terminal.locator(".terminal-preview-row")
         assert terminal_panel.is_visible()
-        assert page.locator("#terminalPreviewTitle").inner_text() == "终端"
+        assert page.locator("#terminalPreviewTitle").inner_text() == "任务日志"
         assert page.locator("#terminalSessionSelect option").count() == 2
         assert page.locator("#terminalSessionSelect").input_value() == (
             "registration:registration-current"

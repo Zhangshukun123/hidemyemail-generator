@@ -107,6 +107,30 @@
       });
     }
 
+    phoneBindingCandidate(task, index) {
+      const email = String(task.email || "");
+      const status = String(task.status || "pending").toLowerCase();
+      const logs = this.taggedLogs(task.logs, "phone_binding", {
+        email,
+        sourceLabel: "手机号绑定",
+      });
+      return this.candidate("phone-binding", "手机号绑定", {
+        ...task,
+        logs,
+        running: status === "running",
+      }, {
+        id: task.jobId || email || "phone-binding-" + (index + 1),
+        processId: task.jobId || "",
+        processLabel: "手机号绑定" + (email ? " · " + email : ""),
+        email,
+        status,
+        running: status === "running",
+        startedAt: task.startedAt || logs[0]?.at || "",
+        finishedAt: task.finishedAt || "",
+        logs,
+      });
+    }
+
     managerCandidates(kind, label, parent, tasks, claimed) {
       if (tasks.length) {
         return tasks.map((task, index) => {
@@ -139,6 +163,11 @@
         flow.manager === "protocol" ? protocolTasks : registrationTasks,
         claimed,
       )).filter(Boolean);
+      const phoneBindings = Array.isArray(state.phoneBindingTasks)
+        ? state.phoneBindingTasks : [];
+      sessions.push(...phoneBindings.map((task, index) =>
+        this.phoneBindingCandidate(task, index)
+      ).filter(Boolean));
       sessions.push(...this.managerCandidates(
         "registration", "注册进程", registration, registrationTasks, claimed,
       ));
@@ -157,7 +186,7 @@
           (record.failureReason || record.message || "注册失败"),
         stage: record.failedStage || record.currentStage || "failed",
         location: record.currentLocation || "注册失败诊断",
-        action: record.suggestedAction || "查看终端日志中的失败上下文后重新注册",
+        action: record.suggestedAction || "查看任务日志中的失败上下文后重新注册",
         status: "error",
         diagnosticCode: record.reasonCode || "",
         source: "registration_diagnostic",
@@ -346,11 +375,40 @@
       this.view = view;
       this.model = model;
       this.state = {};
+      this.phoneBindings = new Map();
+      global.addEventListener("hme:phone-binding-snapshot", (event) => {
+        this.ingestPhoneBinding(event.detail || {});
+      });
     }
 
     present(state) {
-      this.state = state || {};
+      this.state = {
+        ...(state || {}),
+        phoneBindingTasks: [...this.phoneBindings.values()],
+      };
       this.view.render(this.model.build(this.state));
+    }
+
+    ingestPhoneBinding(detail) {
+      const email = String(detail.email || detail.snapshot?.email || "").trim().toLowerCase();
+      const snapshot = detail.snapshot && typeof detail.snapshot === "object"
+        ? detail.snapshot : {};
+      if (!email || !Object.keys(snapshot).length) return;
+      const previous = this.phoneBindings.get(email) || { logs: [] };
+      const keyed = new Map();
+      [...(previous.logs || []), ...(snapshot.logs || [])].forEach((log) => {
+        const sequence = Number(log?.sequence || 0);
+        if (sequence > 0) keyed.set(sequence, log);
+      });
+      this.phoneBindings.set(email, {
+        ...previous,
+        ...snapshot,
+        email,
+        logs: [...keyed.values()].sort(
+          (left, right) => Number(left.sequence || 0) - Number(right.sequence || 0),
+        ).slice(-200),
+      });
+      this.present(this.state);
     }
 
     select(sessionId) {

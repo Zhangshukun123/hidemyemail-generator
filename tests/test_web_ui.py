@@ -61,6 +61,29 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("renderVerificationLogs", page)
         self.assertIn("接口响应和删除原因", page)
         self.assertIn("PP 支付", page)
+        self.assertIn('data-settings-section="sms"', page)
+        self.assertIn("接码配置", page)
+        self.assertIn('id="bindingSmsProvider"', page)
+        self.assertIn('id="bindingSmsMaxPrice"', page)
+        self.assertIn('id="paypalSmsProvider"', page)
+        self.assertIn('id="paypalSmsMaxPrice"', page)
+        self.assertIn('data-sms-country="', page)
+        self.assertIn("取号国家（多选）", page)
+        self.assertIn("允许国家（多选）", page)
+        self.assertIn("/api/payment-sms/config", page)
+        self.assertIn("window.HmeSmsSettings", page)
+        self.assertIn("function routingRenderSignature(routing)", page)
+        self.assertIn(
+            'settingsPanel.querySelector(".sms-routing-settings")', page
+        )
+        self.assertIn(
+            "nextRoutingSignature === renderedRoutingSignature", page
+        )
+        self.assertIn(
+            'const data = await controller.api.post("/api/payment-sms/config", buildPayload());\n'
+            '      renderedRoutingSignature = "";',
+            page,
+        )
         self.assertIn('data-src="/paypal-pay/"', page)
         self.assertIn("/api/paypal/status", page)
         self.assertIn("renderPayPal", page)
@@ -107,6 +130,16 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn("checkoutIdType", page)
         self.assertIn("注册出口", page)
         self.assertIn("item.registrationExitIp", page)
+        self.assertIn("联动小铺", page)
+        self.assertIn('id="accountLiandongFilter"', page)
+        self.assertIn('data-action="upload-liandong-shop"', page)
+        self.assertIn("/api/account/liandong-shop-upload", page)
+        self.assertIn("item.liandongShopUploaded", page)
+        self.assertIn('id="liandongShopMerchantToken"', page)
+        self.assertIn("/api/liandong-shop/config", page)
+        self.assertIn("window.HmeLiandongShop", page)
+        self.assertIn("PLUS--质保首登--未接码", page)
+        self.assertIn("PLUS--质保首登--已接码", page)
         self.assertNotIn("item.checkoutExitIp", page)
         self.assertIn('id="registrationProxyMode"', page)
         self.assertIn("Clash 日本轮询", page)
@@ -144,7 +177,15 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("Session 已保存", page)
         self.assertIn('$("protocolRegistrationPanel").hidden = !protocolMode', page)
         self.assertNotIn('$("taskPanel")', page)
-        self.assertIn('querySelector(".table-panel")', page)
+        inventory_panel = page.index(
+            '<article class="panel table-panel">', page.index('id="accountsView"')
+        )
+        protocol_panel = page.index('id="protocolRegistrationPanel"')
+        self.assertLess(inventory_panel, protocol_panel)
+        self.assertNotIn(
+            'insertBefore($("protocolRegistrationPanel")',
+            page,
+        )
         self.assertIn('browser_engine: mode === "roxy" ? "roxy" : "camoufox"', page)
         self.assertIn('id="roxyWindowMode"', page)
         self.assertIn('id="roxyProfile"', page)
@@ -278,6 +319,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('<option value="direct">本机 IP 直连</option>', page)
         self.assertIn('id="quickRegistrationTargetCount"', page)
         self.assertIn('id="quickCardLinkMethod"', page)
+        self.assertIn('id="quickPostPaymentPhoneBinding" type="checkbox"', page)
+        self.assertIn("不勾选则确认 Plus 后直接结束任务", page)
         self.assertIn('data-action="start-quick-flow"', page)
         self.assertIn('id="quickFlowRunList"', page)
         self.assertIn('id="quickFlowRunCount"', page)
@@ -374,6 +417,7 @@ class StructuredWebUiTests(unittest.TestCase):
             "hme_quick_extraction_second_country",
             "hme_quick_promotion_proxy_choice",
             "hme_quick_paypal_us_target_amount",
+            "hme_quick_post_payment_phone_binding",
         ):
             self.assertIn(storage_key, page)
 
@@ -381,6 +425,13 @@ class StructuredWebUiTests(unittest.TestCase):
             "const configSnapshot = this.quickFlowConfigPresenter.persist()", page
         )
         self.assertIn("configSnapshot,", page)
+        self.assertIn(
+            "postPaymentPhoneBinding: booleanValue(candidate.postPaymentPhoneBinding, false)",
+            page,
+        )
+        self.assertIn(
+            "post_payment_phone_binding: postPaymentPhoneBinding", page
+        )
         self.assertIn("saveCollapsed(collapsed)", page)
         self.assertIn('this.details.addEventListener("toggle"', page)
         self.assertIn("配置已保存，可直接开始", page)
@@ -475,6 +526,15 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="quickFlowResults"', page)
         self.assertIn("error.logs = Array.isArray(data.logs) ? data.logs : []", page)
         self.assertIn('"[直卡提链] " + message', page)
+        self.assertIn("async requestQuickFlowCardLink(runId, payload)", page)
+        self.assertIn('"?log_after=" + logSequence', page)
+        self.assertIn("progress_id: progressId", page)
+        self.assertIn("await new Promise((resolve) => setTimeout(resolve, 500))", page)
+        self.assertIn("remainingLiveCounts", page)
+        self.assertIn('if (account?.accountType === "plus")', page)
+        self.assertIn("账号已是 Plus 套餐，已跳过提链支付", page)
+        self.assertIn("账号均已是 Plus，无需提链支付", page)
+        self.assertIn("该账号已确认 Plus，无需重新提链或支付", page)
         self.assertNotIn(".quick-flow-log .task-log-row.failed span", page)
         self.assertNotIn(
             ".quick-flow-counters,\n.quick-flow-monitor-details {",
@@ -556,6 +616,11 @@ class StructuredWebUiTests(unittest.TestCase):
         page = build_app_page()
 
         self.assertIn("class ApiGateway", page)
+        self.assertIn('if (this.token) headers["X-Local-Token"] = this.token', page)
+        self.assertIn(
+            'response.status === 403 && data.error === "本地请求令牌无效"',
+            page,
+        )
         self.assertIn("class ObservableStore", page)
         self.assertIn("class HashRouter", page)
         self.assertIn("class CommandBus", page)
@@ -642,7 +707,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("class TerminalLogPresenter", page)
         self.assertIn("this.terminalLogPresenter.present(state)", page)
         self.assertIn('id="workbenchTerminalPanel"', page)
-        self.assertIn('id="terminalPreviewTitle">终端</button>', page)
+        self.assertIn('id="terminalPreviewTitle">任务日志</button>', page)
         self.assertIn(
             'id="terminalPreviewList" class="terminal-preview-list" role="log"', page
         )
@@ -653,6 +718,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('"protocol", "Mail Auth 协议注册"', page)
         self.assertIn('this.candidate("verification", "账号验证"', page)
         self.assertIn('this.candidate("pipeline", "注册提链流水线"', page)
+        self.assertIn('this.candidate("phone-binding", "手机号绑定"', page)
+        self.assertIn('"hme:phone-binding-snapshot"', page)
         self.assertIn("item.originTaskId || item.taskId", page)
         self.assertIn("item.originSeq || item.originSequence", page)
         self.assertIn("function redactTerminalLogText", page)
@@ -838,7 +905,7 @@ class StructuredWebUiTests(unittest.TestCase):
 
         self.assertIn("Cookie 刷新选中账号", page)
         self.assertIn("refresh_with_cookie: true", page)
-        self.assertIn("使用保存的 Cookie 刷新 Session 与账号状态", page)
+        self.assertIn("正在使用保存的 Cookie 刷新 Session / AT 并查询实时套餐", page)
         self.assertIn("if (data.task) this.store.patch({ verificationTask: data.task })", page)
         self.assertIn("if (data.task) this.store.patch({ browserTask: data.task })", page)
         self.assertIn("requestSequence !== this.accountsRequestSequence", page)
@@ -1137,8 +1204,8 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.polled = []
 
-            async def poll_next_code(self, polled_email):
-                self.polled.append(polled_email)
+            async def poll_next_code(self, polled_email, *, since=""):
+                self.polled.append((polled_email, since))
                 return "246810"
 
         class ProtocolManagerStub:
@@ -1163,7 +1230,10 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.text(), "246810")
-        self.assertEqual(zkgmail.polled, [email])
+        self.assertEqual(
+            zkgmail.polled,
+            [(email, "2026-08-16T00:00:00+00:00")],
+        )
 
     async def test_protocol_registration_skips_protocol_ready_account(self):
         _save_account_record(

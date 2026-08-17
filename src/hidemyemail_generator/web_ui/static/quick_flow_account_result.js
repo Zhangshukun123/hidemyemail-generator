@@ -46,7 +46,7 @@
       const quotaExplanation = this.explanation(item);
       if (quotaExplanation) return quotaExplanation;
       const detail = String(item.paymentError || item.error || "").trim();
-      if (!detail) return "未记录到具体错误，请查看下方终端日志";
+      if (!detail) return "未记录到具体错误，请查看下方任务日志";
       if (/chatgpt approve result:\s*['\"]?blocked/i.test(detail)) {
         return "ChatGPT Approve 返回 blocked：本次请求被服务端拦截，不代表账号无法提链；可更换请求或线路后重试";
       }

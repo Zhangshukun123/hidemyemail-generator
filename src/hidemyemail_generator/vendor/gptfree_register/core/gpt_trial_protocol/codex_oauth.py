@@ -262,6 +262,9 @@ class CodexOAuthProtocolFlow:
         on_event: Callable[[str, dict[str, Any]], Any] | None = None,
         auth_factory: Callable[[], Any] | None = None,
         email_code_fetcher: Callable[[str, str, str, int], str | None] | None = None,
+        initial_session_token: str = "",
+        initial_session_cookies: list[dict[str, Any]] | None = None,
+        cookie_login_only: bool = False,
     ) -> None:
         self.email = str(email or "").strip()
         self.password = str(password or "")
@@ -276,8 +279,20 @@ class CodexOAuthProtocolFlow:
         self.sms_max_otp_retries = max(0, int(sms_max_otp_retries or 0))
         self.log_fn = log_fn or log.info
         self.on_event = on_event
+        self.initial_session_token = str(initial_session_token or "").strip()
+        self.initial_session_cookies = [
+            dict(item)
+            for item in (initial_session_cookies or [])
+            if isinstance(item, dict)
+        ]
+        self.cookie_login_only = bool(cookie_login_only)
         self.auth_factory = auth_factory or (
-            lambda: OpenAIAuthClient(impersonate=self.impersonate, proxy=self.proxy)
+            lambda: OpenAIAuthClient(
+                impersonate=self.impersonate,
+                proxy=self.proxy,
+                initial_session_token=self.initial_session_token,
+                initial_session_cookies=self.initial_session_cookies,
+            )
         )
         self.email_code_fetcher = email_code_fetcher or _default_email_code_fetcher
         self.events: list[dict[str, Any]] = []
@@ -303,16 +318,39 @@ class CodexOAuthProtocolFlow:
     async def run(self) -> CodexOAuthProtocolResult:
         if not self.email:
             raise CodexOAuthProtocolError("input", "email is required")
-        if not self.password and not self.outlook_refresh_token:
-            raise CodexOAuthProtocolError("input", "password or Outlook refresh_token is required")
+        if (
+            not self.password
+            and not self.outlook_refresh_token
+            and not self.initial_session_token
+            and not self.initial_session_cookies
+        ):
+            raise CodexOAuthProtocolError(
+                "input",
+                "password, Outlook refresh_token, or saved session Cookie is required",
+            )
 
         auth = self.auth_factory()
         try:
             await auth.share_session_with_sentinel()
             session = await auth._get_session()
+            device_id = self._cookie_value(session, "oai-did")
+            if device_id:
+                auth.device_id = device_id
             oauth = generate_oauth_url(login_hint=self.email)
-            oauth_url = self._with_query(oauth["auth_url"], prompt="login")
+            has_saved_session = bool(
+                self.initial_session_token or self.initial_session_cookies
+            )
+            oauth_url = (
+                oauth["auth_url"]
+                if has_saved_session
+                else self._with_query(oauth["auth_url"], prompt="login")
+            )
             expected_state = str(oauth["state"])
+            if has_saved_session:
+                self._emit(
+                    "cookie_login_started",
+                    cookie_count=len(self.initial_session_cookies),
+                )
             self._emit("oauth_started", email=self.email)
             self._say("[codex-protocol] 启动 Codex OAuth")
             current_url, _ = await self._navigate(session, oauth_url)
@@ -363,6 +401,42 @@ class CodexOAuthProtocolFlow:
 
                 parsed = urllib.parse.urlparse(current_url)
                 path = parsed.path.rstrip("/") or "/"
+
+                if (
+                    not self.cookie_login_only
+                    and has_saved_session
+                    and path
+                    in {
+                        "/log-in",
+                        "/log-in/password",
+                        "/create-account/password",
+                        "/api/accounts/email-otp/send",
+                        "/email-verification",
+                    }
+                ):
+                    self._emit(
+                        "cookie_login_fallback",
+                        page=path,
+                        message=(
+                            "ChatGPT Cookie 仍可用于浏览器登录；"
+                            "Codex OAuth 要求邮箱二次验证，正在自动继续"
+                        ),
+                    )
+                    # Emit this transition once even if the state machine
+                    # visits several email-verification endpoints.
+                    has_saved_session = False
+
+                if self.cookie_login_only and path in {
+                    "/log-in",
+                    "/log-in/password",
+                    "/create-account/password",
+                    "/api/accounts/email-otp/send",
+                    "/email-verification",
+                }:
+                    raise CodexOAuthProtocolError(
+                        "cookie_login",
+                        "Codex OAuth 要求邮箱二次验证，但当前任务被配置为仅使用 Cookie",
+                    )
 
                 if path in {"/log-in", "/choose-an-account", "/choose-account"}:
                     payload = await self._authorize_continue(auth, session)

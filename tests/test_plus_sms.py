@@ -3,11 +3,13 @@ import sqlite3
 
 import pytest
 
+from hidemyemail_generator.payment_sms import GLOBAL_SMS_ROUTING_SETTING_KEY
 from hidemyemail_generator.plus_sms import (
     HERO_SMS_SETTING_KEY,
-    PAYMENT_SMS_SETTING_KEY,
+    PLUS_CODEX_SMS_CHILE_MAX_PRICE_USD,
     PLUS_CODEX_SMS_MAX_PRICE_USD,
     PLUS_CODEX_SMS_SERVICE_CODE,
+    PLUS_CODEX_SMS_US_MAX_PRICE_USD,
     PlusSmsActivation,
     PlusSmsError,
     PlusSmsProviderFactory,
@@ -59,49 +61,68 @@ def _save_setting(database, key: str, payload: dict[str, object]) -> None:
         connection.close()
 
 
-def test_openai_number_uses_dr_and_exact_ten_cent_limit_for_each_country():
-    requester = ScriptedRequester(
-        "NO_NUMBERS",
-        "ACCESS_NUMBER:activation-2:+1 (202) 555-0187",
-    )
-    adapter = _adapter(
-        "smsbower",
-        requester,
-        country_ids=(("FIRST", 10), ("SECOND", 20), ("UNUSED", 30)),
-    )
+def test_smsbower_chile_success_never_requests_us():
+    requester = ScriptedRequester("ACCESS_NUMBER:activation-cl:+56 9 1234 5678")
+    logs = []
+    adapter = _adapter("smsbower", requester, on_log=logs.append)
 
     activation = adapter.request_phone()
 
     assert activation is not None
-    assert activation.phone == "+12025550187"
-    assert activation.activation_id == "activation-2"
+    assert activation.phone == "+56912345678"
+    assert activation.activation_id == "activation-cl"
     assert activation.raw == {
-        "country": "SECOND",
-        "country_id": 20,
+        "country": "CL",
+        "country_id": 151,
         "service": "openai",
         "service_code": "dr",
-        "max_price": 0.1,
+        "max_price": 0.054,
     }
-    assert [request["country"] for request in requester.requests] == [10, 20]
-    assert all(
-        request["action"] == "getNumber"
-        and request["service"] == PLUS_CODEX_SMS_SERVICE_CODE == "dr"
-        and request["maxPrice"] == "0.1"
-        for request in requester.requests
-    )
-    assert PLUS_CODEX_SMS_MAX_PRICE_USD == 0.1
+    assert [request["country"] for request in requester.requests] == [151]
+    assert requester.requests[0]["service"] == PLUS_CODEX_SMS_SERVICE_CODE == "dr"
+    assert requester.requests[0]["maxPrice"] == "0.054"
+    assert any("正在尝试智利" in item["message"] for item in logs)
+    assert any(item["level"] == "success" for item in logs)
+    assert PLUS_CODEX_SMS_CHILE_MAX_PRICE_USD == 0.054
+    assert PLUS_CODEX_SMS_US_MAX_PRICE_USD == PLUS_CODEX_SMS_MAX_PRICE_USD == 0.064
 
 
-def test_all_candidate_countries_are_tried_before_returning_no_number():
-    requester = ScriptedRequester("NO_NUMBERS", "NO_NUMBERS", "NO_NUMBERS")
-    adapter = _adapter(
-        "smsbower",
-        requester,
-        country_ids=(("ONE", 1), ("TWO", 2), ("THREE", 3)),
+def test_smsbower_only_falls_back_to_us_after_chile_no_numbers():
+    requester = ScriptedRequester(
+        "NO_NUMBERS", "ACCESS_NUMBER:activation-us:+1 202 555 0187"
     )
+    logs = []
+    adapter = _adapter("smsbower", requester, on_log=logs.append)
+
+    activation = adapter.request_phone()
+
+    assert activation is not None
+    assert activation.raw["country"] == "US"
+    assert activation.raw["max_price"] == 0.064
+    assert [request["country"] for request in requester.requests] == [151, 187]
+    assert [request["maxPrice"] for request in requester.requests] == [
+        "0.054",
+        "0.064",
+    ]
+    assert any("智利线路无库存；仅因此回退美国" in item["message"] for item in logs)
+
+
+def test_smsbower_non_inventory_error_never_requests_us():
+    requester = ScriptedRequester("NO_BALANCE")
+    adapter = _adapter("smsbower", requester)
+
+    with pytest.raises(PlusSmsError, match="余额不足"):
+        adapter.request_phone()
+
+    assert [request["country"] for request in requester.requests] == [151]
+
+
+def test_smsbower_returns_none_after_chile_and_us_are_both_out_of_stock():
+    requester = ScriptedRequester("NO_NUMBERS", "NO_NUMBERS")
+    adapter = _adapter("smsbower", requester)
 
     assert adapter.request_phone() is None
-    assert [request["country"] for request in requester.requests] == [1, 2, 3]
+    assert [request["country"] for request in requester.requests] == [151, 187]
 
 
 def test_smsbower_sends_ready_resend_complete_and_cancel_statuses():
@@ -192,10 +213,17 @@ def test_provider_error_never_leaks_api_key():
 def test_factory_selects_provider_and_key_from_database(tmp_path, monkeypatch):
     database = tmp_path / "settings.db"
     monkeypatch.delenv("HERO_SMS_API_KEY", raising=False)
+    monkeypatch.delenv("SMSBOWER_API_KEY", raising=False)
     _save_setting(
         database,
-        PAYMENT_SMS_SETTING_KEY,
-        {"defaultProvider": "hero-sms"},
+        GLOBAL_SMS_ROUTING_SETTING_KEY,
+        {
+            "binding": {
+                "provider": "hero-sms",
+                "maxPrice": 0.123,
+                "countries": ["ID", "US"],
+            }
+        },
     )
     _save_setting(
         database,
@@ -210,4 +238,8 @@ def test_factory_selects_provider_and_key_from_database(tmp_path, monkeypatch):
     assert adapter.name == "hero-sms"
     assert activation is not None
     assert activation.provider == "hero-sms"
+    assert activation.raw["country"] == "ID"
+    assert activation.raw["max_price"] == 0.123
     assert requester.requests[0]["api_key"] == "hero-database-key"
+    assert requester.requests[0]["country"] == 6
+    assert requester.requests[0]["maxPrice"] == "0.123"

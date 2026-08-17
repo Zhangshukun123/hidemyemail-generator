@@ -9,6 +9,7 @@ import pytest
 import httpx
 
 import web
+from paypal.sms_config import SmsSettingsModel
 from paypal.smsbower import (
     DEFAULT_OTP_TIMEOUT_SECONDS,
     SMSBowerPhoneActivation,
@@ -235,6 +236,7 @@ def test_smsbower_job_can_start_without_manual_phone(monkeypatch):
     assert job.sms_max_price == 1.25
     assert job.to_dict(include_logs=False)["sms_auto"] is True
     assert job.to_dict(include_logs=False)["sms_max_price"] == 1.25
+    assert job.to_dict(include_logs=False)["post_payment_phone_binding"] is False
     assert job.to_dict(include_logs=False)["phone_validation"]["status"] == "not_started"
     job.set_phone_validation(
         "format_valid",
@@ -256,6 +258,71 @@ def test_smsbower_job_can_start_without_manual_phone(monkeypatch):
     assert verification["paypal_send_accepted"] is True
     assert verification["paypal_confirmed"] is False
     web.JOBS.clear()
+
+
+def test_create_job_enforces_shared_global_provider_price_and_country_allowlist(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "hidemyemail.db"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)")
+    connection.execute(
+        "INSERT INTO settings(key, value) VALUES (?, ?)",
+        (
+            "global_sms_routing_config_v1",
+            json.dumps(
+                {
+                    "paypal": {
+                        "provider": "smsbower",
+                        "maxPrice": 0.123,
+                        "countries": ["GB"],
+                    }
+                }
+            ),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    class ClientStub:
+        provider_label = "SMSBower"
+
+        def configured(self):
+            return True
+
+    monkeypatch.setattr(web, "SMS_SETTINGS_MODEL", SmsSettingsModel(database))
+    monkeypatch.setattr(web, "SMSBOWER_PHONE_CLIENT", ClientStub())
+    web.JOBS.clear()
+    try:
+        with patch.object(threading.Thread, "start", autospec=True):
+            job = web.create_job(
+                owner_device_id="d" * 32,
+                ba_token="BA-GLOBAL1234",
+                phone="",
+                debug=False,
+                max_card_attempts=5,
+                sms_provider="hero-sms",
+                sms_country="US",
+                sms_max_price=9.99,
+                country="GB",
+                proxy_pool=["http://user:pass@127.0.0.1:8888"],
+            )
+
+        assert job.sms_provider == "smsbower"
+        assert job.sms_country == "GB"
+        assert job.sms_max_price == 0.123
+        with pytest.raises(ValueError, match="PayPal 国家 US 未在全局接码配置中启用"):
+            web.create_job(
+                owner_device_id="e" * 32,
+                ba_token="BA-BLOCKED1234",
+                phone="",
+                debug=False,
+                max_card_attempts=5,
+                country="US",
+                proxy_pool=["http://user:pass@127.0.0.1:8888"],
+            )
+    finally:
+        web.JOBS.clear()
 
 
 def test_internal_auto_jobs_share_one_device_without_browser_job_limit(monkeypatch):

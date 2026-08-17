@@ -67,7 +67,7 @@ class PortalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('class="steps"', page)
         self.assertNotIn("QQ 邮箱收件", page)
         self.assertNotIn("重复接码", page)
-        self.assertIn("/assets/app.js?v=1.3.2", page)
+        self.assertIn("/assets/app.js?v=1.3.3", page)
         script = await (await self.client.get("/assets/app.js")).text()
         self.assertIn("/api/code/latest", script)
         self.assertIn("timeoutMs: 180 * 1000", script)
@@ -256,3 +256,25 @@ class PortalRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload["state"], "unauthorized")
 
         self.assertEqual(self.repository.requested, [])
+
+    async def test_explicit_public_compatibility_mode_allows_direct_lookup(self):
+        public_app = create_app(
+            repository=self.repository,
+            settings=settings(access_token="", require_invite=False),
+        )
+        public_client = TestClient(TestServer(public_app))
+        await public_client.start_server()
+        try:
+            public_origin = str(public_client.make_url("/")).rstrip("/")
+            response = await public_client.post(
+                "/api/code/latest",
+                json={"email": "public@zkgmail.com"},
+                headers={"Origin": public_origin},
+            )
+            payload = await response.json()
+
+            self.assertEqual(response.status, 200, payload)
+            self.assertEqual(payload["code"], "246810")
+            self.assertEqual(self.repository.requested, ["public@zkgmail.com"])
+        finally:
+            await public_client.close()

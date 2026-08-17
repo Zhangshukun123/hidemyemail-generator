@@ -89,7 +89,7 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
     html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
     payloads = _runtime_state_payloads()
     email = "payment-monitor@icloud.com"
-    state = {"started": False, "job_polls": 0}
+    state = {"started": False, "job_polls": 0, "payment_payloads": []}
     payloads.update(
         {
             "/api/registration/status": {
@@ -222,6 +222,7 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
                     "logs": ["PayPal 链接已生成"],
                 }
             elif path == "/api/account/paypal-payment" and method == "POST":
+                state["payment_payloads"].append(route.request.post_data_json)
                 body = {
                     "ok": True,
                     "country": "DE",
@@ -229,6 +230,7 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
                     "proxySource": "card_link",
                     "smsProvider": "smsbower",
                     "smsProviderLabel": "SMSBower",
+                    "postPaymentPhoneBinding": False,
                     "job": {"id": "payment-job-12345678", "status": "queued", "stage": "排队中"},
                 }
             elif path == "/api/account/paypal-payment/payment-job-12345678":
@@ -291,6 +293,7 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
         page.route("**/*", fulfill)
         page.goto("http://hme-control-center.test/#quick-flow", wait_until="domcontentloaded")
         page.wait_for_function("!document.getElementById('startQuickFlowButton').disabled")
+        assert page.locator("#quickPostPaymentPhoneBinding").is_checked() is False
         page.locator("#startQuickFlowButton").click()
         page.wait_for_function(
             "document.getElementById('quickFlowStatusBadge').textContent === '已完成'",
@@ -301,6 +304,9 @@ def test_quick_flow_waits_for_paypal_success_and_streams_logs_without_navigation
         )
 
         assert state["job_polls"] == 3
+        assert state["payment_payloads"] == [
+            {"email": email, "post_payment_phone_binding": False}
+        ]
         assert page.locator("#quickFlowPaymentCount").inner_text() == "1"
         assert "新 AT 已确认 Plus" in page.locator("#quickFlowResults").inner_text()
         assert "支付后 Cookie 已刷新新 AT" in page.locator("#terminalPreviewList").inner_text()

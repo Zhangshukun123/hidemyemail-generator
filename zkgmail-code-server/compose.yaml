@@ -1,6 +1,8 @@
+name: zkgmail-production
+
 services:
   zkgmail-code-server:
-    image: zkgmail-code-server:1.3.2
+    image: zkgmail-code-server:1.3.3
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,6 +12,8 @@ services:
     init: true
     env_file:
       - ${ZKGMAIL_ENV_FILE:-.env}
+    environment:
+      ZKGMAIL_SESSION_STORE_PATH: "${ZKGMAIL_SESSION_STORE_PATH:-/data/access_sessions.json}"
     command:
       - --host
       - 127.0.0.1
@@ -18,6 +22,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
+    volumes:
+      - zkgmail-session-data:/data
     cap_drop:
       - ALL
     security_opt:
@@ -38,3 +44,6 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+
+volumes:
+  zkgmail-session-data:

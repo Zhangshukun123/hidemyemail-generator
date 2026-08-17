@@ -64,7 +64,8 @@ foreach ($name in @(
     "HIDEMYEMAIL_INVENTORY_USERNAME",
     "HIDEMYEMAIL_INVENTORY_PASSWORD",
     "HIDEMYEMAIL_INVENTORY_LEASE_SECONDS",
-    "HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS"
+    "HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS",
+    "LIANDONG_SHOP_MERCHANT_TOKEN"
 )) {
     if (-not [Environment]::GetEnvironmentVariable($name, "Process")) {
         $userValue = [Environment]::GetEnvironmentVariable($name, "User")

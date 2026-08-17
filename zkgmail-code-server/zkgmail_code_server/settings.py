@@ -35,6 +35,15 @@ def _header_name(name: str, default: str) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9-]{1,64}", value) else default
 
 
+def _boolean(name: str, default: bool) -> bool:
+    value = _environment_value(name, "true" if default else "false").lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     imap_host: str
@@ -57,6 +66,8 @@ class Settings:
     access_rate_limit_requests: int = 10
     access_rate_limit_window_seconds: int = 10 * 60
     rate_limit_max_keys: int = 4096
+    session_store_path: str = ""
+    require_invite: bool = True
 
     @property
     def configured(self) -> bool:
@@ -108,4 +119,6 @@ class Settings:
             rate_limit_max_keys=_bounded_int(
                 "ZKGMAIL_RATE_LIMIT_MAX_KEYS", 4096, 32, 65536
             ),
+            session_store_path=_environment_value("ZKGMAIL_SESSION_STORE_PATH", ""),
+            require_invite=_boolean("ZKGMAIL_REQUIRE_INVITE", True),
         )

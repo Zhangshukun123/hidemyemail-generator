@@ -48,6 +48,8 @@ def build_app_page() -> str:
                 "static/quick_flow_account_result.js",
                 "static/quick_flow_history.js",
                 "static/terminal_log.js",
+                "static/sms_settings.js",
+                "static/liandong_shop.js",
                 "static/app.js",
                 "static/plus_exports.js",
                 "static/account_actions.js",

@@ -1,16 +1,13 @@
 """SMS-Activate adapter for the post-payment Codex add-phone step.
 
-This module intentionally owns a separate service and budget from the PayPal
-SMS flow.  PayPal uses service ``ts`` and its country-specific limits; Codex
-add-phone uses OpenAI service ``dr`` and a hard per-account budget of $0.10.
+This module intentionally owns the OpenAI service code and lifecycle while its
+provider, maximum price, and ordered country fallback come from global config.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,8 +15,17 @@ from typing import Any, Callable, Iterable
 
 import httpx
 
+from .payment_sms import (
+    GlobalSmsRoutingConfigStore,
+    PROVIDER_METADATA,
+    SMS_COUNTRY_CATALOG,
+)
 
-PLUS_CODEX_SMS_MAX_PRICE_USD = 0.10
+
+PLUS_CODEX_SMS_PROVIDER = "smsbower"
+PLUS_CODEX_SMS_CHILE_MAX_PRICE_USD = 0.054
+PLUS_CODEX_SMS_US_MAX_PRICE_USD = 0.064
+PLUS_CODEX_SMS_MAX_PRICE_USD = PLUS_CODEX_SMS_US_MAX_PRICE_USD
 PLUS_CODEX_SMS_SERVICE = "openai"
 PLUS_CODEX_SMS_SERVICE_CODE = "dr"
 SMSBOWER_API_URL = "https://smsbower.page/stubs/handler_api.php"
@@ -44,37 +50,47 @@ PROVIDER_SETTINGS: dict[str, dict[str, str]] = {
     },
 }
 
-# SMS-Activate-compatible country identifiers.  Cheap pools are attempted
-# first; getNumber does not create a lease when it returns NO_NUMBERS.
+# SMS-Activate-compatible country identifiers exposed by the configuration UI.
 PROVIDER_COUNTRY_IDS: dict[str, tuple[tuple[str, int], ...]] = {
     "smsbower": (
-        ("US-VIRTUAL", 12),
+        ("CL", 151),
+        ("US", 187),
+        ("BR", 73),
+        ("DE", 43),
+        ("GB", 16),
+        ("JP", 1001),
+        ("TH", 52),
         ("ID", 6),
         ("PH", 4),
-        ("TH", 52),
-        ("BR", 73),
-        ("GB", 16),
-        ("DE", 43),
-        ("CA", 36),
+        ("TW", 55),
         ("MX", 54),
         ("AE", 95),
         ("AU", 175),
-        ("US", 187),
+        ("CA", 36),
     ),
     "hero-sms": (
+        ("CL", 151),
+        ("US", 187),
+        ("BR", 73),
+        ("DE", 43),
+        ("GB", 16),
+        ("JP", 182),
+        ("TH", 52),
         ("ID", 6),
         ("PH", 4),
-        ("TH", 52),
-        ("BR", 73),
-        ("GB", 16),
-        ("DE", 43),
-        ("CA", 36),
+        ("TW", 55),
         ("MX", 54),
         ("AE", 95),
         ("AU", 175),
-        ("US", 187),
+        ("CA", 36),
     ),
 }
+
+SMSBOWER_CODEX_ROUTES: tuple[tuple[str, int, float], ...] = (
+    ("CL", 151, PLUS_CODEX_SMS_CHILE_MAX_PRICE_USD),
+    ("US", 187, PLUS_CODEX_SMS_US_MAX_PRICE_USD),
+)
+_COUNTRY_NAMES = dict(SMS_COUNTRY_CATALOG)
 
 _CODE_RE = re.compile(r"^[A-Za-z0-9]{4,10}$")
 _WAITING_STATUSES = {"STATUS_WAIT_CODE", "STATUS_WAIT_RESEND"}
@@ -95,6 +111,7 @@ class PlusSmsActivation:
 
 
 Requester = Callable[[dict[str, Any]], str]
+LogCallback = Callable[[dict[str, str]], None]
 
 
 class PlusSmsCredentialModel:
@@ -102,37 +119,20 @@ class PlusSmsCredentialModel:
 
     def __init__(self, db_file: Path) -> None:
         self.db_file = Path(db_file)
-
-    def _setting(self, key: str) -> dict[str, Any]:
-        if not self.db_file.is_file():
-            return {}
-        try:
-            connection = sqlite3.connect(str(self.db_file))
-            try:
-                row = connection.execute(
-                    "SELECT value FROM settings WHERE key = ?", (key,)
-                ).fetchone()
-            finally:
-                connection.close()
-            payload = json.loads(str(row[0] or "{}")) if row else {}
-        except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        self.routing_store = GlobalSmsRoutingConfigStore(self.db_file)
 
     def preferred_provider(self) -> str:
-        state = self._setting(PAYMENT_SMS_SETTING_KEY)
-        provider = str(state.get("defaultProvider") or "smsbower").strip().lower()
-        return provider if provider in PROVIDER_SETTINGS else "smsbower"
+        return str(self.routing_store.purpose("binding")["provider"])
+
+    def routing(self) -> dict[str, Any]:
+        return self.routing_store.purpose("binding")
 
     def api_key(self, provider: str) -> str:
         normalized = str(provider or "").strip().lower()
         metadata = PROVIDER_SETTINGS.get(normalized)
         if metadata is None:
             raise ValueError("Plus 接码平台参数不正确")
-        explicit = str(os.getenv(metadata["env"]) or "").strip()
-        if explicit:
-            return explicit
-        return str(self._setting(metadata["setting"]).get("apiKey") or "").strip()
+        return self.routing_store.provider_api_key(normalized)
 
 
 class SmsActivateCodexAdapter:
@@ -147,6 +147,8 @@ class SmsActivateCodexAdapter:
         poll_interval_seconds: float = 4.0,
         request_timeout_seconds: float = 20.0,
         country_ids: tuple[tuple[str, int], ...] | None = None,
+        country_routes: tuple[tuple[str, int, float], ...] | None = None,
+        on_log: LogCallback | None = None,
     ) -> None:
         normalized = str(provider or "").strip().lower()
         metadata = PROVIDER_SETTINGS.get(normalized)
@@ -164,8 +166,35 @@ class SmsActivateCodexAdapter:
         self._requester = requester
         self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
         self.request_timeout_seconds = max(1.0, float(request_timeout_seconds))
-        self.country_ids = tuple(country_ids or PROVIDER_COUNTRY_IDS[normalized])
+        if country_routes is not None:
+            routes = tuple(country_routes)
+        elif country_ids is not None:
+            routes = tuple(
+                (country, country_id, PLUS_CODEX_SMS_MAX_PRICE_USD)
+                for country, country_id in country_ids
+            )
+        elif normalized == PLUS_CODEX_SMS_PROVIDER:
+            routes = SMSBOWER_CODEX_ROUTES
+        else:
+            routes = tuple(
+                (country, country_id, PLUS_CODEX_SMS_MAX_PRICE_USD)
+                for country, country_id in PROVIDER_COUNTRY_IDS[normalized]
+            )
+        self.country_routes = routes
+        self.country_ids = tuple((country, country_id) for country, country_id, _ in routes)
+        self._on_log = on_log
         self.last_activation: PlusSmsActivation | None = None
+
+    def _log(self, message: str, *, level: str = "info") -> None:
+        if self._on_log is None:
+            return
+        self._on_log(
+            {
+                "stage": "sms_route",
+                "level": level,
+                "message": str(message or "")[:800],
+            }
+        )
 
     def _request(self, action: str, **params: Any) -> str:
         query = {"api_key": self._api_key, "action": action, **params}
@@ -199,7 +228,7 @@ class SmsActivateCodexAdapter:
         messages = {
             "BAD_KEY": f"{self.label} API Key 无效",
             "BAD_SERVICE": f"{self.label} 不支持 OpenAI 接码服务",
-            "NO_NUMBERS": f"{self.label} 暂无 $0.10 内的 OpenAI 号码",
+            "NO_NUMBERS": f"{self.label} 所选国家线路均无库存",
             "NO_BALANCE": f"{self.label} 余额不足",
             "NO_ACTIVATION": f"{self.label} 激活记录不存在",
             "STATUS_CANCEL": f"{self.label} 激活已取消",
@@ -208,12 +237,19 @@ class SmsActivateCodexAdapter:
 
     def request_phone(self) -> PlusSmsActivation | None:
         body = "NO_NUMBERS"
-        for country, country_id in self.country_ids:
+        for route_index, (country, country_id, max_price) in enumerate(
+            self.country_routes
+        ):
+            country_name = _COUNTRY_NAMES.get(country, country)
+            self._log(
+                f"{self.label} 取号：正在尝试{country_name}（country={country_id}），"
+                f"最高 ${max_price:g}"
+            )
             body = self._request(
                 "getNumber",
                 service=PLUS_CODEX_SMS_SERVICE_CODE,
                 country=country_id,
-                maxPrice=f"{PLUS_CODEX_SMS_MAX_PRICE_USD:g}",
+                maxPrice=f"{max_price:g}",
             )
             if body.startswith("ACCESS_NUMBER:"):
                 parts = body.split(":", 2)
@@ -234,13 +270,37 @@ class SmsActivateCodexAdapter:
                         "country_id": country_id,
                         "service": PLUS_CODEX_SMS_SERVICE,
                         "service_code": PLUS_CODEX_SMS_SERVICE_CODE,
-                        "max_price": PLUS_CODEX_SMS_MAX_PRICE_USD,
+                        "max_price": max_price,
                     },
                 )
                 self.last_activation = activation
+                self._log(
+                    f"{self.label} {country_name}线路取号成功，号码已脱敏保存",
+                    level="success",
+                )
                 return activation
-            if body.split(":", 1)[0].upper() != "NO_NUMBERS":
+            code = body.split(":", 1)[0].upper()
+            if code != "NO_NUMBERS":
+                self._log(
+                    f"{self.label} {country_name}线路取号失败：{code}",
+                    level="error",
+                )
                 raise self._error(body, "取号")
+            if route_index + 1 < len(self.country_routes):
+                next_country, next_country_id, next_max_price = self.country_routes[
+                    route_index + 1
+                ]
+                next_name = _COUNTRY_NAMES.get(next_country, next_country)
+                self._log(
+                    f"{self.label} {country_name}线路无库存；仅因此回退"
+                    f"{next_name}（country={next_country_id}），最高 ${next_max_price:g}",
+                    level="warning",
+                )
+            else:
+                self._log(
+                    f"{self.label} {country_name}线路无库存，本次取号结束",
+                    level="warning",
+                )
         if body.split(":", 1)[0].upper() == "NO_NUMBERS":
             return None
         raise self._error(body, "取号")
@@ -312,13 +372,46 @@ class PlusSmsProviderFactory:
         self.model = PlusSmsCredentialModel(db_file)
 
     def create(
-        self, provider: str = "", *, requester: Requester | None = None
+        self,
+        provider: str = "",
+        *,
+        requester: Requester | None = None,
+        on_log: LogCallback | None = None,
+        purpose: str = "binding",
+        countries: Iterable[str] | None = None,
+        max_price: float | None = None,
     ) -> SmsActivateCodexAdapter:
-        selected = str(provider or self.model.preferred_provider()).strip().lower()
+        policy = self.model.routing() if purpose == "binding" else {}
+        selected = str(
+            policy.get("provider") or provider or self.model.preferred_provider()
+        ).strip().lower()
+        selected_countries = [
+            str(country or "").strip().upper()
+            for country in (countries or policy.get("countries") or ())
+        ]
+        route_price = float(
+            max_price
+            if max_price is not None
+            else policy.get("maxPrice") or PLUS_CODEX_SMS_MAX_PRICE_USD
+        )
+        country_ids = dict(PROVIDER_COUNTRY_IDS.get(selected) or ())
+        routes: list[tuple[str, int, float]] = []
+        for country in selected_countries:
+            country_id = country_ids.get(country)
+            if country_id is None:
+                raise PlusSmsError(
+                    f"{PROVIDER_METADATA.get(selected, {}).get('label', selected)} "
+                    f"不支持所选国家 {country}"
+                )
+            routes.append((country, country_id, route_price))
+        if not routes:
+            raise PlusSmsError("绑定手机号接码国家未配置")
         return SmsActivateCodexAdapter(
             provider=selected,
             api_key=self.model.api_key(selected),
             requester=requester,
+            on_log=on_log,
+            country_routes=tuple(routes),
         )
 
 
@@ -329,14 +422,18 @@ def mask_phone(value: str) -> str:
 
 __all__ = [
     "HERO_SMS_API_URL",
+    "PLUS_CODEX_SMS_CHILE_MAX_PRICE_USD",
     "PLUS_CODEX_SMS_MAX_PRICE_USD",
+    "PLUS_CODEX_SMS_PROVIDER",
     "PLUS_CODEX_SMS_SERVICE",
     "PLUS_CODEX_SMS_SERVICE_CODE",
+    "PLUS_CODEX_SMS_US_MAX_PRICE_USD",
     "PlusSmsActivation",
     "PlusSmsCredentialModel",
     "PlusSmsError",
     "PlusSmsProviderFactory",
     "SMSBOWER_API_URL",
+    "SMSBOWER_CODEX_ROUTES",
     "SmsActivateCodexAdapter",
     "mask_phone",
 ]

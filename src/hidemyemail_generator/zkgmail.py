@@ -580,12 +580,16 @@ class ZkgmailMailClient:
         task.add_done_callback(self._finish_sync)
         return True
 
-    def _next_stored_code(self, email: str) -> str:
+    def _next_stored_code(self, email: str, since: str = "") -> str:
         acquired_at = self._acquired_at.get(email)
-        if acquired_at is None:
+        requested_at = _parse_utc(since)
+        if acquired_at is None and requested_at is None:
+            raise RuntimeError("未找到该 zkgmail.com 注册邮箱的本机取码记录")
+        if acquired_at is None and email not in _known_zkgmail_aliases(self.db_file):
             raise RuntimeError("未找到该 zkgmail.com 注册邮箱的本机取码记录")
         # Mail-server clocks can differ slightly from the workstation clock.
-        earliest = acquired_at - timedelta(minutes=5)
+        anchors = [item for item in (acquired_at, requested_at) if item is not None]
+        earliest = max(anchors) - timedelta(minutes=5)
         consumed = self._consumed_message_ids.setdefault(email, set())
         conn = connect_db(str(self.db_file))
         try:
@@ -620,11 +624,11 @@ class ZkgmailMailClient:
             return code
         return ""
 
-    async def poll_code(self, email: str) -> str:
+    async def poll_code(self, email: str, *, since: str = "") -> str:
         target = self._normalize_email(email)
         async with self._lock:
             # Cache-Aside pattern: a local hit must never wait behind remote IMAP.
-            code = self._next_stored_code(target)
+            code = self._next_stored_code(target, since)
             if code:
                 return code
             previous_error = self._sync_error
@@ -635,8 +639,8 @@ class ZkgmailMailClient:
             self._start_sync_if_due()
             return ""
 
-    async def poll_next_code(self, email: str) -> str:
-        return await self.poll_code(email)
+    async def poll_next_code(self, email: str, *, since: str = "") -> str:
+        return await self.poll_code(email, since=since)
 
     async def complete_email(self, email: str, _success: bool, _message: str) -> None:
         self._normalize_email(email)

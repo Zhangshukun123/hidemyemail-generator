@@ -10,7 +10,8 @@ COPY pyproject.toml ./
 COPY zkgmail_code_server ./zkgmail_code_server
 
 RUN pip install --no-cache-dir . \
-    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin app \
+    && install -d -o 10001 -g 10001 -m 700 /data
 
 USER app
 

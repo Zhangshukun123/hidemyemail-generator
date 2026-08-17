@@ -83,10 +83,10 @@ class WorkbenchLayoutTests(unittest.TestCase):
         self.assertIn('<meta name="theme-color" content="#0d0d0d">', self.page)
         self.assertIn('resolved === "dark" ? "#0d0d0d" : "#f7f7f5"', self.page)
 
-    def test_terminal_is_the_only_runtime_log_surface(self):
+    def test_task_log_is_the_only_runtime_log_surface(self):
         self.assertIn('id="workbenchTerminalPanel"', self.page)
         self.assertIn('id="terminalPreviewList"', self.page)
-        self.assertIn('id="terminalPreviewTitle">终端</button>', self.page)
+        self.assertIn('id="terminalPreviewTitle">任务日志</button>', self.page)
         self.assertIn('data-action="toggle-terminal-preview"', self.page)
         self.assertIn('id="sidebarRuntimeLabel"', self.page)
         self.assertNotIn('id="statusBarRuntimeLabel"', self.page)
@@ -116,7 +116,7 @@ class WorkbenchLayoutTests(unittest.TestCase):
             'role="log"',
             'aria-live="off"',
             'data-action="toggle-terminal-preview"',
-            'aria-label="折叠终端日志"',
+            'aria-label="折叠任务日志"',
         )
         for marker in expected_markup:
             self.assertIn(marker, self.page)
@@ -190,8 +190,10 @@ class WorkbenchLayoutTests(unittest.TestCase):
         ]
         self.assertIn("资源管理器", sidebar_markup)
         self.assertIn('class="product-lockup sidebar-brand explorer-title"', sidebar_markup)
-        self.assertIn('id="sidebarTaskGroupTitle"', sidebar_markup)
-        self.assertIn('id="sidebarResourceTitle"', sidebar_markup)
+        self.assertNotIn('class="sidebar-tree-section"', sidebar_markup)
+        self.assertNotIn('id="sidebarTaskGroupTitle"', sidebar_markup)
+        self.assertNotIn('id="sidebarResourceTitle"', sidebar_markup)
+        self.assertNotIn("任务分组", sidebar_markup)
         self.assertLess(
             sidebar_markup.index('class="product-lockup sidebar-brand explorer-title"'),
             sidebar_markup.index('id="sidebarCollapseButton"'),
@@ -222,6 +224,21 @@ class WorkbenchLayoutTests(unittest.TestCase):
         )
         for marker in expected_styles:
             self.assertIn(marker, self.page)
+
+    def test_bottom_panel_only_shows_task_log_tab(self):
+        panel_nav = self.page[
+            self.page.index('<nav aria-label="底部面板">') :
+            self.page.index("</nav>", self.page.index('<nav aria-label="底部面板">'))
+        ]
+        self.assertEqual(panel_nav.count("<button"), 1)
+        self.assertIn('id="terminalPreviewTitle">任务日志</button>', panel_nav)
+        for removed_label in ("问题", "输出", "调试控制台", "终端"):
+            self.assertNotIn(removed_label, panel_nav)
+
+    def test_card_link_route_is_named_link_center(self):
+        self.assertIn('aria-label="提连中心" title="提连中心"', self.page)
+        self.assertIn('"card-links": ["CHECKOUT WORKSPACE", "提连中心"', self.page)
+        self.assertNotIn("直卡提链接", self.page)
 
     def test_control_center_uses_real_task_state_and_redacted_log_preview(self):
         expected_markup = (

@@ -40,9 +40,11 @@ from hidemyemail_generator.webapp import (
     _generation_failure_message,
     _latest_code_for_email,
     _load_local_env_file,
+    _run_card_link_bridge,
     _save_account_card_link,
     create_app,
 )
+from hidemyemail_generator.liandong_shop import LiandongShopError
 
 
 class WebAppStdioTests(unittest.TestCase):
@@ -175,6 +177,48 @@ class WebAppStdioTests(unittest.TestCase):
                 app["browser_manager"].target_project_dir,
                 packaged.resolve(),
             )
+
+
+class CardLinkBridgeStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_bridge_publishes_log_before_process_finishes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bridge = root / "fake_card_link_bridge.py"
+            bridge.write_text(
+                "import json,time\n"
+                "print('HME_CARD_LINK_LOG:' + json.dumps({'message':'legacy live step'}), flush=True)\n"
+                "time.sleep(0.25)\n"
+                "print('HME_CARD_LINK_EVENT:' + json.dumps({"
+                "'status':'success','url':'https://chatgpt.com/checkout/openai_llc/cs_stream',"
+                "'country':'US','currency':'USD'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            progress: list[str] = []
+            first_log = asyncio.Event()
+
+            def publish(message: str) -> None:
+                progress.append(message)
+                first_log.set()
+
+            task = asyncio.create_task(
+                _run_card_link_bridge(
+                    target_project_dir=root,
+                    python_executable=Path(sys.executable),
+                    bridge_file=bridge,
+                    access_token="at-streaming-test",
+                    method="standard",
+                    country="US",
+                    currency="USD",
+                    locale="en-US",
+                    progress_callback=publish,
+                )
+            )
+            await asyncio.wait_for(first_log.wait(), timeout=2)
+            self.assertFalse(task.done())
+            result = await asyncio.wait_for(task, timeout=2)
+
+        self.assertEqual(progress, ["legacy live step"])
+        self.assertEqual(result["logs"], ["legacy live step"])
 
 
 class CardLinkProxyResolverTests(unittest.TestCase):
@@ -370,6 +414,152 @@ class GptCredentialEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())["error"], "邮箱地址无效")
 
 
+class LiandongShopUploadEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.app = create_app(base_dir=Path(self.temp_dir.name))
+        self.email = "shop-upload@zkgmail.com"
+        _save_account_record(
+            self.app["db_file"],
+            self.email,
+            result={
+                "access_token": "at-shop-upload",
+                "session_json": '{"accessToken":"at-shop-upload"}',
+            },
+            password="Account-Password",
+            password_confirmed=True,
+            two_factor={"enabled": True, "secret": "JBSWY3DPEHPK3PXP"},
+        )
+        self.set_account_fields(account_type="plus")
+        self.app["liandong_shop_config"].save("merchant-test-token")
+        self.upload_card = mock.AsyncMock(return_value={"code": 1, "message": "ok"})
+        self.app["liandong_shop_client"].upload_card = self.upload_card
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp_dir.cleanup()
+
+    def set_account_fields(self, email: str = "", **changes):
+        target = email or self.email
+        record = load_account_record(self.app["db_file"], target)
+        record.update(changes)
+        conn = connect_db(str(self.app["db_file"]))
+        try:
+            conn.execute(
+                """
+                INSERT INTO settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (f"gpt_account:{target}", json.dumps(record)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def test_uploads_unbound_account_and_marks_only_after_success(self):
+        headers = {"X-Local-Token": self.app["local_token"]}
+        response = await self.client.post(
+            "/api/account/liandong-shop-upload",
+            json={"email": self.email},
+            headers=headers,
+        )
+
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertTrue(payload["uploaded"])
+        self.assertEqual(payload["goodsId"], 698207)
+        self.assertEqual(payload["goodsLabel"], "未接码商品")
+        self.upload_card.assert_awaited_once()
+        call = self.upload_card.await_args.kwargs
+        self.assertEqual(call["token"], "merchant-test-token")
+        self.assertEqual(call["goods"].goods_id, 698207)
+        self.assertEqual(
+            call["content"],
+            f"{self.email}----Account-Password----JBSWY3DPEHPK3PXP",
+        )
+        stored = load_account_record(self.app["db_file"], self.email)
+        self.assertTrue(stored["liandong_shop"]["uploaded"])
+        self.assertNotIn("content", stored["liandong_shop"])
+        listed = await self.client.get("/api/gpt-emails")
+        listed_account = next(
+            item
+            for item in (await listed.json())["items"]
+            if item["email"] == self.email
+        )
+        self.assertTrue(listed_account["liandongShopUploaded"])
+        self.assertEqual(listed_account["liandongShopGoodsLabel"], "未接码商品")
+
+    async def test_routes_phone_bound_account_to_bound_goods(self):
+        self.set_account_fields(plus_sms={"status": "completed", "phone_bound": True})
+        response = await self.client.post(
+            "/api/account/liandong-shop-upload",
+            json={"email": self.email},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["goodsId"], 685418)
+        self.assertEqual(self.upload_card.await_args.kwargs["goods"].goods_id, 685418)
+
+    async def test_existing_manual_upload_marker_is_never_uploaded_again(self):
+        self.set_account_fields(
+            liandong_shop={
+                "uploaded": True,
+                "uploaded_at": "2026-08-17T00:00:00+00:00",
+            }
+        )
+        response = await self.client.post(
+            "/api/account/liandong-shop-upload",
+            json={"email": self.email},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue((await response.json())["alreadyUploaded"])
+        self.upload_card.assert_not_awaited()
+
+    async def test_failed_shop_response_does_not_mark_account(self):
+        self.upload_card.side_effect = LiandongShopError("小铺库存添加失败")
+        response = await self.client.post(
+            "/api/account/liandong-shop-upload",
+            json={"email": self.email},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 502)
+        record = load_account_record(self.app["db_file"], self.email)
+        self.assertFalse(record.get("liandong_shop", {}).get("uploaded", False))
+
+    async def test_status_and_config_never_return_merchant_token(self):
+        status = await self.client.get("/api/liandong-shop/status")
+        status_payload = await status.json()
+        self.assertTrue(status_payload["configured"])
+        self.assertNotIn("merchant-test-token", json.dumps(status_payload))
+
+        configured = await self.client.post(
+            "/api/liandong-shop/config",
+            json={"merchantToken": "replacement-secret-token"},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+        configured_payload = await configured.json()
+        self.assertEqual(configured.status, 200)
+        self.assertNotIn("replacement-secret-token", json.dumps(configured_payload))
+
+    async def test_rejects_upload_when_account_is_not_plus(self):
+        self.set_account_fields(account_type="free")
+        response = await self.client.post(
+            "/api/account/liandong-shop-upload",
+            json={"email": self.email},
+            headers={"X-Local-Token": self.app["local_token"]},
+        )
+
+        self.assertEqual(response.status, 409)
+        self.assertIn("Plus", (await response.json())["error"])
+        self.upload_card.assert_not_awaited()
+
+
 class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -436,6 +626,61 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         finally:
             connection.close()
 
+    def set_account_fields(self, email, **fields):
+        record = load_account_record(self.app["db_file"], email)
+        record.update(fields)
+        self.save_setting(f"gpt_account:{email}", record)
+
+    async def test_plus_account_skips_card_link_and_paypal_payment_endpoints(self):
+        email = "card-link@icloud.com"
+        self.set_account_fields(email, account_type="plus")
+        bridge = mock.AsyncMock()
+        create_job = mock.AsyncMock()
+
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=bridge,
+            ),
+            mock.patch.object(self.app["paypal_service"], "create_job", create_job),
+        ):
+            card_link_response = await self.client.post(
+                "/api/account/card-link",
+                json={"email": email, "country": "US"},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            payment_response = await self.client.post(
+                "/api/account/paypal-payment",
+                json={"email": email},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        self.assertEqual(card_link_response.status, 409)
+        self.assertEqual(payment_response.status, 409)
+        self.assertIn("已是 Plus", (await card_link_response.json())["error"])
+        self.assertIn("无需再次提链支付", (await payment_response.json())["error"])
+        bridge.assert_not_awaited()
+        create_job.assert_not_awaited()
+
+    async def test_account_list_projects_legacy_phone_binding_as_bound(self):
+        email = "card-link@icloud.com"
+        self.set_account_fields(
+            email,
+            account_type="plus",
+            plus_codex={"status": "failed", "sms_verified": False},
+            plus_sms={"status": "completed", "phone_bound": True},
+        )
+
+        response = await self.client.get("/api/gpt-emails")
+        item = next(
+            entry
+            for entry in (await response.json())["items"]
+            if entry["email"] == email
+        )
+
+        self.assertTrue(item["plusPhoneBound"])
+        self.assertEqual(item["plusPhoneBindingStatus"], "completed")
+
     async def test_generates_and_persists_card_link(self):
         generated = {
             "status": "success",
@@ -469,6 +714,76 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
             generated["url"],
         )
         self.assertEqual(bridge.await_args.kwargs["locale"], "ja-JP")
+
+    async def test_card_link_progress_is_available_while_post_is_still_running(self):
+        generated = {
+            "status": "success",
+            "url": "https://chatgpt.com/checkout/openai_llc/cs_live_progress",
+            "country": "US",
+            "currency": "USD",
+            "logs": ["步骤 1/2：已创建 Checkout", "步骤 2/2：已生成链接"],
+        }
+        bridge_started = asyncio.Event()
+        release_bridge = asyncio.Event()
+
+        async def bridge(**kwargs):
+            publish = kwargs["progress_callback"]
+            publish("步骤 1/2：已创建 Checkout")
+            bridge_started.set()
+            await release_bridge.wait()
+            publish("步骤 2/2：已生成链接")
+            return generated
+
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(side_effect=bridge),
+            ),
+        ):
+            post_task = asyncio.create_task(
+                self.client.post(
+                    "/api/account/card-link",
+                    json={
+                        "email": "card-link@icloud.com",
+                        "country": "US",
+                        "progress_id": "cardlink-live-test",
+                    },
+                    headers={"X-Local-Token": self.app["local_token"]},
+                )
+            )
+            await asyncio.wait_for(bridge_started.wait(), timeout=2)
+
+            progress_response = await self.client.get(
+                "/api/account/card-link/progress/cardlink-live-test?log_after=0",
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            progress = await progress_response.json()
+            self.assertFalse(post_task.done())
+            self.assertEqual(progress_response.status, 200)
+            self.assertTrue(progress["running"])
+            self.assertEqual(
+                [item["message"] for item in progress["logs"]],
+                ["步骤 1/2：已创建 Checkout"],
+            )
+
+            release_bridge.set()
+            response = await post_task
+            self.assertEqual(response.status, 200)
+            final_response = await self.client.get(
+                "/api/account/card-link/progress/cardlink-live-test?log_after=1",
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+            final_progress = await final_response.json()
+            self.assertFalse(final_progress["running"])
+            self.assertEqual(final_progress["status"], "completed")
+            self.assertEqual(
+                [item["message"] for item in final_progress["logs"]],
+                ["步骤 2/2：已生成链接"],
+            )
 
     async def test_direct_card_link_failure_returns_bridge_step_logs(self):
         bridge_error = CardLinkBridgeError(
@@ -580,7 +895,9 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.app["paypal_service"], "create_job", created):
             response = await self.client.post(
                 "/api/account/paypal-payment",
-                json={"email": "card-link@icloud.com"},
+                json={
+                    "email": "card-link@icloud.com",
+                },
                 headers={"X-Local-Token": self.app["local_token"]},
             )
 
@@ -592,6 +909,8 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(protocol["source_account_email"], "card-link@icloud.com")
         self.assertEqual(protocol["account_cookies"], cookies)
         self.assertEqual(protocol["completion_target"], "openai_plus")
+        self.assertFalse(protocol["post_payment_phone_binding"])
+        self.assertFalse(payload["postPaymentPhoneBinding"])
         self.assertEqual(protocol["country"], "TH")
         self.assertEqual(protocol["sms_provider"], "smsbower")
         self.assertEqual(len(protocol["proxy_pool"]), 3)
@@ -656,7 +975,84 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancel_response.status, 404)
         self.assertEqual(await guard.active_emails(), set())
 
-    async def test_one_click_us_paypal_uses_us_paypal_virtual_number_budget(self):
+    async def test_global_sms_config_endpoint_persists_routing_without_leaking_keys(self):
+        response = await self.client.post(
+            "/api/payment-sms/config",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={
+                "binding": {
+                    "provider": "hero-sms",
+                    "maxPrice": 0.071,
+                    "countries": ["US", "CL"],
+                },
+                "paypal": {
+                    "provider": "smsbower",
+                    "maxPrice": 0.123,
+                    "countries": ["GB", "US"],
+                },
+                "apiKeys": {
+                    "smsbower": "smsbower-api-secret",
+                    "hero-sms": "hero-api-secret",
+                },
+            },
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["routing"]["binding"]["provider"], "hero-sms")
+        self.assertEqual(payload["routing"]["binding"]["countries"], ["US", "CL"])
+        self.assertEqual(payload["routing"]["paypal"]["maxPrice"], 0.123)
+        self.assertEqual(payload["routing"]["paypal"]["countries"], ["GB", "US"])
+        self.assertNotIn("api-secret", json.dumps(payload))
+
+        status = await self.client.get("/api/payment-sms/status")
+        status_payload = await status.json()
+        self.assertEqual(status.status, 200)
+        self.assertEqual(status_payload["routing"]["binding"]["provider"], "hero-sms")
+        self.assertNotIn("api-secret", json.dumps(status_payload))
+
+    async def test_paypal_country_outside_global_sms_allowlist_is_rejected(self):
+        email = "gb-paypal-country-block@zkgmail.com"
+        _save_account_record(
+            self.app["db_file"],
+            email,
+            result={"cookies_json": '[{"name":"session","value":"cookie"}]'},
+        )
+        _save_account_card_link(
+            self.app["db_file"],
+            email,
+            url="https://www.paypal.com/agreements/approve?ba_token=gb_blocked",
+            country="GB",
+            currency="GBP",
+            method="paypal_gb",
+            link_proxy_country="GB",
+            link_proxy_ip="203.0.113.39",
+        )
+        self.app["sms_routing_config_store"].configure(
+            {
+                "paypal": {
+                    "provider": "smsbower",
+                    "maxPrice": 0.123,
+                    "countries": ["US"],
+                },
+                "apiKeys": {"smsbower": "smsbower-test-key"},
+            }
+        )
+        created = mock.AsyncMock()
+
+        with mock.patch.object(self.app["paypal_service"], "create_job", created):
+            response = await self.client.post(
+                "/api/account/paypal-payment",
+                json={"email": email},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 409)
+        self.assertIn("PayPal 国家 GB 未在全局接码配置中启用", payload["error"])
+        created.assert_not_awaited()
+
+    async def test_one_click_us_paypal_uses_global_sms_budget(self):
         email = "us-paypal-phone@zkgmail.com"
         _save_account_record(
             self.app["db_file"],
@@ -680,9 +1076,15 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
             proxy_line="extract.example:3010:extract-user:extract-password",
             card_link_modes={"paypal_us": "dynamic"},
         )
-        self.app["smsbower_config_store"].configure(
-            api_key="smsbower-test-key",
-            max_price=0.05,
+        self.app["sms_routing_config_store"].configure(
+            {
+                "paypal": {
+                    "provider": "smsbower",
+                    "maxPrice": 0.123,
+                    "countries": ["US"],
+                },
+                "apiKeys": {"smsbower": "smsbower-test-key"},
+            }
         )
         created = mock.AsyncMock(return_value=(201, {"job": {"id": "pay-us-phone"}}))
         with mock.patch.object(self.app["paypal_service"], "create_job", created):
@@ -699,11 +1101,11 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(protocol["sms_provider"], "smsbower")
         self.assertEqual(protocol["sms_service"], "paypal")
         self.assertEqual(protocol["sms_country"], "US")
-        self.assertEqual(protocol["sms_max_price"], 0.25)
+        self.assertEqual(protocol["sms_max_price"], 0.123)
         self.assertEqual(payload["smsCountry"], "US")
         self.assertEqual(payload["smsService"], "paypal")
         self.assertEqual(payload["smsServiceCode"], "ts")
-        self.assertEqual(payload["smsMaxPrice"], 0.25)
+        self.assertEqual(payload["smsMaxPrice"], 0.123)
         self.assertTrue(payload["smsVirtualAllowed"])
 
     async def test_one_click_paypal_uses_configured_hero_sms_provider(self):
@@ -730,11 +1132,15 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
             proxy_line="extract.example:3010:extract-user:extract-password",
             card_link_modes={"paypal_us": "dynamic"},
         )
-        self.save_setting(
-            "paypal_sms_config_v1", {"defaultProvider": "hero-sms"}
-        )
-        self.save_setting(
-            "hero_sms_phone_config_v1", {"apiKey": "hero-test-key"}
+        self.app["sms_routing_config_store"].configure(
+            {
+                "paypal": {
+                    "provider": "hero-sms",
+                    "maxPrice": 0.456,
+                    "countries": ["US"],
+                },
+                "apiKeys": {"hero-sms": "hero-test-key"},
+            }
         )
         created = mock.AsyncMock(
             return_value=(201, {"job": {"id": "pay-hero-phone"}})
@@ -751,6 +1157,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         protocol = created.await_args.args[0]
         self.assertEqual(response.status, 201)
         self.assertEqual(protocol["sms_provider"], "hero-sms")
+        self.assertEqual(protocol["sms_max_price"], 0.456)
         self.assertEqual(payload["smsProvider"], "hero-sms")
         self.assertEqual(payload["smsProviderLabel"], "HeroSMS")
         self.assertFalse(payload["smsVirtualAllowed"])

@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from unittest import mock
@@ -392,6 +392,89 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first, "246810")
             self.assertEqual(repeated, "")
             sync_strategy.assert_called_once()
+
+    async def test_saved_address_reads_fresh_code_after_service_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            email = "savedaccount90@zkgmail.com"
+            requested_at = datetime.now(timezone.utc)
+            old_at = requested_at.replace(microsecond=0) - timedelta(hours=2)
+            fresh_at = requested_at.replace(microsecond=0)
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO addresses(
+                        email, label, state, source, note, is_active,
+                        created_at, updated_at
+                    ) VALUES (?, '', 'used', 'zkgmail', '', 1, ?, ?)
+                    """,
+                    (email, old_at.isoformat(), old_at.isoformat()),
+                )
+                for uid, code, received_at in (
+                    ("old", "111111", old_at),
+                    ("fresh", "597127", fresh_at),
+                ):
+                    insert_message(
+                        conn,
+                        {
+                            "account_key": "qq@imap.qq.com/INBOX",
+                            "folder": "INBOX",
+                            "uid": uid,
+                            "sender": "noreply@openai.com",
+                            "recipients": email,
+                            "hme_address": email,
+                            "subject": "OpenAI verification code",
+                            "code": code,
+                            "body_preview": f"Your verification code is {code}",
+                            "received_at": received_at.isoformat(),
+                            "created_at": received_at.isoformat(),
+                        },
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            restarted = ZkgmailMailClient(
+                store,
+                sync_interval_seconds=0,
+                sync_strategy=mock.Mock(return_value=0),
+            )
+            code = await restarted.poll_next_code(
+                email,
+                since=requested_at.isoformat(),
+            )
+
+            self.assertEqual(code, "597127")
+
+    async def test_saved_address_without_signed_poll_time_stays_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            email = "savedaccount90@zkgmail.com"
+            now = datetime.now(timezone.utc).isoformat()
+            conn = connect_db(str(db_file))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO addresses(
+                        email, label, state, source, note, is_active,
+                        created_at, updated_at
+                    ) VALUES (?, '', 'used', 'zkgmail', '', 1, ?, ?)
+                    """,
+                    (email, now, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            restarted = ZkgmailMailClient(store)
+
+            with self.assertRaisesRegex(RuntimeError, "本机取码记录"):
+                await restarted.poll_next_code(email)
 
     async def test_generated_address_retries_an_existing_human_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:

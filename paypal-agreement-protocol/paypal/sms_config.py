@@ -16,10 +16,26 @@ from typing import Any, Callable
 
 
 PAYMENT_SMS_SETTING_KEY = "paypal_sms_config_v1"
+GLOBAL_SMS_ROUTING_SETTING_KEY = "global_sms_routing_config_v1"
 SMSBOWER_SETTING_KEY = "smsbower_mail_config_v1"
 HERO_SMS_SETTING_KEY = "hero_sms_phone_config_v1"
 AUTOMATIC_SMS_PROVIDERS = ("smsbower", "hero-sms")
 SMS_PROVIDERS = ("manual", *AUTOMATIC_SMS_PROVIDERS)
+PAYPAL_SMS_COUNTRIES = (
+    "US",
+    "BR",
+    "DE",
+    "GB",
+    "JP",
+    "TH",
+    "ID",
+    "PH",
+    "TW",
+    "MX",
+    "AE",
+    "AU",
+    "CA",
+)
 
 PROVIDER_SETTINGS: dict[str, dict[str, str]] = {
     "smsbower": {
@@ -126,6 +142,9 @@ class SmsSettingsModel:
         self._write_setting(setting_key, state)
 
     def default_provider(self) -> str:
+        global_policy = self.routing_policy()
+        if global_policy:
+            return str(global_policy["provider"])
         state = self._read_setting(PAYMENT_SMS_SETTING_KEY)
         selected = str(state.get("defaultProvider") or "smsbower").strip().lower()
         return selected if selected in SMS_PROVIDERS else "smsbower"
@@ -137,6 +156,41 @@ class SmsSettingsModel:
         state = self._read_setting(PAYMENT_SMS_SETTING_KEY)
         state.update({"defaultProvider": normalized, "updatedAt": _utc_now()})
         self._write_setting(PAYMENT_SMS_SETTING_KEY, state)
+        if normalized not in AUTOMATIC_SMS_PROVIDERS:
+            return
+        routing = self._read_setting(GLOBAL_SMS_ROUTING_SETTING_KEY)
+        paypal = routing.get("paypal")
+        paypal = dict(paypal) if isinstance(paypal, dict) else {}
+        paypal.update(
+            provider=normalized,
+            maxPrice=float(paypal.get("maxPrice") or 0.30),
+            countries=list(paypal.get("countries") or PAYPAL_SMS_COUNTRIES),
+        )
+        routing.update(paypal=paypal, version=1, updatedAt=_utc_now())
+        self._write_setting(GLOBAL_SMS_ROUTING_SETTING_KEY, routing)
+
+    def routing_policy(self) -> dict[str, Any]:
+        routing = self._read_setting(GLOBAL_SMS_ROUTING_SETTING_KEY)
+        raw = routing.get("paypal")
+        if not isinstance(raw, dict):
+            return {}
+        provider = str(raw.get("provider") or "smsbower").strip().lower()
+        if provider not in AUTOMATIC_SMS_PROVIDERS:
+            provider = "smsbower"
+        try:
+            max_price = round(float(raw.get("maxPrice") or 0.30), 4)
+        except (TypeError, ValueError):
+            max_price = 0.30
+        countries = [
+            str(country or "").strip().upper()
+            for country in list(raw.get("countries") or PAYPAL_SMS_COUNTRIES)
+            if str(country or "").strip().upper() in PAYPAL_SMS_COUNTRIES
+        ]
+        return {
+            "provider": provider,
+            "maxPrice": max_price,
+            "countries": countries or list(PAYPAL_SMS_COUNTRIES),
+        }
 
 
 ClientResolver = Callable[[str], Any]
@@ -162,6 +216,7 @@ class SmsSettingsPresenter:
             providers.append(state)
         return {
             "defaultProvider": self.model.default_provider(),
+            "globalPolicy": self.model.routing_policy(),
             "timeoutSeconds": int(self.timeout_seconds),
             "maxPhoneAttempts": int(self.max_phone_attempts),
             "providers": providers,
@@ -182,7 +237,9 @@ class SmsSettingsPresenter:
 __all__ = [
     "AUTOMATIC_SMS_PROVIDERS",
     "HERO_SMS_SETTING_KEY",
+    "GLOBAL_SMS_ROUTING_SETTING_KEY",
     "PAYMENT_SMS_SETTING_KEY",
+    "PAYPAL_SMS_COUNTRIES",
     "PROVIDER_SETTINGS",
     "SMSBOWER_SETTING_KEY",
     "SMS_PROVIDERS",

@@ -17,12 +17,12 @@
     }
 
     async request(path, payload) {
+      const headers = {};
+      if (this.token) headers["X-Local-Token"] = this.token;
+      if (payload !== undefined) headers["Content-Type"] = "application/json";
       const response = await fetch(path, {
         method: payload === undefined ? "GET" : "POST",
-        headers: payload === undefined ? {} : {
-          "Content-Type": "application/json",
-          "X-Local-Token": this.token,
-        },
+        headers,
         body: payload === undefined ? undefined : JSON.stringify(payload),
         cache: "no-store",
       });
@@ -92,6 +92,9 @@
     }
 
     async extractAndPay(account) {
+      if (account.accountType === "plus") {
+        throw new Error("该账号已是 Plus 套餐，无需再次提链支付");
+      }
       const config = this.quickFlowConfig();
       const reusable = account.cardLink && account.cardLinkStatus === "generated" &&
         account.cardLinkMethod === config.method;
@@ -116,6 +119,14 @@
 
     bindPhone(email) {
       return this.request("/api/account/actions/bind-phone", { email });
+    }
+
+    bindPhoneStatus(email, logAfter = 0) {
+      const query = new URLSearchParams({
+        email: String(email || ""),
+        log_after: String(Math.max(0, Number(logAfter) || 0)),
+      });
+      return this.request("/api/account/actions/bind-phone/status?" + query);
     }
 
     openBrowser(email, mode) {
@@ -163,29 +174,34 @@
     actions(item) {
       const hasCookies = Boolean(item.hasCookies);
       const hasSession = item.sessionStatus === "ready";
+      const isPlus = item.accountType === "plus";
       const paymentRunning = Boolean(item.accountPaymentRunning);
-      const phoneStatus = String(item.plusCodexStatus || "").toLowerCase();
-      const phoneBound = Boolean(item.plusSmsVerified);
+      const phoneStatus = String(
+        item.plusPhoneBindingStatus || item.plusCodexStatus || "",
+      ).toLowerCase();
+      const phoneBound = Boolean(
+        item.plusPhoneBound || item.plusSmsVerified || phoneStatus === "completed",
+      );
       const phoneRunning = phoneStatus === "running";
       const phoneFailed = phoneStatus === "failed";
-      const plusReady = item.accountType === "plus" && Boolean(item.hasPassword);
+      const plusReady = isPlus;
       const phoneLabel = phoneBound ? "手机号已绑定"
-        : phoneRunning ? "手机号绑定中" : phoneFailed ? "手机号绑定失败" : "绑定手机号";
+        : phoneRunning ? "手机号绑定中" : phoneFailed ? "重新绑定手机号" : "绑定手机号";
       const phoneTitle = phoneBound ? "该账号已完成 Plus 手机验证"
-        : phoneRunning ? "自动取号和取码正在后台执行"
-          : phoneFailed ? "该账号的唯一一次接码流程已结束"
-            : plusReady ? "使用已配置接码平台自动绑定手机号"
-              : "需先提链支付、确认 Plus，并保存账号密码";
+        : phoneRunning ? "Roxy 登录与协议接码正在后台执行"
+          : phoneFailed && plusReady ? "上次绑定失败，可直接使用已保存的 Cookie 重新尝试"
+            : plusReady ? "直接使用已保存的 Cookie 登录，并通过已配置接码平台自动绑定手机号"
+              : "需先确认账号已升级为 Plus";
       return [
-        this.button(paymentRunning ? "提链支付中" : "提链支付", "extract-payment", item, {
-          disabled: paymentRunning || !hasCookies || !hasSession,
+        this.button(isPlus ? "无需提链支付" : paymentRunning ? "提链支付中" : "提链支付", "extract-payment", item, {
+          disabled: isPlus || paymentRunning || !hasCookies || !hasSession,
           style: "primary",
-          title: paymentRunning ? "该账号已有提链支付任务正在执行" : hasCookies && hasSession
+          title: isPlus ? "该账号已是 Plus 套餐" : paymentRunning ? "该账号已有提链支付任务正在执行" : hasCookies && hasSession
             ? "按一键流程配置提取 PayPal 链接并启动协议支付"
             : "需要可用 Session、AT 和 Cookie",
         }),
         this.button(phoneLabel, "bind-phone", item, {
-          disabled: phoneBound || phoneRunning || phoneFailed || !plusReady,
+          disabled: phoneBound || phoneRunning || !plusReady,
           title: phoneTitle,
         }),
         this.button("打开谷歌无痕浏览器", "open-chrome", item, {
@@ -199,19 +215,32 @@
       ].join("");
     }
 
-    decorate(accountMap, replace = false) {
+    renderPhoneLogs(container) {
+      const detail = container.closest(".account-detail");
+      if (!detail) return;
+      const panel = [...detail.children].find(
+        (child) => child.classList?.contains("phone-binding-log-panel"),
+      );
+      if (panel) panel.remove();
+    }
+
+    decorate(accountMap, replace = false, phoneSnapshots = new Map()) {
       document.querySelectorAll(".account-detail-row .credential-actions").forEach((container) => {
         const existing = [...container.querySelectorAll("[data-account-operation]")];
-        if (existing.length && !replace) return;
         const anchor = container.querySelector("[data-email]");
         const email = String(anchor?.dataset.email || "").trim().toLowerCase();
         const item = accountMap.get(email);
         if (!item) return;
+        if (existing.length && !replace) {
+          this.renderPhoneLogs(container, item, phoneSnapshots.get(email));
+          return;
+        }
         existing.forEach((button) => button.remove());
         const template = document.createElement("template");
         template.innerHTML = this.actions(item);
         const deleteButton = container.querySelector('[data-action="delete-email"]');
         container.insertBefore(template.content, deleteButton || null);
+        this.renderPhoneLogs(container, item, phoneSnapshots.get(email));
       });
     }
 
@@ -257,6 +286,8 @@
       this.view = view;
       this.accounts = new Map();
       this.paymentInFlight = new Set();
+      this.phoneSnapshots = new Map();
+      this.phoneMonitors = new Map();
       this.renderQueued = false;
       this.observer = new MutationObserver(() => this.queueRender());
     }
@@ -272,7 +303,17 @@
           ),
         }];
       }));
-      this.view.decorate(this.accounts, true);
+      this.view.decorate(this.accounts, true, this.phoneSnapshots);
+      this.accounts.forEach((item, email) => {
+        const status = String(
+          item.plusPhoneBindingStatus || item.plusCodexStatus || "",
+        ).toLowerCase();
+        if (status === "running" || (
+          ["completed", "failed"].includes(status) && !this.phoneSnapshots.has(email)
+        )) {
+          void this.monitorPhoneBinding(email);
+        }
+      });
     }
 
     queueRender() {
@@ -280,7 +321,7 @@
       this.renderQueued = true;
       requestAnimationFrame(() => {
         this.renderQueued = false;
-        this.view.decorate(this.accounts);
+        this.view.decorate(this.accounts, false, this.phoneSnapshots);
       });
     }
 
@@ -290,10 +331,93 @@
       return item;
     }
 
+    mergePhoneSnapshot(email, snapshot) {
+      const target = String(email || "").trim().toLowerCase();
+      const previous = this.phoneSnapshots.get(target) || { logs: [], logSequence: 0 };
+      const keyed = new Map();
+      [...(previous.logs || []), ...(snapshot.logs || [])].forEach((log) => {
+        const sequence = Number(log?.sequence || 0);
+        if (sequence > 0) keyed.set(sequence, log);
+      });
+      const merged = {
+        ...previous,
+        ...snapshot,
+        logs: [...keyed.values()].sort(
+          (left, right) => Number(left.sequence || 0) - Number(right.sequence || 0),
+        ).slice(-200),
+        logSequence: Math.max(
+          Number(previous.logSequence || 0),
+          Number(snapshot.logSequence || 0),
+        ),
+      };
+      this.phoneSnapshots.set(target, merged);
+      window.dispatchEvent(new CustomEvent("hme:phone-binding-snapshot", {
+        detail: { email: target, snapshot: merged },
+      }));
+      const item = this.accounts.get(target);
+      if (item) {
+        this.accounts.set(target, {
+          ...item,
+          plusPhoneBindingStatus: merged.status,
+          plusCodexStatus: merged.status,
+          plusPhoneBound: merged.status === "completed" || Boolean(merged.smsVerified),
+          plusSmsVerified: Boolean(merged.smsVerified),
+        });
+      }
+      this.view.decorate(this.accounts, true, this.phoneSnapshots);
+      return merged;
+    }
+
+    monitorPhoneBinding(email) {
+      const target = String(email || "").trim().toLowerCase();
+      if (this.phoneMonitors.has(target)) return this.phoneMonitors.get(target);
+      const monitor = (async () => {
+        const deadline = Date.now() + 2 * 60 * 60 * 1000;
+        while (Date.now() < deadline) {
+          try {
+            const previous = this.phoneSnapshots.get(target) || {};
+            const snapshot = await this.model.bindPhoneStatus(
+              target,
+              Number(previous.logSequence || 0),
+            );
+            const merged = this.mergePhoneSnapshot(target, snapshot);
+            if (["completed", "failed"].includes(String(merged.status || ""))) {
+              await this.refresh().catch(() => {});
+              return merged;
+            }
+          } catch (_error) {
+            // Status reads are transient; keep the live monitor attached.
+          }
+          await new Promise((resolve) => setTimeout(resolve, 800));
+        }
+        return this.phoneSnapshots.get(target) || null;
+      })().finally(() => this.phoneMonitors.delete(target));
+      this.phoneMonitors.set(target, monitor);
+      return monitor;
+    }
+
     async execute(button) {
       const operation = String(button.dataset.accountOperation || "");
       const email = String(button.dataset.email || "").trim().toLowerCase();
       const item = this.account(email);
+      const phoneStatus = String(
+        item.plusPhoneBindingStatus || item.plusCodexStatus || "",
+      ).toLowerCase();
+      const phoneBound = Boolean(
+        item.plusPhoneBound || item.plusSmsVerified || phoneStatus === "completed",
+      );
+      if (operation === "extract-payment" && item.accountType === "plus") {
+        this.view.notify("该账号已是 Plus 套餐，无需再次提链支付", "warning");
+        return;
+      }
+      if (operation === "bind-phone" && phoneBound) {
+        this.view.notify("该账号手机号已绑定，无需重复操作", "warning");
+        return;
+      }
+      if (operation === "bind-phone" && phoneStatus === "running") {
+        this.view.notify("该账号手机号绑定任务正在执行", "warning");
+        return;
+      }
       if (operation === "extract-payment" && this.paymentInFlight.has(email)) {
         this.view.notify("该账号已有提链支付任务正在执行", "error");
         return;
@@ -309,7 +433,7 @@
       if (operation === "extract-payment") {
         this.paymentInFlight.add(email);
         this.accounts.set(email, { ...item, accountPaymentRunning: true });
-        this.view.decorate(this.accounts, true);
+        this.view.decorate(this.accounts, true, this.phoneSnapshots);
       }
       try {
         if (operation === "extract-payment") {
@@ -324,7 +448,9 @@
           void this.monitorPayment(payment, email);
         } else if (operation === "bind-phone") {
           const result = await this.model.bindPhone(email);
+          this.mergePhoneSnapshot(email, result);
           this.view.notify(result.message || "手机号绑定任务已启动");
+          void this.monitorPhoneBinding(email);
         } else if (operation === "open-chrome") {
           const result = await this.model.openBrowser(email, "chrome");
           this.view.notify(result.message || "Google Chrome 无痕窗口已打开");

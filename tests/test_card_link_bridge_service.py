@@ -54,6 +54,7 @@ class MemoryCardLinkBridgeProcessView:
         payload: dict[str, object],
         *,
         timeout_seconds: float,
+        on_log=None,
     ) -> CardLinkBridgeResult:
         await self.start()
         self.exchange_calls.append(
@@ -79,8 +80,11 @@ class MemoryCardLinkBridgeProcessView:
                     outcome = outcome(request_id, deepcopy(payload))
                 if isinstance(outcome, BaseException):
                     raise outcome
+                if isinstance(outcome, CardLinkBridgeResult) and on_log is not None:
+                    for message in outcome.logs:
+                        on_log(message)
                 return outcome
-            return CardLinkBridgeResult(
+            result = CardLinkBridgeResult(
                 event={
                     "status": "success",
                     "url": f"https://example.test/{payload['account_email']}",
@@ -90,6 +94,10 @@ class MemoryCardLinkBridgeProcessView:
                 },
                 logs=(f"completed:{payload['account_email']}",),
             )
+            if on_log is not None:
+                for message in result.logs:
+                    on_log(message)
+            return result
         finally:
             self.active_exchanges -= 1
 
@@ -125,6 +133,24 @@ def command(
 
 
 class SharedCardLinkBridgePresenterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_callback_receives_worker_logs_before_result_hand_off(self):
+        view = MemoryCardLinkBridgeProcessView()
+        presenter = SharedCardLinkBridgePresenter(view)
+        progress: list[str] = []
+
+        result = await presenter.generate(
+            command(
+                email="live-progress@example.test",
+                token="at-live-progress",
+                proxy="http://live:secret@live-proxy.test:8000",
+            ),
+            on_log=progress.append,
+        )
+
+        self.assertEqual(progress, ["completed:live-progress@example.test"])
+        self.assertEqual(tuple(progress), result.logs)
+        await presenter.close()
+
     async def test_consecutive_requests_start_one_worker_and_keep_payloads_separate(
         self,
     ):

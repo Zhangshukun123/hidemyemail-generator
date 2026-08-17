@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,12 @@ from urllib.parse import parse_qs, urlsplit
 import aiohttp
 from aiohttp import web
 
-from .account_actions import account_payment_job_is_terminal, setup_account_action_routes
+from .account_actions import (
+    account_is_plus,
+    account_payment_job_is_terminal,
+    account_phone_binding_state,
+    setup_account_action_routes,
+)
 from .account_deactivation import (
     mark_deactivation_notice_processed,
     pending_deactivation_notices,
@@ -61,6 +67,14 @@ from .inbox import (
     sync_inbox,
 )
 from .inbox_retry_policy import InboxRetryPolicy
+from .liandong_shop import (
+    LiandongShopClient,
+    LiandongShopConfigStore,
+    LiandongShopError,
+    card_upload_for_account,
+    persist_uploaded_account,
+    uploaded_marker,
+)
 from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
@@ -75,7 +89,7 @@ from .payment_proxy_pool import (
     PaymentProxyPoolPresenter,
     PaymentProxySource,
 )
-from .payment_sms import PaymentSmsProviderResolver
+from .payment_sms import GlobalSmsRoutingConfigStore, PaymentSmsProviderResolver
 from .plus_account_export import AccountExportPresenter
 from .plus_codex import (
     PlusCodexModel,
@@ -185,6 +199,91 @@ PAYPAL_CARD_LINK_METHODS = {"de_oaics_paypal", "paypal_us", "paypal_gb"}
 SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS = {"paypal_us", "paypal_gb"}
 PAYPAL_US_SMSBOWER_MAX_PRICE = 0.25
 PAYPAL_GB_SMSBOWER_MAX_PRICE = 0.30
+CARD_LINK_PROGRESS_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,80}")
+
+
+class CardLinkProgressRegistry:
+    """Bounded in-memory progress feed for long-running card-link requests."""
+
+    def __init__(self, *, max_entries: int = 32, max_logs: int = 300) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.max_logs = max(1, int(max_logs))
+        self._entries: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def normalize_id(value: object) -> str:
+        progress_id = str(value or "").strip()
+        return progress_id if CARD_LINK_PROGRESS_ID_RE.fullmatch(progress_id) else ""
+
+    def start(self, progress_id: str) -> None:
+        target = self.normalize_id(progress_id)
+        if not target:
+            return
+        self._entries[target] = {
+            "status": "running",
+            "running": True,
+            "sequence": 0,
+            "logs": [],
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": "",
+        }
+        while len(self._entries) > self.max_entries:
+            oldest = next(iter(self._entries))
+            if oldest == target and len(self._entries) == 1:
+                break
+            self._entries.pop(oldest, None)
+
+    def append(self, progress_id: str, message: object) -> None:
+        target = self.normalize_id(progress_id)
+        detail = str(message or "").strip()
+        entry = self._entries.get(target)
+        if not entry or not detail:
+            return
+        sequence = int(entry.get("sequence") or 0) + 1
+        entry["sequence"] = sequence
+        logs = list(entry.get("logs") or [])
+        logs.append(
+            {
+                "sequence": sequence,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "message": detail[:500],
+            }
+        )
+        entry["logs"] = logs[-self.max_logs :]
+
+    def finish(self, progress_id: str, status: str) -> None:
+        target = self.normalize_id(progress_id)
+        entry = self._entries.get(target)
+        if not entry:
+            return
+        normalized = str(status or "completed").strip().lower()
+        entry["status"] = (
+            normalized if normalized in {"completed", "failed"} else "completed"
+        )
+        entry["running"] = False
+        entry["finishedAt"] = datetime.now(timezone.utc).isoformat()
+
+    def snapshot(
+        self, progress_id: str, *, log_after: int = 0
+    ) -> dict[str, Any] | None:
+        target = self.normalize_id(progress_id)
+        entry = self._entries.get(target)
+        if not entry:
+            return None
+        after = max(0, int(log_after or 0))
+        return {
+            "progressId": target,
+            "status": str(entry.get("status") or "running"),
+            "running": bool(entry.get("running")),
+            "logSequence": int(entry.get("sequence") or 0),
+            "logs": [
+                dict(item)
+                for item in entry.get("logs", [])
+                if int(item.get("sequence") or 0) > after
+            ],
+            "startedAt": str(entry.get("startedAt") or ""),
+            "finishedAt": str(entry.get("finishedAt") or ""),
+        }
 
 
 class CardLinkBridgeError(RuntimeError):
@@ -3244,6 +3343,7 @@ async def _run_card_link_bridge(
     promotion_proxy_url: str = "",
     target_amount: str = "",
     shared_presenter: SharedCardLinkBridgePresenter | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict:
     token = str(access_token or "").strip()
     create_proxy = str(create_proxy_url or "").strip()
@@ -3261,7 +3361,8 @@ async def _run_card_link_bridge(
                     create_proxy_url=create_proxy,
                     promotion_proxy_url=promotion_proxy,
                     target_amount=target_amount,
-                )
+                ),
+                on_log=progress_callback,
             )
         except CardLinkBridgeServiceError as error:
             raise CardLinkBridgeError(
@@ -3323,6 +3424,57 @@ async def _run_card_link_bridge(
         creationflags=creationflags,
         limit=1024 * 1024,
     )
+    event: dict = {}
+    progress_logs: list[str] = []
+
+    def publish_progress(message: str) -> None:
+        detail = str(message or "").strip()[:500]
+        if not detail:
+            return
+        progress_logs.append(detail)
+        if progress_callback is not None:
+            try:
+                progress_callback(detail)
+            except Exception:
+                pass
+
+    async def read_stdout() -> None:
+        nonlocal event
+        if process.stdout is None:
+            return
+        async for raw_line in process.stdout:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if line.startswith(CARD_LINK_LOG_PREFIX):
+                try:
+                    progress = json.loads(line[len(CARD_LINK_LOG_PREFIX) :])
+                except json.JSONDecodeError:
+                    continue
+                message = str(
+                    progress.get("message") if isinstance(progress, dict) else ""
+                ).strip()
+                if message:
+                    if token:
+                        message = message.replace(token, "[REDACTED]")
+                    for proxy in (create_proxy, promotion_proxy):
+                        if proxy:
+                            message = message.replace(proxy, "[REDACTED_PROXY]")
+                    publish_progress(message)
+                continue
+            if not line.startswith(CARD_LINK_EVENT_PREFIX):
+                continue
+            try:
+                candidate = json.loads(line[len(CARD_LINK_EVENT_PREFIX) :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                event = candidate
+
+    stdout_task = asyncio.create_task(read_stdout())
+    stderr_task = asyncio.create_task(
+        process.stderr.read()
+        if process.stderr is not None
+        else asyncio.sleep(0, result=b"")
+    )
     try:
         timeout = (
             240
@@ -3331,42 +3483,15 @@ async def _run_card_link_bridge(
             if method == "ph_hosted"
             else 75
         )
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+        await stdout_task
+        stderr = await stderr_task
     except asyncio.TimeoutError as error:
         if process.returncode is None:
             process.kill()
             await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         raise RuntimeError("生成直卡支付链接超时，请稍后重试") from error
-
-    event: dict = {}
-    progress_logs: list[str] = []
-    for line in stdout.decode("utf-8", errors="replace").splitlines():
-        if line.startswith(CARD_LINK_LOG_PREFIX):
-            try:
-                progress = json.loads(line[len(CARD_LINK_LOG_PREFIX) :])
-            except json.JSONDecodeError:
-                continue
-            message = str(
-                progress.get("message") if isinstance(progress, dict) else ""
-            ).strip()
-            if message:
-                if token:
-                    message = message.replace(token, "[REDACTED]")
-                for proxy in (create_proxy, promotion_proxy):
-                    if proxy:
-                        message = message.replace(proxy, "[REDACTED_PROXY]")
-                progress_logs.append(message[:500])
-            continue
-        if not line.startswith(CARD_LINK_EVENT_PREFIX):
-            continue
-        try:
-            candidate = json.loads(line[len(CARD_LINK_EVENT_PREFIX) :])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(candidate, dict):
-            event = candidate
     event_status = str(event.get("status") or "")
     if process.returncode != 0 or event_status not in {"success", "classified"}:
         detail = str(event.get("detail") or "").strip()
@@ -3697,6 +3822,9 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
             account_type = "unverified"
         plus_codex = account.get("plus_codex")
         plus_codex = plus_codex if isinstance(plus_codex, dict) else {}
+        liandong_shop = account.get("liandong_shop")
+        liandong_shop = liandong_shop if isinstance(liandong_shop, dict) else {}
+        phone_binding = account_phone_binding_state(account)
         timestamp = identity.get("createTimestamp")
         created_at = str(account.get("created_at") or account.get("updated_at") or "")
         if isinstance(timestamp, (int, float)):
@@ -3771,7 +3899,23 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 "accountTypeSource": str(account.get("account_type_source") or ""),
                 "plusCodexStatus": str(plus_codex.get("status") or ""),
                 "plusSmsVerified": bool(plus_codex.get("sms_verified")),
+                "plusPhoneBound": bool(phone_binding["bound"]),
+                "plusPhoneBindingStatus": str(phone_binding["status"]),
                 "plusExportReady": bool(plus_codex.get("export_ready")),
+                "liandongShopUploaded": liandong_shop.get("uploaded") is True,
+                "liandongShopUploadedAt": str(
+                    liandong_shop.get("uploaded_at") or ""
+                ),
+                "liandongShopGoodsId": liandong_shop.get("goods_id"),
+                "liandongShopGoodsName": str(liandong_shop.get("goods_name") or ""),
+                "liandongShopGoodsLabel": str(
+                    liandong_shop.get("goods_label") or ""
+                ),
+                "liandongShopUploadMethod": str(
+                    liandong_shop.get("upload_method") or "manual"
+                )
+                if liandong_shop.get("uploaded") is True
+                else "",
                 "verifiedAt": str(account.get("verified_at") or ""),
                 "cardLink": str(card_link.get("url") or ""),
                 "cardLinkStatus": str(
@@ -3951,6 +4095,9 @@ def create_app(
     app["cookie_file"] = _resolve_data_path(base_dir, cookie_file)
     app["output_file"] = _resolve_data_path(base_dir, output_file)
     app["db_file"] = _resolve_data_path(base_dir, db_file)
+    app["liandong_shop_config"] = LiandongShopConfigStore(app["db_file"])
+    app["liandong_shop_client"] = LiandongShopClient()
+    app["liandong_shop_upload_locks"] = {}
     monitor_log_setting = str(
         os.environ.get("HME_REGISTRATION_MONITOR_LOG") or ""
     ).strip()
@@ -3997,6 +4144,7 @@ def create_app(
     app["inbox_sync_lock"] = asyncio.Lock()
     app["identity_lock"] = asyncio.Lock()
     app["card_link_lock"] = asyncio.Lock()
+    app["card_link_progress"] = CardLinkProgressRegistry()
     app["workbench_url"] = str(workbench_url or "").strip().rstrip("/")
     app["workbench_import_token"] = str(workbench_import_token or "").strip()
     app["inventory_server_enabled"] = bool(inventory_server_enabled)
@@ -4125,11 +4273,13 @@ def create_app(
     app["smsbower_client"] = SMSBowerMailClient(
         app["smsbower_config_store"], base_url=smsbower_api_base_url
     )
+    app["sms_routing_config_store"] = GlobalSmsRoutingConfigStore(app["db_file"])
     app["payment_sms_resolver"] = PaymentSmsProviderResolver(
         app["db_file"],
         smsbower_configured=lambda: bool(
             app["smsbower_config_store"].public_state().get("configured")
         ),
+        routing_store=app["sms_routing_config_store"],
     )
     app["payment_completion_presenter"] = PaymentCompletionPresenter(
         PaymentCompletionModel(app["db_file"])
@@ -4138,7 +4288,7 @@ def create_app(
         PlusCodexModel(app["db_file"]),
         runner=ProtocolPlusCodexRunner(
             db_file=app["db_file"],
-            python_executable=Path(target_python) if target_python else None,
+            roxy_registration_store=app["roxy_registration_store"],
         ),
         on_account_saved=sync_saved_account_to_remote,
     )
@@ -5064,6 +5214,126 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def liandong_shop_status(request: web.Request) -> web.Response:
+        status = await asyncio.to_thread(
+            app["liandong_shop_config"].public_status
+        )
+        return web.json_response(status, headers={"Cache-Control": "no-store"})
+
+    async def liandong_shop_config_update(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        token = str(payload.get("merchantToken") or "")
+        clear = payload.get("clear") is True
+        try:
+            if clear:
+                await asyncio.to_thread(app["liandong_shop_config"].clear)
+            elif token.strip():
+                await asyncio.to_thread(app["liandong_shop_config"].save, token)
+            else:
+                raise LiandongShopError("请输入联动小铺 Merchant-Token")
+            status = await asyncio.to_thread(
+                app["liandong_shop_config"].public_status
+            )
+        except LiandongShopError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        return web.json_response(status, headers={"Cache-Control": "no-store"})
+
+    async def liandong_shop_upload(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        email = str(payload.get("email") or "").strip().lower()
+        if not _valid_supported_account_email(email):
+            return web.json_response(
+                {"ok": False, "error": "邮箱地址无效"}, status=400
+            )
+        locks: dict[str, asyncio.Lock] = app["liandong_shop_upload_locks"]
+        lock = locks.setdefault(email, asyncio.Lock())
+        async with lock:
+            record = await asyncio.to_thread(load_account_record, app["db_file"], email)
+            if not record:
+                return web.json_response(
+                    {"ok": False, "error": "未找到账号记录"}, status=404
+                )
+            current_marker = uploaded_marker(record)
+            if current_marker.get("uploaded") is True:
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "email": email,
+                        "uploaded": True,
+                        "alreadyUploaded": True,
+                        "uploadedAt": str(current_marker.get("uploaded_at") or ""),
+                        "goodsId": current_marker.get("goods_id"),
+                        "goodsName": str(current_marker.get("goods_name") or ""),
+                        "goodsLabel": str(current_marker.get("goods_label") or ""),
+                    },
+                    headers={"Cache-Control": "no-store"},
+                )
+            token, _source = await asyncio.to_thread(app["liandong_shop_config"].token)
+            if not token:
+                return web.json_response(
+                    {"ok": False, "error": "请先配置联动小铺 Merchant-Token"},
+                    status=409,
+                )
+            try:
+                goods, content = card_upload_for_account(email, record)
+            except LiandongShopError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            try:
+                upload_result = await app["liandong_shop_client"].upload_card(
+                    token=token,
+                    goods=goods,
+                    content=content,
+                )
+            except LiandongShopError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=502
+                )
+            try:
+                marker = await asyncio.to_thread(
+                    persist_uploaded_account,
+                    app["db_file"],
+                    email,
+                    goods=goods,
+                    response_code=upload_result.get("code"),
+                )
+            except LiandongShopError as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=500
+                )
+        return web.json_response(
+            {
+                "ok": True,
+                "email": email,
+                "uploaded": True,
+                "alreadyUploaded": False,
+                "uploadedAt": marker["uploaded_at"],
+                "goodsId": marker["goods_id"],
+                "goodsName": marker["goods_name"],
+                "goodsLabel": marker["goods_label"],
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def gpt_credential(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
@@ -5361,7 +5631,10 @@ def create_app(
             }, "", 200
         if email.endswith(f"@{ZKGMAIL_DOMAIN}") and len(email) <= 320:
             try:
-                code = await app["zkgmail_client"].poll_next_code(email)
+                code = await app["zkgmail_client"].poll_next_code(
+                    email,
+                    since=since,
+                )
             except RuntimeError as error:
                 return None, str(error), 502
             if not code:
@@ -5682,6 +5955,33 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def card_link_progress(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        progress_id = CardLinkProgressRegistry.normalize_id(
+            request.match_info.get("progress_id")
+        )
+        if not progress_id:
+            return web.json_response(
+                {"ok": False, "error": "提链进度 ID 无效"}, status=400
+            )
+        try:
+            log_after = max(0, int(request.query.get("log_after", "0") or 0))
+        except (TypeError, ValueError):
+            log_after = 0
+        snapshot = app["card_link_progress"].snapshot(
+            progress_id, log_after=log_after
+        )
+        if snapshot is None:
+            return web.json_response(
+                {"ok": False, "error": "提链进度尚未建立"}, status=404
+            )
+        return web.json_response(
+            {"ok": True, **snapshot}, headers={"Cache-Control": "no-store"}
+        )
+
     async def create_card_link(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
@@ -5695,6 +5995,12 @@ def create_app(
             )
         email = str(body.get("email") or "").strip().lower()
         method = str(body.get("method") or "standard").strip().lower()
+        raw_progress_id = str(body.get("progress_id") or "").strip()
+        progress_id = CardLinkProgressRegistry.normalize_id(raw_progress_id)
+        if raw_progress_id and not progress_id:
+            return web.json_response(
+                {"ok": False, "error": "提链进度 ID 无效"}, status=400
+            )
         force_retry = body.get("force_retry") is True
         try:
             attempt_limit = int(body.get("attempt_limit") or 1)
@@ -5761,6 +6067,11 @@ def create_app(
         record = await asyncio.to_thread(
             load_account_record, app["db_file"], email
         )
+        if account_is_plus(record):
+            return web.json_response(
+                {"ok": False, "error": "该账号已是 Plus 套餐，无需再次提链支付"},
+                status=409,
+            )
         existing_card_link = (
             record.get("card_link") if isinstance(record, dict) else {}
         )
@@ -6056,6 +6367,14 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "OpenAI 支付运行环境不可用"}, status=503
             )
+        progress_registry: CardLinkProgressRegistry = app["card_link_progress"]
+        progress_registry.start(progress_id)
+        for progress_message in proxy_candidate_logs:
+            progress_registry.append(progress_id, progress_message)
+
+        def publish_card_link_progress(message: str) -> None:
+            progress_registry.append(progress_id, message)
+
         try:
             async with app["card_link_lock"]:
                 result: dict[str, Any] = {}
@@ -6101,6 +6420,7 @@ def create_app(
                             promotion_proxy_url=attempt_promotion_proxy,
                             target_amount=target_amount,
                             shared_presenter=app["card_link_bridge_service"],
+                            progress_callback=publish_card_link_progress,
                         )
                     except CardLinkBridgeError as error:
                         accumulated_logs.extend(error.logs)
@@ -6124,10 +6444,12 @@ def create_app(
                                 logs=accumulated_logs,
                                 retryable=error.retryable,
                             ) from error
-                        accumulated_logs.append(
+                        retry_message = (
                             f"[提链重试] 第 {attempt_count}/{attempt_limit} 次失败："
                             f"{error}；正在刷新 {country} 第一代理后重试"
                         )
+                        accumulated_logs.append(retry_message)
+                        publish_card_link_progress(retry_message)
                         continue
                     current_logs = list(result.get("logs") or [])
                     if accumulated_logs:
@@ -6185,6 +6507,7 @@ def create_app(
                     ),
                 )
         except CardLinkBridgeError as error:
+            progress_registry.finish(progress_id, "failed")
             return web.json_response(
                 {
                     "ok": False,
@@ -6198,10 +6521,12 @@ def create_app(
                 status=502,
             )
         except RuntimeError as error:
+            progress_registry.finish(progress_id, "failed")
             return web.json_response(
                 {"ok": False, "error": f"生成直卡支付链接失败：{error}"},
                 status=502,
             )
+        progress_registry.finish(progress_id, "completed")
         return web.json_response(
             {
                 "ok": True,
@@ -6798,7 +7123,8 @@ def create_app(
 
     async def payment_sms_status(_: web.Request) -> web.Response:
         resolver = app["payment_sms_resolver"]
-        selected = resolver.resolve()
+        selected = resolver.resolve("paypal")
+        routing = app["sms_routing_config_store"].public_state()
         return web.json_response(
             {
                 "ok": True,
@@ -6807,6 +7133,35 @@ def create_app(
                 "label": selected.label if selected else "",
                 "defaultProvider": resolver.preferred_provider(),
                 "timeoutSeconds": 60,
+                "routing": routing,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def payment_sms_config(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+            state = app["sms_routing_config_store"].configure(payload)
+        except (json.JSONDecodeError, web.HTTPBadRequest):
+            return web.json_response(
+                {"ok": False, "error": "请求格式无效"}, status=400
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        selected = app["payment_sms_resolver"].resolve("paypal")
+        return web.json_response(
+            {
+                "ok": True,
+                "configured": selected is not None,
+                "provider": selected.provider if selected else "",
+                "label": selected.label if selected else "",
+                "defaultProvider": state["paypal"]["provider"],
+                "timeoutSeconds": 60,
+                "routing": state,
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -8068,21 +8423,37 @@ def create_app(
             and result.get("status") == "success"
         ):
             confirmation = await app["payment_completion_presenter"].confirm(upstream)
-            if str(confirmation.get("status") or "") == "plus":
-                resolved_sms = app["payment_sms_resolver"].resolve()
+            post_payment_phone_binding = (
+                upstream.get("post_payment_phone_binding", False) is True
+            )
+            if (
+                str(confirmation.get("status") or "") == "plus"
+                and post_payment_phone_binding
+            ):
                 delivery = await app["plus_codex_presenter"].ensure(
                     job=upstream,
                     confirmation=confirmation,
                     base_url=str(browser_service_url).rstrip("/"),
                     sms_provider=str(
-                        upstream.get("sms_provider")
-                        or (resolved_sms.provider if resolved_sms else "")
+                        app["sms_routing_config_store"]
+                        .purpose("binding")
+                        .get("provider")
+                        or "smsbower"
                     ),
                 )
                 confirmation = PlusCodexView.merge_confirmation(
                     confirmation, delivery
                 )
                 upstream = {**upstream, "plus_codex": delivery}
+            elif str(confirmation.get("status") or "") == "plus":
+                confirmation = {
+                    **confirmation,
+                    "post_payment_phone_binding": False,
+                    "detail": str(
+                        confirmation.get("detail")
+                        or "支付后 Cookie 已刷新新 AT，已确认 Plus"
+                    ),
+                }
             upstream = {**upstream, "account_confirmation": confirmation}
         if isinstance(upstream, dict) and account_payment_job_is_terminal(upstream):
             await app["account_payment_guard"].release(
@@ -8139,6 +8510,13 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
+        post_payment_phone_binding = payload.get(
+            "post_payment_phone_binding", False
+        )
+        if not isinstance(post_payment_phone_binding, bool):
+            return web.json_response(
+                {"ok": False, "error": "支付后接码选项必须是布尔值"}, status=400
+            )
         if not _valid_supported_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
@@ -8147,6 +8525,11 @@ def create_app(
         if not record:
             return web.json_response(
                 {"ok": False, "error": "未找到账号记录"}, status=404
+            )
+        if account_is_plus(record):
+            return web.json_response(
+                {"ok": False, "error": "该账号已是 Plus 套餐，无需再次提链支付"},
+                status=409,
             )
         card_link = _account_card_link(record)
         paypal_url = str(card_link.get("url") or "").strip()
@@ -8209,8 +8592,19 @@ def create_app(
                 {"ok": False, "error": "当前账号没有可传入 PP 协议的 Cookie"},
                 status=409,
             )
-        sms_state = app["smsbower_config_store"].public_state()
-        resolved_sms = app["payment_sms_resolver"].resolve()
+        sms_policy = app["sms_routing_config_store"].purpose("paypal")
+        if protocol_country not in sms_policy["countries"]:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        f"PayPal 国家 {protocol_country} 未在全局接码配置中启用，"
+                        "请先到设置 → 接码配置勾选"
+                    ),
+                },
+                status=409,
+            )
+        resolved_sms = app["payment_sms_resolver"].resolve("paypal")
         if resolved_sms is None:
             return web.json_response(
                 {
@@ -8321,17 +8715,12 @@ def create_app(
             "sms_provider": sms_provider,
             "sms_service": "paypal",
             "sms_country": protocol_country,
-            "sms_max_price": (
-                PAYPAL_US_SMSBOWER_MAX_PRICE
-                if protocol_country == "US"
-                else PAYPAL_GB_SMSBOWER_MAX_PRICE
-                if protocol_country == "GB"
-                else sms_state.get("maxPrice")
-            ),
+            "sms_max_price": sms_policy["maxPrice"],
             "proxy_pool": proxy_urls,
             "source_account_email": email,
             "account_cookies": cookies,
             "completion_target": "openai_plus",
+            "post_payment_phone_binding": post_payment_phone_binding,
         }
         try:
             status, upstream = await app["paypal_service"].create_job(
@@ -8379,6 +8768,7 @@ def create_app(
                 "smsVirtualAllowed": (
                     resolved_sms.virtual_us and protocol_country == "US"
                 ),
+                "postPaymentPhoneBinding": post_payment_phone_binding,
                 "job": job,
                 "url": "/paypal-pay/",
             },
@@ -8516,11 +8906,17 @@ def create_app(
     app.router.add_route("*", f"{PAYPAL_PROTOCOL_PREFIX}/{{tail:.*}}", paypal_proxy)
     app.router.add_get("/api/gpt-emails", gpt_emails)
     app.router.add_post("/api/account/type", account_type_update)
+    app.router.add_get("/api/liandong-shop/status", liandong_shop_status)
+    app.router.add_post("/api/liandong-shop/config", liandong_shop_config_update)
+    app.router.add_post("/api/account/liandong-shop-upload", liandong_shop_upload)
     app.router.add_post("/api/gpt-credential", gpt_credential)
     app.router.add_post("/api/gpt-accounts/export", export_gpt_accounts)
     app.router.add_post("/api/plus-accounts/export", export_plus_accounts)
     app.router.add_post(
         "/api/account/import-workbench", import_workbench_account
+    )
+    app.router.add_get(
+        "/api/account/card-link/progress/{progress_id}", card_link_progress
     )
     app.router.add_post("/api/account/card-link", create_card_link)
     app.router.add_post("/api/gpt-email/delete", delete_gpt_email)
@@ -8558,6 +8954,7 @@ def create_app(
     app.router.add_get("/api/smsbower/status", smsbower_status)
     app.router.add_post("/api/smsbower/config", smsbower_config)
     app.router.add_get("/api/payment-sms/status", payment_sms_status)
+    app.router.add_post("/api/payment-sms/config", payment_sms_config)
     app.router.add_get("/api/zkgmail/status", zkgmail_status)
     app.router.add_post("/api/zkgmail/config", zkgmail_config)
     app.router.add_get(

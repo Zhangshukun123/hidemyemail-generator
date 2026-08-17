@@ -236,6 +236,23 @@ def test_account_management_registration_launchpad_is_compact_and_responsive():
         assert page.locator("#registrationManualBlock").evaluate(
             "element => element.classList.contains('mode-disabled')"
         )
+        inventory_panel = page.locator("#accountsView > .table-panel")
+        protocol_panel = page.locator("#protocolRegistrationPanel")
+        assert page.evaluate(
+            """() => {
+              const inventory = document.querySelector('#accountsView > .table-panel');
+              const protocol = document.getElementById('protocolRegistrationPanel');
+              return Boolean(
+                inventory.compareDocumentPosition(protocol) &
+                Node.DOCUMENT_POSITION_FOLLOWING
+              );
+            }"""
+        )
+        inventory_box = inventory_panel.bounding_box()
+        protocol_box = protocol_panel.bounding_box()
+        assert inventory_box is not None
+        assert protocol_box is not None
+        assert inventory_box["y"] < protocol_box["y"]
 
         page.locator(
             'label:has(input[name="registrationMode"][value="roxy"])'

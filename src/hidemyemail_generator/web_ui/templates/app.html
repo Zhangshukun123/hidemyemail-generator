@@ -53,7 +53,7 @@
       <button class="nav-item activity-item" type="button" data-route="accounts" aria-label="账号管理" title="账号管理"><svg><use href="#i-mail"/></svg><span class="activity-label">账号管理</span></button>
       <button class="nav-item activity-item" type="button" data-route="quick-flow" aria-label="注册、提链并支付" title="注册、提链并支付"><svg><use href="#i-rocket"/></svg><span class="activity-label">注册并支付</span></button>
       <button class="nav-item activity-item" type="button" data-route="network" aria-label="代理与线路" title="代理与线路"><svg><use href="#i-network"/></svg><span class="activity-label">代理与线路</span></button>
-      <button class="nav-item activity-item" type="button" data-route="card-links" aria-label="直卡提链接" title="直卡提链接"><svg><use href="#i-link"/></svg><span class="activity-label">直卡提链接</span></button>
+      <button class="nav-item activity-item" type="button" data-route="card-links" aria-label="提连中心" title="提连中心"><svg><use href="#i-link"/></svg><span class="activity-label">提连中心</span></button>
       <button class="nav-item activity-item" type="button" data-route="pp-payment" aria-label="PP 支付" title="PP 支付"><svg><use href="#i-paypal"/></svg><span class="activity-label">PP 支付</span></button>
       <button class="nav-item activity-item" type="button" data-route="verification" aria-label="验证记录" title="验证记录"><svg><use href="#i-checklist"/></svg><span class="activity-label">验证记录</span></button>
       <button class="nav-item activity-item" type="button" data-route="settings" aria-label="系统设置" title="系统设置"><svg><use href="#i-settings"/></svg><span class="activity-label">系统设置</span></button>
@@ -69,29 +69,11 @@
         <button class="nav-item" type="button" data-route="quick-flow"><svg><use href="#i-rocket"/></svg><span>快速流程</span><b id="quickFlowNavState">NEW</b></button>
         <button class="nav-item" type="button" data-route="accounts"><svg><use href="#i-mail"/></svg><span>账号库存</span><b id="accountNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="network"><svg><use href="#i-network"/></svg><span>网络线路</span><b id="networkNavState">—</b></button>
-        <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>直卡提链接</span><b id="cardLinkNavCount">—</b></button>
+        <button class="nav-item" type="button" data-route="card-links"><svg><use href="#i-link"/></svg><span>提连中心</span><b id="cardLinkNavCount">—</b></button>
         <button class="nav-item" type="button" data-route="pp-payment"><svg><use href="#i-paypal"/></svg><span>PP 支付</span><b id="paypalNavState">—</b></button>
         <button class="nav-item" type="button" data-route="verification"><svg><use href="#i-checklist"/></svg><span>验证记录</span></button>
         <button class="nav-item" type="button" data-route="settings"><svg><use href="#i-settings"/></svg><span>设置</span></button>
       </nav>
-      <section class="sidebar-tree-section" aria-labelledby="sidebarTaskGroupTitle">
-        <div class="sidebar-tree-heading"><span id="sidebarTaskGroupTitle">任务分组</span><b aria-hidden="true">＋</b></div>
-        <div class="sidebar-tree-items">
-          <span><svg><use href="#i-folder"/></svg><em>全部任务</em><b id="sidebarAllTaskCount">0</b></span>
-          <span><svg><use href="#i-folder"/></svg><em>运行中</em><b id="sidebarRunningTaskCount">0</b></span>
-          <span><svg><use href="#i-folder"/></svg><em>已完成</em><b id="sidebarCompletedTaskCount">0</b></span>
-          <span><svg><use href="#i-folder"/></svg><em>失败任务</em><b id="sidebarFailedTaskCount">0</b></span>
-        </div>
-      </section>
-      <section class="sidebar-tree-section" aria-labelledby="sidebarResourceTitle">
-        <div class="sidebar-tree-heading"><span id="sidebarResourceTitle">资源</span><b aria-hidden="true">＋</b></div>
-        <div class="sidebar-tree-items">
-          <span><svg><use href="#i-mail"/></svg><em>邮箱账号</em><b id="sidebarAccountResourceCount">0</b></span>
-          <span><svg><use href="#i-network"/></svg><em>代理线路</em><b id="sidebarProxyResourceCount">0</b></span>
-          <span><svg><use href="#i-dashboard"/></svg><em>指纹环境</em><b id="sidebarProfileResourceCount">0</b></span>
-          <span><svg><use href="#i-settings"/></svg><em>API 配置</em><b id="sidebarApiResourceCount">0</b></span>
-        </div>
-      </section>
       <div class="sidebar-status"><span><i id="sidebarRuntimeDot"></i><b id="sidebarRuntimeLabel">正在检查运行环境</b></span><small>版本 1.3.0</small></div>
     </aside>
     <button id="sidebarExpandRail" class="sidebar-expand-rail" type="button" data-action="toggle-sidebar" aria-controls="workbenchSidebar" aria-expanded="false" aria-label="展开导航" title="展开导航" hidden><svg aria-hidden="true"><use href="#i-panel-expand"/></svg></button>
@@ -195,7 +177,7 @@
             </div>
             </div>
             <div id="registrationRuntimeControls" class="registration-runtime-controls" aria-label="注册任务操作">
-              <div class="registration-runtime-state"><span id="registrationRuntimeState">当前无运行任务</span><small id="registrationRuntimeMessage">运行详情请查看下方终端日志</small></div>
+              <div class="registration-runtime-state"><span id="registrationRuntimeState">当前无运行任务</span><small id="registrationRuntimeMessage">运行详情请查看下方任务日志</small></div>
               <button id="registerProviderButton" class="button primary registration-start-button" type="button" data-action="register-provider">开始注册</button>
               <details id="registrationMoreOptions" class="registration-more-options">
                 <summary class="button"><span>更多选项</span><small>自有邮箱 · Session</small></summary>
@@ -220,9 +202,10 @@
         <article class="panel table-panel">
           <div class="panel-head account-list-head">
             <div class="account-list-heading"><div><h2>邮箱账号</h2><p id="accountSummary">正在加载…</p></div><div id="accountMetrics" class="metric-grid compact account-inline-metrics"></div></div>
-            <div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select></div>
+            <div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select><select id="accountLiandongFilter"><option value="all">联动小铺：全部</option><option value="uploaded">已上传</option><option value="pending">未上传</option></select></div>
+            <div class="filter-bar liandong-shop-config"><span id="liandongShopConfigStatus" class="badge warning">正在检查小铺配置</span><input id="liandongShopMerchantToken" type="password" autocomplete="off" placeholder="输入 Merchant-Token"><button id="liandongShopSaveToken" class="button small" type="button" data-action="save-liandong-shop-config">保存小铺 Token</button><small>未接码 → PLUS--质保首登--未接码；已接码 → PLUS--质保首登--已接码</small></div>
           </div>
-          <div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>注册状态</th><th>套餐</th><th>Session 状态</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>注册状态</th><th>套餐</th><th>Session 状态</th><th>联动小铺</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
         </article>
       <div class="protocol-registration-view account-protocol-panel" id="protocolRegistrationPanel" hidden>
         <article class="panel protocol-registration-toolbar">
@@ -300,6 +283,7 @@
                   <label id="quickPromotionProxyChoiceLabel" class="field-label">更新优惠使用 IP<select id="quickPromotionProxyChoice"><option value="first">第一提链 IP</option><option value="second">第二提链 IP</option></select></label>
                   <label id="quickCardLinkTargetAmountLabel" class="field-label" hidden>目标金额<input id="quickCardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
                 </div>
+                <label class="quick-flow-post-payment-option" for="quickPostPaymentPhoneBinding"><input id="quickPostPaymentPhoneBinding" type="checkbox"><span><strong>确认 Plus 后继续接码</strong><small>用于绑定 OpenAI 手机号并获取 Codex OAuth；不勾选则确认 Plus 后直接结束任务</small></span></label>
                 <div class="quick-flow-context-group"><div id="quickCardLinkHint" class="mode-label">返回 cs_live 时自动继续同模式提链，直到单账号次数用完；首次使用第一代理出口，重试切换第二代理出口。</div><div id="quickExtractionProxySummary" class="mode-label">提链代理：请选择模式与两个出口</div></div>
                 <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span><span>✓ 自动协议支付</span></div>
               </section>
@@ -432,15 +416,15 @@
       </section>
 
       <section class="view" id="settingsView" data-view="settings" hidden>
-        <div class="settings-layout"><aside class="panel settings-nav"><button class="active" data-settings-section="imap">邮箱与 IMAP</button><button data-settings-section="browser">浏览器运行</button><button data-settings-section="workbench">工作台集成</button><button data-settings-section="security">安全与访问</button><button data-settings-section="appearance">外观</button></aside><article class="panel settings-content"><div class="panel-head"><div><h2 id="settingsTitle">邮箱与 IMAP</h2><p id="settingsSubtitle">配置验证码收件服务</p></div><span id="settingsStatus" class="badge">尚未检查</span></div><div id="settingsPanel"></div></article></div>
+        <div class="settings-layout"><aside class="panel settings-nav"><button class="active" data-settings-section="imap">邮箱与 IMAP</button><button data-settings-section="sms">接码配置</button><button data-settings-section="browser">浏览器运行</button><button data-settings-section="workbench">工作台集成</button><button data-settings-section="security">安全与访问</button><button data-settings-section="appearance">外观</button></aside><article class="panel settings-content"><div class="panel-head"><div><h2 id="settingsTitle">邮箱与 IMAP</h2><p id="settingsSubtitle">配置验证码收件服务</p></div><span id="settingsStatus" class="badge">尚未检查</span></div><div id="settingsPanel"></div></article></div>
       </section>
     </main>
     <section id="workbenchTerminalPanel" class="workbench-terminal-panel" aria-labelledby="terminalPreviewTitle">
       <header class="terminal-preview-header">
-        <nav aria-label="底部面板"><button type="button" disabled>问题</button><button type="button" disabled>输出</button><button type="button" disabled>调试控制台</button><button class="active" type="button" id="terminalPreviewTitle">终端</button><button type="button" disabled>任务日志</button></nav>
-        <div><label class="terminal-session-picker" for="terminalSessionSelect"><span>日志会话</span><select id="terminalSessionSelect" aria-label="选择日志会话" disabled><option value="">暂无日志会话</option></select></label><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="toggle-terminal-preview" aria-label="折叠终端日志" title="折叠终端日志">⌄</button></div>
+        <nav aria-label="底部面板"><button class="active" type="button" id="terminalPreviewTitle">任务日志</button></nav>
+        <div><label class="terminal-session-picker" for="terminalSessionSelect"><span>日志会话</span><select id="terminalSessionSelect" aria-label="选择日志会话" disabled><option value="">暂无日志会话</option></select></label><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="toggle-terminal-preview" aria-label="折叠任务日志" title="折叠任务日志">⌄</button></div>
       </header>
-      <div id="terminalPreviewList" class="terminal-preview-list" role="log" aria-live="off"><div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，日志会显示在这里。</div></div>
+      <div id="terminalPreviewList" class="terminal-preview-list" role="log" aria-live="off"><div class="terminal-preview-empty">启动注册、浏览器、协议、验证、提链或手机号绑定任务后，日志会显示在这里。</div></div>
     </section>
   </div>
   <footer class="workbench-footer" aria-label="工作台状态栏">

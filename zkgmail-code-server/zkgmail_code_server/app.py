@@ -124,7 +124,7 @@ async def establish_access(request: web.Request) -> web.Response:
         response.headers["Retry-After"] = str(retry_after)
         return response
     settings = request.app[SETTINGS_KEY]
-    if not settings.access_protected:
+    if not settings.require_invite or not settings.access_protected:
         return request.app[VIEW_KEY].error("邀请访问尚未配置", 503, state="unconfigured")
     try:
         payload: Any = await request.json(loads=json.loads)
@@ -162,13 +162,6 @@ async def establish_access(request: web.Request) -> web.Response:
 async def latest_code(request: web.Request) -> web.Response:
     if not _same_origin_json(request):
         return request.app[VIEW_KEY].error("请求来源无效", 403, state="forbidden")
-    access_email = _access_scope(request)
-    if not access_email:
-        return request.app[VIEW_KEY].error(
-            "请使用有效邀请链接访问",
-            401,
-            state="unauthorized",
-        )
     try:
         payload: Any = await request.json(loads=json.loads)
     except (json.JSONDecodeError, web.HTTPBadRequest, TypeError, ValueError):
@@ -180,21 +173,29 @@ async def latest_code(request: web.Request) -> web.Response:
         target_email = normalize_zkgmail_address(raw_email)
     except InvalidAddressError:
         target_email = ""
-    if target_email and not hmac.compare_digest(target_email, access_email):
-        return request.app[VIEW_KEY].error(
-            "该邀请链接未授权此邮箱",
-            403,
-            state="forbidden",
-        )
-    cookie_digest = hashlib.sha256(
-        str(request.cookies.get(ACCESS_COOKIE_NAME) or "").encode("utf-8")
-    ).hexdigest()
-    email_digest = hashlib.sha256(access_email.encode("utf-8")).hexdigest()
-    for limit_key in (
-        f"ip:{_client_key(request)}",
-        f"session:{cookie_digest}",
-        f"email:{email_digest}",
-    ):
+    settings = request.app[SETTINGS_KEY]
+    limit_keys = [f"ip:{_client_key(request)}"]
+    if settings.require_invite:
+        access_email = _access_scope(request)
+        if not access_email:
+            return request.app[VIEW_KEY].error(
+                "请使用有效邀请链接访问",
+                401,
+                state="unauthorized",
+            )
+        if target_email and not hmac.compare_digest(target_email, access_email):
+            return request.app[VIEW_KEY].error(
+                "该邀请链接未授权此邮箱",
+                403,
+                state="forbidden",
+            )
+        cookie_digest = hashlib.sha256(
+            str(request.cookies.get(ACCESS_COOKIE_NAME) or "").encode("utf-8")
+        ).hexdigest()
+        limit_keys.append(f"session:{cookie_digest}")
+    email_digest = hashlib.sha256(target_email.encode("utf-8")).hexdigest()
+    limit_keys.append(f"email:{email_digest}")
+    for limit_key in limit_keys:
         allowed, retry_after = request.app[LIMITER_KEY].allow(limit_key)
         if not allowed:
             response = request.app[VIEW_KEY].error(
@@ -223,7 +224,7 @@ def create_app(
     settings: Settings | None = None,
 ) -> web.Application:
     current_settings = settings or Settings.from_env()
-    if not current_settings.access_protected:
+    if current_settings.require_invite and not current_settings.access_protected:
         raise RuntimeError("ZKGMAIL_ACCESS_TOKEN must be a 64-character hex secret")
     if repository is None:
         imap_repository = ImapCodeRepository(
@@ -254,8 +255,10 @@ def create_app(
         max_age_seconds=current_settings.session_max_age_seconds,
         max_sessions=current_settings.session_max_sessions,
         max_sessions_per_invite=current_settings.session_max_per_invite,
+        storage_path=current_settings.session_store_path or None,
     )
-    app[INVITE_SERVICE_KEY] = InviteTokenService(current_settings.access_token)
+    if current_settings.require_invite:
+        app[INVITE_SERVICE_KEY] = InviteTokenService(current_settings.access_token)
     app.router.add_get("/", index)
     app.router.add_get("/assets/app.css", stylesheet)
     app.router.add_get("/assets/app.js", script)

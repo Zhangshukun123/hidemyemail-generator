@@ -56,6 +56,8 @@ def _email_code_fetcher(
     _client_id: str,
     timeout_seconds: int,
 ) -> str | None:
+    """Poll the signed local code relay without exposing its token in logs."""
+
     deadline = time.monotonic() + max(5, int(timeout_seconds or 180))
     while time.monotonic() < deadline:
         try:
@@ -70,12 +72,26 @@ def _email_code_fetcher(
             if 4 <= len(code) <= 10:
                 return code
         except HTTPError as error:
-            if error.code not in {404, 408, 425, 429, 503}:
+            if error.code not in {404, 408, 425, 429, 502, 503}:
                 raise
         except (OSError, TimeoutError, URLError):
             pass
         time.sleep(1.2)
     return None
+
+
+def _browser_oauth_session(payload: dict[str, Any]) -> dict[str, Any]:
+    """Authenticate OAuth using only code shipped in this project."""
+
+    from hidemyemail_generator.plus_codex_browser import (
+        run_browser_oauth_session,
+    )
+
+    return run_browser_oauth_session(
+        payload,
+        emit=_emit,
+        email_code_fetcher=_email_code_fetcher,
+    )
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -86,10 +102,49 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             sys.path.insert(0, path)
 
     from gpt_trial_protocol.codex_oauth import run_codex_oauth_protocol
+    from hidemyemail_generator.browser_tasks import sync_account_browser_cookies
     from hidemyemail_generator.plus_sms import PlusSmsProviderFactory
 
+    browser_auth = _browser_oauth_session(payload)
+    browser_cookies = [
+        dict(item)
+        for item in (browser_auth.get("cookies") or [])
+        if isinstance(item, dict)
+    ]
+    sync_account_browser_cookies(
+        Path(str(payload.get("db_file") or "")),
+        str(payload.get("email") or ""),
+        browser_cookies,
+    )
+    _emit(
+        "cookies_synced",
+        {
+            "message": "Roxy 登录 Cookie 已同步到当前账号；现在切换纯协议手机号接码",
+            "stage": "cookie_sync",
+            "level": "success",
+            "cookie_count": len(browser_cookies),
+        },
+    )
+    oauth_record = browser_auth.get("oauth_record")
+    if isinstance(oauth_record, dict) and oauth_record:
+        return {
+            "ok": True,
+            **oauth_record,
+            "phone_bound": True,
+            "phone": "",
+            "activation_id": "",
+            "sms_provider": "",
+            "sms_country": "",
+            "sms_max_price": 0,
+            "phone_attempts": 0,
+        }
+
     provider = PlusSmsProviderFactory(Path(str(payload.get("db_file") or ""))).create(
-        str(payload.get("sms_provider") or "")
+        str(payload.get("sms_provider") or ""),
+        on_log=lambda event: _emit("sms_route", event),
+        purpose="binding",
+        countries=payload.get("sms_countries") or [],
+        max_price=float(payload.get("sms_max_price") or 0.064),
     )
 
     def log_fn(message: str) -> None:
@@ -98,17 +153,21 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     result = run_codex_oauth_protocol(
         email=str(payload.get("email") or ""),
         password=str(payload.get("password") or ""),
-        # The protocol currently requires a non-empty relay credential even
-        # when a custom fetcher is supplied.  The signed local URL satisfies
-        # that contract and is consumed only by _email_code_fetcher.
+        # A signed local relay URL lets iCloud, Gmail, and zkgmail accounts use
+        # the workspace's existing OTP readers when OAuth asks for confirmation.
         outlook_refresh_token=str(payload.get("code_url") or ""),
         outlook_client_id="",
+        initial_session_token="",
+        initial_session_cookies=browser_cookies,
+        # Browser authentication owns email/MFA verification.  The HTTP phase
+        # is intentionally limited to the phone challenge and token exchange.
+        cookie_login_only=True,
         sms_provider=provider,
         proxy=str(payload.get("proxy_url") or ""),
         impersonate=str(payload.get("impersonate") or "firefox144"),
         email_otp_timeout=180,
         sms_otp_timeout=60,
-        # One lease keeps the entire post-payment phone budget at $0.10.
+        # One lease uses the global ordered country fallback route.
         sms_max_attempts=1,
         sms_max_otp_retries=1,
         log_fn=log_fn,
@@ -120,6 +179,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     activation = provider.last_activation
     result["sms_country"] = (
         str(activation.raw.get("country") or "") if activation is not None else ""
+    )
+    result["sms_max_price"] = (
+        float(activation.raw.get("max_price") or 0) if activation is not None else 0
     )
     result["ok"] = bool(result.get("ok"))
     return result

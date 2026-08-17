@@ -291,6 +291,264 @@ class QuickFlowHistoryFrontendTests(unittest.TestCase):
 
         self.assertEqual(deleted, [{"runId": "run-restored"}])
 
+    def test_interrupted_extract_run_exposes_and_executes_card_link_retry(self):
+        html = build_app_page().replace(
+            "__LOCAL_TOKEN__", json.dumps("history-ui-token")
+        )
+        payloads = _workspace_payloads()
+        email = "retry-interrupted@example.com"
+        payloads["/api/quick-flow/history"] = {
+            "ok": True,
+            "count": 1,
+            "items": [
+                {
+                    **flow(
+                        "run-interrupted-extract",
+                        status="failed",
+                        started_at="2026-08-17T12:30:00+00:00",
+                    ),
+                    "phase": "extract",
+                    "progress": 65,
+                    "interrupted": True,
+                    "method": "de_oaics_paypal",
+                    "extractionCount": 1,
+                    "emails": [email],
+                    "currentEmail": email,
+                    "currentAction": "服务器重启导致前端流水线中断",
+                    "message": "服务器重启前提链未完成；记录已恢复",
+                    "results": [],
+                }
+            ],
+        }
+        payloads["/api/gpt-emails"] = {
+            "ok": True,
+            "items": [
+                {
+                    "email": email,
+                    "sessionStatus": "ready",
+                    "accountType": "free",
+                    "cardLink": "",
+                    "cardLinkStatus": "",
+                }
+            ],
+        }
+        card_link_requests: list[dict] = []
+        progress_request_tokens: list[str | None] = []
+        page_errors: list[str] = []
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 980})
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+            def fulfill(route):
+                path = urlparse(route.request.url).path
+                if path == "/":
+                    route.fulfill(
+                        status=200,
+                        content_type="text/html; charset=utf-8",
+                        body=html,
+                    )
+                    return
+                if path == "/api/account/card-link" and route.request.method == "POST":
+                    card_link_requests.append(route.request.post_data_json)
+                    body = {
+                        "ok": True,
+                        "url": "https://chatgpt.com/checkout/openai_llc/cs_live_retry",
+                        "country": "DE",
+                        "link_proxy_country": "DE",
+                        "cardLinkStatus": "cs_live",
+                        "attemptCount": 1,
+                        "attemptLimit": 1,
+                        "logs": [],
+                    }
+                elif path.startswith("/api/account/card-link/progress/"):
+                    progress_request_tokens.append(
+                        route.request.headers.get("x-local-token")
+                    )
+                    body = {"ok": True, "logs": [], "logSequence": 0}
+                else:
+                    body = payloads.get(path, {"ok": True, "logs": []})
+                route.fulfill(
+                    status=200,
+                    content_type="application/json; charset=utf-8",
+                    body=json.dumps(body, ensure_ascii=False),
+                )
+
+            page.route("**/*", fulfill)
+            page.goto("http://quick-flow.test/#quick-flow", wait_until="domcontentloaded")
+            retry_button = page.locator(
+                '.quick-flow-account-card [data-action="retry-quick-card-link"]'
+            )
+            retry_button.wait_for(state="visible")
+
+            self.assertEqual(retry_button.inner_text(), "重新提链")
+            self.assertIn("服务器重启前提链未完成", page.locator("#quickFlowResults").inner_text())
+            self.assertTrue(retry_button.is_enabled())
+
+            with page.expect_request(
+                lambda request: urlparse(request.url).path == "/api/account/card-link"
+                and request.method == "POST"
+            ):
+                retry_button.click()
+            page.wait_for_function(
+                "document.getElementById('quickFlowResults').textContent.includes('cs_live')"
+            )
+
+            self.assertEqual(len(card_link_requests), 1)
+            self.assertEqual(card_link_requests[0]["email"], email)
+            self.assertTrue(card_link_requests[0]["force_retry"])
+            self.assertTrue(progress_request_tokens)
+            self.assertEqual(set(progress_request_tokens), {"history-ui-token"})
+            self.assertEqual(page_errors, [])
+            browser.close()
+
+    def test_interrupted_payment_can_restart_from_saved_account_and_link(self):
+        html = build_app_page().replace(
+            "__LOCAL_TOKEN__", json.dumps("history-ui-token")
+        )
+        payloads = _workspace_payloads()
+        email = "resume-payment@example.com"
+        payloads["/api/quick-flow/history"] = {
+            "ok": True,
+            "count": 1,
+            "items": [
+                {
+                    **flow(
+                        "run-interrupted-payment",
+                        status="failed",
+                        started_at="2026-08-17T12:40:00+00:00",
+                    ),
+                    "phase": "payment",
+                    "progress": 99,
+                    "interrupted": True,
+                    "currentEmail": email,
+                    "currentAction": "服务器重启导致前端流水线中断",
+                    "message": "服务器重启前流程未完成；记录已永久保留",
+                    "results": [
+                        {
+                            "ok": True,
+                            "email": email,
+                            "url": "https://www.paypal.com/agreements/approve?ba_token=BA-RESUME123",
+                            "country": "DE",
+                            "paymentStarted": True,
+                            "paymentJobId": "missing-old-job",
+                            "paymentStatus": "running",
+                            "paymentSucceeded": False,
+                        }
+                    ],
+                }
+            ],
+        }
+        payloads["/api/gpt-emails"] = {
+            "ok": True,
+            "items": [
+                {
+                    "email": email,
+                    "sessionStatus": "ready",
+                    "accountType": "free",
+                    "cardLink": "https://www.paypal.com/agreements/approve?ba_token=BA-RESUME123",
+                    "cardLinkStatus": "generated",
+                }
+            ],
+        }
+        payment_requests: list[dict] = []
+        page_errors: list[str] = []
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 980})
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+            def fulfill(route):
+                path = urlparse(route.request.url).path
+                method = route.request.method
+                if path == "/":
+                    route.fulfill(
+                        status=200,
+                        content_type="text/html; charset=utf-8",
+                        body=html,
+                    )
+                    return
+                if path == "/api/account/paypal-payment/missing-old-job":
+                    route.fulfill(
+                        status=404,
+                        content_type="application/json; charset=utf-8",
+                        body=json.dumps({"ok": False, "error": "任务不存在"}, ensure_ascii=False),
+                    )
+                    return
+                if path == "/api/account/paypal-payment" and method == "POST":
+                    payment_requests.append(route.request.post_data_json)
+                    body = {
+                        "ok": True,
+                        "country": "DE",
+                        "proxyMode": "dynamic",
+                        "proxySource": "card_link",
+                        "smsProvider": "smsbower",
+                        "smsProviderLabel": "SMSBower",
+                        "postPaymentPhoneBinding": False,
+                        "job": {
+                            "id": "resumed-payment-job",
+                            "status": "queued",
+                            "stage": "排队中",
+                        },
+                    }
+                    route.fulfill(
+                        status=201,
+                        content_type="application/json; charset=utf-8",
+                        body=json.dumps(body, ensure_ascii=False),
+                    )
+                    return
+                if path == "/api/account/paypal-payment/resumed-payment-job":
+                    body = {
+                        "ok": True,
+                        "job": {
+                            "id": "resumed-payment-job",
+                            "status": "completed",
+                            "stage": "已完成",
+                            "result": {"status": "success", "settlement_status": "confirmed"},
+                            "account_confirmation": {
+                                "status": "plus",
+                                "protocol_succeeded": True,
+                                "payment_succeeded": True,
+                                "plus_confirmed": True,
+                                "at_refreshed": True,
+                                "account_type": "plus",
+                                "plan": "plus",
+                                "detail": "支付后 Cookie 已刷新新 AT，已确认 Plus",
+                            },
+                            "logs": [],
+                            "log_count": 0,
+                            "log_sequence": 0,
+                        },
+                    }
+                else:
+                    body = payloads.get(path, {"ok": True})
+                route.fulfill(
+                    status=200,
+                    content_type="application/json; charset=utf-8",
+                    body=json.dumps(body, ensure_ascii=False),
+                )
+
+            page.route("**/*", fulfill)
+            page.goto("http://quick-flow.test/#quick-flow", wait_until="domcontentloaded")
+            restart = page.locator('[data-action="resume-interrupted-quick-flow"]')
+            restart.wait_for(state="visible")
+
+            self.assertEqual(restart.inner_text(), "重新运行")
+            restart.click()
+            page.wait_for_function(
+                "document.getElementById('quickFlowStatusBadge').textContent === '已完成'"
+            )
+
+            self.assertEqual(
+                payment_requests,
+                [{"email": email, "post_payment_phone_binding": False}],
+            )
+            self.assertIn("新 AT 已确认 Plus", page.locator("#quickFlowResults").inner_text())
+            self.assertEqual(page_errors, [])
+            browser.close()
+
 
 if __name__ == "__main__":
     unittest.main()

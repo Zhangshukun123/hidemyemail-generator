@@ -222,3 +222,32 @@ test("lookup keeps polling for three minutes before timing out", async () => {
     "3 分钟内没有收到验证码，请确认收件地址后重试。",
   );
 });
+
+
+test("lookup retries a transient network failure during server restart", async () => {
+  const replies = [
+    new TypeError("fetch failed"),
+    response(200, {
+      ok: true,
+      email: "restart@zkgmail.com",
+      code: "246810",
+      cursor: "restart-cursor",
+      receivedAt: "2026-08-17T14:00:00+00:00",
+    }),
+  ];
+  const { elements, requests } = loadPortal(() => {
+    const reply = replies.shift();
+    if (reply instanceof Error) throw reply;
+    return reply;
+  });
+  elements.get("email").value = "restart@zkgmail.com";
+
+  await submit(elements);
+  await eventually(
+    () => elements.get("code").textContent === "246810",
+    "lookup did not recover after a transient network failure",
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(elements.get("statusTitle").textContent, "验证码已收到");
+});

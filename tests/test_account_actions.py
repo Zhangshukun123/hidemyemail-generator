@@ -19,6 +19,7 @@ from hidemyemail_generator.account_actions import (
     AccountPaymentGuard,
     AccountPhoneBindingModel,
     AccountPhoneBindingPresenter,
+    account_phone_binding_state,
     account_payment_job_is_terminal,
     setup_account_action_routes,
 )
@@ -36,6 +37,7 @@ from hidemyemail_generator.account_browser_worker import (
     _proxy_options,
 )
 from hidemyemail_generator.inbox import connect_db
+from hidemyemail_generator.payment_sms import GlobalSmsRoutingConfigStore
 from hidemyemail_generator.web_ui import page_builder
 from hidemyemail_generator.web_ui.page_builder import build_app_page
 from tests.test_account_management_compact_ui import _workspace_payloads
@@ -54,6 +56,19 @@ def save_record(database: Path, email: str, record: dict) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def configure_binding_sms(database: Path, provider: str = "smsbower") -> None:
+    GlobalSmsRoutingConfigStore(database).configure(
+        {
+            "binding": {
+                "provider": provider,
+                "maxPrice": 0.064,
+                "countries": ["CL", "US"],
+            },
+            "apiKeys": {provider: f"{provider}-test-api-key"},
+        }
+    )
 
 
 def account_record(cookie_value: str = "private-session-cookie") -> dict:
@@ -556,7 +571,24 @@ class FakePlusCodex:
 
 
 class AccountPhoneBindingTests(unittest.TestCase):
-    def test_reuses_confirmed_plus_payment_and_configured_sms_provider(self):
+    def test_normalizes_current_and_legacy_bound_phone_markers(self):
+        self.assertTrue(
+            account_phone_binding_state(
+                {"plus_sms": {"phone_bound": True, "phone_masked": "+***1234"}}
+            )["bound"]
+        )
+        self.assertTrue(
+            account_phone_binding_state(
+                {"phone_binding_status": "手机号码已绑定"}
+            )["bound"]
+        )
+        self.assertFalse(
+            account_phone_binding_state(
+                {"plus_codex": {"status": "failed", "sms_verified": False}}
+            )["bound"]
+        )
+
+    def test_reuses_confirmed_plus_payment_and_uses_global_binding_provider(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "accounts.db"
             email = "phone-binding@icloud.com"
@@ -574,6 +606,7 @@ class AccountPhoneBindingTests(unittest.TestCase):
                     },
                 },
             )
+            configure_binding_sms(database, "hero-sms")
             plus_codex = FakePlusCodex()
             presenter = AccountPhoneBindingPresenter(
                 AccountPhoneBindingModel(database),
@@ -591,6 +624,152 @@ class AccountPhoneBindingTests(unittest.TestCase):
         self.assertEqual(plus_codex.calls[0]["sms_provider"], "hero-sms")
         self.assertNotIn("password", json.dumps(result).lower())
 
+    def test_existing_plus_without_payment_history_can_start_phone_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "accounts.db"
+            email = "existing-plus@icloud.com"
+            save_record(
+                database,
+                email,
+                {
+                    "account_type": "plus",
+                    "registration_proxy_url": "http://user:pass@proxy.test:8080",
+                },
+            )
+            configure_binding_sms(database)
+            plus_codex = FakePlusCodex()
+            presenter = AccountPhoneBindingPresenter(
+                AccountPhoneBindingModel(database),
+                plus_codex=plus_codex,
+                sms_resolver=SimpleNamespace(
+                    resolve=lambda: SimpleNamespace(provider="smsbower")
+                ),
+                base_url="http://127.0.0.1:8765",
+            )
+
+            result = asyncio.run(presenter.bind(email))
+
+        self.assertEqual(result["status"], "running")
+        call = plus_codex.calls[0]
+        self.assertTrue(call["job"]["id"].startswith("plus-account-"))
+        self.assertEqual(call["confirmation"]["source"], "existing_plus_account")
+        self.assertFalse(call["confirmation"]["payment_succeeded"])
+
+    def test_failed_phone_binding_is_retryable_until_it_is_really_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "accounts.db"
+            email = "retry-plus@icloud.com"
+            job_id = "payment-job-retry"
+            save_record(
+                database,
+                email,
+                {
+                    **account_record(),
+                    "account_type": "plus",
+                    "payment_confirmation": {
+                        "job_id": job_id,
+                        "status": "plus",
+                        "payment_succeeded": True,
+                    },
+                    "plus_codex": {
+                        "job_id": job_id,
+                        "status": "failed",
+                        "sms_verified": False,
+                    },
+                },
+            )
+            configure_binding_sms(database)
+            plus_codex = FakePlusCodex()
+            presenter = AccountPhoneBindingPresenter(
+                AccountPhoneBindingModel(database),
+                plus_codex=plus_codex,
+                sms_resolver=SimpleNamespace(
+                    resolve=lambda: SimpleNamespace(provider="smsbower")
+                ),
+                base_url="http://127.0.0.1:8765",
+            )
+
+            result = asyncio.run(presenter.bind(email))
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(plus_codex.calls[0]["job"]["id"], job_id)
+        self.assertTrue(plus_codex.calls[0]["retry_failed"])
+
+    def test_phone_binding_status_returns_only_new_persisted_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "accounts.db"
+            email = "phone-status@icloud.com"
+            save_record(
+                database,
+                email,
+                {
+                    **account_record(),
+                    "account_type": "plus",
+                    "plus_codex": {
+                        "job_id": "plus-status-job",
+                        "email": email,
+                        "status": "failed",
+                        "stage": "failed",
+                        "detail": "SMSBower 美国线路无库存",
+                        "log_sequence": 2,
+                        "logs": [
+                            {
+                                "sequence": 1,
+                                "stage": "sms_route",
+                                "level": "warning",
+                                "message": "智利线路无库存，回退美国",
+                            },
+                            {
+                                "sequence": 2,
+                                "stage": "failed",
+                                "level": "error",
+                                "message": "美国线路无库存",
+                            },
+                        ],
+                    },
+                },
+            )
+            presenter = AccountPhoneBindingPresenter(
+                AccountPhoneBindingModel(database),
+                plus_codex=FakePlusCodex(),
+                sms_resolver=SimpleNamespace(resolve=lambda: None),
+                base_url="http://127.0.0.1:8765",
+            )
+
+            result = asyncio.run(presenter.status(email, log_after=1))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["logSequence"], 2)
+        self.assertEqual([item["sequence"] for item in result["logs"]], [2])
+
+    def test_legacy_bound_phone_does_not_start_another_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "accounts.db"
+            email = "already-bound@icloud.com"
+            save_record(
+                database,
+                email,
+                {
+                    **account_record(),
+                    "account_type": "plus",
+                    "bound_phone": "+15551234567",
+                },
+            )
+            plus_codex = FakePlusCodex()
+            presenter = AccountPhoneBindingPresenter(
+                AccountPhoneBindingModel(database),
+                plus_codex=plus_codex,
+                sms_resolver=SimpleNamespace(resolve=lambda: None),
+                base_url="http://127.0.0.1:8765",
+            )
+
+            result = asyncio.run(presenter.bind(email))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["smsVerified"])
+        self.assertEqual(plus_codex.calls, [])
+
     def test_rejects_free_account_before_renting_a_phone(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "accounts.db"
@@ -605,7 +784,7 @@ class AccountPhoneBindingTests(unittest.TestCase):
                 base_url="http://127.0.0.1:8765",
             )
 
-            with self.assertRaisesRegex(RuntimeError, "提链支付"):
+            with self.assertRaisesRegex(RuntimeError, "升级为 Plus"):
                 asyncio.run(presenter.bind(email))
 
 
@@ -683,6 +862,16 @@ class RoutePhonePresenter:
         self.calls.append(email)
         return {"ok": True, "email": email, "status": "running"}
 
+    async def status(self, email, *, log_after=0):
+        self.calls.append((email, log_after))
+        return {
+            "ok": True,
+            "email": email,
+            "status": "running",
+            "logSequence": 3,
+            "logs": [{"sequence": 3, "message": "智利线路无库存，回退美国"}],
+        }
+
 
 class AccountActionRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -729,6 +918,24 @@ class AccountActionRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
         self.assertEqual(self.phone.calls, ["route@icloud.com", "route@icloud.com"])
 
+    async def test_bind_phone_status_aliases_forward_incremental_log_sequence(self):
+        for path in (
+            "/api/account/actions/bind-phone/status",
+            "/api/account/bind-phone/status",
+        ):
+            response = await self.client.get(
+                path + "?email=route%40icloud.com&log_after=2",
+                headers=self.headers,
+            )
+            payload = await response.json()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["logSequence"], 3)
+            self.assertIn("回退美国", payload["logs"][0]["message"])
+        self.assertEqual(
+            self.phone.calls,
+            [("route@icloud.com", 2), ("route@icloud.com", 2)],
+        )
+
     async def test_routes_require_local_token(self):
         response = await self.client.post(
             "/api/account/actions/open-browser",
@@ -759,6 +966,11 @@ class AccountActionFrontendTests(unittest.TestCase):
         self.assertIn('data-account-operation="', page)
         self.assertIn('"/api/account/actions/open-browser"', page)
         self.assertIn('"/api/account/actions/bind-phone"', page)
+        self.assertIn('"/api/account/actions/bind-phone/status?"', page)
+        self.assertIn('"hme:phone-binding-snapshot"', page)
+        self.assertIn("phoneBindingCandidate", page)
+        self.assertNotIn("手机号绑定日志</strong>", page)
+        self.assertIn("setTimeout(resolve, 800)", page)
         self.assertIn('"/api/account/card-link"', page)
         self.assertIn('"/api/account/paypal-payment"', page)
 
@@ -768,16 +980,74 @@ class AccountActionFrontendTests(unittest.TestCase):
 
         self.assertIn('"static/account_actions.js"', source)
         self.assertIn('"static/payment_outcome.js"', source)
+        self.assertIn('"static/sms_settings.js"', source)
         for filename in (
             "app.js",
             "account_actions.js",
             "payment_outcome.js",
             "quick_flow_account_result.js",
+            "sms_settings.js",
         ):
             line_count = len(
                 (static_root / filename).read_text(encoding="utf-8").splitlines()
             )
             self.assertLessEqual(line_count, 5000, filename)
+
+    def test_phone_binding_logs_are_rendered_in_terminal_session(self):
+        html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+            page = browser.new_page()
+
+            def fulfill(route):
+                if urlparse(route.request.url).path == "/":
+                    route.fulfill(
+                        status=200,
+                        content_type="text/html; charset=utf-8",
+                        body=html,
+                    )
+                else:
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json; charset=utf-8",
+                        body='{"ok":true,"items":[]}',
+                    )
+
+            page.route("**/*", fulfill)
+            page.goto("http://hme-account.test/", wait_until="domcontentloaded")
+            page.evaluate(
+                """() => window.dispatchEvent(new CustomEvent(
+                  "hme:phone-binding-snapshot",
+                  {detail: {
+                    email: "terminal-phone@icloud.com",
+                    snapshot: {
+                      jobId: "phone-job-terminal",
+                      status: "running",
+                      startedAt: "2026-08-17T13:34:41Z",
+                      logs: [{
+                        sequence: 1,
+                        at: "2026-08-17T13:34:42Z",
+                        stage: "cookie_login",
+                        level: "info",
+                        message: "正在使用已保存的 Cookie 登录",
+                      }],
+                    },
+                  }},
+                ))"""
+            )
+            page.wait_for_function(
+                "() => document.getElementById('terminalPreviewList').textContent.includes('Cookie 登录')"
+            )
+
+            self.assertIn(
+                "手机号绑定 · terminal-phone@icloud.com",
+                page.locator("#terminalSessionSelect").input_value()
+                + " "
+                + " ".join(page.locator("#terminalSessionSelect option").all_text_contents()),
+            )
+            self.assertIn("[手机号绑定]", page.locator("#terminalPreviewList").inner_text())
+            self.assertEqual(page.locator(".phone-binding-log-panel").count(), 0)
+            browser.close()
 
     def test_expanded_account_shows_actions_and_browser_request_never_uploads_cookie(
         self,
@@ -786,7 +1056,7 @@ class AccountActionFrontendTests(unittest.TestCase):
         payloads = _workspace_payloads()
         account = payloads["/api/gpt-emails"]["items"][0]
         account.update(
-            accountType="plus",
+            accountType="free",
             hasCookies=True,
             plusCodexStatus="",
             plusSmsVerified=False,
@@ -941,11 +1211,6 @@ class AccountActionFrontendTests(unittest.TestCase):
                 browser_requests[-1],
                 {"email": account["email"], "mode": "roxy"},
             )
-            page.locator('[data-account-operation="bind-phone"]').click()
-            page.wait_for_function(
-                "() => document.getElementById('toast').textContent.includes('手机号绑定任务已启动')"
-            )
-            self.assertEqual(phone_requests, [{"email": account["email"]}])
             page.locator('[data-account-operation="extract-payment"]').click()
             page.wait_for_function(
                 "() => document.getElementById('paypalPaymentFrame').dataset.loaded === '1'"
@@ -962,6 +1227,7 @@ class AccountActionFrontendTests(unittest.TestCase):
             self.assertEqual(payment_requests[1][1], {"email": account["email"]})
             self.assertNotIn("cookie", json.dumps(payment_requests).lower())
             self.assertEqual(len(payment_status_reads), 2)
+            self.assertEqual(phone_requests, [])
             warning = page.evaluate(
                 """async (email) => {
                   const messages = [];
@@ -1021,6 +1287,68 @@ class AccountActionFrontendTests(unittest.TestCase):
                 "document.getElementById('accountsView').clientWidth"
             )
             self.assertLessEqual(overflow, 1)
+            browser.close()
+
+    def test_plus_payment_and_phone_buttons_follow_real_binding_state(self):
+        html = build_app_page().replace("__LOCAL_TOKEN__", json.dumps("ui-test-token"))
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+            page = browser.new_page()
+            page.route(
+                "**/*",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=html,
+                )
+                if urlparse(route.request.url).path == "/"
+                else route.fulfill(
+                    status=200,
+                    content_type="application/json; charset=utf-8",
+                    body='{"ok":true,"items":[]}',
+                ),
+            )
+            page.goto("http://hme-account.test/", wait_until="domcontentloaded")
+
+            states = page.evaluate(
+                """() => {
+                  const read = (item) => {
+                    const template = document.createElement("template");
+                    template.innerHTML = new window.AccountActionView().actions(item);
+                    return [...template.content.querySelectorAll("button")].slice(0, 2).map(
+                      (button) => ({
+                        label: button.textContent,
+                        disabled: button.disabled,
+                        title: button.title,
+                      }),
+                    );
+                  };
+                  const base = {
+                    email: "plus@example.com",
+                    accountType: "plus",
+                    hasPassword: true,
+                    hasCookies: true,
+                    sessionStatus: "ready",
+                  };
+                  return {
+                    failed: read({...base, plusPhoneBindingStatus: "failed"}),
+                    bound: read({...base, plusPhoneBound: true}),
+                    running: read({...base, plusPhoneBindingStatus: "running"}),
+                    noPassword: read({...base, hasPassword: false}),
+                  };
+                }"""
+            )
+
+            self.assertEqual(states["failed"][0]["label"], "无需提链支付")
+            self.assertTrue(states["failed"][0]["disabled"])
+            self.assertEqual(states["failed"][1]["label"], "重新绑定手机号")
+            self.assertFalse(states["failed"][1]["disabled"])
+            self.assertEqual(states["bound"][1]["label"], "手机号已绑定")
+            self.assertTrue(states["bound"][1]["disabled"])
+            self.assertEqual(states["running"][1]["label"], "手机号绑定中")
+            self.assertTrue(states["running"][1]["disabled"])
+            self.assertFalse(states["noPassword"][1]["disabled"])
+            self.assertIn("Cookie 登录", states["noPassword"][1]["title"])
             browser.close()
 
 

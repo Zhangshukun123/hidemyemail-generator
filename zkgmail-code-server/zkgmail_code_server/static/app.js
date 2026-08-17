@@ -176,6 +176,7 @@ async function startLookup(email, afterCursor = "") {
   activeController = null;
   const runId = ++activeRun;
   const deadline = Date.now() + POLLING_POLICY.timeoutMs;
+  let lastAttemptHadNetworkError = false;
   elements.result.hidden = true;
   setBusy(true, Boolean(afterCursor));
 
@@ -188,6 +189,7 @@ async function startLookup(email, afterCursor = "") {
     setStatus("loading", title, message);
     try {
       const { response, data } = await requestCode(email, afterCursor);
+      lastAttemptHadNetworkError = false;
       if (runId !== activeRun) return;
       if (response.ok && data.ok && data.code) {
         const responseCursor = String(data.cursor || "");
@@ -208,16 +210,23 @@ async function startLookup(email, afterCursor = "") {
       }
     } catch (error) {
       if (error.name === "AbortError" || runId !== activeRun) return;
-      setStatus("error", "网络连接失败", "暂时无法连接接码服务，请稍后重试。");
-      setBusy(false);
+      lastAttemptHadNetworkError = true;
+      setStatus(
+        "loading",
+        "正在恢复连接",
+        `服务器可能正在重启，将自动重试，剩余 ${secondsLeft} 秒…`,
+      );
       activeController = null;
-      return;
     }
     await delay(POLLING_POLICY.intervalMs, runId);
   }
 
   if (runId === activeRun) {
     setBusy(false);
+    if (lastAttemptHadNetworkError) {
+      setStatus("error", "连接超时", "服务器暂时无法连接，请稍后再次获取验证码。");
+      return;
+    }
     const message = afterCursor
       ? `${POLLING_POLICY.timeoutLabel}内没有收到下一条验证码，请确认已重新发送后再试。`
       : `${POLLING_POLICY.timeoutLabel}内没有收到验证码，请确认收件地址后重试。`;

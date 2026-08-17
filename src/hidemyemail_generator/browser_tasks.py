@@ -451,6 +451,13 @@ def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
 
     merged: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+    def is_expired(cookie: dict[str, Any]) -> bool:
+        try:
+            expires = float(cookie.get("expires", -1) or -1)
+        except (TypeError, ValueError):
+            return False
+        return expires > 0 and expires <= time.time()
+
     def merge_cookie_list(value: Any) -> None:
         if isinstance(value, str) and value.strip():
             try:
@@ -468,7 +475,11 @@ def account_saved_cookies(record: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             domain = str(cookie.get("domain") or "chatgpt.com").strip().lower()
             path = str(cookie.get("path") or "/").strip() or "/"
-            merged[(name, domain.lstrip("."), path)] = cookie
+            key = (name, domain.lstrip("."), path)
+            existing = merged.get(key)
+            if existing is not None and is_expired(cookie) and not is_expired(existing):
+                continue
+            merged[key] = cookie
 
     raw_state = record.get("storage_state_json")
     if isinstance(raw_state, str) and raw_state.strip():
@@ -561,7 +572,7 @@ def _save_account_record(
         registration_proxy = result.get("registration_proxy")
         registration_environment = result.get("registration_environment")
         registration_diagnostics = result.get("registration_diagnostics")
-        if access_token or session_json:
+        if access_token or session_json or storage_state_json or cookies_json:
             current.pop("session_invalid_at", None)
         if access_token:
             current["access_token"] = access_token
@@ -643,6 +654,37 @@ def _save_account_record(
             mark_address(conn, target, "used")
     finally:
         conn.close()
+
+
+def sync_account_browser_cookies(
+    db_file: Path,
+    email: str,
+    cookies: list[dict[str, Any]],
+    *,
+    acquisition_method: str = "roxy_email_login",
+) -> None:
+    """Replace the account's browser Cookie snapshot after a fresh login."""
+
+    target = str(email or "").strip().lower()
+    if not target:
+        raise ValueError("同步 Roxy Cookie 时缺少账号邮箱")
+    normalized = [dict(item) for item in cookies if isinstance(item, dict)]
+    if not normalized:
+        raise RuntimeError("Roxy 邮箱登录完成，但没有可同步的 Cookie")
+    cookies_json = json.dumps(normalized, ensure_ascii=False)
+    _save_account_record(
+        Path(db_file),
+        target,
+        result={
+            "storage_state_json": json.dumps(
+                {"cookies": normalized, "origins": []},
+                ensure_ascii=False,
+            ),
+            "cookies_json": cookies_json,
+            "session_acquisition_method": str(acquisition_method or "").strip()
+            or "roxy_email_login",
+        },
+    )
 
 
 def set_manual_account_type(
@@ -2295,4 +2337,5 @@ __all__ = [
     "build_registration_environment",
     "registration_email_type",
     "set_manual_account_type",
+    "sync_account_browser_cookies",
 ]
