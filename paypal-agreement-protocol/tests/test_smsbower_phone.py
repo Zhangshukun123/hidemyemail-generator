@@ -10,6 +10,7 @@ import httpx
 
 import web
 from paypal.smsbower import (
+    DEFAULT_OTP_TIMEOUT_SECONDS,
     SMSBowerPhoneActivation,
     SMSBowerPhoneClient,
     SMSBowerPhoneError,
@@ -105,10 +106,16 @@ def test_us_paypal_price_status_selects_the_available_virtual_pool():
     assert [item["countryId"] for item in status["routes"]] == [12, 187]
 
 
-def test_payment_sms_timeout_is_70_seconds_and_germany_is_supported():
-    assert web.SMSBOWER_OTP_TIMEOUT_SECONDS == 70
-    assert web.SMSBOWER_PHONE_CLIENT.otp_timeout_seconds == 70
+def test_payment_sms_timeout_is_60_seconds_for_every_automatic_provider():
+    assert DEFAULT_OTP_TIMEOUT_SECONDS == 60
+    assert web.AUTO_SMS_OTP_TIMEOUT_SECONDS == 60
+    assert web.AUTO_SMS_MAX_PHONE_ATTEMPTS == 10
+    assert web.SMSBOWER_OTP_TIMEOUT_SECONDS == 60
+    assert web.SMSBOWER_MAX_PHONE_ATTEMPTS == 10
+    assert web.SMSBOWER_PHONE_CLIENT.otp_timeout_seconds == 60
+    assert web.HERO_SMS_PHONE_CLIENT.otp_timeout_seconds == 60
     assert web.SMSBOWER_COUNTRY_IDS["DE"] == 43
+    assert web.HERO_SMS_COUNTRY_IDS["DE"] == 43
     assert "DE" in web.VERIFIED_PROTOCOL_COUNTRIES
 
 
@@ -408,14 +415,22 @@ def test_manual_phone_check_api_does_not_create_a_job_or_send_sms():
         thread.join(timeout=5)
 
 
-def test_smsbower_timeout_cancels_number_and_acquires_another(monkeypatch):
+@pytest.mark.parametrize(
+    ("provider", "client_attribute"),
+    (("smsbower", "SMSBOWER_PHONE_CLIENT"), ("hero-sms", "HERO_SMS_PHONE_CLIENT")),
+)
+def test_automatic_sms_timeout_cancels_then_reacquires(
+    monkeypatch, provider, client_attribute
+):
     activations = [
-        SMSBowerPhoneActivation("70-a", "+66811111111", "TH"),
-        SMSBowerPhoneActivation("70-b", "+66822222222", "TH"),
+        SMSBowerPhoneActivation("60-a", "+66811111111", "TH", provider=provider),
+        SMSBowerPhoneActivation("60-b", "+66822222222", "TH", provider=provider),
     ]
     events = []
 
     class ClientStub:
+        provider_label = "HeroSMS" if provider == "hero-sms" else "SMSBower"
+
         def acquire_phone(self, country, *, max_price):
             item = activations.pop(0)
             events.append(("acquire", item.activation_id, country, max_price))
@@ -426,16 +441,18 @@ def test_smsbower_timeout_cancels_number_and_acquires_another(monkeypatch):
 
         def wait_for_code(self, item, **kwargs):
             events.append(("wait", item.activation_id, kwargs["timeout_seconds"]))
-            if item.activation_id == "70-a":
-                raise SMSBowerPhoneError("SMSBower PayPal 短信验证码等待超时")
+            if item.activation_id == "60-a":
+                raise SMSBowerPhoneError(
+                    f"{self.provider_label} PayPal 短信验证码等待超时"
+                )
             return "739104"
 
     class JobStub:
-        sms_provider = "smsbower"
         sms_max_price = 1.0
         _cancel_event = threading.Event()
 
         def __init__(self):
+            self.sms_provider = provider
             self.current = None
 
         def check_cancelled(self):
@@ -471,28 +488,38 @@ def test_smsbower_timeout_cancels_number_and_acquires_another(monkeypatch):
     flow._confirm_2fa_phone_confirmation = MethodType(
         lambda _self, _token, _url, _auth, _challenge, code: code == "739104", flow
     )
-    monkeypatch.setattr(web, "SMSBOWER_PHONE_CLIENT", ClientStub())
+    monkeypatch.setattr(web, client_attribute, ClientStub())
 
     flow._confirm_phone_with_retry("token", "https://paypal.test/signup")
 
-    assert ("wait", "70-a", 70) in events
+    assert ("wait", "60-a", 60) in events
     assert ("validation", "format_valid", 1) in events
     assert ("verification", "sms_timeout", 1) in events
-    assert ("finalize", "70-a", False) in events
-    assert ("acquire", "70-b", "TH", 1.0) in events
+    assert ("finalize", "60-a", False) in events
+    assert ("acquire", "60-b", "TH", 1.0) in events
+    assert events.index(("finalize", "60-a", False)) < events.index(
+        ("acquire", "60-b", "TH", 1.0)
+    )
     assert ("validation", "format_valid", 2) in events
     assert ("verification", "code_sent", 2) in events
     assert ("verification", "confirmed", 2) in events
-    assert events[-1] == ("finalize", "70-b", True)
+    assert events[-1] == ("finalize", "60-b", True)
 
 
-def test_paypal_ui_exposes_smsbower_provider_controls():
+def test_paypal_ui_exposes_provider_controls_and_separate_sms_settings_entry():
     root = Path(__file__).resolve().parents[1]
     page = (root / "web_static" / "index.html").read_text(encoding="utf-8")
     script = (root / "web_static" / "app.js").read_text(encoding="utf-8")
 
     assert 'id="smsProvider"' in page
     assert 'value="smsbower"' in page
+    assert 'value="hero-sms"' in page
+    assert 'id="smsSettingsOpen"' in page
+    assert 'id="smsSettingsDialog"' in page
+    assert 'id="smsDefaultProvider"' in page
+    assert 'id="smsbowerApiKey" type="password"' in page
+    assert 'id="heroSmsApiKey" type="password"' in page
+    assert "60 秒获取不到验证码" in page
     assert 'id="smsbowerPaymentService"' in page
     assert '<option value="paypal">PayPal</option>' in page
     assert 'id="smsbowerCountry"' in page
@@ -512,6 +539,12 @@ def test_paypal_ui_exposes_smsbower_provider_controls():
     assert "api('/phone/check'" in script
     assert "未访问 PayPal，未发送验证码" in script
     assert "/smsbower/status?country=" in script
+    assert "/sms/providers?country=" in script
+    assert "this.request('/sms/config'" in script
+    assert "接码平台状态已同步；API Key 不会回显。" in script
+    assert "const automaticSms = smsProvider !== 'manual'" in script
+    assert "class SmsSettingsView" in script
+    assert "class SmsSettingsPresenter" in script
     assert "sms_provider: smsProvider" in script
     assert "sms_service: smsService" in script
     assert "sms_country: automaticSms ? smsCountry" in script

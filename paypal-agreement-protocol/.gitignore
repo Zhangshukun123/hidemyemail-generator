@@ -1,4 +1,6 @@
 __pycache__/
+data/protocol_full.log
+data/used_local_card_hashes.txt
 *.pyc
 
 # Runtime state / secrets

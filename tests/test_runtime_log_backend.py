@@ -1,9 +1,14 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from hidemyemail_generator.browser_tasks import BrowserTaskManager
+from hidemyemail_generator.paypal_protocol_service import (
+    PayPalProtocolService,
+    ProtocolLogTee,
+)
 
 
 class BrowserRuntimeLogTests(unittest.IsolatedAsyncioTestCase):
@@ -97,6 +102,27 @@ class BrowserRuntimeLogTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("并发 1", parameter_logs[0]["message"])
             self.assertIn("窗口模式 无头", parameter_logs[0]["message"])
             self.assertNotIn("NeverWriteThisPassword!7", repr(started["logs"]))
+
+    def test_paypal_protocol_log_tee_writes_file_and_parent_terminal(self):
+        source = io.BytesIO("协议支付日志\nsecond line\n".encode("utf-8"))
+        log_file = io.BytesIO()
+        terminal = io.StringIO()
+        forwarder = ProtocolLogTee(log_file, terminal)
+
+        forwarder.start(source)
+        forwarder.close()
+
+        self.assertEqual(
+            log_file.getvalue().decode("utf-8"), "协议支付日志\nsecond line\n"
+        )
+        self.assertEqual(terminal.getvalue(), "协议支付日志\nsecond line\n")
+
+    def test_paypal_protocol_child_output_is_unbuffered(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = PayPalProtocolService(project_dir=root, runtime_dir=root)
+
+            self.assertEqual(service._runtime_environment()["PYTHONUNBUFFERED"], "1")
 
 
 if __name__ == "__main__":

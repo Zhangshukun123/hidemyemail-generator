@@ -8,7 +8,6 @@ key already stored by the parent Hide My Email application or read a dedicated
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -19,6 +18,8 @@ from typing import Any, Callable
 
 import httpx
 
+from paypal.sms_config import SmsSettingsModel
+
 
 SMSBOWER_API_URL = "https://smsbower.page/stubs/handler_api.php"
 SMSBOWER_API_DOCS_URL = "https://smsbower.app/cn/api?page=client"
@@ -27,7 +28,7 @@ SMSBOWER_PAYPAL_SERVICE_CODE = "ts"
 SMSBOWER_SETTING_KEY = "smsbower_mail_config_v1"
 DEFAULT_MAX_PRICE = 3.0
 DEFAULT_POLL_INTERVAL_SECONDS = 4.0
-DEFAULT_OTP_TIMEOUT_SECONDS = 300.0
+DEFAULT_OTP_TIMEOUT_SECONDS = 60.0
 
 # SMSBower uses the established SMS-Activate numeric country identifiers.
 # These are the PayPal countries exposed by the verified web workflow.
@@ -73,6 +74,34 @@ class SMSBowerPhoneActivation:
     country: str
     service: str = SMSBOWER_PAYPAL_SERVICE
     is_virtual: bool = False
+    provider: str = "smsbower"
+
+
+@dataclass(frozen=True)
+class SmsActivateProviderSpec:
+    """Provider metadata injected into the SMS-Activate client strategy."""
+
+    provider_id: str
+    label: str
+    api_url: str
+    docs_url: str
+    country_ids: dict[str, int]
+    country_purchase_ids: dict[str, tuple[int, ...]]
+    virtual_country_ids: frozenset[int] = frozenset()
+    service: str = SMSBOWER_PAYPAL_SERVICE
+    service_code: str = SMSBOWER_PAYPAL_SERVICE_CODE
+    mark_sent_status: int | None = 1
+
+
+SMSBOWER_PROVIDER_SPEC = SmsActivateProviderSpec(
+    provider_id="smsbower",
+    label="SMSBower",
+    api_url=SMSBOWER_API_URL,
+    docs_url=SMSBOWER_API_DOCS_URL,
+    country_ids=COUNTRY_IDS,
+    country_purchase_ids=COUNTRY_PURCHASE_IDS,
+    virtual_country_ids=frozenset({SMSBOWER_US_VIRTUAL_COUNTRY_ID}),
+)
 
 
 Requester = Callable[[dict[str, Any]], str]
@@ -111,20 +140,7 @@ def _setting_api_key(db_file: Path) -> str:
 def resolve_api_key() -> str:
     """Resolve a dedicated key first, then reuse the parent app's local key."""
 
-    explicit = str(os.getenv("SMSBOWER_API_KEY") or "").strip()
-    if explicit:
-        return explicit
-    configured_db = str(os.getenv("HME_DB_FILE") or "").strip()
-    candidates = [
-        Path(configured_db).expanduser() if configured_db else None,
-        Path(__file__).resolve().parents[2] / "hidemyemail.db",
-    ]
-    for candidate in candidates:
-        if candidate is not None:
-            key = _setting_api_key(candidate)
-            if key:
-                return key
-    return ""
+    return SmsSettingsModel().api_key("smsbower")
 
 
 class SMSBowerPhoneClient:
@@ -140,8 +156,12 @@ class SMSBowerPhoneClient:
         timeout_seconds: float = 20.0,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         otp_timeout_seconds: float = DEFAULT_OTP_TIMEOUT_SECONDS,
+        provider_spec: SmsActivateProviderSpec = SMSBOWER_PROVIDER_SPEC,
     ) -> None:
-        self.api_url = str(api_url or SMSBOWER_API_URL).strip()
+        self.spec = provider_spec
+        self.provider_id = provider_spec.provider_id
+        self.provider_label = provider_spec.label
+        self.api_url = str(api_url or provider_spec.api_url).strip()
         self._api_key = str(api_key or "").strip()
         self._api_key_resolver = api_key_resolver or resolve_api_key
         self._requester = requester
@@ -152,7 +172,9 @@ class SMSBowerPhoneClient:
     def _key(self) -> str:
         key = self._api_key or str(self._api_key_resolver() or "").strip()
         if not key:
-            raise SMSBowerPhoneError("请先在账号工作台设置 SMSBower API Key")
+            raise SMSBowerPhoneError(
+                f"请先在接码配置中设置 {self.provider_label} API Key"
+            )
         return key
 
     def configured(self) -> bool:
@@ -170,7 +192,7 @@ class SMSBowerPhoneClient:
                 response = httpx.get(
                     self.api_url,
                     params=query,
-                    headers={"User-Agent": "PAY.153 SMSBower/1.0"},
+                    headers={"User-Agent": f"PAY.153 {self.provider_label}/1.0"},
                     timeout=self.timeout_seconds,
                     follow_redirects=False,
                     trust_env=False,
@@ -179,28 +201,27 @@ class SMSBowerPhoneClient:
                 body = response.text
             except httpx.HTTPError as error:
                 raise SMSBowerPhoneError(
-                    f"SMSBower API 连接失败：{type(error).__name__}"
+                    f"{self.provider_label} API 连接失败：{type(error).__name__}"
                 ) from None
         text = str(body or "").strip()
         if not text:
-            raise SMSBowerPhoneError("SMSBower API 返回空响应")
+            raise SMSBowerPhoneError(f"{self.provider_label} API 返回空响应")
         return text
 
-    @staticmethod
-    def _provider_error(body: str, *, action: str) -> SMSBowerPhoneError:
+    def _provider_error(self, body: str, *, action: str) -> SMSBowerPhoneError:
         code = str(body or "").strip().split(":", 1)[0].upper()
         messages = {
-            "BAD_KEY": "SMSBower API Key 无效",
-            "BAD_ACTION": "SMSBower API 操作无效",
-            "BAD_SERVICE": "SMSBower 不支持 PayPal 服务代码",
-            "BAD_COUNTRY": "SMSBower 不支持所选国家",
-            "NO_NUMBERS": "SMSBower 当前没有符合条件的 PayPal 号码",
-            "NO_BALANCE": "SMSBower 余额不足",
-            "NO_ACTIVATION": "SMSBower 激活记录不存在",
-            "STATUS_CANCEL": "SMSBower 激活已取消",
-            "EARLY_CANCEL_DENIED": "SMSBower 购买后暂不可取消，请稍后在号码历史中处理",
+            "BAD_KEY": f"{self.provider_label} API Key 无效",
+            "BAD_ACTION": f"{self.provider_label} API 操作无效",
+            "BAD_SERVICE": f"{self.provider_label} 不支持 PayPal 服务代码",
+            "BAD_COUNTRY": f"{self.provider_label} 不支持所选国家",
+            "NO_NUMBERS": f"{self.provider_label} 当前没有符合条件的 PayPal 号码",
+            "NO_BALANCE": f"{self.provider_label} 余额不足",
+            "NO_ACTIVATION": f"{self.provider_label} 激活记录不存在",
+            "STATUS_CANCEL": f"{self.provider_label} 激活已取消",
+            "EARLY_CANCEL_DENIED": f"{self.provider_label} 购买后暂不可取消，请稍后在号码历史中处理",
         }
-        message = messages.get(code) or f"SMSBower {action}失败：{code[:80]}"
+        message = messages.get(code) or f"{self.provider_label} {action}失败：{code[:80]}"
         return SMSBowerPhoneError(message)
 
     def balance(self) -> float:
@@ -210,34 +231,36 @@ class SMSBowerPhoneClient:
         try:
             return round(float(body.split(":", 1)[1]), 4)
         except (TypeError, ValueError):
-            raise SMSBowerPhoneError("SMSBower 余额响应格式无效") from None
+            raise SMSBowerPhoneError(
+                f"{self.provider_label} 余额响应格式无效"
+            ) from None
 
     def price(self, country: str) -> dict[str, Any]:
         normalized_country = str(country or "").strip().upper()
-        country_id = COUNTRY_IDS.get(normalized_country)
+        country_id = self.spec.country_ids.get(normalized_country)
         if country_id is None:
             return {"supported": False, "country": normalized_country, "price": None, "count": 0}
         routes: list[dict[str, Any]] = []
-        for candidate_id in COUNTRY_PURCHASE_IDS.get(
+        for candidate_id in self.spec.country_purchase_ids.get(
             normalized_country, (country_id,)
         ):
             body = self._request(
                 "getPrices",
-                service=SMSBOWER_PAYPAL_SERVICE_CODE,
+                service=self.spec.service_code,
                 country=candidate_id,
             )
             try:
                 payload = json.loads(body)
                 country_state = payload.get(str(candidate_id), {})
                 service_state = country_state.get(
-                    SMSBOWER_PAYPAL_SERVICE_CODE, {}
+                    self.spec.service_code, {}
                 )
                 routes.append(
                     {
                         "countryId": candidate_id,
                         "price": round(float(service_state.get("cost")), 4),
                         "count": max(0, int(service_state.get("count") or 0)),
-                        "virtual": candidate_id == SMSBOWER_US_VIRTUAL_COUNTRY_ID,
+                        "virtual": candidate_id in self.spec.virtual_country_ids,
                     }
                 )
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
@@ -255,13 +278,14 @@ class SMSBowerPhoneClient:
         configured = self.configured()
         state: dict[str, Any] = {
             "configured": configured,
-            "provider": "smsbower",
-            "service": SMSBOWER_PAYPAL_SERVICE,
-            "serviceCode": SMSBOWER_PAYPAL_SERVICE_CODE,
+            "provider": self.provider_id,
+            "label": self.provider_label,
+            "service": self.spec.service,
+            "serviceCode": self.spec.service_code,
             "country": str(country or "BR").strip().upper(),
-            "supportedCountries": sorted(COUNTRY_IDS),
+            "supportedCountries": sorted(self.spec.country_ids),
             "defaultMaxPrice": DEFAULT_MAX_PRICE,
-            "docsUrl": SMSBOWER_API_DOCS_URL,
+            "docsUrl": self.spec.docs_url,
             "balance": None,
             "price": None,
             "count": 0,
@@ -283,24 +307,26 @@ class SMSBowerPhoneClient:
         max_price: Any = DEFAULT_MAX_PRICE,
     ) -> SMSBowerPhoneActivation:
         normalized_country = str(country or "").strip().upper()
-        country_id = COUNTRY_IDS.get(normalized_country)
+        country_id = self.spec.country_ids.get(normalized_country)
         if country_id is None:
-            raise SMSBowerPhoneError("SMSBower 自动取号暂不支持所选 PayPal 国家")
+            raise SMSBowerPhoneError(
+                f"{self.provider_label} 自动取号暂不支持所选 PayPal 国家"
+            )
         normalized_price = _positive_float(
             max_price,
-            label="SMSBower PayPal 最高价",
+            label=f"{self.provider_label} PayPal 最高价",
             minimum=0.001,
             maximum=50,
         )
         selected_country_id = country_id
         body = ""
-        for candidate_id in COUNTRY_PURCHASE_IDS.get(
+        for candidate_id in self.spec.country_purchase_ids.get(
             normalized_country, (country_id,)
         ):
             selected_country_id = candidate_id
             body = self._request(
                 "getNumber",
-                service=SMSBOWER_PAYPAL_SERVICE_CODE,
+                service=self.spec.service_code,
                 country=candidate_id,
                 maxPrice=f"{normalized_price:g}",
             )
@@ -312,16 +338,20 @@ class SMSBowerPhoneClient:
             raise self._provider_error(body, action="取号")
         parts = body.split(":", 2)
         if len(parts) != 3:
-            raise SMSBowerPhoneError("SMSBower 取号响应格式无效")
+            raise SMSBowerPhoneError(f"{self.provider_label} 取号响应格式无效")
         activation_id = parts[1].strip()
         phone_digits = "".join(character for character in parts[2] if character.isdigit())
         if not activation_id or not 8 <= len(phone_digits) <= 20:
-            raise SMSBowerPhoneError("SMSBower 未返回有效的激活 ID 或手机号")
+            raise SMSBowerPhoneError(
+                f"{self.provider_label} 未返回有效的激活 ID 或手机号"
+            )
         return SMSBowerPhoneActivation(
             activation_id=activation_id,
             phone=f"+{phone_digits}",
             country=normalized_country,
-            is_virtual=(selected_country_id == SMSBOWER_US_VIRTUAL_COUNTRY_ID),
+            service=self.spec.service,
+            is_virtual=(selected_country_id in self.spec.virtual_country_ids),
+            provider=self.provider_id,
         )
 
     def set_status(self, activation: SMSBowerPhoneActivation, status: int) -> str:
@@ -339,7 +369,8 @@ class SMSBowerPhoneClient:
         return body
 
     def mark_sent(self, activation: SMSBowerPhoneActivation) -> None:
-        self.set_status(activation, 1)
+        if self.spec.mark_sent_status is not None:
+            self.set_status(activation, self.spec.mark_sent_status)
 
     def request_another(self, activation: SMSBowerPhoneActivation) -> None:
         self.set_status(activation, 3)
@@ -355,7 +386,9 @@ class SMSBowerPhoneClient:
         if body.startswith("STATUS_OK:"):
             code = body.split(":", 1)[1].strip().strip("'\"")
             if not _CODE_RE.fullmatch(code):
-                raise SMSBowerPhoneError("SMSBower 返回的验证码格式无效")
+                raise SMSBowerPhoneError(
+                    f"{self.provider_label} 返回的验证码格式无效"
+                )
             return code
         prefix = body.split(":", 1)[0]
         if prefix in _WAITING_STATUSES or prefix == "STATUS_WAIT_RETRY":
@@ -388,7 +421,9 @@ class SMSBowerPhoneClient:
                     raise SMSBowerPhoneCancelled("短信等待已随任务停止")
             else:
                 time.sleep(wait_time)
-        raise SMSBowerPhoneError("SMSBower PayPal 短信验证码等待超时")
+        raise SMSBowerPhoneError(
+            f"{self.provider_label} PayPal 短信验证码等待超时"
+        )
 
 
 __all__ = [
@@ -400,6 +435,8 @@ __all__ = [
     "SMSBOWER_PAYPAL_SERVICE",
     "SMSBOWER_PAYPAL_SERVICE_CODE",
     "SMSBOWER_US_VIRTUAL_COUNTRY_ID",
+    "SMSBOWER_PROVIDER_SPEC",
+    "SmsActivateProviderSpec",
     "SMSBowerPhoneActivation",
     "SMSBowerPhoneCancelled",
     "SMSBowerPhoneClient",

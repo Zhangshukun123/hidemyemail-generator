@@ -33,6 +33,7 @@ android/*.png
 # BEGIN codex generated-file cleanup
 /.codex/
 /.codex-diagnostics/
+/.codex-delivery/
 /artifacts/
 /output/
 /.pytest_cache/

@@ -1,4 +1,5 @@
 import os
+
 os.environ["PAYPAL_WEB_ENABLE_DYNAMIC_COUNTRIES"] = "1"
 from unittest.mock import patch
 import web
@@ -13,9 +14,11 @@ class FakeFlow:
         self.user = kwargs["user"]
         assert self.address.country == "SG"
         assert self.user.phone_country_code == "+65"
+
     def run(self):
         self.job.runtime_schema = {"country": "SG", "source": "fixture"}
         return {"status": "success", "return_url": "https://merchant.fixture/return"}
+
     def close(self):
         return None
 
@@ -23,15 +26,23 @@ class FakeFlow:
 class FakeResponse:
     status_code = 404
     text = ""
+
     def json(self):
         return {}
 
 
 class FakeClient:
-    def __init__(self, *args, **kwargs): pass
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
-    def post(self, *args, **kwargs): return FakeResponse()
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, *args, **kwargs):
+        return FakeResponse()
 
 
 def test_run_job_dynamic_country_fixture():
@@ -48,9 +59,17 @@ def test_run_job_dynamic_country_fixture():
         _proxy_config=proxy,
         _proxy_pool=["http://127.0.0.1:9999"],
     )
-    with patch("web.select_working_proxy", return_value=proxy), patch(
-        "web.generate_card", return_value=CardInfo("4111111111111111", "12/2030", "123")
-    ), patch("web.WebIdentityElevationPayPalFlow", FakeFlow), patch("web.httpx.Client", FakeClient):
+    with (
+        patch("web.select_working_proxy", return_value=proxy),
+        patch(
+            "web.generate_card",
+            return_value=CardInfo("4111111111111111", "12/2030", "123"),
+        ),
+        patch("web.WebIdentityElevationPayPalFlow", FakeFlow),
+        patch("web.httpx.Client", FakeClient),
+        patch("web.record_payment_audit"),
+        patch("web.record_protocol_metric"),
+    ):
         web.run_job(job)
     assert job.status == "completed"
     assert job.result["status"] == "success"

@@ -108,13 +108,41 @@ def _normalize_country(value: Any) -> str:
     return country
 
 
+class CardLinkProxyCountryPolicy:
+    """Keep fixed-region checkout methods and proxy roles in one country."""
+
+    METHOD_COUNTRIES = {
+        "paypal_us": "US",
+        "paypal_gb": "GB",
+    }
+    PREFERENCE_COUNTRIES = {
+        "paypalUsCreate": "US",
+        "paypalUsFollowup": "US",
+        "paypalGbCreate": "GB",
+    }
+
+    @classmethod
+    def for_method(cls, method: Any, requested_country: Any = "") -> str:
+        fixed_country = cls.METHOD_COUNTRIES.get(
+            str(method or "").strip().casefold()
+        )
+        return fixed_country or _normalize_country(requested_country)
+
+    @classmethod
+    def for_preference(cls, preference: Any, requested_country: Any) -> str:
+        fixed_country = cls.PREFERENCE_COUNTRIES.get(str(preference or "").strip())
+        return fixed_country or _normalize_country(requested_country)
+
+
 def _normalize_card_link_countries(value: Any) -> dict[str, str]:
     selections = dict(CARD_LINK_PROXY_COUNTRY_DEFAULTS)
     if not isinstance(value, dict):
         return selections
     for key, default_country in CARD_LINK_PROXY_COUNTRY_DEFAULTS.items():
         try:
-            selections[key] = _normalize_country(value.get(key) or default_country)
+            selections[key] = CardLinkProxyCountryPolicy.for_preference(
+                key, value.get(key) or default_country
+            )
         except ValueError:
             selections[key] = default_country
     return selections
@@ -510,7 +538,9 @@ class RegistrationProxyStore:
                 for key, selected_country in card_link_countries.items():
                     if key not in CARD_LINK_PROXY_COUNTRY_DEFAULTS:
                         raise ValueError("提链代理国家配置无效")
-                    selections[key] = _normalize_country(selected_country)
+                    selections[key] = CardLinkProxyCountryPolicy.for_preference(
+                        key, selected_country
+                    )
                 state["cardLinkCountries"] = selections
             if card_link_modes is not None:
                 if not isinstance(card_link_modes, dict):
@@ -684,6 +714,7 @@ __all__ = [
     "CARD_LINK_PROXY_SETTING_KEY",
     "CARD_LINK_PROXY_MODE_KEYS",
     "CARD_LINK_PROXY_COUNTRY_DEFAULTS",
+    "CardLinkProxyCountryPolicy",
     "DEFAULT_PROXY_COUNTRY",
     "DEFAULT_PROXY_MODE",
     "PROXY_MODE_CLASH",

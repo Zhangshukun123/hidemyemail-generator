@@ -35,6 +35,15 @@ from .browser_tasks import (
     load_account_record,
     set_manual_account_type,
 )
+from .card_link_bridge_service import (
+    CardLinkBridgeCommand,
+    CardLinkBridgeServiceError,
+    SharedCardLinkBridgePresenter,
+)
+from .card_link_proxy_resolver import (
+    CardLinkProxyResolutionError,
+    CardLinkProxyResolver,
+)
 from .code_portal import CODE_PORTAL_HTML
 from .deleted_email_repository import DeletedEmailRepository
 from .inbox import (
@@ -55,6 +64,19 @@ from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
 from .paypal_protocol_service import PayPalProtocolService
+from .payment_completion import (
+    PaymentCompletionModel,
+    PaymentCompletionPresenter,
+    reconcile_openai_protocol_job,
+)
+from .payment_sms import PaymentSmsProviderResolver
+from .plus_account_export import AccountExportPresenter
+from .plus_codex import (
+    PlusCodexModel,
+    PlusCodexPresenter,
+    PlusCodexView,
+    ProtocolPlusCodexRunner,
+)
 from .protocol_registration import (
     ConcurrentProtocolRegistrationManager,
     PROTOCOL_CODE_PREFIX,
@@ -93,7 +115,11 @@ from .registration_tasks import (
     RegistrationTaskManager,
     generate_openai_password,
 )
-from .registration_proxy import CARD_LINK_PROXY_SETTING_KEY, RegistrationProxyStore
+from .registration_proxy import (
+    CARD_LINK_PROXY_SETTING_KEY,
+    CardLinkProxyCountryPolicy,
+    RegistrationProxyStore,
+)
 from .roxy_registration import RoxyRegistrationStore
 from .scheduled_generation import (
     DEFAULT_BATCH_SIZE as DEFAULT_INVENTORY_BATCH_SIZE,
@@ -219,6 +245,7 @@ OPENAI_RUNTIME_SIBLING_NAMES = (
 )
 PAYPAL_PROTOCOL_PREFIX = "/paypal-pay"
 PAYPAL_AUTO_DEVICE_COOKIE_NAME = "hme_paypal_auto_device_id"
+PAYPAL_PROTOCOL_PROXY_CANDIDATES = 3
 
 
 def _default_paypal_runtime_dir() -> Path:
@@ -2686,9 +2713,19 @@ async def auth_middleware(
         request.path in PUBLIC_PATHS
         or (
             request.path.startswith(PROTOCOL_CODE_PREFIX)
-            and request.app.get("protocol_registration_manager") is not None
-            and request.app["protocol_registration_manager"].valid_code_token(
-                request.path.removeprefix(PROTOCOL_CODE_PREFIX)
+            and (
+                (
+                    request.app.get("protocol_registration_manager") is not None
+                    and request.app["protocol_registration_manager"].valid_code_token(
+                        request.path.removeprefix(PROTOCOL_CODE_PREFIX)
+                    )
+                )
+                or (
+                    request.app.get("plus_codex_presenter") is not None
+                    and request.app["plus_codex_presenter"].valid_code_token(
+                        request.path.removeprefix(PROTOCOL_CODE_PREFIX)
+                    )
+                )
             )
         )
         or (
@@ -3199,10 +3236,48 @@ async def _run_card_link_bridge(
     create_proxy_url: str = "",
     promotion_proxy_url: str = "",
     target_amount: str = "",
+    shared_presenter: SharedCardLinkBridgePresenter | None = None,
 ) -> dict:
     token = str(access_token or "").strip()
     create_proxy = str(create_proxy_url or "").strip()
     promotion_proxy = str(promotion_proxy_url or "").strip()
+    if shared_presenter is not None and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
+        try:
+            shared_result = await shared_presenter.generate(
+                CardLinkBridgeCommand(
+                    method=method,
+                    access_token=token,
+                    country=country,
+                    currency=currency,
+                    locale=locale,
+                    account_email=account_email,
+                    create_proxy_url=create_proxy,
+                    promotion_proxy_url=promotion_proxy,
+                    target_amount=target_amount,
+                )
+            )
+        except CardLinkBridgeServiceError as error:
+            raise CardLinkBridgeError(
+                str(error),
+                logs=error.logs,
+                retryable=error.retryable,
+            ) from error
+        event = dict(shared_result.event)
+        event_status = str(event.get("status") or "")
+        if event_status != "success":
+            raise CardLinkBridgeError(
+                str(event.get("detail") or "直卡支付链接生成失败")[:1000],
+                logs=list(shared_result.logs),
+                retryable=(
+                    event.get("retryable")
+                    if isinstance(event.get("retryable"), bool)
+                    else None
+                ),
+            )
+        if not _valid_card_link(str(event.get("url") or ""), method):
+            raise RuntimeError("生成器没有返回有效的支付链接")
+        event["logs"] = list(shared_result.logs)
+        return event
     env = os.environ.copy()
     env.update(
         {
@@ -3614,6 +3689,8 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
         account_type = str(account.get("account_type") or "").lower()
         if account_type not in {"plus", "free"}:
             account_type = "unverified"
+        plus_codex = account.get("plus_codex")
+        plus_codex = plus_codex if isinstance(plus_codex, dict) else {}
         timestamp = identity.get("createTimestamp")
         created_at = str(account.get("created_at") or account.get("updated_at") or "")
         if isinstance(timestamp, (int, float)):
@@ -3685,6 +3762,9 @@ def _browser_email_items(db_file: Path, identities: list[dict]) -> list[dict]:
                 ),
                 "accountType": account_type,
                 "accountTypeSource": str(account.get("account_type_source") or ""),
+                "plusCodexStatus": str(plus_codex.get("status") or ""),
+                "plusSmsVerified": bool(plus_codex.get("sms_verified")),
+                "plusExportReady": bool(plus_codex.get("export_ready")),
                 "verifiedAt": str(account.get("verified_at") or ""),
                 "cardLink": str(card_link.get("url") or ""),
                 "cardLinkStatus": str(
@@ -3995,6 +4075,7 @@ def create_app(
     app["card_link_proxy_store"] = RegistrationProxyStore(
         app["db_file"], setting_key=CARD_LINK_PROXY_SETTING_KEY
     )
+    app["card_link_proxy_resolver"] = CardLinkProxyResolver()
     app["roxy_registration_store"] = RoxyRegistrationStore(app["db_file"])
     app["registration_proxy_tester"] = test_registration_proxy_connection
     def create_protocol_registration_process() -> ProtocolRegistrationManager:
@@ -4021,6 +4102,24 @@ def create_app(
     app["smsbower_client"] = SMSBowerMailClient(
         app["smsbower_config_store"], base_url=smsbower_api_base_url
     )
+    app["payment_sms_resolver"] = PaymentSmsProviderResolver(
+        app["db_file"],
+        smsbower_configured=lambda: bool(
+            app["smsbower_config_store"].public_state().get("configured")
+        ),
+    )
+    app["payment_completion_presenter"] = PaymentCompletionPresenter(
+        PaymentCompletionModel(app["db_file"])
+    )
+    app["plus_codex_presenter"] = PlusCodexPresenter(
+        PlusCodexModel(app["db_file"]),
+        runner=ProtocolPlusCodexRunner(
+            db_file=app["db_file"],
+            python_executable=Path(target_python) if target_python else None,
+        ),
+        on_account_saved=sync_saved_account_to_remote,
+    )
+    app["plus_account_exporter"] = AccountExportPresenter(app["db_file"])
     app["zkgmail_config_store"] = ZkgmailConfigStore(app["db_file"])
     app["zkgmail_client"] = ZkgmailMailClient(app["zkgmail_config_store"])
     paypal_source = (
@@ -4054,6 +4153,11 @@ def create_app(
     app["card_link_bridge_file"] = Path(__file__).with_name(
         "openai_card_link_bridge.py"
     ).resolve()
+    app["card_link_bridge_service"] = SharedCardLinkBridgePresenter.from_paths(
+        python_executable=Path(sys.executable),
+        bridge_file=app["card_link_bridge_file"],
+        working_directory=app["card_link_bridge_file"].parents[2],
+    )
 
     gpt_code_identity_cache: list[dict] = []
     gpt_code_identity_cache_at = 0.0
@@ -4516,6 +4620,14 @@ def create_app(
 
     app.cleanup_ctx.append(paypal_service_context)
 
+    async def card_link_bridge_context(_: web.Application):
+        try:
+            yield
+        finally:
+            await app["card_link_bridge_service"].close()
+
+    app.cleanup_ctx.append(card_link_bridge_context)
+
     async def browser_manager_context(_: web.Application):
         try:
             yield
@@ -4547,6 +4659,24 @@ def create_app(
             await app["protocol_registration_manager"].close()
 
     app.cleanup_ctx.append(protocol_registration_manager_context)
+
+    async def plus_codex_presenter_context(_: web.Application):
+        try:
+            yield
+        finally:
+            await app["plus_codex_presenter"].close()
+
+    app.cleanup_ctx.append(plus_codex_presenter_context)
+
+    zkgmail_client = app["zkgmail_client"]
+
+    async def zkgmail_client_context(_: web.Application):
+        try:
+            yield
+        finally:
+            await zkgmail_client.close()
+
+    app.cleanup_ctx.append(zkgmail_client_context)
 
     async def deactivation_scan_context(_: web.Application):
         state: dict = app["deactivation_scan_state"]
@@ -4983,6 +5113,43 @@ def create_app(
                 "Cache-Control": "no-store",
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "X-Account-Count": str(len(lines)),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def export_plus_accounts(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, TypeError, web.HTTPBadRequest):
+            payload = {}
+        export_format = str(payload.get("format") or "").strip().lower()
+        email = str(payload.get("email") or "").strip().lower() or None
+        try:
+            artifact = await asyncio.to_thread(
+                app["plus_account_exporter"].export, export_format, email
+            )
+        except ValueError as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        if artifact.count < 1:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "没有同时完成 Plus 支付、Plus 接码和 Codex OAuth 的可导出账号",
+                },
+                status=404,
+            )
+        return web.Response(
+            body=artifact.content,
+            content_type="application/json",
+            charset="utf-8",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+                "X-Account-Count": str(artifact.count),
                 "X-Content-Type-Options": "nosniff",
             },
         )
@@ -5589,6 +5756,13 @@ def create_app(
             if reuse_registration_proxy
             else app["card_link_proxy_store"]
         )
+        proxy_mode = str(body.get("proxy_mode") or "").strip().lower()
+        country_routing_requested = bool(
+            proxy_mode
+            or body.get("create_proxy_country")
+            or body.get("promotion_proxy_country")
+            or body.get("secondary_proxy_country")
+        )
         create_proxy_country = str(
             body.get("create_proxy_country") or ""
         ).strip().upper()
@@ -5606,24 +5780,56 @@ def create_app(
             or registration_environment.get("proxy_country")
             or ""
         ).strip().upper()
-        proxy_mode = str(body.get("proxy_mode") or "").strip().lower()
+        if (
+            method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+            and country_routing_requested
+        ):
+            fixed_proxy_country = CardLinkProxyCountryPolicy.for_method(method)
+            create_proxy_country = fixed_proxy_country
+            promotion_proxy_country = fixed_proxy_country
+            secondary_proxy_country = fixed_proxy_country
+        proxy_candidate_logs: list[str] = []
 
         async def configured_proxy_for_country(
             selected_country: str, legacy_value: object
         ) -> str:
+            legacy_proxy = _normalize_card_link_proxy_url(str(legacy_value or ""))
             if selected_country:
-                try:
-                    proxy_url, _ = await asyncio.to_thread(
-                        proxy_store.proxy_for_country,
+
+                def build_proxy_candidate() -> str:
+                    try:
+                        proxy_url, _ = proxy_store.proxy_for_country(
+                            selected_country,
+                            mode=proxy_mode,
+                        )
+                    except ValueError as error:
+                        if legacy_proxy:
+                            return legacy_proxy
+                        raise RuntimeError(str(error)) from error
+                    if not proxy_url:
+                        if legacy_proxy:
+                            return legacy_proxy
+                        raise RuntimeError("请先在“代理与线路”中保存代理配置")
+                    return proxy_url
+
+                if (
+                    proxy_mode == "kookeey"
+                    and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                ):
+                    selection = await asyncio.to_thread(
+                        app["card_link_proxy_resolver"].resolve,
+                        build_proxy_candidate,
                         selected_country,
-                        mode=proxy_mode,
                     )
-                except ValueError as error:
-                    raise RuntimeError(str(error)) from error
-                if not proxy_url:
-                    raise RuntimeError("请先在“代理与线路”中保存代理配置")
-                return proxy_url
-            return _normalize_card_link_proxy_url(str(legacy_value or ""))
+                    if selection.candidates_tested > 1:
+                        proxy_candidate_logs.append(
+                            f"[提链代理] {selected_country} 真实出口预检丢弃了 "
+                            f"{selection.candidates_tested - 1} 个错国或不可用候选；"
+                            f"第 {selection.candidates_tested} 个候选已匹配"
+                        )
+                    return selection.proxy_url
+                return await asyncio.to_thread(build_proxy_candidate)
+            return legacy_proxy
 
         retry_create_proxy = ""
         if method == "standard":
@@ -5731,7 +5937,12 @@ def create_app(
                     )
             except RuntimeError as error:
                 return web.json_response(
-                    {"ok": False, "error": str(error)}, status=400
+                    {"ok": False, "error": str(error)},
+                    status=(
+                        502
+                        if isinstance(error, CardLinkProxyResolutionError)
+                        else 400
+                    ),
                 )
         session = account_session(record)
         access_token = account_session_access_token(record)
@@ -5764,7 +5975,7 @@ def create_app(
             async with app["card_link_lock"]:
                 result: dict[str, Any] = {}
                 attempt_count = 0
-                accumulated_logs: list[str] = []
+                accumulated_logs: list[str] = list(proxy_candidate_logs)
                 for attempt_count in range(1, attempt_limit + 1):
                     attempt_create_proxy = (
                         retry_create_proxy
@@ -5804,6 +6015,7 @@ def create_app(
                             create_proxy_url=attempt_create_proxy,
                             promotion_proxy_url=attempt_promotion_proxy,
                             target_amount=target_amount,
+                            shared_presenter=app["card_link_bridge_service"],
                         )
                     except CardLinkBridgeError as error:
                         accumulated_logs.extend(error.logs)
@@ -6460,6 +6672,8 @@ def create_app(
         token = str(request.match_info.get("token") or "")
         record = app["protocol_registration_manager"].token_record(token)
         if not record:
+            record = app["plus_codex_presenter"].token_record(token)
+        if not record:
             return web.Response(
                 text="协议取码令牌已失效",
                 status=404,
@@ -6484,6 +6698,21 @@ def create_app(
     async def smsbower_status(_: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, **app["smsbower_client"].public_state()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def payment_sms_status(_: web.Request) -> web.Response:
+        resolver = app["payment_sms_resolver"]
+        selected = resolver.resolve()
+        return web.json_response(
+            {
+                "ok": True,
+                "configured": selected is not None,
+                "provider": selected.provider if selected else "",
+                "label": selected.label if selected else "",
+                "defaultProvider": resolver.preferred_provider(),
+                "timeoutSeconds": 60,
+            },
             headers={"Cache-Control": "no-store"},
         )
 
@@ -7689,6 +7918,110 @@ def create_app(
             {"ok": True, **state}, headers={"Cache-Control": "no-store"}
         )
 
+    def paypal_auto_device_id(request: web.Request, *, create: bool = False) -> str:
+        device_id = str(
+            request.cookies.get(PAYPAL_AUTO_DEVICE_COOKIE_NAME) or ""
+        ).strip()
+        if re.fullmatch(r"[a-f0-9]{32}", device_id):
+            return device_id
+        session_cookie = str(request.cookies.get(SESSION_COOKIE_NAME) or "")
+        if create and session_cookie:
+            return hmac.new(
+                str(app["local_token"]).encode("utf-8"),
+                session_cookie.encode("utf-8"),
+                "sha256",
+            ).hexdigest()[:32]
+        return secrets.token_hex(16) if create else ""
+
+    async def account_paypal_payment_status(request: web.Request) -> web.Response:
+        job_id = str(request.match_info.get("job_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", job_id):
+            return web.json_response(
+                {"ok": False, "error": "协议支付任务 ID 无效"}, status=400
+            )
+        try:
+            log_offset = max(0, int(request.query.get("log_offset", "0") or 0))
+            log_after = max(0, int(request.query.get("log_after", "0") or 0))
+        except ValueError:
+            return web.json_response(
+                {"ok": False, "error": "日志偏移量无效"}, status=400
+            )
+        device_id = paypal_auto_device_id(request)
+        if not device_id:
+            return web.json_response(
+                {"ok": False, "error": "协议支付任务会话已失效"}, status=404
+            )
+        status, upstream = await app["paypal_service"].get_job(
+            job_id, device_id=device_id, log_offset=log_offset, log_after=log_after
+        )
+        if status != 200:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": str(upstream.get("error") or "协议支付任务状态读取失败"),
+                },
+                status=status if 400 <= status < 600 else 502,
+            )
+        upstream = reconcile_openai_protocol_job(upstream)
+        result = upstream.get("result") if isinstance(upstream, dict) else None
+        if (
+            isinstance(upstream, dict)
+            and upstream.get("status") == "completed"
+            and isinstance(result, dict)
+            and result.get("status") == "success"
+        ):
+            confirmation = await app["payment_completion_presenter"].confirm(upstream)
+            if str(confirmation.get("status") or "") == "plus":
+                resolved_sms = app["payment_sms_resolver"].resolve()
+                delivery = await app["plus_codex_presenter"].ensure(
+                    job=upstream,
+                    confirmation=confirmation,
+                    base_url=str(browser_service_url).rstrip("/"),
+                    sms_provider=str(
+                        upstream.get("sms_provider")
+                        or (resolved_sms.provider if resolved_sms else "")
+                    ),
+                )
+                confirmation = PlusCodexView.merge_confirmation(
+                    confirmation, delivery
+                )
+                upstream = {**upstream, "plus_codex": delivery}
+            upstream = {**upstream, "account_confirmation": confirmation}
+        return web.json_response(
+            {"ok": True, "job": upstream}, headers={"Cache-Control": "no-store"}
+        )
+
+    async def cancel_account_paypal_payment(request: web.Request) -> web.Response:
+        if not _local_token_valid(request, app):
+            return web.json_response(
+                {"ok": False, "error": "本地请求令牌无效"}, status=403
+            )
+        job_id = str(request.match_info.get("job_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", job_id):
+            return web.json_response(
+                {"ok": False, "error": "协议支付任务 ID 无效"}, status=400
+            )
+        device_id = paypal_auto_device_id(request)
+        if not device_id:
+            return web.json_response(
+                {"ok": False, "error": "协议支付任务会话已失效"}, status=404
+            )
+        status, upstream = await app["paypal_service"].cancel_job(
+            job_id, device_id=device_id
+        )
+        if status != 200:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": str(upstream.get("error") or "协议支付任务取消失败"),
+                },
+                status=status if 400 <= status < 600 else 502,
+            )
+        job = upstream.get("job") if isinstance(upstream.get("job"), dict) else upstream
+        return web.json_response(
+            {"ok": True, "job": job}, headers={"Cache-Control": "no-store"}
+        )
+
     async def start_account_paypal_payment(request: web.Request) -> web.Response:
         if not _local_token_valid(request, app):
             return web.json_response(
@@ -7772,12 +8105,18 @@ def create_app(
                 status=409,
             )
         sms_state = app["smsbower_config_store"].public_state()
-        if not sms_state.get("configured"):
+        resolved_sms = app["payment_sms_resolver"].resolve()
+        if resolved_sms is None:
             return web.json_response(
-                {"ok": False, "error": "请先在系统设置配置 SMSBower API Key"},
+                {
+                    "ok": False,
+                    "error": "请先在接码配置中设置 SMSBower 或 HeroSMS API Key",
+                },
                 status=409,
             )
+        sms_provider = resolved_sms.provider
         proxy_url = ""
+        proxy_urls: list[str] = []
         proxy_mode = ""
         proxy_source = ""
         proxy_error = ""
@@ -7796,17 +8135,23 @@ def create_app(
             candidate_mode = preferred_mode or str(
                 proxy_state.get("mode") or "dynamic"
             )
-            try:
-                candidate_url, _ = proxy_store.proxy_for_country(
-                    link_proxy_country, mode=candidate_mode
-                )
-            except ValueError as error:
-                proxy_error = str(error)
-                continue
-            if candidate_url:
-                proxy_url = candidate_url
-                proxy_mode = candidate_mode
-                proxy_source = candidate_source
+            for _ in range(PAYPAL_PROTOCOL_PROXY_CANDIDATES):
+                try:
+                    candidate_url, _ = proxy_store.proxy_for_country(
+                        link_proxy_country, mode=candidate_mode
+                    )
+                except ValueError as error:
+                    proxy_error = str(error)
+                    break
+                if candidate_url and candidate_url not in proxy_urls:
+                    proxy_urls.append(candidate_url)
+                    if not proxy_url:
+                        proxy_url = candidate_url
+                        proxy_mode = candidate_mode
+                        proxy_source = candidate_source
+                if len(proxy_urls) >= PAYPAL_PROTOCOL_PROXY_CANDIDATES:
+                    break
+            if len(proxy_urls) >= PAYPAL_PROTOCOL_PROXY_CANDIDATES:
                 break
         if not proxy_url:
             return web.json_response(
@@ -7816,22 +8161,11 @@ def create_app(
                 },
                 status=409,
             )
-        session_cookie = str(request.cookies.get(SESSION_COOKIE_NAME) or "")
-        device_id = str(
-            request.cookies.get(PAYPAL_AUTO_DEVICE_COOKIE_NAME) or ""
-        ).strip()
-        if not device_id and session_cookie:
-            device_id = hmac.new(
-                str(app["local_token"]).encode("utf-8"),
-                session_cookie.encode("utf-8"),
-                "sha256",
-            ).hexdigest()[:32]
-        if not re.fullmatch(r"[a-f0-9]{32}", device_id):
-            device_id = secrets.token_hex(16)
+        device_id = paypal_auto_device_id(request, create=True)
         protocol_payload = {
             "paypal_url": paypal_url,
             "country": protocol_country,
-            "sms_provider": "smsbower",
+            "sms_provider": sms_provider,
             "sms_service": "paypal",
             "sms_country": protocol_country,
             "sms_max_price": (
@@ -7841,9 +8175,10 @@ def create_app(
                 if protocol_country == "GB"
                 else sms_state.get("maxPrice")
             ),
-            "proxy_pool": [proxy_url],
+            "proxy_pool": proxy_urls,
             "source_account_email": email,
             "account_cookies": cookies,
+            "completion_target": "openai_plus",
         }
         status, upstream = await app["paypal_service"].create_job(
             protocol_payload, device_id=device_id
@@ -7867,12 +8202,16 @@ def create_app(
                 "cookieCount": len(cookies),
                 "proxyMode": proxy_mode,
                 "proxySource": proxy_source,
-                "smsProvider": "smsbower",
+                "proxyCandidateCount": len(proxy_urls),
+                "smsProvider": sms_provider,
+                "smsProviderLabel": resolved_sms.label,
                 "smsService": "paypal",
                 "smsServiceCode": "ts",
                 "smsCountry": protocol_country,
                 "smsMaxPrice": protocol_payload["sms_max_price"],
-                "smsVirtualAllowed": protocol_country == "US",
+                "smsVirtualAllowed": (
+                    resolved_sms.virtual_us and protocol_country == "US"
+                ),
                 "job": job,
                 "url": "/paypal-pay/",
             },
@@ -8000,12 +8339,19 @@ def create_app(
     app.router.add_get("/", index)
     app.router.add_get("/api/paypal/status", paypal_status)
     app.router.add_post("/api/account/paypal-payment", start_account_paypal_payment)
+    app.router.add_get(
+        "/api/account/paypal-payment/{job_id}", account_paypal_payment_status
+    )
+    app.router.add_post(
+        "/api/account/paypal-payment/{job_id}/cancel", cancel_account_paypal_payment
+    )
     app.router.add_route("*", PAYPAL_PROTOCOL_PREFIX, paypal_proxy)
     app.router.add_route("*", f"{PAYPAL_PROTOCOL_PREFIX}/{{tail:.*}}", paypal_proxy)
     app.router.add_get("/api/gpt-emails", gpt_emails)
     app.router.add_post("/api/account/type", account_type_update)
     app.router.add_post("/api/gpt-credential", gpt_credential)
     app.router.add_post("/api/gpt-accounts/export", export_gpt_accounts)
+    app.router.add_post("/api/plus-accounts/export", export_plus_accounts)
     app.router.add_post(
         "/api/account/import-workbench", import_workbench_account
     )
@@ -8044,6 +8390,7 @@ def create_app(
     )
     app.router.add_get("/api/smsbower/status", smsbower_status)
     app.router.add_post("/api/smsbower/config", smsbower_config)
+    app.router.add_get("/api/payment-sms/status", payment_sms_status)
     app.router.add_get("/api/zkgmail/status", zkgmail_status)
     app.router.add_post("/api/zkgmail/config", zkgmail_config)
     app.router.add_get(

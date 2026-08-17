@@ -2,10 +2,12 @@ import asyncio
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import unquote, urlsplit
 
@@ -16,6 +18,10 @@ from hidemyemail_generator.account_verifier import mark_account_session_invalid
 from hidemyemail_generator.browser_tasks import (
     _save_account_record,
     load_account_record,
+)
+from hidemyemail_generator.card_link_proxy_resolver import (
+    CardLinkProxyResolutionError,
+    CardLinkProxyResolver,
 )
 from hidemyemail_generator.inbox import (
     InboxConfig,
@@ -168,6 +174,45 @@ class WebAppStdioTests(unittest.TestCase):
                 app["browser_manager"].target_project_dir,
                 packaged.resolve(),
             )
+
+
+class CardLinkProxyResolverTests(unittest.TestCase):
+    def test_discards_wrong_country_before_returning_matching_candidate(self):
+        candidates = iter(["http://candidate-one", "http://candidate-two"])
+        observed = iter(["NL", "GB"])
+        resolver = CardLinkProxyResolver(
+            health_detector=lambda *_args, **_kwargs: SimpleNamespace(
+                success=True,
+                country=next(observed),
+            ),
+            max_candidates=3,
+        )
+
+        selection = resolver.resolve(lambda: next(candidates), "GB")
+
+        self.assertEqual(selection.proxy_url, "http://candidate-two")
+        self.assertEqual(selection.actual_country, "GB")
+        self.assertEqual(selection.candidates_tested, 2)
+        self.assertEqual(selection.observations, ("NL", "GB"))
+
+    def test_exhaustion_error_reports_countries_without_proxy_credentials(self):
+        secret_url = "http://private-user:private-password@proxy.example:1000"
+        resolver = CardLinkProxyResolver(
+            health_detector=lambda *_args, **_kwargs: SimpleNamespace(
+                success=True,
+                country="NL",
+            ),
+            max_candidates=2,
+        )
+
+        with self.assertRaises(CardLinkProxyResolutionError) as context:
+            resolver.resolve(lambda: secret_url, "GB")
+
+        detail = str(context.exception)
+        self.assertIn("连续 2 个 GB", detail)
+        self.assertIn("NL、NL", detail)
+        self.assertNotIn("private-user", detail)
+        self.assertNotIn("private-password", detail)
 
 
 class WorkbenchOpenAICodeEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -328,6 +373,20 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self.temp_dir.cleanup()
 
+    def save_setting(self, key, value):
+        connection = connect_db(str(self.app["db_file"]))
+        try:
+            connection.execute(
+                """
+                INSERT INTO settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, json.dumps(value)),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     async def test_generates_and_persists_card_link(self):
         generated = {
             "status": "success",
@@ -483,8 +542,12 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["smsProvider"], "smsbower")
         self.assertEqual(protocol["source_account_email"], "card-link@icloud.com")
         self.assertEqual(protocol["account_cookies"], cookies)
+        self.assertEqual(protocol["completion_target"], "openai_plus")
         self.assertEqual(protocol["country"], "TH")
         self.assertEqual(protocol["sms_provider"], "smsbower")
+        self.assertEqual(len(protocol["proxy_pool"]), 3)
+        self.assertEqual(len(set(protocol["proxy_pool"])), 3)
+        self.assertEqual(payload["proxyCandidateCount"], 3)
         self.assertIn("-region-TH-sid-", unquote(urlsplit(protocol["proxy_pool"][0]).username or ""))
         set_cookies = "\n".join(response.headers.getall("Set-Cookie", []))
         self.assertIn("paypal_web_device_id=", set_cookies)
@@ -539,6 +602,60 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["smsServiceCode"], "ts")
         self.assertEqual(payload["smsMaxPrice"], 0.25)
         self.assertTrue(payload["smsVirtualAllowed"])
+
+    async def test_one_click_paypal_uses_configured_hero_sms_provider(self):
+        email = "hero-paypal-phone@zkgmail.com"
+        _save_account_record(
+            self.app["db_file"],
+            email,
+            result={"cookies_json": '[{"name":"session","value":"cookie"}]'},
+        )
+        _save_account_card_link(
+            self.app["db_file"],
+            email,
+            url="https://www.paypal.com/agreements/approve?ba_token=hero_phone",
+            country="US",
+            currency="USD",
+            method="paypal_us",
+            link_proxy_country="US",
+            link_proxy_ip="203.0.113.38",
+        )
+        self.app["card_link_proxy_store"].configure(
+            enabled=True,
+            mode="dynamic",
+            country="US",
+            proxy_line="extract.example:3010:extract-user:extract-password",
+            card_link_modes={"paypal_us": "dynamic"},
+        )
+        self.save_setting(
+            "paypal_sms_config_v1", {"defaultProvider": "hero-sms"}
+        )
+        self.save_setting(
+            "hero_sms_phone_config_v1", {"apiKey": "hero-test-key"}
+        )
+        created = mock.AsyncMock(
+            return_value=(201, {"job": {"id": "pay-hero-phone"}})
+        )
+
+        with mock.patch.object(self.app["paypal_service"], "create_job", created):
+            response = await self.client.post(
+                "/api/account/paypal-payment",
+                json={"email": email},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        protocol = created.await_args.args[0]
+        self.assertEqual(response.status, 201)
+        self.assertEqual(protocol["sms_provider"], "hero-sms")
+        self.assertEqual(payload["smsProvider"], "hero-sms")
+        self.assertEqual(payload["smsProviderLabel"], "HeroSMS")
+        self.assertFalse(payload["smsVirtualAllowed"])
+        status = await self.client.get("/api/payment-sms/status")
+        status_payload = await status.json()
+        self.assertTrue(status_payload["configured"])
+        self.assertEqual(status_payload["provider"], "hero-sms")
+        self.assertEqual(status_payload["timeoutSeconds"], 60)
 
     async def test_one_click_gb_paypal_uses_gb_proxy_phone_and_budget(self):
         email = "gb-paypal-phone@zkgmail.com"
@@ -1222,6 +1339,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             call["target_project_dir"], self.app["card_link_bridge_file"].parents[2]
         )
+        self.assertIs(call["shared_presenter"], self.app["card_link_bridge_service"])
 
     async def test_generates_gb_paypal_link_with_first_proxy_only(self):
         browser_manager = self.app["browser_manager"]
@@ -1278,6 +1396,128 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             call["target_project_dir"], self.app["card_link_bridge_file"].parents[2]
         )
+        self.assertIs(call["shared_presenter"], self.app["card_link_bridge_service"])
+
+    async def test_gb_kookeey_preflight_discards_nl_without_using_link_attempt(self):
+        self.app["card_link_proxy_store"].configure(
+            enabled=True,
+            mode="kookeey",
+            country="TH",
+            proxy_endpoint="gate.kookeey.info:1000",
+            proxy_username="1234567-AbCdEf1234",
+            proxy_password="private-secret",
+        )
+        candidates = []
+        countries = iter(["NL", "GB"])
+
+        def detector(proxy_url, **_kwargs):
+            candidates.append(proxy_url)
+            return SimpleNamespace(success=True, country=next(countries))
+
+        self.app["card_link_proxy_resolver"] = CardLinkProxyResolver(
+            health_detector=detector,
+            max_candidates=3,
+        )
+        generated = {
+            "status": "success",
+            "url": "https://www.paypal.com/agreements/approve?ba_token=gb_preflight",
+            "method": "paypal_gb",
+            "country": "GB",
+            "currency": "GBP",
+            "link_proxy_country": "GB",
+            "link_proxy_ip": "203.0.113.38",
+        }
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=mock.AsyncMock(return_value=generated),
+            ) as bridge,
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "paypal_gb",
+                    "proxy_mode": "kookeey",
+                    # Simulate a stale browser snapshot: the method is
+                    # authoritative and must bind every proxy role to GB.
+                    "create_proxy_country": "NL",
+                    "promotion_proxy_country": "NL",
+                    "secondary_proxy_country": "NL",
+                    "independent_proxy_pair": True,
+                    "attempt_limit": 3,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        passwords = [unquote(urlsplit(item).password or "") for item in candidates]
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["attemptCount"], 1)
+        self.assertEqual(payload["attemptLimit"], 3)
+        self.assertEqual(len(candidates), 2)
+        self.assertNotEqual(candidates[0], candidates[1])
+        self.assertTrue(
+            all(
+                re.fullmatch(r"private-secret-GB-[A-Za-z0-9]{8}-5m", password)
+                for password in passwords
+            )
+        )
+        self.assertEqual(bridge.await_count, 1)
+        self.assertEqual(bridge.await_args.kwargs["create_proxy_url"], candidates[1])
+        self.assertEqual(bridge.await_args.kwargs["promotion_proxy_url"], candidates[1])
+        self.assertTrue(any("预检丢弃了 1 个" in item for item in payload["logs"]))
+
+    async def test_gb_kookeey_preflight_exhaustion_never_starts_bridge(self):
+        self.app["card_link_proxy_store"].configure(
+            enabled=True,
+            mode="kookeey",
+            country="TH",
+            proxy_endpoint="gate.kookeey.info:1000",
+            proxy_username="1234567-AbCdEf1234",
+            proxy_password="private-secret",
+        )
+        self.app["card_link_proxy_resolver"] = CardLinkProxyResolver(
+            health_detector=lambda *_args, **_kwargs: SimpleNamespace(
+                success=True,
+                country="NL",
+            ),
+            max_candidates=2,
+        )
+        bridge = mock.AsyncMock()
+        with (
+            mock.patch(
+                "hidemyemail_generator.webapp.access_token_is_expired",
+                return_value=False,
+            ),
+            mock.patch(
+                "hidemyemail_generator.webapp._run_card_link_bridge",
+                new=bridge,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/account/card-link",
+                json={
+                    "email": "card-link@icloud.com",
+                    "method": "paypal_gb",
+                    "proxy_mode": "kookeey",
+                    "create_proxy_country": "GB",
+                    "independent_proxy_pair": True,
+                    "attempt_limit": 3,
+                },
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        payload = await response.json()
+        self.assertEqual(response.status, 502)
+        self.assertEqual(bridge.await_count, 0)
+        self.assertIn("连续 2 个 GB", payload["error"])
+        self.assertIn("NL、NL", payload["error"])
+        self.assertNotIn("private-secret", payload["error"])
 
 
     async def test_independent_extraction_proxy_selects_first_and_second_exits(self):

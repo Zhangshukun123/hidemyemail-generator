@@ -16,7 +16,7 @@ class PageSpec:
 
     template: str
     styles: tuple[str, ...]
-    script: str
+    scripts: tuple[str, ...]
 
 
 class PageBuilder:
@@ -31,7 +31,7 @@ class PageBuilder:
     def build(self, spec: PageSpec) -> str:
         page = self._read(spec.template)
         css = "\n".join(self._read(path) for path in spec.styles)
-        script = self._read(spec.script)
+        script = "\n".join(self._read(path) for path in spec.scripts)
         return page.replace("{{PAGE_STYLES}}", css).replace(
             "{{PAGE_SCRIPT}}", script
         )
@@ -43,7 +43,7 @@ def build_app_page() -> str:
         PageSpec(
             template="templates/app.html",
             styles=("static/base.css", "static/app.css", "static/workbench.css"),
-            script="static/app.js",
+            scripts=("static/app.js", "static/plus_exports.js"),
         )
     )
 
@@ -54,6 +54,6 @@ def build_login_page() -> str:
         PageSpec(
             template="templates/login.html",
             styles=("static/base.css", "static/login.css"),
-            script="static/login.js",
+            scripts=("static/login.js",),
         )
     )

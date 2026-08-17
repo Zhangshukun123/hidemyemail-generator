@@ -649,7 +649,12 @@ def message_to_record(
     }
 
 
-def insert_message(conn: sqlite3.Connection, record: dict) -> bool:
+def insert_message(
+    conn: sqlite3.Connection,
+    record: dict,
+    *,
+    address_source: str = "inbox",
+) -> bool:
     try:
         cursor = conn.execute(
             """
@@ -670,7 +675,12 @@ def insert_message(conn: sqlite3.Connection, record: dict) -> bool:
     record["id"] = cursor.lastrowid
     if record.get("hme_address"):
         # No note: anything non-empty here would overwrite the user's own note.
-        upsert_address(conn, record["hme_address"], state="unused", source="inbox")
+        upsert_address(
+            conn,
+            record["hme_address"],
+            state="unused",
+            source=address_source,
+        )
     conn.commit()
     return True
 

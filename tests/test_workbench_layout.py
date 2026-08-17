@@ -18,7 +18,6 @@ class WorkbenchLayoutTests(unittest.TestCase):
             'class="control-task-panel"',
             'class="workbench-terminal-panel"',
             'class="workbench-footer"',
-            'class="runtime-log-drawer"',
         )
         for region in regions:
             self.assertIn(region, self.page)
@@ -84,24 +83,43 @@ class WorkbenchLayoutTests(unittest.TestCase):
         self.assertIn('<meta name="theme-color" content="#0d0d0d">', self.page)
         self.assertIn('resolved === "dark" ? "#0d0d0d" : "#f7f7f5"', self.page)
 
-    def test_runtime_log_is_presented_as_a_right_side_drawer(self):
-        self.assertIn("class RuntimeLogView", self.page)
-        self.assertIn("class RuntimeLogPresenter", self.page)
-        self.assertIn('data-action="open-runtime-log"', self.page)
+    def test_terminal_is_the_only_runtime_log_surface(self):
+        self.assertIn('id="workbenchTerminalPanel"', self.page)
+        self.assertIn('id="terminalPreviewList"', self.page)
+        self.assertIn('id="terminalPreviewTitle">终端</button>', self.page)
+        self.assertIn('data-action="toggle-terminal-preview"', self.page)
         self.assertIn('id="sidebarRuntimeLabel"', self.page)
         self.assertNotIn('id="statusBarRuntimeLabel"', self.page)
         self.assertNotIn('$("statusBarRuntime").dataset.status', self.page)
-        self.assertIn("--runtime-log-drawer-width: 680px", self.page)
-        self.assertIn("width: min(var(--runtime-log-drawer-width, 680px)", self.page)
-        self.assertIn("top: var(--workbench-titlebar-height)", self.page)
-        self.assertIn("right: 0", self.page)
-        self.assertIn("bottom: 0", self.page)
-        self.assertIn("left: auto", self.page)
-        self.assertIn("border-left: 1px solid var(--border-strong)", self.page)
-        self.assertIn("animation: runtime-log-drawer-in 200ms", self.page)
+        for removed_marker in (
+            'id="runtimeLogButton"',
+            'id="runtimeLogDrawer"',
+            'id="runtimeLogBackdrop"',
+            'data-action="open-runtime-log"',
+            'data-action="close-runtime-log"',
+            'data-action="copy-runtime-logs"',
+            'class="runtime-log-drawer"',
+            "class RuntimeLogView",
+            "class RuntimeLogResizeView",
+            "class RuntimeLogResizePresenter",
+            "--runtime-log-drawer-width",
+        ):
+            self.assertNotIn(removed_marker, self.page)
 
-    def test_runtime_log_drawer_has_an_accessible_mvp_resize_control(self):
+    def test_terminal_log_has_an_accessible_collapsible_scroll_surface(self):
         expected_markup = (
+            'id="workbenchTerminalPanel"',
+            'aria-labelledby="terminalPreviewTitle"',
+            'id="terminalPreviewList"',
+            'role="log"',
+            'aria-live="off"',
+            'data-action="toggle-terminal-preview"',
+            'aria-label="折叠终端日志"',
+        )
+        for marker in expected_markup:
+            self.assertIn(marker, self.page)
+
+        removed_resize_markup = (
             'id="runtimeLogResizeHandle"',
             'role="separator"',
             'aria-label="调整运行日志宽度"',
@@ -111,30 +129,25 @@ class WorkbenchLayoutTests(unittest.TestCase):
             'aria-valuemax="1200"',
             'aria-valuenow="680"',
         )
-        for marker in expected_markup:
-            self.assertIn(marker, self.page)
+        for marker in removed_resize_markup:
+            self.assertNotIn(marker, self.page)
 
         expected_behavior = (
-            "class RuntimeLogResizeView",
-            "class RuntimeLogResizePresenter",
-            'this.storageKey = "hme_runtime_log_width"',
-            'resizeHandle.addEventListener("pointerdown"',
-            'resizeHandle.addEventListener("pointermove"',
-            'resizeHandle.addEventListener("keydown"',
-            'resizeHandle.addEventListener("dblclick"',
-            "this.runtimeLogResizePresenter.restore()",
+            "class TerminalLogView",
+            "class TerminalLogPresenter",
+            "this.terminalLogPresenter.present(state)",
+            "setTerminalPreviewCollapsed(",
+            'this.commands.register("toggle-terminal-preview"',
+            'localStorage.setItem("hme_terminal_preview_collapsed"',
         )
         for marker in expected_behavior:
             self.assertIn(marker, self.page)
 
         expected_styles = (
-            ".runtime-log-resize-handle",
-            "cursor: ew-resize",
-            "touch-action: none",
-            "container: runtime-log / inline-size",
-            "@container runtime-log (max-width: 459px)",
-            "@media (forced-colors: active)",
-            "background: Highlight",
+            ".workbench-terminal-panel",
+            ".terminal-preview-list",
+            "overflow: auto",
+            ".workbench-terminal-panel.is-collapsed .terminal-preview-list",
         )
         for marker in expected_styles:
             self.assertIn(marker, self.page)
@@ -221,9 +234,8 @@ class WorkbenchLayoutTests(unittest.TestCase):
             "function workspaceTaskRows(state)",
             "normalizeWorkspaceTaskStatus",
             "this.renderControlCenter(state)",
-            "renderTerminalPreview(model)",
-            "this.runtimeLogPresenter.model",
-            "redactRuntimeLogText(raw.message)",
+            "this.terminalLogPresenter.present(state)",
+            "redactTerminalLogText(raw.message)",
             'this.commands.register("toggle-terminal-preview"',
             'this.commands.register("focus-control-task-search"',
             "scheduleWorkspaceRefresh()",

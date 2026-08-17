@@ -256,9 +256,37 @@ _PROXY_EXIT_PROBES = (
 
 _PROXY_EXIT_CACHE_TTL = 900.0
 
+_PROXY_EXIT_CACHE_MAX_ENTRIES = 256
+
 _PROXY_EXIT_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
 
 _PROXY_EXIT_CACHE_LOCK = threading.Lock()
+
+
+def clear_proxy_exit_cache() -> None:
+    """Clear request-scoped proxy identity state at a shared-worker boundary."""
+
+    with _PROXY_EXIT_CACHE_LOCK:
+        _PROXY_EXIT_CACHE.clear()
+
+
+def _prune_proxy_exit_cache(now: float) -> None:
+    expired = [
+        key
+        for key, (created_at, _payload) in _PROXY_EXIT_CACHE.items()
+        if now - created_at > _PROXY_EXIT_CACHE_TTL
+    ]
+    for key in expired:
+        _PROXY_EXIT_CACHE.pop(key, None)
+    overflow = len(_PROXY_EXIT_CACHE) - _PROXY_EXIT_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        oldest = sorted(
+            _PROXY_EXIT_CACHE,
+            key=lambda key: _PROXY_EXIT_CACHE[key][0],
+        )[:overflow]
+        for key in oldest:
+            _PROXY_EXIT_CACHE.pop(key, None)
+
 
 def _new_proxy_probe_session():
     """Create an isolated probe client with the payment stack's TLS profile."""
@@ -339,6 +367,7 @@ def detect_proxy_health(
     cache_key = _proxy_exit_cache_key(normalized)
     if session is None:
         with _PROXY_EXIT_CACHE_LOCK:
+            _prune_proxy_exit_cache(time.monotonic())
             cached = _PROXY_EXIT_CACHE.get(cache_key)
             if cached and time.monotonic() - cached[0] <= _PROXY_EXIT_CACHE_TTL:
                 base = dict(cached[1])
@@ -390,7 +419,9 @@ def detect_proxy_health(
         return ProxyHealthResult(False, failed_stage="出口", error="；".join(exit_errors))
     if session is None:
         with _PROXY_EXIT_CACHE_LOCK:
-            _PROXY_EXIT_CACHE[cache_key] = (time.monotonic(), dict(base))
+            now = time.monotonic()
+            _PROXY_EXIT_CACHE[cache_key] = (now, dict(base))
+            _prune_proxy_exit_cache(now)
 
     if not check_chatgpt:
         return ProxyHealthResult(True, **base)
@@ -551,7 +582,7 @@ def opll_proxy_is_loopback(proxy_url: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 def opll_describe_proxy_endpoint(proxy_url: str) -> str:
-    """把代理 URL 收成可读出口标签：region/sid/host:port（不含密码）。"""
+    """把代理 URL 收成不含凭据的 region/sid/host:port 出口标签。"""
     text = str(proxy_url or "").strip()
     if not text:
         return "直连"
@@ -598,11 +629,6 @@ def opll_describe_proxy_endpoint(proxy_url: str) -> str:
         parts.append(f"sid={sid}")
     if duration:
         parts.append(f"t={duration}")
-    if username and not region and not sid:
-        # 非提供商格式时给一点 user 前缀，仍不带密码
-        user_prefix = username.split(":")[0][:36]
-        if user_prefix:
-            parts.append(f"user={user_prefix}")
     return " ".join(parts)
 
 def opll_format_approve_proxy_fingerprint(

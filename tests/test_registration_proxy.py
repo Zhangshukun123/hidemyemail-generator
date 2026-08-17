@@ -172,6 +172,21 @@ class RegistrationProxyStoreTests(unittest.TestCase):
         self.assertEqual(persisted["country"], "NL")
         self.assertEqual(persisted["cardLinkCountries"]["phPromotion"], "TR")
 
+    def test_fixed_paypal_country_preferences_ignore_stale_saved_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RegistrationProxyStore(Path(temp_dir) / "hme.db")
+            saved = store.configure(
+                card_link_countries={
+                    "paypalUsCreate": "NL",
+                    "paypalUsFollowup": "JP",
+                    "paypalGbCreate": "NL",
+                }
+            )
+
+        self.assertEqual(saved["cardLinkCountries"]["paypalUsCreate"], "US")
+        self.assertEqual(saved["cardLinkCountries"]["paypalUsFollowup"], "US")
+        self.assertEqual(saved["cardLinkCountries"]["paypalGbCreate"], "GB")
+
     def test_card_link_proxy_mode_is_saved_and_does_not_change_registration_mode(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = RegistrationProxyStore(Path(temp_dir) / "hme.db")

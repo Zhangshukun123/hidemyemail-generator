@@ -33,7 +33,9 @@
 - 支持 HTTP、HTTPS、SOCKS5 代理池；带认证的 SOCKS5 可通过任务级代理桥交给 Chromium 使用。
 - 自动执行协议页面初始化、风险信号、账号流程和最终授权阶段。
 - 短信验证码错误后可继续提交，也可更换手机号重新发送。
-- 接入 SMSBower PayPal 服务：任务/API 使用 `paypal`，底层供应商请求自动转换为服务代码 `ts`；按任务国家自动购买号码、轮询 OTP、提交验证码，并在成功/失败/停止时完成或取消激活。
+- 接入 SMSBower 与 HeroSMS PayPal 服务：任务/API 使用 `paypal`，底层供应商请求自动转换为服务代码 `ts`；按任务国家自动购买号码、轮询 OTP、提交验证码，并在成功/失败/停止时完成或取消激活。
+- 页面提供独立“接码配置”入口，用于选择默认平台及保存/清除两家 API Key；Key 只保存在本地数据库且不会由状态接口回传。
+- 所有自动接码平台执行同一重启策略：单号等待 60 秒仍未取得验证码时，取消旧激活并立即重新获取手机号；默认最多尝试 10 个号码。
 - 出现浏览器验证时启动临时 Chromium，并将任务 Cookie 同步回协议会话。
 - 自动维护 EUAT Cookie、Buyer Context 与 Hermes `billingLite` 会话。
 - 所有国家优先使用在线地图规范地址，失败或并发繁忙时回退本地地址池。
@@ -55,7 +57,10 @@ paypal-agreement-protocol/
 │  ├─ manual_browser.py       # 临时 Chromium 与远程交互
 │  ├─ models.py               # 用户、地址、卡片及在线地图解析
 │  ├─ proxy.py                # 代理格式解析与代理池
-│  ├─ smsbower.py             # SMSBower PayPal 自动取号、取码与激活生命周期
+│  ├─ smsbower.py             # SMS-Activate 兼容客户端模板与 SMSBower 策略
+│  ├─ hero_sms.py             # HeroSMS PayPal 自动取号与取码策略
+│  ├─ sms_provider.py         # 自动接码 Strategy 接口与 Registry
+│  ├─ sms_config.py           # 接码配置 Model/Presenter 与本地持久化
 │  ├─ fingerprint.py          # 设备与浏览器信号
 │  ├─ analytics.py            # 页面事件与分析信号
 │  └─ tealeaf.py              # Tealeaf 会话数据
@@ -130,9 +135,11 @@ socks5h://username:password@host:port
 | `PAYPAL_WEB_MAX_TOTAL_JOBS` | 内存保留任务上限 | `200` |
 | `PAYPAL_WEB_OTP_TIMEOUT_SECONDS` | 短信验证码等待时间 | `1800` |
 | `SMSBOWER_API_KEY` | 独立运行时的 SMSBower API Key；嵌入账号工作台时自动复用本地 Key | `32位 Key` |
-| `SMSBOWER_OTP_TIMEOUT_SECONDS` | SMSBower 单个号码自动取码超时 | `300` |
-| `SMSBOWER_MAX_PHONE_ATTEMPTS` | 自动换号次数 | `3` |
+| `HERO_SMS_API_KEY` | 独立运行时的 HeroSMS API Key；也可在“接码配置”中保存 | `API Key` |
+| `SMS_MAX_PHONE_ATTEMPTS` | 所有自动平台最多重新取号次数；单号取码超时固定为 60 秒 | `10` |
+| `SMSBOWER_MAX_PHONE_ATTEMPTS` | 旧版自动换号次数变量，未设置新变量时继续兼容 | `10` |
 | `SMSBOWER_POLL_INTERVAL_SECONDS` | 取码轮询间隔 | `4` |
+| `HERO_SMS_POLL_INTERVAL_SECONDS` | HeroSMS 取码轮询间隔 | `4` |
 | `PAYPAL_MANUAL_BROWSER_LIMIT` | 临时浏览器并发数 | `2` |
 | `PAYPAL_WEB_COOKIE_SECURE` | 为会话 Cookie 添加 Secure | `1` |
 | `PAYPAL_WEB_PRODUCTION` | 开启生产模式 | `1` |

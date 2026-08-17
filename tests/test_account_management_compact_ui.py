@@ -32,7 +32,21 @@ def _workspace_payloads() -> dict[str, dict]:
         "modes": [],
     }
     return {
-        "/api/gpt-emails": {"ok": True, "items": []},
+        "/api/gpt-emails": {
+            "ok": True,
+            "items": [
+                {
+                    "email": f"layout-{index:02d}@icloud.com",
+                    "accountType": "free",
+                    "sessionStatus": "ready",
+                    "hasPassword": True,
+                    "hasSession": True,
+                    "hasTwoFactor": False,
+                    "createdAt": "2026-08-17T00:00:00+00:00",
+                }
+                for index in range(12)
+            ],
+        },
         "/api/browser/status": idle_task,
         "/api/registration/status": idle_task,
         "/api/protocol-registration/status": idle_task,
@@ -158,11 +172,54 @@ def test_account_management_registration_launchpad_is_compact_and_responsive():
         ):
             assert page.locator(f"#{element_id}").is_visible(), element_id
 
+        config_toggle = page.locator("#registrationConfigToggle")
+        config_panel = page.locator("#registrationConfigPanel")
+        register_button = page.locator("#registerProviderButton")
+        assert config_toggle.get_attribute("aria-controls") == "registrationConfigPanel"
+        assert config_toggle.get_attribute("aria-expanded") == "true"
+        assert config_panel.is_visible()
+        assert register_button.evaluate(
+            "element => element.closest('#registrationConfigPanel') === null"
+        )
+
+        config_toggle.click()
+        assert config_toggle.get_attribute("aria-expanded") == "false"
+        assert config_panel.is_hidden()
+        assert register_button.is_visible()
+        assert register_button.is_enabled()
+        assert page.evaluate(
+            "localStorage.getItem('hme_registration_config_collapsed')"
+        ) == "1"
+
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_function("document.title === '账号管理 · 账号工作台'")
+        assert config_panel.is_hidden()
+        assert config_toggle.get_attribute("aria-expanded") == "false"
+        assert register_button.is_visible()
+        config_toggle.click()
+        page.wait_for_function(
+            "!document.getElementById('registrationConfigPanel').hidden"
+        )
+
         desktop_roxy = _geometry(page)
         assert desktop_roxy["deckHeight"] <= 430
         assert desktop_roxy["tableY"] <= 590
         assert desktop_roxy["documentOverflow"] <= 1
         assert desktop_roxy["accountOverflow"] <= 1
+
+        accounts_view = page.locator("#accountsView")
+        first_account_row = page.locator("#accountTableBody tr").first
+        assert accounts_view.evaluate(
+            "element => element.scrollHeight > element.clientHeight"
+        )
+        first_account_row.scroll_into_view_if_needed()
+        view_box = accounts_view.bounding_box()
+        row_box = first_account_row.bounding_box()
+        assert view_box is not None
+        assert row_box is not None
+        assert accounts_view.evaluate("element => element.scrollTop") > 0
+        assert row_box["y"] >= view_box["y"]
+        assert row_box["y"] + row_box["height"] <= view_box["y"] + view_box["height"]
 
         page.locator(
             'label:has(input[name="registrationMode"][value="headed"])'

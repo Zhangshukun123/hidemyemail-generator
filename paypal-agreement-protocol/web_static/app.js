@@ -3,15 +3,11 @@ const GROK_API_BASE = '/api/grok-trial';
 const $ = (id) => document.getElementById(id);
 const PRIVATE_BRAINTREE_SLUG = 'bt-vault-8f1d2e4c9a7b6d3e';
 const privateBraintreeEnabled = location.pathname.includes(`/${PRIVATE_BRAINTREE_SLUG}`);
-const SMSBOWER_COUNTRY_CODES = ['BR', 'GB', 'US', 'JP', 'TH', 'ID', 'PH', 'TW', 'MX', 'AE', 'AU', 'CA'];
+const SMS_PROVIDER_IDS = ['manual', 'smsbower', 'hero-sms'];
+const SMS_PROVIDER_LABELS = {manual: '手动接码', smsbower: 'SMSBower', 'hero-sms': 'Hero-SMS'};
+const FALLBACK_SMS_COUNTRY_CODES = ['BR', 'GB', 'US', 'JP', 'TH', 'ID', 'PH', 'TW', 'MX', 'AE', 'AU', 'CA'];
+const shellParams = new URLSearchParams(location.search);
 const handoffJobId = new URLSearchParams(location.search).get('job') || '';
-
-if (/^[a-f0-9-]{6,64}$/i.test(handoffJobId)) {
-  document.body.classList.add('auto-handoff-mode');
-  const title = document.querySelector('.status-panel h2');
-  if (title) title.textContent = '自动支付进度';
-  document.title = '自动支付进度 · PAY.153';
-}
 
 const state = {
   jobId: '',
@@ -22,8 +18,10 @@ const state = {
   browserFrameUrl: '',
   logPinned: true,
   renderedLogCount: 0,
-  smsBower: {configured: false, price: null, count: 0, balance: null, error: ''},
-  smsBowerProbe: 0,
+  smsSettings: {
+    defaultProvider: 'manual', timeoutSeconds: 60, maxPhoneAttempts: 3,
+    providers: [], probe: 0, initialized: false, initialSelectionResolved: false,
+  },
 };
 
 const vaultState = {
@@ -47,22 +45,80 @@ $('vaultProxy').addEventListener('input', () => {
   sessionStorage.setItem('pay153-braintree-proxy', $('vaultProxy').value.trim());
 });
 
-function applyTheme(mode) {
-  const dark = mode === 'dark' || (mode === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
-  document.documentElement.classList.toggle('dark', dark);
-  $('themeToggle').textContent = dark ? '☀' : '◐';
+class PaymentShellModel {
+  constructor(params) {
+    this.embedded = params.get('embedded') === '1' || window.self !== window.top;
+    this.requestedTheme = ['dark', 'light'].includes(params.get('theme')) ? params.get('theme') : '';
+    this.handoffJobId = params.get('job') || '';
+  }
 }
 
-const savedTheme = localStorage.getItem('pay153-theme') || 'system';
-applyTheme(savedTheme);
-$('themeToggle').addEventListener('click', () => {
-  const next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
-  localStorage.setItem('pay153-theme', next);
-  applyTheme(next);
-});
-matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  if ((localStorage.getItem('pay153-theme') || 'system') === 'system') applyTheme('system');
-});
+class PaymentShellView {
+  constructor() {
+    this.root = document.documentElement;
+    this.themeToggle = $('themeToggle');
+  }
+
+  setEmbedded(embedded) { this.root.classList.toggle('embedded', embedded); }
+  setTheme(dark) {
+    this.root.classList.toggle('dark', dark);
+    this.themeToggle.textContent = dark ? '☀' : '◐';
+  }
+  setHandoff(jobId) {
+    if (!/^[a-f0-9-]{6,64}$/i.test(jobId)) return;
+    document.body.classList.add('auto-handoff-mode');
+    const title = document.querySelector('.status-panel h2');
+    if (title) title.textContent = '自动支付进度';
+    document.title = '自动支付进度 · PAY.153';
+  }
+}
+
+class PaymentShellPresenter {
+  constructor(model, view) {
+    this.model = model;
+    this.view = view;
+    this.colorScheme = matchMedia('(prefers-color-scheme: dark)');
+  }
+
+  parentTheme() {
+    if (!this.model.embedded || window.parent === window) return '';
+    try { return window.parent.document.documentElement.dataset.theme || ''; } catch (_) { return ''; }
+  }
+
+  applyTheme(mode, persist = false) {
+    const dark = mode === 'dark' || (mode === 'system' && this.colorScheme.matches);
+    this.view.setTheme(dark);
+    if (persist && !this.model.embedded) localStorage.setItem('pay153-theme', mode);
+  }
+
+  mount() {
+    this.view.setEmbedded(this.model.embedded);
+    this.view.setHandoff(this.model.handoffJobId);
+    const saved = localStorage.getItem('pay153-theme') || 'system';
+    this.applyTheme(this.model.requestedTheme || this.parentTheme() || (this.model.embedded ? 'dark' : saved));
+    this.view.themeToggle.addEventListener('click', () => {
+      const next = this.view.root.classList.contains('dark') ? 'light' : 'dark';
+      this.applyTheme(next, true);
+    });
+    this.colorScheme.addEventListener('change', () => {
+      if (!this.model.embedded && (localStorage.getItem('pay153-theme') || 'system') === 'system') this.applyTheme('system');
+    });
+    window.addEventListener('message', event => {
+      if (!this.model.embedded || event.origin !== location.origin || event.data?.type !== 'hme-theme') return;
+      if (['dark', 'light'].includes(event.data.theme)) this.applyTheme(event.data.theme);
+    });
+    if (this.model.embedded && window.parent !== window) {
+      try {
+        const parentRoot = window.parent.document.documentElement;
+        this.parentObserver = new MutationObserver(() => this.applyTheme(parentRoot.dataset.theme || 'dark'));
+        this.parentObserver.observe(parentRoot, {attributes: true, attributeFilter: ['data-theme']});
+      } catch (_) {}
+    }
+  }
+}
+
+const paymentShellPresenter = new PaymentShellPresenter(new PaymentShellModel(shellParams), new PaymentShellView());
+paymentShellPresenter.mount();
 
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -121,7 +177,7 @@ async function updateCountrySchemaHint(country) {
   }
 }
 
-function updateCountryFields() {
+function updateCountryFields({probe = true} = {}) {
   const select = $('paypalCountry');
   const country = select.value;
   const option = select.selectedOptions[0];
@@ -135,12 +191,8 @@ function updateCountryFields() {
   $('phone').required = true;
   $('phone').disabled = false;
   $('proxyCountryHint').textContent = `\u63a8\u8350\u586b\u5199 ${country}`;
-  if ($('smsbowerCountry').querySelector(`option[value="${country}"]`)) {
-    $('smsbowerCountry').value = country;
-    localStorage.setItem('pay153-smsbower-country', country);
-  }
   updateCountrySchemaHint(country);
-  updateSmsProvider({probe: true});
+  updateSmsProvider({probe});
 }
 
 function selectedSmsBowerCountry() {
@@ -148,111 +200,405 @@ function selectedSmsBowerCountry() {
 }
 
 function populateSmsBowerCountrySelect() {
-  const select = $('smsbowerCountry');
-  const byCode = new Map(paypalCountries.map(item => [item.code, item]));
-  select.replaceChildren();
-  SMSBOWER_COUNTRY_CODES.forEach(code => {
-    const item = byCode.get(code);
-    if (!item) return;
-    const option = document.createElement('option');
-    option.value = code;
-    option.textContent = `${code} · ${item.name_zh} · ${item.name_en}`;
-    select.appendChild(option);
-  });
-  const saved = localStorage.getItem('pay153-smsbower-country') || '';
-  const preferred = SMSBOWER_COUNTRY_CODES.includes(saved) ? saved : ($('paypalCountry').value || 'BR');
-  select.value = preferred;
-  if (!select.value) select.value = select.options[0]?.value || '';
+  smsSettingsPresenter.populateCountrySelect();
 }
 
-function renderSmsBowerStatus(data) {
-  state.smsBower = data || state.smsBower;
-  const badge = $('smsbowerStatus');
-  const hint = $('smsbowerPriceHint');
-  if (!data?.configured) {
-    badge.textContent = 'SMSBower 未配置';
-    badge.className = 'status-badge error';
-    hint.textContent = '请先在账号工作台点击“SMSBower API”保存 Key';
-    return;
+class SmsSettingsView {
+  constructor() {
+    this.panel = document.querySelector('.sms-provider-panel');
+    this.dialog = $('smsSettingsDialog');
+    this.providerSelect = $('smsProvider');
+    this.defaultProviderSelect = $('smsDefaultProvider');
+    this.countrySelect = $('smsbowerCountry');
+    this.maxPriceInput = $('smsbowerMaxPrice');
   }
-  if (data.error) {
-    badge.textContent = 'SMSBower 检查异常';
-    badge.className = 'status-badge error';
-    hint.textContent = data.error;
-    return;
-  }
-  badge.textContent = 'SMSBower 在线';
-  badge.className = 'status-badge done';
-  const price = Number(data.price);
-  const balance = Number(data.balance);
-  const service = data.service || $('smsbowerPaymentService').value || 'paypal';
-  const pieces = [service === 'paypal' ? 'PayPal' : service, `${data.country || selectedSmsBowerCountry()} 库存 ${Number(data.count) || 0}`];
-  if (Number.isFinite(price)) pieces.push(`当前 $${price.toFixed(3)}`);
-  if (Number.isFinite(balance)) pieces.push(`余额 $${balance.toFixed(2)}`);
-  hint.textContent = pieces.join(' · ');
-}
 
-async function loadSmsBowerStatus() {
-  const country = selectedSmsBowerCountry();
-  const probe = ++state.smsBowerProbe;
-  $('smsbowerStatus').textContent = '正在检查 SMSBower';
-  $('smsbowerStatus').className = 'status-badge running';
-  try {
-    const data = await api(`/smsbower/status?country=${encodeURIComponent(country)}`);
-    if (probe === state.smsBowerProbe) renderSmsBowerStatus(data);
-  } catch (error) {
-    if (probe === state.smsBowerProbe) renderSmsBowerStatus({configured: true, error: error.message});
-  }
-}
+  providerId() { return SMS_PROVIDER_IDS.includes(this.providerSelect.value) ? this.providerSelect.value : 'manual'; }
+  defaultProviderId() { return SMS_PROVIDER_IDS.includes(this.defaultProviderSelect.value) ? this.defaultProviderSelect.value : 'manual'; }
+  country() { return this.countrySelect.value || $('paypalCountry').value || 'BR'; }
+  maxPrice() { return Number(this.maxPriceInput.value); }
+  setProvider(provider) { this.providerSelect.value = SMS_PROVIDER_IDS.includes(provider) ? provider : 'manual'; }
 
-function updateSmsProvider({probe = false} = {}) {
-  const automatic = $('smsProvider').value === 'smsbower';
-  localStorage.setItem('pay153-sms-provider', automatic ? 'smsbower' : 'manual');
-  const panel = document.querySelector('.sms-provider-panel');
-  panel.dataset.provider = automatic ? 'smsbower' : 'manual';
-  $('smsbowerControls').hidden = !automatic;
-  $('phone').disabled = automatic;
-  $('phone').required = !automatic;
-  $('phoneField').classList.toggle('provider-disabled', automatic);
-  $('smsProviderHint').textContent = automatic
-    ? '任务启动后将按支付设置、国家和最高价购买号码，并自动轮询、提交验证码；失败时最多自动换号 3 次。'
-    : '使用自有手机号时，PayPal 发码后在右侧手动提交验证码。';
-  if (automatic) {
-    $('phoneLabel').textContent = '手机号由 SMSBower 自动分配';
+  bind(presenter) {
+    $('smsSettingsOpen').addEventListener('click', () => presenter.open());
+    $('smsSettingsOpenInline').addEventListener('click', () => presenter.open());
+    $('smsSettingsClose').addEventListener('click', () => this.closeDialog());
+    this.dialog.addEventListener('click', event => { if (event.target === this.dialog) this.closeDialog(); });
+    this.dialog.addEventListener('close', () => document.documentElement.classList.remove('dialog-open'));
+    this.providerSelect.addEventListener('change', () => presenter.changeProvider());
+    this.countrySelect.addEventListener('change', () => presenter.changeCountry());
+    $('smsbowerPaymentService').addEventListener('change', () => presenter.changePaymentService());
+    this.maxPriceInput.addEventListener('change', () => presenter.changeMaxPrice());
+    $('smsDefaultSave').addEventListener('click', () => presenter.saveDefaultProvider());
+    document.querySelectorAll('[data-sms-action]').forEach(button => {
+      button.addEventListener('click', () => {
+        if (button.dataset.smsAction === 'clear') presenter.clearApiKey(button.dataset.provider);
+        else presenter.saveApiKey(button.dataset.provider);
+      });
+    });
+  }
+
+  openDialog() {
+    document.documentElement.classList.add('dialog-open');
+    if (typeof this.dialog.showModal === 'function') this.dialog.showModal();
+    else this.dialog.setAttribute('open', '');
+  }
+
+  closeDialog() {
+    if (typeof this.dialog.close === 'function' && this.dialog.open) this.dialog.close();
+    else this.dialog.removeAttribute('open');
+    document.documentElement.classList.remove('dialog-open');
+  }
+
+  apiKey(provider) {
+    return (provider === 'hero-sms' ? $('heroSmsApiKey') : $('smsbowerApiKey')).value.trim();
+  }
+
+  clearApiKeyInput(provider) {
+    (provider === 'hero-sms' ? $('heroSmsApiKey') : $('smsbowerApiKey')).value = '';
+  }
+
+  setFeedback(message, kind = '') {
+    $('smsSettingsFeedback').textContent = message;
+    $('smsSettingsFeedback').className = `sms-settings-feedback${kind ? ` ${kind}` : ''}`;
+  }
+
+  setBusy(provider, busy) {
+    const selector = provider
+      ? `[data-sms-action][data-provider="${provider}"]`
+      : '#smsDefaultSave';
+    document.querySelectorAll(selector).forEach(button => { button.disabled = busy; });
+  }
+
+  renderCredential(providerId, provider) {
+    const hero = providerId === 'hero-sms';
+    const badge = $(hero ? 'heroSmsConfigBadge' : 'smsbowerConfigBadge');
+    const meta = $(hero ? 'heroSmsConfigMeta' : 'smsbowerConfigMeta');
+    const docs = $(hero ? 'heroSmsConfigDocs' : 'smsbowerConfigDocs');
+    const label = provider?.label || SMS_PROVIDER_LABELS[providerId];
+    if (!provider?.configured) {
+      badge.textContent = '未配置';
+      badge.className = 'status-badge error';
+    } else if (provider.error) {
+      badge.textContent = '检查异常';
+      badge.className = 'status-badge error';
+    } else {
+      badge.textContent = '已配置';
+      badge.className = 'status-badge done';
+    }
+    const pieces = [];
+    if (provider?.error) pieces.push(provider.error);
+    if (Number.isFinite(provider?.balance)) pieces.push(`余额 $${provider.balance.toFixed(2)}`);
+    if (Number.isFinite(provider?.price)) pieces.push(`当前价 $${provider.price.toFixed(3)}`);
+    if (Number.isFinite(provider?.count)) pieces.push(`库存 ${provider.count}`);
+    meta.textContent = pieces.join(' · ') || `${label} ${provider?.configured ? '凭据已安全保存' : '尚未保存 API Key'}`;
+    const docsUrl = provider?.docsUrl || (!hero ? 'https://smsbower.app/cn/api?page=client' : '');
+    docs.hidden = !docsUrl;
+    if (docsUrl) docs.href = docsUrl;
+  }
+
+  renderSettings(model) {
+    const settings = model.smsSettings;
+    this.defaultProviderSelect.value = SMS_PROVIDER_IDS.includes(settings.defaultProvider) ? settings.defaultProvider : 'manual';
+    $('smsConfigSummary').textContent = `默认 · ${SMS_PROVIDER_LABELS[this.defaultProviderSelect.value]}`;
+    const timeout = Number(settings.timeoutSeconds) || 60;
+    $('smsDialogTimeoutPolicy').textContent = `SMSBower 与 Hero-SMS 均在 ${timeout} 秒未收到验证码时取消旧号码，并立即重新获取手机号。`;
+    this.renderCredential('smsbower', settings.providers.find(item => item.id === 'smsbower'));
+    this.renderCredential('hero-sms', settings.providers.find(item => item.id === 'hero-sms'));
+    this.renderTaskProvider(model);
+  }
+
+  renderTaskProvider(model) {
+    const providerId = this.providerId();
+    const automatic = providerId !== 'manual';
+    const provider = model.smsSettings.providers.find(item => item.id === providerId);
+    const label = provider?.label || SMS_PROVIDER_LABELS[providerId];
+    const timeout = Number(model.smsSettings.timeoutSeconds) || 60;
+    const attempts = Number(model.smsSettings.maxPhoneAttempts) || 3;
+    this.panel.dataset.provider = providerId;
+    $('smsbowerControls').hidden = !automatic;
+    $('smsTimeoutPolicy').hidden = !automatic;
+    $('phone').disabled = automatic;
+    $('phone').required = !automatic;
+    $('phoneField').classList.toggle('provider-disabled', automatic);
+    if (!automatic) {
+      const option = $('paypalCountry').selectedOptions[0];
+      const country = $('paypalCountry').value || '';
+      $('phoneLabel').textContent = `${option?.dataset.zh || country}手机号`;
+      $('phone').placeholder = `${option?.dataset.calling || '+'} 手机号`;
+      $('smsProviderHint').textContent = '使用自有手机号时，PayPal 发码后在右侧手动提交验证码。';
+      return;
+    }
+    $('phoneLabel').textContent = `手机号由 ${label} 自动分配`;
     $('phone').placeholder = '任务运行时自动取号';
-    if (probe || !state.smsBower.configured) loadSmsBowerStatus();
-  } else {
-    const option = $('paypalCountry').selectedOptions[0];
-    const country = $('paypalCountry').value || '';
-    const zh = option?.dataset.zh || country;
-    $('phoneLabel').textContent = `${zh}手机号`;
-    $('phone').placeholder = `${option?.dataset.calling || '+'} 手机号`;
+    $('smsProviderHint').textContent = `任务使用 ${label} 自动取号取码；${timeout} 秒无验证码会取消旧号并立即重取，最多尝试 ${attempts} 个号码。`;
+    const badge = $('smsProviderStatus');
+    const meta = $('smsProviderMeta');
+    if (!provider?.configured) {
+      badge.textContent = `${label} 未配置`;
+      badge.className = 'status-badge error';
+      meta.textContent = '请打开“接码配置”保存该平台 API Key';
+    } else if (provider.error) {
+      badge.textContent = `${label} 检查异常`;
+      badge.className = 'status-badge error';
+      meta.textContent = provider.error;
+    } else {
+      badge.textContent = `${label} 在线`;
+      badge.className = 'status-badge done';
+      const pieces = ['PayPal', `${this.country()} 库存 ${Number(provider.count) || 0}`];
+      if (Number.isFinite(provider.price)) pieces.push(`当前 $${provider.price.toFixed(3)}`);
+      if (Number.isFinite(provider.balance)) pieces.push(`余额 $${provider.balance.toFixed(2)}`);
+      meta.textContent = pieces.join(' · ');
+    }
+    const docs = $('smsProviderDocs');
+    docs.hidden = !provider?.docsUrl;
+    if (provider?.docsUrl) docs.href = provider.docsUrl;
   }
 }
 
-const savedSmsProvider = localStorage.getItem('pay153-sms-provider');
-if (savedSmsProvider === 'smsbower' || savedSmsProvider === 'manual') $('smsProvider').value = savedSmsProvider;
-const savedSmsService = localStorage.getItem('pay153-smsbower-service');
-if (savedSmsService === 'ts') $('smsbowerPaymentService').value = savedSmsService;
-const savedSmsMaxPrice = Number(localStorage.getItem('pay153-smsbower-max-price'));
-if (Number.isFinite(savedSmsMaxPrice) && savedSmsMaxPrice >= 0.001 && savedSmsMaxPrice <= 50) $('smsbowerMaxPrice').value = String(savedSmsMaxPrice);
-$('smsProvider').addEventListener('change', () => {
-  const smsCountry = selectedSmsBowerCountry();
-  if ($('smsProvider').value === 'smsbower' && smsCountry && $('paypalCountry').value !== smsCountry) $('paypalCountry').value = smsCountry;
-  updateCountryFields();
-});
-$('smsbowerPaymentService').addEventListener('change', () => {
-  localStorage.setItem('pay153-smsbower-service', $('smsbowerPaymentService').value);
-  loadSmsBowerStatus();
-});
-$('smsbowerCountry').addEventListener('change', () => {
-  const country = selectedSmsBowerCountry();
-  localStorage.setItem('pay153-smsbower-country', country);
-  if ($('paypalCountry').value !== country) $('paypalCountry').value = country;
-  updateCountryFields();
-});
-$('smsbowerMaxPrice').addEventListener('change', () => localStorage.setItem('pay153-smsbower-max-price', $('smsbowerMaxPrice').value));
-updateSmsProvider();
+class SmsSettingsPresenter {
+  constructor(model, view, request) {
+    this.model = model;
+    this.view = view;
+    this.request = request;
+  }
+
+  mount() {
+    this.view.bind(this);
+    const savedProvider = localStorage.getItem('pay153-sms-provider');
+    this.view.setProvider(SMS_PROVIDER_IDS.includes(savedProvider) ? savedProvider : 'manual');
+    const savedMaxPrice = Number(localStorage.getItem('pay153-sms-max-price') || localStorage.getItem('pay153-smsbower-max-price'));
+    if (Number.isFinite(savedMaxPrice) && savedMaxPrice >= 0.001 && savedMaxPrice <= 50) this.view.maxPriceInput.value = String(savedMaxPrice);
+    this.view.renderSettings(this.model);
+  }
+
+  provider(providerId = this.view.providerId()) {
+    return this.model.smsSettings.providers.find(item => item.id === providerId);
+  }
+
+  normalizeResponse(payload) {
+    const rawProviders = Array.isArray(payload?.providers) ? payload.providers : [];
+    const providers = rawProviders.filter(item => item && ['smsbower', 'hero-sms'].includes(String(item.id || item.provider || '').toLowerCase())).map(item => {
+      const id = String(item.id || item.provider).toLowerCase();
+      const balance = item.balance == null || item.balance === '' ? null : Number(item.balance);
+      const price = item.price == null || item.price === '' ? null : Number(item.price);
+      const count = item.count == null || item.count === '' ? null : Number(item.count);
+      const defaultMaxPrice = Number(item.defaultMaxPrice);
+      return {
+        id,
+        label: String(item.label || SMS_PROVIDER_LABELS[id]),
+        configured: item.configured === true,
+        supportedCountries: Array.isArray(item.supportedCountries) ? item.supportedCountries.map(value => String(value).toUpperCase()).filter(Boolean) : [],
+        defaultMaxPrice: Number.isFinite(defaultMaxPrice) ? defaultMaxPrice : 3,
+        docsUrl: /^https?:\/\//i.test(String(item.docsUrl || '')) ? String(item.docsUrl) : '',
+        balance: Number.isFinite(balance) ? balance : null,
+        price: Number.isFinite(price) ? price : null,
+        count: Number.isFinite(count) ? count : null,
+        error: String(item.error || ''),
+      };
+    });
+    ['smsbower', 'hero-sms'].forEach(id => {
+      if (!providers.some(item => item.id === id)) providers.push({id, label: SMS_PROVIDER_LABELS[id], configured: false, supportedCountries: [], defaultMaxPrice: 3, docsUrl: '', balance: null, price: null, count: null, error: ''});
+    });
+    const defaultProvider = SMS_PROVIDER_IDS.includes(payload?.defaultProvider) ? payload.defaultProvider : 'manual';
+    return {
+      defaultProvider,
+      timeoutSeconds: Math.max(1, Number(payload?.timeoutSeconds) || 60),
+      maxPhoneAttempts: Math.max(1, Number(payload?.maxPhoneAttempts) || 3),
+      providers,
+    };
+  }
+
+  async loadLegacySmsBower(country) {
+    const legacy = await this.request(`/smsbower/status?country=${encodeURIComponent(country)}`);
+    return {
+      defaultProvider: localStorage.getItem('pay153-sms-provider') || 'manual',
+      timeoutSeconds: 60,
+      maxPhoneAttempts: 3,
+      providers: [{
+        id: 'smsbower', label: 'SMSBower', configured: legacy.configured === true,
+        supportedCountries: FALLBACK_SMS_COUNTRY_CODES, defaultMaxPrice: Number(legacy.defaultMaxPrice) || 3,
+        docsUrl: 'https://smsbower.app/cn/api?page=client', balance: legacy.balance,
+        price: legacy.price, count: legacy.count, error: legacy.error || '',
+      }],
+    };
+  }
+
+  applyResponse(payload) {
+    const normalized = this.normalizeResponse(payload);
+    Object.assign(this.model.smsSettings, normalized, {initialized: true});
+    if (!this.model.smsSettings.initialSelectionResolved) {
+      const saved = localStorage.getItem('pay153-sms-provider');
+      this.view.setProvider(SMS_PROVIDER_IDS.includes(saved) ? saved : normalized.defaultProvider);
+      this.model.smsSettings.initialSelectionResolved = true;
+    }
+    this.populateCountrySelect();
+    const provider = this.provider();
+    if (!localStorage.getItem('pay153-sms-max-price') && Number.isFinite(provider?.defaultMaxPrice)) {
+      this.view.maxPriceInput.value = String(provider.defaultMaxPrice);
+    }
+    const country = this.view.country();
+    if (this.view.providerId() !== 'manual' && country && $('paypalCountry').querySelector(`option[value="${country}"]`) && $('paypalCountry').value !== country) {
+      $('paypalCountry').value = country;
+      updateCountryFields({probe: false});
+    }
+    this.view.renderSettings(this.model);
+  }
+
+  async refresh(country = this.view.country()) {
+    const probe = ++this.model.smsSettings.probe;
+    const providerId = this.view.providerId();
+    if (providerId !== 'manual') {
+      $('smsProviderStatus').textContent = `正在检查 ${SMS_PROVIDER_LABELS[providerId]}`;
+      $('smsProviderStatus').className = 'status-badge running';
+    }
+    try {
+      let payload;
+      try {
+        payload = await this.request(`/sms/providers?country=${encodeURIComponent(country || 'BR')}`);
+      } catch (error) {
+        if (Number(error.status) !== 404) throw error;
+        payload = await this.loadLegacySmsBower(country || 'BR');
+      }
+      if (probe === this.model.smsSettings.probe) {
+        this.applyResponse(payload);
+        this.view.setFeedback('接码平台状态已同步；API Key 不会回显。', 'success');
+      }
+    } catch (error) {
+      if (probe !== this.model.smsSettings.probe) return;
+      const provider = this.provider();
+      if (provider) provider.error = error.message || String(error);
+      this.view.renderSettings(this.model);
+      this.view.setFeedback(`接码配置读取失败：${error.message || error}`, 'error');
+    }
+  }
+
+  populateCountrySelect() {
+    const select = this.view.countrySelect;
+    const previous = select.value;
+    const saved = localStorage.getItem('pay153-sms-country') || localStorage.getItem('pay153-smsbower-country') || '';
+    const supported = this.provider()?.supportedCountries || [];
+    const allowed = supported.length ? new Set(supported) : new Set(FALLBACK_SMS_COUNTRY_CODES);
+    const candidates = paypalCountries.filter(item => allowed.has(item.code));
+    select.replaceChildren();
+    candidates.forEach(item => {
+      const option = document.createElement('option');
+      option.value = item.code;
+      option.textContent = `${item.code} · ${item.name_zh} · ${item.name_en}`;
+      select.appendChild(option);
+    });
+    const preferred = [previous, saved, $('paypalCountry').value, 'BR', candidates[0]?.code].find(code => code && candidates.some(item => item.code === code));
+    select.value = preferred || '';
+  }
+
+  syncFromPayPalCountry(country, {probe = false} = {}) {
+    if (this.view.providerId() === 'manual') {
+      this.view.renderTaskProvider(this.model);
+      return;
+    }
+    if (this.view.countrySelect.querySelector(`option[value="${country}"]`)) {
+      this.view.countrySelect.value = country;
+      localStorage.setItem('pay153-sms-country', country);
+      localStorage.setItem('pay153-smsbower-country', country);
+    }
+    this.view.renderTaskProvider(this.model);
+    if (probe) this.refresh(this.view.country());
+  }
+
+  changeProvider() {
+    const providerId = this.view.providerId();
+    this.model.smsSettings.initialSelectionResolved = true;
+    localStorage.setItem('pay153-sms-provider', providerId);
+    this.populateCountrySelect();
+    const provider = this.provider(providerId);
+    if (!localStorage.getItem('pay153-sms-max-price') && Number.isFinite(provider?.defaultMaxPrice)) this.view.maxPriceInput.value = String(provider.defaultMaxPrice);
+    const country = this.view.country();
+    if (providerId !== 'manual' && country && $('paypalCountry').querySelector(`option[value="${country}"]`)) $('paypalCountry').value = country;
+    updateCountryFields({probe: false});
+    this.view.renderTaskProvider(this.model);
+    if (providerId !== 'manual') this.refresh(country);
+  }
+
+  changeCountry() {
+    const country = this.view.country();
+    localStorage.setItem('pay153-sms-country', country);
+    localStorage.setItem('pay153-smsbower-country', country);
+    if ($('paypalCountry').querySelector(`option[value="${country}"]`)) $('paypalCountry').value = country;
+    updateCountryFields({probe: false});
+    this.refresh(country);
+  }
+
+  changePaymentService() {
+    localStorage.setItem('pay153-sms-service', $('smsbowerPaymentService').value);
+    localStorage.setItem('pay153-smsbower-service', $('smsbowerPaymentService').value);
+  }
+
+  changeMaxPrice() {
+    localStorage.setItem('pay153-sms-max-price', this.view.maxPriceInput.value);
+    localStorage.setItem('pay153-smsbower-max-price', this.view.maxPriceInput.value);
+  }
+
+  open() {
+    this.view.openDialog();
+    this.view.setFeedback('正在读取接码平台状态…');
+    this.refresh();
+  }
+
+  async configure(provider, apiKey, successMessage) {
+    this.view.setBusy(provider, true);
+    try {
+      const payload = await this.request('/sms/config', {method: 'POST', body: JSON.stringify({
+        provider, apiKey, defaultProvider: this.model.smsSettings.defaultProvider,
+      })});
+      this.applyResponse(payload);
+      this.view.clearApiKeyInput(provider);
+      this.view.setFeedback(successMessage, 'success');
+    } catch (error) {
+      this.view.setFeedback(`配置操作失败：${error.message || error}`, 'error');
+    } finally {
+      this.view.setBusy(provider, false);
+    }
+  }
+
+  saveApiKey(provider) {
+    const apiKey = this.view.apiKey(provider);
+    if (!apiKey) {
+      this.view.setFeedback(`请输入 ${SMS_PROVIDER_LABELS[provider]} API Key；留空不会覆盖现有 Key。`, 'error');
+      return;
+    }
+    this.configure(provider, apiKey, `${SMS_PROVIDER_LABELS[provider]} API Key 已保存；Key 未回显。`);
+  }
+
+  clearApiKey(provider) {
+    this.configure(provider, '', `${SMS_PROVIDER_LABELS[provider]} API Key 已清除。`);
+  }
+
+  async saveDefaultProvider() {
+    const provider = this.view.defaultProviderId();
+    this.view.setBusy('', true);
+    try {
+      const payload = await this.request('/sms/config', {method: 'POST', body: JSON.stringify({provider, defaultProvider: provider})});
+      this.applyResponse(payload);
+      this.view.setProvider(provider);
+      localStorage.setItem('pay153-sms-provider', provider);
+      this.changeProvider();
+      this.view.setFeedback(`默认接码平台已设为 ${SMS_PROVIDER_LABELS[provider]}。`, 'success');
+    } catch (error) {
+      this.view.setFeedback(`默认平台保存失败：${error.message || error}`, 'error');
+    } finally {
+      this.view.setBusy('', false);
+    }
+  }
+}
+
+const smsSettingsView = new SmsSettingsView();
+const smsSettingsPresenter = new SmsSettingsPresenter(state, smsSettingsView, api);
+smsSettingsPresenter.mount();
+
+async function loadSmsBowerStatus() { return smsSettingsPresenter.refresh(); }
+function updateSmsProvider({probe = false} = {}) {
+  smsSettingsPresenter.syncFromPayPalCountry($('paypalCountry').value, {probe});
+}
 
 function populateCountrySelect() {
   const select = $('paypalCountry');
@@ -319,7 +665,18 @@ function renderCountryOptionList(query = '') {
   addRows('\u6309\u9700\u5b9e\u65f6\u89e3\u6790', matches.filter(v => !v.verified));
   if (!matches.length) { const empty = document.createElement('div'); empty.className = 'country-option-empty'; empty.textContent = '\u6ca1\u6709\u5339\u914d\u7684\u56fd\u5bb6'; list.appendChild(empty); }
 }
-async function loadPayPalCountries() { const data = await api('/supported-countries'); paypalCountries = Array.isArray(data.countries) ? data.countries : []; dynamicCountriesEnabled = data.dynamic_countries_enabled === true; populateCountrySelect(); populatePhoneCheckCountrySelect(); populateSmsBowerCountrySelect(); if ($('smsProvider').value === 'smsbower' && selectedSmsBowerCountry()) $('paypalCountry').value = selectedSmsBowerCountry(); renderCountryOptionList(''); updateCountryFields(); }
+async function loadPayPalCountries() {
+  const data = await api('/supported-countries');
+  paypalCountries = Array.isArray(data.countries) ? data.countries : [];
+  dynamicCountriesEnabled = data.dynamic_countries_enabled === true;
+  populateCountrySelect();
+  populatePhoneCheckCountrySelect();
+  populateSmsBowerCountrySelect();
+  if ($('smsProvider').value !== 'manual' && selectedSmsBowerCountry()) $('paypalCountry').value = selectedSmsBowerCountry();
+  renderCountryOptionList('');
+  updateCountryFields({probe: false});
+  await smsSettingsPresenter.refresh(selectedSmsBowerCountry());
+}
 $('countryPickerToggle').addEventListener('click', () => { if ($('countryPickerMenu').hidden) openCountryPicker(); else closeCountryPicker(); });
 $('countrySearch').addEventListener('input', () => renderCountryOptionList($('countrySearch').value));
 $('countrySearch').addEventListener('keydown', event => { if (event.key === 'Escape') { closeCountryPicker(); $('countryPickerToggle').focus(); } });
@@ -857,7 +1214,7 @@ $('protocolForm').addEventListener('submit', async (event) => {
   const selectedCountryOption = $('paypalCountry').selectedOptions[0];
   if (selectedCountryOption?.dataset.live !== '1' && !dynamicCountriesEnabled) return showClientError('\u8be5\u56fd\u5bb6\u5df2\u8fdb\u5165\u5b9e\u65f6\u89e3\u6790\u76ee\u5f55\uff0c\u52a8\u6001\u56fd\u5bb6\u6267\u884c\u5f00\u5173\u5f53\u524d\u5173\u95ed');
   const smsProvider = $('smsProvider').value || 'manual';
-  const automaticSms = smsProvider === 'smsbower';
+  const automaticSms = smsProvider !== 'manual';
   const phone = automaticSms ? '' : normalizePhone($('phone').value);
   const smsService = $('smsbowerPaymentService').value || 'paypal';
   const smsCountry = selectedSmsBowerCountry();
@@ -875,11 +1232,15 @@ $('protocolForm').addEventListener('submit', async (event) => {
     }
   }
   if (automaticSms) {
-    if (!state.smsBower.configured) return showClientError('请先在账号工作台设置 SMSBower API Key');
-    if (state.smsBower.error) return showClientError(state.smsBower.error);
-    if (smsService !== 'paypal') return showClientError('SMSBower 支付设置当前仅支持 PayPal');
+    const smsProviderState = smsSettingsPresenter.provider(smsProvider);
+    const smsProviderLabel = smsProviderState?.label || SMS_PROVIDER_LABELS[smsProvider] || smsProvider;
+    if (!SMS_PROVIDER_IDS.includes(smsProvider)) return showClientError('请选择有效的验证码平台');
+    if (!smsProviderState?.configured) return showClientError(`请先打开“接码配置”保存 ${smsProviderLabel} API Key`);
+    if (smsProviderState.error) return showClientError(smsProviderState.error);
+    if (smsService !== 'paypal') return showClientError(`${smsProviderLabel} 支付设置当前仅支持 PayPal`);
     if (smsCountry !== $('paypalCountry').value) return showClientError('验证码国家必须与 PayPal 国家一致');
-    if (!Number.isFinite(smsMaxPrice) || smsMaxPrice < 0.001 || smsMaxPrice > 50) return showClientError('SMSBower PayPal 最高价必须在 0.001–50 美元之间');
+    if (smsProviderState.supportedCountries.length && !smsProviderState.supportedCountries.includes(smsCountry)) return showClientError(`${smsProviderLabel} 暂不支持 ${smsCountry} 接码`);
+    if (!Number.isFinite(smsMaxPrice) || smsMaxPrice < 0.001 || smsMaxPrice > 50) return showClientError('自动接码 PayPal 最高价必须在 0.001–50 美元之间');
   } else {
     if (!/^\+?\d{8,20}$/.test(phone)) return showClientError('请填写有效手机号');
     if (country === 'BR' && !/^\+?55\d{8,15}$/.test(phone)) return showClientError('巴西 PayPal 请填写 +55 手机号');

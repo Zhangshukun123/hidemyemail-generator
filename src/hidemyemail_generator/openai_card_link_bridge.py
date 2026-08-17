@@ -6,9 +6,15 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hidemyemail_generator import card_link_runtime
+from hidemyemail_generator.card_link_bridge_service import (
+    MAX_PROTOCOL_LINE_BYTES,
+    WORKER_MESSAGE_PREFIX,
+    WORKER_PROTOCOL_VERSION,
+)
 from hidemyemail_generator.openai_browser_bridge import ensure_tkinter_importable
 
 
@@ -248,8 +254,235 @@ def generate_paypal_gb_event(
     }
 
 
+def emit_worker(payload: dict, *, output_stream=None) -> None:
+    stream = output_stream or sys.stdout
+    message = {"v": WORKER_PROTOCOL_VERSION, **payload}
+    stream.write(
+        WORKER_MESSAGE_PREFIX
+        + json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+    stream.flush()
+
+
+def _worker_redact(value: object, secrets: tuple[str, ...]) -> str:
+    text = str(value or "").strip()
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def _worker_request_secrets(payload: dict) -> tuple[str, ...]:
+    candidates = [
+        str(payload.get("access_token") or "").strip(),
+        str(payload.get("account_email") or "").strip(),
+    ]
+    for key in ("create_proxy_url", "promotion_proxy_url"):
+        proxy_url = str(payload.get(key) or "").strip()
+        candidates.append(proxy_url)
+        if not proxy_url:
+            continue
+        try:
+            parsed = urlsplit(proxy_url)
+        except ValueError:
+            continue
+        for component in (parsed.username, parsed.password):
+            raw = str(component or "").strip()
+            if raw:
+                candidates.extend((raw, unquote(raw)))
+    return tuple(
+        sorted(
+            {candidate for candidate in candidates if candidate},
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _worker_generate(
+    request_id: str,
+    payload: dict,
+    *,
+    output_stream=None,
+) -> dict:
+    method = str(payload.get("method") or "").strip()
+    if method not in {"paypal_us", "paypal_gb"}:
+        raise ValueError(f"共享提链服务不支持方法：{method or 'empty'}")
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise ValueError("Access Token 为空")
+    create_proxy_url = str(payload.get("create_proxy_url") or "").strip()
+    promotion_proxy_url = create_proxy_url
+    account_email = str(payload.get("account_email") or "").strip()
+    target_amount = str(payload.get("target_amount") or "").strip()
+    secrets = _worker_request_secrets(payload)
+    card_link_runtime.clear_proxy_exit_cache()
+
+    def diagnostic_log(message: object) -> None:
+        text = _worker_redact(message, secrets)
+        if text:
+            emit_worker(
+                {
+                    "id": request_id,
+                    "type": "log",
+                    "message": text[:500],
+                },
+                output_stream=output_stream,
+            )
+
+    generator = (
+        generate_paypal_us_event
+        if method == "paypal_us"
+        else generate_paypal_gb_event
+    )
+    return generator(
+        token,
+        create_proxy_url,
+        promotion_proxy_url,
+        target_amount,
+        account_email=account_email,
+        diagnostic_log=diagnostic_log,
+    )
+
+
+def _handle_worker_request(request: dict, *, output_stream=None) -> bool:
+    """Handle one request and release all request-owned values before returning."""
+
+    payload = None
+    try:
+        request_id = str(request.get("id") or "")[:128]
+        if request.get("v") != WORKER_PROTOCOL_VERSION:
+            emit_worker(
+                {
+                    "id": request_id,
+                    "type": "error",
+                    "detail": "提链服务协议版本不匹配",
+                    "retryable": False,
+                },
+                output_stream=output_stream,
+            )
+            return False
+        operation = str(request.get("op") or "")
+        if operation == "shutdown":
+            emit_worker(
+                {"id": request_id, "type": "stopped"},
+                output_stream=output_stream,
+            )
+            return True
+        payload = request.get("payload")
+        if operation != "generate" or not isinstance(payload, dict):
+            emit_worker(
+                {
+                    "id": request_id,
+                    "type": "error",
+                    "detail": "提链请求操作无效",
+                    "retryable": False,
+                },
+                output_stream=output_stream,
+            )
+            return False
+        secrets = _worker_request_secrets(payload)
+        method = str(payload.get("method") or "").strip()
+        try:
+            event = _worker_generate(
+                request_id,
+                payload,
+                output_stream=output_stream,
+            )
+            emit_worker(
+                {"id": request_id, "type": "result", "event": event},
+                output_stream=output_stream,
+            )
+        except Exception as error:
+            detail = _worker_redact(error, secrets)
+            emit_worker(
+                {
+                    "id": request_id,
+                    "type": "error",
+                    "detail": (detail or "直卡支付链接生成失败")[:1000],
+                    "retryable": card_link_error_is_retryable(
+                        method,
+                        error,
+                    ),
+                },
+                output_stream=output_stream,
+            )
+        return False
+    finally:
+        if isinstance(payload, dict):
+            payload.clear()
+        request.clear()
+
+
+def worker_main(*, input_stream=None, output_stream=None) -> int:
+    """Serve PayPal US/GB requests over a bounded JSONL pipe."""
+
+    source = input_stream or sys.stdin.buffer
+    emit_worker({"type": "ready", "pid": os.getpid()}, output_stream=output_stream)
+    while True:
+        raw_line = source.readline(MAX_PROTOCOL_LINE_BYTES + 1)
+        if not raw_line:
+            return 0
+        if isinstance(raw_line, bytes):
+            oversized = len(raw_line) > MAX_PROTOCOL_LINE_BYTES
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            oversized = len(raw_line.encode("utf-8")) > MAX_PROTOCOL_LINE_BYTES
+            line = raw_line
+        if oversized:
+            while raw_line and not raw_line.endswith(
+                b"\n" if isinstance(raw_line, bytes) else "\n"
+            ):
+                raw_line = source.readline(MAX_PROTOCOL_LINE_BYTES + 1)
+            emit_worker(
+                {
+                    "id": "",
+                    "type": "error",
+                    "detail": "提链请求数据过长",
+                    "retryable": False,
+                },
+                output_stream=output_stream,
+            )
+            raw_line = None
+            line = ""
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            emit_worker(
+                {
+                    "id": "",
+                    "type": "error",
+                    "detail": "提链请求格式无效",
+                    "retryable": False,
+                },
+                output_stream=output_stream,
+            )
+            raw_line = None
+            line = ""
+            continue
+        raw_line = None
+        line = ""
+        if not isinstance(request, dict):
+            request = None
+            continue
+        should_stop = _handle_worker_request(
+            request,
+            output_stream=output_stream,
+        )
+        request = None
+        if should_stop:
+            return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create one ChatGPT card checkout link")
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Serve reusable PayPal US/GB requests over stdin/stdout",
+    )
     parser.add_argument(
         "--source-dir",
         default="",
@@ -272,6 +505,9 @@ def main() -> int:
     parser.add_argument("--locale", default="en-US")
     parser.add_argument("--target-amount", default="")
     args = parser.parse_args()
+
+    if args.worker:
+        return worker_main()
 
     token = str(os.environ.get("HME_OPENAI_ACCESS_TOKEN") or "").strip()
     create_proxy_url = str(

@@ -18,7 +18,6 @@
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
     <symbol id="i-paypal" viewBox="0 0 24 24"><path d="M7 20 9.3 4h6.2a4.8 4.8 0 0 1 0 9.6h-4.7"/><path d="m10.1 20 1.4-9.5h4.4a3.6 3.6 0 0 1 0 7.2h-3.4"/></symbol>
     <symbol id="i-checklist" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="m8 9 1.5 1.5L12 8M13 10h3M8 15h8"/></symbol>
-    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M12 15h5"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
     <symbol id="i-panel-collapse" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m7-12-4 4 4 4"/></symbol>
     <symbol id="i-panel-expand" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m3-12 4 4-4 4"/></symbol>
@@ -42,7 +41,6 @@
     </button>
     <div class="header-actions">
       <span class="runtime-pill"><i id="runtimeDot"></i><span id="runtimeLabel">正在连接运行环境</span></span>
-      <button id="runtimeLogButton" class="runtime-log-trigger" type="button" data-action="open-runtime-log" aria-label="打开运行日志，0 条" aria-controls="runtimeLogDrawer" aria-expanded="false"><svg aria-hidden="true"><use href="#i-terminal"/></svg><span>运行日志</span><b id="runtimeLogTriggerCount">0</b><i id="runtimeLogLiveDot" aria-hidden="true"></i></button>
       <button class="icon-button" type="button" data-action="refresh" aria-label="刷新"><svg><use href="#i-refresh"/></svg></button>
       <button class="icon-button" id="themeToggle" type="button" data-action="toggle-theme" aria-label="切换主题">◐</button>
       <button class="icon-button" type="button" data-action="logout" aria-label="退出登录"><svg><use href="#i-logout"/></svg></button>
@@ -152,15 +150,18 @@
         <div class="view-actions registration-launch-shell">
           <div class="registration-command-deck" data-density="compact" aria-label="紧凑注册命令台">
             <div class="registration-launch-head">
-              <div><span class="eyebrow">QUICK REGISTER</span><h2>快速注册</h2><p>方式、来源与网络集中配置，减少滚动后即可启动</p></div>
-              <span class="badge blue registration-capacity"><i aria-hidden="true"></i>Roxy · 最多 5 个并发</span>
+              <div class="registration-launch-copy"><span class="eyebrow">QUICK REGISTER</span><h2>快速注册</h2><p>方式、来源与网络集中配置，减少滚动后即可启动</p></div>
+              <div class="registration-launch-actions">
+                <span class="badge blue registration-capacity"><i aria-hidden="true"></i>Roxy · 最多 5 个并发</span>
+                <button id="registrationConfigToggle" class="button small registration-config-toggle" type="button" data-action="toggle-registration-config" aria-controls="registrationConfigPanel" aria-expanded="true" aria-label="收起注册配置" title="收起注册配置"><span>收起配置</span><b aria-hidden="true">⌃</b></button>
+              </div>
             </div>
+            <div id="registrationConfigPanel" class="registration-config-panel">
             <div class="command-block command-source" id="registrationSourceBlock">
               <div class="command-heading"><span>02 · SOURCE</span><strong>注册来源</strong></div>
               <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="zkgmail">zkgmail.com · QQ 接码</option><option value="gmail">Gmail · SMSBower</option></select></label>
               <div id="smsbowerControls" class="command-subcontrols" hidden><span id="smsbowerStatus" class="badge warning">SMSBower 未配置</span><label class="command-field smsbower-price-field" for="smsbowerMaxPrice"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="10" step="0.001" value="0.05"></label><button class="button" data-action="set-smsbower-key">SMSBower API</button></div>
               <div id="zkgmailControls" class="command-subcontrols" hidden><span id="zkgmailStatus" class="badge warning">QQ 接码未配置</span><button class="button" data-action="set-zkgmail-auth">QQ 邮箱授权码</button></div>
-              <button id="registerProviderButton" class="button primary command-primary" data-action="register-provider"><span aria-hidden="true">▶</span>开始注册</button>
             </div>
             <div class="command-block command-network" id="registrationNetworkBlock">
               <div class="command-heading"><span>03 · NETWORK</span><strong>注册网络</strong></div>
@@ -192,8 +193,10 @@
               <input id="headless" type="checkbox" hidden>
               <input id="concurrency" type="hidden" value="1">
             </div>
+            </div>
             <div id="registrationRuntimeControls" class="registration-runtime-controls" aria-label="注册任务操作">
-              <div class="registration-runtime-state"><span id="registrationRuntimeState">当前无运行任务</span><small id="registrationRuntimeMessage">运行详情请打开日志界面查看</small></div>
+              <div class="registration-runtime-state"><span id="registrationRuntimeState">当前无运行任务</span><small id="registrationRuntimeMessage">运行详情请查看下方终端日志</small></div>
+              <button id="registerProviderButton" class="button primary registration-start-button" type="button" data-action="register-provider">开始注册</button>
               <details id="registrationMoreOptions" class="registration-more-options">
                 <summary class="button"><span>更多选项</span><small>自有邮箱 · Session</small></summary>
                 <div class="registration-more-panel">
@@ -205,7 +208,6 @@
                   <button id="fetchAllButton" class="button registration-fetch-all" data-action="fetch-all">批量获取全部 Session</button>
                 </div>
               </details>
-              <button class="button" type="button" data-action="open-runtime-log" aria-controls="runtimeLogDrawer" aria-expanded="false">查看运行日志</button>
               <button id="stopTaskButton" class="button danger small" type="button" data-action="stop-task" disabled>停止任务</button>
             </div>
             <div id="registrationCodePanel" class="registration-code-panel registration-code-command" hidden>
@@ -253,7 +255,7 @@
             <span class="quick-flow-kicker"><i></i>AUTOMATION STUDIO</span>
             <h2>从邮箱到协议支付，交给一条自动化流水线</h2>
             <p>领取 iCloud 库存或生成 zkgmail.com 邮箱、完成账号注册并保存 Session，生成所选 PayPal 链接后自动选代理、取手机号并启动协议支付。</p>
-            <div class="quick-flow-hero-tags"><span id="quickFlowSourceTag">iCloud 库存</span><span>自动选择代理</span><span>SMSBower 自动取号</span><span>协议支付</span></div>
+            <div class="quick-flow-hero-tags"><span id="quickFlowSourceTag">iCloud 库存</span><span>自动选择代理</span><span>接码平台自动取号</span><span>协议支付</span></div>
           </div>
           <div class="quick-flow-hero-state">
             <div class="quick-flow-state-label"><small>PIPELINE STATUS</small><i aria-hidden="true"></i></div>
@@ -263,7 +265,8 @@
           </div>
         </article>
         <div class="quick-flow-layout">
-          <details class="panel quick-flow-config" open>
+          <section class="panel quick-flow-config-shell">
+          <details id="quickFlowConfigDetails" class="quick-flow-config" open>
             <summary class="panel-head quick-flow-panel-head quick-flow-config-summary">
               <div><span class="quick-flow-panel-kicker">CONFIG</span><h2>任务配置</h2><p>注册、PayPal 提链与自动协议支付集中在这里</p></div>
               <div class="quick-flow-summary-tools"><span id="quickFlowConfigBadge" class="badge blue">iCloud 库存</span><span class="quick-flow-collapse-label"><b class="when-open">收起</b><b class="when-closed">展开</b><i aria-hidden="true">⌃</i></span></div>
@@ -301,10 +304,11 @@
                 <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span><span>✓ 自动协议支付</span></div>
               </section>
             </div>
-            <div class="quick-flow-actions"><div><strong>每次点击都会创建独立注册流程</strong><span>流程可并行运行；停止或关闭在下方对应流程卡片中操作</span></div><button id="startQuickFlowButton" class="button primary" type="button" data-action="start-quick-flow"><span>启动新的自动流水线</span><b aria-hidden="true">▶</b></button></div>
-            <section class="quick-flow-run-board" aria-labelledby="quickFlowRunBoardTitle"><div class="quick-flow-run-board-head"><div><span>PIPELINE LIST</span><strong id="quickFlowRunBoardTitle">注册流程列表</strong></div><b id="quickFlowRunCount">暂无流程</b></div><div id="quickFlowRunList" class="quick-flow-run-list" aria-live="polite"><div class="task-log-empty">点击“启动新的自动流水线”可创建第一个独立注册流程。</div></div></section>
             </div>
           </details>
+          <div class="quick-flow-actions" aria-label="一键注册启动操作"><div class="quick-flow-saved-config"><strong><i aria-hidden="true">✓</i><span id="quickFlowSavedConfigState">配置将自动保存</span></strong><span id="quickFlowSavedConfigSummary">正在读取任务配置…</span></div><button id="saveQuickFlowConfigButton" class="button quick-flow-save-button" type="button" data-action="save-quick-flow-config">保存配置</button><button id="startQuickFlowButton" class="button primary" type="button" data-action="start-quick-flow"><span>开始一键注册</span><b aria-hidden="true">▶</b></button></div>
+          <section class="quick-flow-run-board" aria-labelledby="quickFlowRunBoardTitle"><div class="quick-flow-run-board-head"><div><span>PIPELINE LIST</span><strong id="quickFlowRunBoardTitle">注册流程列表</strong></div><b id="quickFlowRunCount">暂无流程</b></div><div id="quickFlowRunList" class="quick-flow-run-list" aria-live="polite"><div class="task-log-empty">点击“开始一键注册”可创建第一个独立注册流程。</div></div></section>
+          </section>
           <aside class="panel quick-flow-monitor">
             <div class="panel-head quick-flow-panel-head"><div><span class="quick-flow-panel-kicker">DIRECT CARD LINK MONITOR</span><h2>直卡提链与协议支付进度</h2><p id="quickFlowMessage">尚未启动流水线</p></div><span id="quickFlowStatusBadge" class="badge">空闲</span></div>
             <div class="quick-flow-monitor-overview">
@@ -326,8 +330,8 @@
                 <div class="quick-flow-progress"><div><span>总体进度</span><strong id="quickFlowProgressValue">0%</strong></div><progress id="quickFlowProgress" value="0" max="100"></progress></div>
               </section>
             </div>
-            <div class="quick-flow-counters"><div class="registered"><i>↗</i><span>已注册</span><strong id="quickFlowRegisteredCount">0</strong></div><div class="generated"><i>◆</i><span id="quickFlowGeneratedLabel">已补 OAICS</span><strong id="quickFlowGeneratedCount">0</strong></div><div class="payment"><i>P</i><span>已启动支付</span><strong id="quickFlowPaymentCount">0</strong></div><div class="skipped"><i>–</i><span>已跳过</span><strong id="quickFlowSkippedCount">0</strong></div><div class="failed"><i>!</i><span>失败</span><strong id="quickFlowFailedCount">0</strong></div></div>
-            <div class="quick-flow-monitor-details"><section class="quick-flow-console-section"><div class="quick-flow-log-head"><strong>直卡提链日志</strong><span id="quickFlowLogCount">0 条</span></div><div id="quickFlowLog" class="inline-log quick-flow-log" role="log" aria-live="polite"><div class="task-log-empty">尚无流水线日志</div></div></section><section class="quick-flow-result-section"><div class="quick-flow-log-head"><strong>输出结果</strong><span>账号、PayPal 链接与协议任务</span></div><div id="quickFlowResults" class="quick-flow-results"><div class="empty-state compact">完成后在这里显示账号、PayPal 链接与协议支付任务</div></div></section></div>
+            <div class="quick-flow-counters"><div class="registered"><i>↗</i><span>已注册</span><strong id="quickFlowRegisteredCount">0</strong></div><div class="generated"><i>◆</i><span id="quickFlowGeneratedLabel">已补 OAICS</span><strong id="quickFlowGeneratedCount">0</strong></div><div class="payment"><i>P</i><span>协议成功</span><strong id="quickFlowPaymentCount">0</strong></div><div class="skipped"><i>–</i><span>已跳过</span><strong id="quickFlowSkippedCount">0</strong></div><div class="failed"><i>!</i><span>失败</span><strong id="quickFlowFailedCount">0</strong></div></div>
+            <div class="quick-flow-monitor-details"><section class="quick-flow-result-section"><div class="quick-flow-log-head"><strong>输出结果</strong><span>账号、PayPal 链接与协议任务</span></div><div id="quickFlowResults" class="quick-flow-results"><div class="empty-state compact">完成后在这里显示账号、PayPal 链接与协议支付任务</div></div></section></div>
           </aside>
         </div>
       </section>
@@ -406,13 +410,17 @@
       </section>
 
       <section class="view pp-payment-view" id="ppPaymentView" data-view="pp-payment" hidden>
-        <article class="panel pp-payment-toolbar">
-          <div class="pp-payment-heading"><span class="pp-mark">P</span><div><h2>PayPal 协议支付</h2><p>接收快速流程生成的 BA 链接，按国家自动选择代理，并由 SMSBower 自动取号、取码和完成协议授权</p></div></div>
-          <div class="pp-payment-actions"><span id="paypalServiceStatus" class="badge">正在连接</span><button class="button" type="button" data-action="reload-paypal">刷新支付台</button><a class="button primary" href="/paypal-pay/" target="_blank" rel="noopener">新窗口打开</a></div>
+        <article class="panel pp-payment-toolbar" aria-label="协议支付工具栏">
+          <div class="pp-payment-heading"><span class="pp-mark" aria-hidden="true">P</span><div><span class="pp-payment-kicker">PAYPAL AGREEMENT</span><h2>PayPal 协议支付</h2><p>BA 链接、国家代理和接码流程统一在当前工作台内完成</p></div></div>
+          <div class="pp-payment-actions"><span id="paypalServiceStatus" class="badge" aria-live="polite">正在连接</span><button class="button" type="button" data-action="reload-paypal">刷新支付台</button><a class="button primary" href="/paypal-pay/" target="_blank" rel="noopener">新窗口打开</a></div>
         </article>
         <div class="panel pp-payment-frame-shell">
           <iframe id="paypalPaymentFrame" title="PayPal 协议支付工作台" data-src="/paypal-pay/" loading="lazy" referrerpolicy="no-referrer"></iframe>
-          <div id="paypalPaymentEmpty" class="pp-payment-empty"><span class="pp-mark large">P</span><strong>正在启动 PP 支付服务</strong><p>服务就绪后会自动载入协议支付工作台。</p></div>
+          <div id="paypalPaymentEmpty" class="pp-payment-empty" data-state="loading">
+            <span class="pp-payment-empty-signal" aria-hidden="true"><span class="pp-mark large">P</span><i></i></span>
+            <div class="pp-payment-empty-copy" role="status" aria-live="polite"><strong>正在启动协议支付服务</strong><p>服务就绪后会自动载入协议支付工作台。</p></div>
+            <button class="button pp-payment-retry" type="button" data-action="reload-paypal">重新连接</button>
+          </div>
         </div>
       </section>
 
@@ -430,41 +438,17 @@
     <section id="workbenchTerminalPanel" class="workbench-terminal-panel" aria-labelledby="terminalPreviewTitle">
       <header class="terminal-preview-header">
         <nav aria-label="底部面板"><button type="button" disabled>问题</button><button type="button" disabled>输出</button><button type="button" disabled>调试控制台</button><button class="active" type="button" id="terminalPreviewTitle">终端</button><button type="button" disabled>任务日志</button></nav>
-        <div><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="open-runtime-log" aria-controls="runtimeLogDrawer" aria-expanded="false">展开详细日志</button><button type="button" data-action="toggle-terminal-preview" aria-label="折叠终端预览" title="折叠终端预览">⌄</button></div>
+        <div><span id="terminalPreviewTask">等待任务</span><button type="button" data-action="toggle-terminal-preview" aria-label="折叠终端日志" title="折叠终端日志">⌄</button></div>
       </header>
       <div id="terminalPreviewList" class="terminal-preview-list" role="log" aria-live="off"><div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，日志会显示在这里。</div></div>
     </section>
   </div>
   <footer class="workbench-footer" aria-label="工作台状态栏">
-    <button type="button" data-action="open-runtime-log" aria-controls="runtimeLogDrawer" aria-expanded="false"><i id="footerRuntimeDot"></i><span id="footerRuntimeLabel">正在连接</span></button>
+    <span class="footer-runtime-status"><i id="footerRuntimeDot"></i><span id="footerRuntimeLabel">正在连接</span></span>
     <span>环境：本地</span><span>版本：2.1.0</span>
     <div class="workbench-footer-spacer"></div>
     <span>运行中：<b id="footerRunningCount">0</b></span><span>排队中：<b id="footerQueuedCount">0</b></span><span>成功：<b id="footerSuccessCount">0</b></span><span class="footer-failed">失败：<b id="footerFailedCount">0</b></span><span class="footer-api"><i id="footerApiDot"></i>API：<b id="footerApiLabel">检查中</b></span>
   </footer>
-  <div id="runtimeLogBackdrop" class="runtime-log-backdrop" data-action="close-runtime-log" hidden></div>
-  <aside id="runtimeLogDrawer" class="runtime-log-drawer" role="dialog" aria-modal="true" aria-labelledby="runtimeLogTitle" aria-describedby="runtimeLogSubtitle" hidden>
-    <div id="runtimeLogResizeHandle" class="runtime-log-resize-handle" role="separator" tabindex="0" aria-label="调整运行日志宽度" aria-orientation="vertical" aria-controls="runtimeLogDrawer" aria-valuemin="420" aria-valuemax="1200" aria-valuenow="680" aria-valuetext="680 像素" title="左右拖动调整宽度；方向键微调；双击恢复默认">
-      <span class="sr-only">左右拖动，或使用左右方向键调整运行日志宽度</span>
-    </div>
-    <header class="runtime-log-header">
-      <div><span class="eyebrow">LIVE RUNTIME</span><h2 id="runtimeLogTitle">当前运行日志</h2><p id="runtimeLogSubtitle">等待任务数据</p></div>
-      <button id="runtimeLogCloseButton" class="icon-button" type="button" data-action="close-runtime-log" aria-label="关闭运行日志">×</button>
-    </header>
-    <section class="runtime-log-summary" aria-label="当前日志任务摘要">
-      <div><small>任务状态</small><strong id="runtimeLogState">等待任务</strong></div>
-      <div><small>任务 / 进程</small><strong id="runtimeLogTask">—</strong></div>
-      <div><small>开始时间</small><strong id="runtimeLogStartedAt">—</strong></div>
-      <div><small>当前记录</small><strong id="runtimeLogTotal">0 条</strong></div>
-    </section>
-    <div class="runtime-log-toolbar">
-      <label class="runtime-log-search" for="runtimeLogSearch"><span>搜索日志</span><input id="runtimeLogSearch" type="search" autocomplete="off" placeholder="消息、邮箱、任务 ID、页面或动作"></label>
-      <label for="runtimeLogLevel"><span>日志级别</span><select id="runtimeLogLevel"><option value="all">全部级别</option><option value="error">错误</option><option value="warning">警告 / 等待</option><option value="success">成功</option><option value="active">运行信息</option></select></label>
-      <label class="runtime-log-autoscroll"><input id="runtimeLogAutoscroll" type="checkbox" checked><span>自动滚动</span></label>
-      <button class="button" type="button" data-action="copy-runtime-logs">复制当前日志</button>
-    </div>
-    <div id="runtimeLogList" class="runtime-log-list" role="log" aria-live="off"><div class="runtime-log-empty"><strong>暂无运行日志</strong><span>启动注册、浏览器、协议或验证任务后，详细日志会实时显示在这里。</span></div></div>
-    <footer class="runtime-log-footer"><span id="runtimeLogVisibleCount">显示 0 / 0 条</span><span id="runtimeLogUpdatedAt">尚未更新</span><span id="runtimeLogAnnouncement" class="sr-only" role="status" aria-live="polite"></span></footer>
-  </aside>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>window.__HME_LOCAL_TOKEN__ = __LOCAL_TOKEN__;</script>
   <script>{{PAGE_SCRIPT}}</script>

@@ -1,4 +1,6 @@
+import asyncio
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -7,12 +9,13 @@ from unittest import mock
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from hidemyemail_generator.inbox import connect_db
+from hidemyemail_generator.inbox import connect_db, insert_message
 from hidemyemail_generator.webapp import create_app
 from hidemyemail_generator.zkgmail import (
     ZkgmailConfigStore,
     ZkgmailMailClient,
     _generate_human_local_part,
+    _known_zkgmail_aliases,
     _sync_relevant_messages,
 )
 
@@ -112,14 +115,164 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
                 rows = conn.execute(
                     "SELECT hme_address, code FROM messages"
                 ).fetchall()
+                address = conn.execute(
+                    "SELECT source FROM addresses WHERE lower(email) = ?",
+                    (target,),
+                ).fetchone()
             finally:
                 conn.close()
+            known_aliases = _known_zkgmail_aliases(db_file)
 
         self.assertEqual(inserted, 1)
         self.assertEqual(
             [(row["hme_address"], row["code"]) for row in rows],
             [(target, "123456")],
         )
+        self.assertEqual(address["source"], "zkgmail")
+        self.assertIn(target, known_aliases)
+
+    async def test_poll_returns_while_single_flight_sync_is_still_running(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            client = ZkgmailMailClient(store, sync_interval_seconds=0)
+            email = await client.acquire_email("OpenAI 注册")
+            sync_started = threading.Event()
+            allow_insert = threading.Event()
+            code_inserted = threading.Event()
+            allow_finish = threading.Event()
+            sync_calls = 0
+
+            def slow_sync(_config, target_db, _aliases, *, limit):
+                nonlocal sync_calls
+                sync_calls += 1
+                sync_started.set()
+                allow_insert.wait()
+                now = datetime.now(timezone.utc).isoformat()
+                conn = connect_db(str(target_db))
+                try:
+                    insert_message(
+                        conn,
+                        {
+                            "account_key": "qq@imap.qq.com/INBOX",
+                            "folder": "INBOX",
+                            "uid": "slow-sync-1",
+                            "sender": "noreply@openai.com",
+                            "recipients": email,
+                            "hme_address": email,
+                            "subject": "OpenAI verification code",
+                            "code": "135790",
+                            "body_preview": "Your verification code is 135790",
+                            "received_at": now,
+                            "created_at": now,
+                        },
+                    )
+                finally:
+                    conn.close()
+                code_inserted.set()
+                allow_finish.wait()
+                return 1
+
+            with mock.patch(
+                "hidemyemail_generator.zkgmail._sync_relevant_messages",
+                side_effect=slow_sync,
+            ):
+                first_poll = asyncio.create_task(client.poll_code(email))
+                sync_task = None
+                close_task = None
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(sync_started.wait, 1),
+                        "后台 IMAP 同步没有启动",
+                    )
+                    self.assertEqual(
+                        await asyncio.wait_for(asyncio.shield(first_poll), 0.1),
+                        "",
+                    )
+                    sync_task = client.sync_task
+                    self.assertIsNotNone(sync_task)
+
+                    concurrent = await asyncio.gather(
+                        *(client.poll_code(email) for _ in range(5))
+                    )
+                    self.assertEqual(concurrent, [""] * 5)
+                    self.assertEqual(sync_calls, 1)
+
+                    allow_insert.set()
+                    self.assertTrue(
+                        await asyncio.to_thread(code_inserted.wait, 1),
+                        "后台同步没有写入验证码",
+                    )
+                    self.assertEqual(await client.poll_code(email), "135790")
+                    self.assertFalse(sync_task.done())
+                    close_task = asyncio.create_task(client.close())
+                    await asyncio.sleep(0)
+                    self.assertFalse(close_task.done())
+                finally:
+                    allow_insert.set()
+                    allow_finish.set()
+                    await asyncio.gather(first_poll, return_exceptions=True)
+                    if close_task is not None:
+                        await close_task
+                    elif sync_task is not None:
+                        await asyncio.gather(sync_task, return_exceptions=True)
+                self.assertIsNone(client.sync_task)
+
+    async def test_poll_surfaces_sync_failure_once_before_retrying(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            strategy = mock.Mock(side_effect=OSError("imap unavailable"))
+            client = ZkgmailMailClient(
+                store,
+                sync_interval_seconds=0,
+                sync_strategy=strategy,
+            )
+            email = await client.acquire_email("OpenAI 注册")
+
+            self.assertEqual(await client.poll_code(email), "")
+            first_sync = client.sync_task
+            self.assertIsNotNone(first_sync)
+            await asyncio.gather(first_sync, return_exceptions=True)
+
+            with self.assertRaisesRegex(RuntimeError, "无法连接 QQ 邮箱 IMAP 服务"):
+                await client.poll_code(email)
+
+            self.assertEqual(await client.poll_code(email), "")
+            retry_sync = client.sync_task
+            self.assertIsNotNone(retry_sync)
+            await asyncio.gather(retry_sync, return_exceptions=True)
+            self.assertEqual(strategy.call_count, 2)
+
+    async def test_configure_clears_a_completed_sync_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="old-qq-auth-code")
+            strategy = mock.Mock(side_effect=OSError("old connection failed"))
+            client = ZkgmailMailClient(
+                store,
+                sync_interval_seconds=0,
+                sync_strategy=strategy,
+            )
+            email = await client.acquire_email("OpenAI 注册")
+
+            self.assertEqual(await client.poll_code(email), "")
+            failed_sync = client.sync_task
+            self.assertIsNotNone(failed_sync)
+            await asyncio.gather(failed_sync, return_exceptions=True)
+
+            with mock.patch(
+                "hidemyemail_generator.zkgmail._test_imap_connection"
+            ):
+                await client.configure("new-qq-auth-code")
+
+            self.assertEqual(await client.poll_code(email), "")
+            retry_sync = client.sync_task
+            self.assertIsNotNone(retry_sync)
+            await asyncio.gather(retry_sync, return_exceptions=True)
 
     def test_sync_refreshes_qq_snapshot_without_opening_message(self):
         target = "fresh.alias@zkgmail.com"
@@ -191,7 +344,12 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             db_file = Path(temp_dir) / "mail.db"
             store = ZkgmailConfigStore(db_file)
             store.configure(authorization_code="local-qq-auth-code")
-            client = ZkgmailMailClient(store, sync_interval_seconds=0)
+            sync_strategy = mock.Mock(return_value=0)
+            client = ZkgmailMailClient(
+                store,
+                sync_interval_seconds=0,
+                sync_strategy=sync_strategy,
+            )
             email = await client.acquire_email("OpenAI 注册")
             conn = connect_db(str(db_file))
             try:
@@ -220,11 +378,12 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 conn.close()
 
-            with mock.patch(
-                "hidemyemail_generator.zkgmail._sync_relevant_messages", return_value=0
-            ):
-                first = await client.poll_code(email)
-                repeated = await client.poll_code(email)
+            first = await client.poll_code(email)
+            sync_strategy.assert_not_called()
+            repeated = await client.poll_code(email)
+            sync_task = client.sync_task
+            self.assertIsNotNone(sync_task)
+            await asyncio.gather(sync_task, return_exceptions=True)
 
             self.assertRegex(
                 email,
@@ -232,6 +391,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(first, "246810")
             self.assertEqual(repeated, "")
+            sync_strategy.assert_called_once()
 
     async def test_generated_address_retries_an_existing_human_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:

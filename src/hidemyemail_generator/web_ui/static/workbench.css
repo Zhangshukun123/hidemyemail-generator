@@ -12,7 +12,6 @@ html[data-theme="dark"] {
   --workbench-activitybar-width: 48px;
   --workbench-statusbar-height: 0px;
   --sidebar-width: 238px;
-  --runtime-log-drawer-width: 680px;
   --canvas: #0d0d0d;
   --canvas-soft: #111111;
   --surface: #181818;
@@ -232,27 +231,6 @@ html[data-theme="light"] .workbench-titlebar {
   padding: 4px 7px;
   background: transparent;
   font-size: 9px;
-}
-
-.workbench-titlebar .runtime-log-trigger {
-  min-height: 27px;
-  border-color: transparent;
-  border-radius: 3px;
-  padding: 4px 7px;
-  background: transparent;
-  font-size: 9px;
-}
-
-.workbench-titlebar .runtime-log-trigger:hover,
-.workbench-titlebar .runtime-log-trigger[aria-expanded="true"] {
-  border-color: var(--border);
-  background: var(--surface-raised);
-}
-
-.workbench-titlebar .runtime-log-trigger b {
-  min-width: 18px;
-  border-radius: 3px;
-  padding: 1px 4px;
 }
 
 .app-shell {
@@ -726,145 +704,6 @@ table th {
   border-color: var(--border);
 }
 
-.runtime-log-backdrop {
-  top: var(--workbench-titlebar-height);
-  bottom: 0;
-  background: rgba(0, 0, 0, .34);
-}
-
-.runtime-log-drawer {
-  width: min(var(--runtime-log-drawer-width, 680px), calc(100vw - var(--workbench-activitybar-width)));
-  height: auto;
-  top: var(--workbench-titlebar-height);
-  right: 0;
-  bottom: 0;
-  left: auto;
-  border-top: 0;
-  border-left: 1px solid var(--border-strong);
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-  background: #121212;
-  box-shadow: -18px 0 42px rgba(0, 0, 0, .34);
-  will-change: transform;
-  container: runtime-log / inline-size;
-}
-
-.runtime-log-resize-handle {
-  position: absolute;
-  z-index: 3;
-  top: 0;
-  bottom: 0;
-  left: -6px;
-  width: 12px;
-  border: 0;
-  padding: 0;
-  cursor: ew-resize;
-  touch-action: none;
-  outline: none;
-}
-
-.runtime-log-resize-handle::after {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 5px;
-  width: 2px;
-  content: "";
-  background: transparent;
-  transition: background-color 120ms ease, box-shadow 120ms ease;
-}
-
-.runtime-log-resize-handle:hover::after,
-.runtime-log-resize-handle:focus-visible::after,
-body.runtime-log-resizing .runtime-log-resize-handle::after {
-  background: var(--blue);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 16%, transparent);
-}
-
-body.runtime-log-resizing {
-  cursor: ew-resize;
-  user-select: none;
-}
-
-.runtime-log-backdrop:not([hidden]) {
-  animation: runtime-log-backdrop-in 180ms ease-out;
-}
-
-.runtime-log-drawer:not([hidden]) {
-  animation: runtime-log-drawer-in 200ms cubic-bezier(.2, .8, .2, 1);
-}
-
-@keyframes runtime-log-backdrop-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-@keyframes runtime-log-drawer-in {
-  from { transform: translateX(100%); }
-  to { transform: translateX(0); }
-}
-
-html[data-theme="light"] .runtime-log-drawer {
-  background: #ffffff;
-}
-
-.runtime-log-header {
-  min-height: 42px;
-  padding: 6px 12px;
-}
-
-.runtime-log-header h2 {
-  margin-top: 1px;
-  font-size: 12px;
-}
-
-.runtime-log-header p {
-  margin-top: 1px;
-  font-size: 8px;
-}
-
-.runtime-log-header .eyebrow {
-  font-size: 7px;
-}
-
-.runtime-log-summary {
-  padding: 7px 12px;
-  gap: 7px;
-}
-
-.runtime-log-toolbar {
-  padding: 7px 12px;
-  grid-template-columns: minmax(190px, 1fr) 130px auto auto;
-}
-
-.runtime-log-toolbar input,
-.runtime-log-toolbar select,
-.runtime-log-toolbar .button {
-  min-height: 29px;
-}
-
-.runtime-log-list {
-  padding: 7px 11px 12px;
-  gap: 4px;
-}
-
-.runtime-log-entry {
-  border-left-width: 2px;
-  border-radius: 2px;
-  padding: 7px 9px;
-  gap: 5px;
-  background: var(--surface-muted);
-}
-
-.runtime-log-message {
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.runtime-log-footer {
-  min-height: 27px;
-  padding: 4px 12px;
-}
-
 .toast {
   right: 16px;
   bottom: 12px;
@@ -908,8 +747,7 @@ html[data-theme="light"] .runtime-log-drawer {
   }
 
   .titlebar-brand > span:last-child,
-  .runtime-pill,
-  .workbench-titlebar .runtime-log-trigger > span {
+  .runtime-pill {
     display: none;
   }
 }
@@ -968,20 +806,6 @@ html[data-theme="light"] .runtime-log-drawer {
     grid-template-columns: 1fr;
   }
 
-  .runtime-log-drawer {
-    width: 100vw;
-    left: 0;
-    right: 0;
-  }
-
-  .runtime-log-resize-handle {
-    display: none;
-  }
-
-  .runtime-log-toolbar {
-    grid-template-columns: 1fr 110px;
-  }
-
 }
 
 @media (min-width: 901px) {
@@ -1001,73 +825,11 @@ html[data-theme="light"] .runtime-log-drawer {
   }
 }
 
-@media (max-height: 600px) {
-  .runtime-log-drawer {
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
-  }
-
-  .runtime-log-summary {
-    display: none;
-  }
-}
-
-@container runtime-log (max-width: 559px) {
-  .runtime-log-summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .runtime-log-summary > div:nth-child(2) {
-    border-right: 0;
-  }
-
-  .runtime-log-toolbar {
-    grid-template-columns: minmax(0, 1fr) 110px;
-  }
-
-  .runtime-log-toolbar .button,
-  .runtime-log-autoscroll {
-    justify-self: stretch;
-  }
-}
-
-@container runtime-log (max-width: 459px) {
-  .runtime-log-toolbar,
-  .runtime-log-context-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .runtime-log-entry-head {
-    flex-wrap: wrap;
-  }
-
-  .runtime-log-entry-head .runtime-log-sequence {
-    margin-left: 0;
-  }
-}
-
-@media (forced-colors: active) {
-  .runtime-log-resize-handle:focus-visible::after {
-    background: Highlight;
-    box-shadow: none;
-    forced-color-adjust: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .runtime-log-backdrop:not([hidden]),
-  .runtime-log-drawer:not([hidden]),
-  .runtime-log-resize-handle::after {
-    animation: none;
-    transition: none;
-  }
-}
-
 /*
  * Control-center composition.
  *
- * The detailed runtime log remains the fixed, modal drawer above.  The styles
- * below only arrange the persistent workbench chrome and its read-only terminal
- * preview; none of the `.runtime-log-*` drawer contracts are repurposed.
+ * The styles below arrange the persistent workbench chrome and its terminal.
+ * Task output stays in that terminal instead of a separate modal log surface.
  */
 :root,
 html[data-theme="dark"],
@@ -2059,8 +1821,7 @@ html[data-terminal-collapsed="true"] .terminal-preview-list,
   white-space: nowrap;
 }
 
-.workbench-footer > span,
-.workbench-footer > button {
+.workbench-footer > span {
   min-width: 0;
   min-height: 25px;
   border: 0;
@@ -2073,15 +1834,6 @@ html[data-terminal-collapsed="true"] .terminal-preview-list,
   color: inherit;
   background: transparent;
   font: inherit;
-}
-
-.workbench-footer > button {
-  padding-left: 4px;
-}
-
-.workbench-footer > button:hover {
-  color: var(--text);
-  background: var(--surface-raised);
 }
 
 .workbench-footer b {
@@ -2231,8 +1983,8 @@ html[data-terminal-collapsed="true"] .terminal-preview-list,
     display: none;
   }
 
-  .workbench-footer > span:nth-of-type(1),
-  .workbench-footer > span:nth-of-type(2) {
+  .workbench-footer > span:nth-of-type(2),
+  .workbench-footer > span:nth-of-type(3) {
     display: none;
   }
 }
@@ -2302,8 +2054,7 @@ html[data-terminal-collapsed="true"] .terminal-preview-list,
   }
 
   .terminal-preview-header nav button:not(.active),
-  .terminal-preview-header > div > span,
-  .terminal-preview-header > div > button:first-of-type {
+  .terminal-preview-header > div > span {
     display: none;
   }
 
@@ -2322,8 +2073,7 @@ html[data-terminal-collapsed="true"] .terminal-preview-list,
     padding-inline: 5px;
   }
 
-  .workbench-footer > span,
-  .workbench-footer > button {
+  .workbench-footer > span {
     padding-inline: 7px;
   }
 

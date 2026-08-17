@@ -7,7 +7,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from hidemyemail_generator.web_ui import build_app_page, build_login_page
 from hidemyemail_generator.webapp import create_app
-from hidemyemail_generator.browser_tasks import _save_account_record, load_account_record
+from hidemyemail_generator.browser_tasks import (
+    _save_account_record,
+    load_account_record,
+)
 
 
 class StructuredWebUiTests(unittest.TestCase):
@@ -35,16 +38,19 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("gpt-link · PH / PHP hosted · 双代理严格 0", page)
         self.assertIn('id="cardLinkMethod"', page)
         self.assertIn('value="de_oaics_paypal">PayPal / 德国 · EUR', page)
-        self.assertIn("generate_opll_de_oaics_paypal_link", (
-            Path(__file__).resolve().parents[1]
-            / "src"
-            / "hidemyemail_generator"
-            / "openai_card_link_bridge.py"
-        ).read_text(encoding="utf-8"))
+        self.assertIn(
+            "generate_opll_de_oaics_paypal_link",
+            (
+                Path(__file__).resolve().parents[1]
+                / "src"
+                / "hidemyemail_generator"
+                / "openai_card_link_bridge.py"
+            ).read_text(encoding="utf-8"),
+        )
         self.assertIn("cardLinkExtractionModes", page)
-        self.assertIn('method, country: config.country', page)
+        self.assertIn("method, country: config.country", page)
         self.assertIn('config.singleProxy ? ""', page)
-        self.assertIn('.field-label[hidden] { display: none; }', page)
+        self.assertIn(".field-label[hidden] { display: none; }", page)
         self.assertIn('id="verificationAccountSelect"', page)
         self.assertIn('id="verificationConcurrency"', page)
         self.assertIn('data-action="previous-verification"', page)
@@ -66,19 +72,22 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("根据提链真实出口国家自动生成身份资料", page)
         self.assertNotIn('data-payment-country="1"', page)
         self.assertIn("支付地址</span><strong>自动匹配", page)
-        self.assertIn("当前账号 Cookie、提链代理与 SMSBower", page)
+        self.assertIn("当前账号 Cookie、提链代理与接码平台", page)
         self.assertIn("startQuickFlowPaypalPayment", page)
         self.assertIn("await this.startQuickFlowPaypalPayment(", page)
         self.assertIn('phase: "payment"', page)
         self.assertIn('id="quickFlowPaymentCount"', page)
         self.assertIn('data-quick-stage="payment"', page)
-        self.assertIn("自动选择代理、获取 SMSBower 手机号并启动协议支付", page)
-        self.assertIn("请先在系统设置配置 SMSBower API Key", page)
+        self.assertIn("自动选择代理、获取接码手机号并启动协议支付", page)
+        self.assertIn("请先打开 PP 支付中的“接码配置”", page)
         self.assertIn("单账号提链次数", page)
         self.assertIn("返回 cs_live 时自动继续同模式提链", page)
         self.assertIn("attempt_limit:", page)
-        self.assertIn('[methodConfig.createProxyPreference]', page)
-        self.assertIn('cardLinkModes: { [method]: $("quickExtractionProxyMode").value }', page)
+        self.assertIn("[methodConfig.createProxyPreference]", page)
+        self.assertIn(
+            "cardLinkModes: { [method]: configSnapshot.extractionProxyMode }",
+            page,
+        )
         self.assertIn("协议注册", page)
         self.assertIn('id="protocolRegistrationPanel"', page)
         self.assertNotIn('data-route="protocol-registration"', page)
@@ -91,11 +100,11 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("renderProtocolRegistration", page)
         self.assertIn("密码（可选）", page)
         self.assertIn("2FA（可选）", page)
-        self.assertNotIn('badge(checkoutLabel, checkoutKind)', page)
+        self.assertNotIn("badge(checkoutLabel, checkoutKind)", page)
         self.assertNotIn('"重新检测 Checkout"', page)
         self.assertNotIn('this.commands.register("retry-checkout-probe"', page)
-        self.assertNotIn('/api/account/checkout-probe', page)
-        self.assertNotIn('checkoutIdType', page)
+        self.assertNotIn("/api/account/checkout-probe", page)
+        self.assertNotIn("checkoutIdType", page)
         self.assertIn("注册出口", page)
         self.assertIn("item.registrationExitIp", page)
         self.assertNotIn("item.checkoutExitIp", page)
@@ -147,8 +156,8 @@ class StructuredWebUiTests(unittest.TestCase):
 
         self.assertNotIn('<option value="oai">OAI 账号</option>', page)
         self.assertIn('(plan === "all" || item.accountType === plan)', page)
-        self.assertNotIn('item.checkoutIsOaics', page)
-        self.assertNotIn('item.checkoutIdType', page)
+        self.assertNotIn("item.checkoutIsOaics", page)
+        self.assertNotIn("item.checkoutIdType", page)
 
     def test_protocol_registration_uses_provider_entry_without_account_picker(self):
         page = build_app_page()
@@ -165,9 +174,9 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn('this.commands.register("start-protocol-selected"', page)
         self.assertNotIn('this.commands.register("start-protocol-all"', page)
         self.assertIn('class="panel protocol-task-panel"', page)
-        self.assertIn('this.assertProtocolRuntime()', page)
-        self.assertIn('provider: protocolProvider', page)
-        self.assertIn('const options = this.browserOptions();', page)
+        self.assertIn("this.assertProtocolRuntime()", page)
+        self.assertIn("provider: protocolProvider", page)
+        self.assertIn("const options = this.browserOptions();", page)
 
     def test_account_workbench_configures_country_registration_proxy(self):
         page = build_app_page()
@@ -197,10 +206,10 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("注册出口", page)
         self.assertIn('data-action="save-registration-proxy"', page)
         self.assertIn('data-action="test-registration-proxy"', page)
-        self.assertIn('/api/registration-proxy/test', page)
-        self.assertIn('payload.proxyEndpoint = endpoint', page)
-        self.assertIn('payload.proxyUsername = username', page)
-        self.assertIn('payload.proxyPassword = password', page)
+        self.assertIn("/api/registration-proxy/test", page)
+        self.assertIn("payload.proxyEndpoint = endpoint", page)
+        self.assertIn("payload.proxyUsername = username", page)
+        self.assertIn("payload.proxyPassword = password", page)
         self.assertIn('country: $("registrationProxyCountry").value || "NL"', page)
         self.assertIn("proxy.dynamicEndpoint", page)
         self.assertIn("matchProxyCountry", page)
@@ -218,8 +227,9 @@ class StructuredWebUiTests(unittest.TestCase):
             / "webapp.py"
         ).read_text(encoding="utf-8")
         card_link_handler = webapp_source[
-            webapp_source.index("async def create_card_link"):
-            webapp_source.index("async def browser_status")
+            webapp_source.index("async def create_card_link") : webapp_source.index(
+                "async def browser_status"
+            )
         ]
 
         self.assertIn('id="cardLinkCreateProxyCountry"', page)
@@ -246,7 +256,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('data-action="generate-all-card-links"', page)
         self.assertIn('this.commands.register("generate-all-card-links"', page)
         self.assertIn("cardLinkMarkedForMethod", page)
-        self.assertIn('item?.cardLinkMethod === method', page)
+        self.assertIn("item?.cardLinkMethod === method", page)
         self.assertIn("cs_live 可重新提链", page)
         self.assertIn("重新提链当前账号", page)
         self.assertIn("force_retry: cardLinkMarkedForMethod(item, method)", page)
@@ -273,10 +283,12 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('this.commands.register("start-quick-flow"', page)
         self.assertIn('this.commands.register("stop-quick-flow-run"', page)
         self.assertIn('this.commands.register("dismiss-quick-flow-run"', page)
-        self.assertIn('quickFlows: []', page)
-        self.assertIn('activeQuickFlowId', page)
+        self.assertIn("quickFlows: []", page)
+        self.assertIn("activeQuickFlowId", page)
         self.assertIn('this.schedule("quick-flow:" + runId', page)
-        self.assertIn('await this.extractQuickFlowAccounts(runId, succeededEmails)', page)
+        self.assertIn(
+            "await this.extractQuickFlowAccounts(runId, succeededEmails)", page
+        )
         self.assertIn('this.api.post("/api/registration/start"', page)
         self.assertIn('this.api.post("/api/protocol-registration/start"', page)
         self.assertIn('this.api.post("/api/account/card-link"', page)
@@ -297,19 +309,118 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("reuse_registration_proxy: false", page)
         self.assertIn("independent_proxy_pair: !singleProxy", page)
         self.assertIn("use_secondary_proxy: !singleProxy && Boolean(forceRetry)", page)
-        self.assertIn('promotion_proxy_choice: singleProxy', page)
-        self.assertIn('localStorage.setItem("hme_quick_registration_proxy_mode", mode)', page)
-        self.assertIn('每次点击都会创建独立注册流程', page)
-        self.assertIn('停止或关闭在下方对应流程卡片中操作', page)
-        self.assertIn('process_id: flow.taskId', page)
-        self.assertIn('enabled: Boolean(candidate?.configured)', page)
-        self.assertIn('provider: registrationProvider', page)
+        self.assertIn("promotion_proxy_choice: singleProxy", page)
+        self.assertIn(
+            'localStorage.setItem("hme_quick_registration_proxy_mode", mode)', page
+        )
+        self.assertIn('id="quickFlowSavedConfigState"', page)
+        self.assertIn('id="quickFlowSavedConfigSummary"', page)
+        self.assertIn("开始一键注册", page)
+        self.assertIn("process_id: flow.taskId", page)
+        self.assertIn("enabled: Boolean(candidate?.configured)", page)
+        self.assertIn("provider: registrationProvider", page)
         self.assertIn('registrationProvider === "zkgmail"', page)
         self.assertIn('localStorage.setItem("hme_quick_registration_provider"', page)
         self.assertIn('class="quick-flow-steps"', page)
         self.assertIn('data-quick-stage="payment"', page)
-        self.assertIn("SMSBower 自动取号", page)
+        self.assertIn("接码平台自动取号", page)
         self.assertIn(".quick-flow-layout", page)
+
+    def test_quick_flow_config_uses_mvp_persistence_and_keeps_start_outside_details(
+        self,
+    ):
+        page = build_app_page()
+
+        details_start = page.index('id="quickFlowConfigDetails"')
+        details_end = page.index("</details>", details_start)
+        start_button = page.index('id="startQuickFlowButton"')
+        run_board = page.index('class="quick-flow-run-board"')
+        shell_end = page.index("</section>", run_board)
+
+        self.assertLess(details_end, start_button)
+        self.assertLess(start_button, run_board)
+        self.assertLess(run_board, shell_end)
+        self.assertEqual(page.count('id="startQuickFlowButton"'), 1)
+        self.assertIn('class="panel quick-flow-config-shell"', page)
+        self.assertIn('aria-label="一键注册启动操作"', page)
+        self.assertIn(".quick-flow-config-shell", page)
+        self.assertIn(".quick-flow-saved-config", page)
+
+        for presenter_component in (
+            "class QuickFlowConfigModel",
+            "class QuickFlowConfigView",
+            "class QuickFlowConfigPresenter",
+            "this.quickFlowConfigPresenter.restore()",
+            "this.quickFlowConfigPresenter.bind()",
+            "this.quickFlowConfigPresenter.present()",
+        ):
+            self.assertIn(presenter_component, page)
+
+        for storage_key in (
+            "hme_quick_flow_config_v1",
+            "hme_quick_flow_config_collapsed",
+            "hme_quick_registration_provider",
+            "hme_quick_registration_mode",
+            "hme_quick_registration_concurrency",
+            "hme_quick_registration_target",
+            "hme_quick_registration_proxy_mode",
+            "hme_quick_registration_proxy_country",
+            "hme_quick_card_link_method",
+            "hme_quick_extraction_count",
+            "hme_quick_extraction_proxy_mode",
+            "hme_quick_extraction_first_country",
+            "hme_quick_extraction_second_country",
+            "hme_quick_promotion_proxy_choice",
+            "hme_quick_paypal_us_target_amount",
+        ):
+            self.assertIn(storage_key, page)
+
+        self.assertIn(
+            "const configSnapshot = this.quickFlowConfigPresenter.persist()", page
+        )
+        self.assertIn("configSnapshot,", page)
+        self.assertIn("saveCollapsed(collapsed)", page)
+        self.assertIn('this.details.addEventListener("toggle"', page)
+        self.assertIn("配置已保存，可直接开始", page)
+
+    def test_quick_flow_monitors_protocol_payment_to_terminal_state(self):
+        page = build_app_page()
+        app_js = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "hidemyemail_generator"
+            / "web_ui"
+            / "static"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+        self.assertLessEqual(len(app_js.splitlines()), 5000)
+
+        for component in (
+            "class PayPalPaymentJobModel",
+            "class PayPalPaymentMonitorPresenter",
+            "this.paypalPaymentMonitorPresenter = new PayPalPaymentMonitorPresenter(this.api)",
+            "await this.paypalPaymentMonitorPresenter.monitor(",
+            '"?log_offset=0&log_after=" + this.logSequence',
+            "await Promise.all(monitorTargets.map",
+            "const confirmation = job.account_confirmation",
+            "confirmation.plus_confirmed === true",
+            "paymentSucceeded: succeeded",
+            "paymentAtRefreshStatus: confirmationStatus",
+            'source: "paypal_protocol"',
+            'source: "payment_at_refresh"',
+            'this.candidate("paypal_protocol", "协议支付"',
+            "const atFailure = Boolean(item.paymentProtocolSucceeded)",
+            "协议已完成，未重复发起支付",
+            "新 AT 已确认 Plus",
+            "协议支付失败",
+        ):
+            self.assertIn(component, page)
+        self.assertIn("协议成功", page)
+        self.assertNotIn(">查看 PP 支付</button>", page)
+        self.assertNotIn(
+            '$("quickFlowPaymentCount").textContent = Number(flow.paymentStarted || 0)',
+            page,
+        )
 
     def test_one_click_pipeline_skips_only_an_existing_generated_paypal_link(self):
         page = build_app_page()
@@ -321,15 +432,18 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("更新优惠使用 IP", page)
         self.assertIn("第一提链 IP", page)
         self.assertIn("第二提链 IP", page)
-        self.assertIn('const supportedMethods = ["de_oaics_paypal", "paypal_us", "paypal_gb"]', page)
-        self.assertIn('hasGeneratedCardLinkForMethod(account, method)', page)
+        self.assertIn(
+            'const supportedMethods = ["de_oaics_paypal", "paypal_us", "paypal_gb"]',
+            page,
+        )
+        self.assertIn("hasGeneratedCardLinkForMethod(account, method)", page)
         self.assertIn("账号已有同模式 PayPal 链接，已跳过重复创建", page)
         self.assertIn("cs_live 已自动重试", page)
         self.assertIn("提链未完成 · 可重试", page)
         self.assertIn("results.length > 0 && failed === 0", page)
         self.assertIn('id="quickFlowSkippedCount"', page)
         self.assertIn("一键注册、提链并协议支付已启动：使用 ", page)
-        self.assertIn('methodConfig.label', page)
+        self.assertIn("methodConfig.label", page)
         self.assertIn('id="quickExtractionCount"', page)
         self.assertIn("单账号提链次数必须是 1–100 的整数", page)
         self.assertIn("attempt_limit:", page)
@@ -338,21 +452,27 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("quickFlowFailureExplanation", page)
         self.assertIn("本次请求被服务端拦截，不代表账号无法提链", page)
         self.assertIn('class="quick-flow-monitor-details"', page)
-        self.assertIn("直卡提链日志", page)
+        self.assertNotIn("直卡提链日志", page)
+        self.assertNotIn('id="quickFlowLog"', page)
+        self.assertNotIn('id="quickFlowLogCount"', page)
+        self.assertNotIn('class="quick-flow-console-section"', page)
+        self.assertIn('id="quickFlowResults"', page)
         self.assertIn("error.logs = Array.isArray(data.logs) ? data.logs : []", page)
         self.assertIn('"[直卡提链] " + message', page)
-        self.assertIn(".quick-flow-log .task-log-row.failed span", page)
+        self.assertNotIn(".quick-flow-log .task-log-row.failed span", page)
         self.assertNotIn(
             ".quick-flow-counters,\n.quick-flow-monitor-details {",
             page,
         )
-        quick_flow = page[page.index('id="quickFlowView"'):page.index('id="networkView"')]
+        quick_flow = page[
+            page.index('id="quickFlowView"') : page.index('id="networkView"')
+        ]
         self.assertNotIn('value="ph_hosted"', quick_flow)
         self.assertIn('value="de_oaics_paypal"', quick_flow)
         self.assertIn('value="paypal_us"', quick_flow)
         self.assertIn('value="paypal_gb"', quick_flow)
         self.assertIn('id="quickCardLinkTargetAmount"', quick_flow)
-        self.assertIn('target_amount: config.targetAmount', page)
+        self.assertIn("target_amount: config.targetAmount", page)
 
     def test_proxy_module_is_not_disabled_by_registration_mode(self):
         page = build_app_page()
@@ -368,12 +488,20 @@ class StructuredWebUiTests(unittest.TestCase):
             '["registrationSourceBlock", "registrationNetworkBlock", "registrationManualBlock"]',
             page,
         )
-        self.assertIn('$("registrationProxyEnabled").disabled = !proxy.configured', page)
+        self.assertIn(
+            '$("registrationProxyEnabled").disabled = !proxy.configured', page
+        )
         self.assertNotIn('$("registrationProxyEnabled").disabled = protocolMode', page)
         self.assertNotIn('$("registrationProxyMode").disabled = protocolMode', page)
-        self.assertNotIn('$("registrationProxySetupButton").disabled = protocolMode', page)
-        self.assertNotIn('$("rotateRegistrationProxyButton").disabled = protocolMode', page)
-        self.assertIn('.registration-proxy-credentials[hidden] { display: none; }', page)
+        self.assertNotIn(
+            '$("registrationProxySetupButton").disabled = protocolMode', page
+        )
+        self.assertNotIn(
+            '$("rotateRegistrationProxyButton").disabled = protocolMode', page
+        )
+        self.assertIn(
+            ".registration-proxy-credentials[hidden] { display: none; }", page
+        )
 
     def test_icloud_and_zkgmail_can_start_protocol_registration(self):
         page = build_app_page()
@@ -389,7 +517,9 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('"开始 zkgmail.com 协议注册"', page)
         self.assertIn('["icloud", "zkgmail"].includes(registrationProvider)', page)
         self.assertIn('registrationProvider === "zkgmail" && !zkgmail.configured', page)
-        self.assertIn('$("zkgmailControls").hidden = registrationProvider !== "zkgmail"', page)
+        self.assertIn(
+            '$("zkgmailControls").hidden = registrationProvider !== "zkgmail"', page
+        )
         self.assertIn('this.store.state.registrationMode === "protocol"', page)
         self.assertIn('this.api.post("/api/protocol-registration/start"', command)
         self.assertIn(
@@ -403,12 +533,8 @@ class StructuredWebUiTests(unittest.TestCase):
             command.index("if (protocolMode)"),
             command.index("const options = this.browserOptions();"),
         )
-        self.assertIn(
-            "已切换为协议注册，可选择 iCloud 或 zkgmail.com 邮箱", page
-        )
-        self.assertIn(
-            "setup_credentials: setupCredentials", page
-        )
+        self.assertIn("已切换为协议注册，可选择 iCloud 或 zkgmail.com 邮箱", page)
+        self.assertIn("setup_credentials: setupCredentials", page)
 
     def test_app_page_uses_frontend_design_patterns(self):
         page = build_app_page()
@@ -465,10 +591,10 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertNotIn("task-console-activity", page)
         self.assertNotIn("task-timeline", page)
 
-    def test_runtime_log_drawer_uses_mvp_and_shows_detailed_current_logs(self):
+    def test_terminal_is_the_only_runtime_log_surface(self):
         page = build_app_page()
 
-        for element_id in (
+        for removed_element_id in (
             "runtimeLogButton",
             "runtimeLogTriggerCount",
             "runtimeLogLiveDot",
@@ -487,17 +613,24 @@ class StructuredWebUiTests(unittest.TestCase):
             "runtimeLogUpdatedAt",
             "runtimeLogAnnouncement",
         ):
-            self.assertIn(f'id="{element_id}"', page)
-        self.assertIn('aria-controls="runtimeLogDrawer"', page)
-        self.assertIn('aria-expanded="false"', page)
-        self.assertIn('role="dialog" aria-modal="true"', page)
-        self.assertIn('id="runtimeLogList" class="runtime-log-list" role="log" aria-live="off"', page)
-        self.assertIn('data-action="open-runtime-log"', page)
-        self.assertIn('data-action="close-runtime-log"', page)
-        self.assertIn('data-action="copy-runtime-logs"', page)
-        self.assertIn("class RuntimeLogView", page)
-        self.assertIn("class RuntimeLogPresenter", page)
-        self.assertIn("this.runtimeLogPresenter.present(state)", page)
+            self.assertNotIn(f'id="{removed_element_id}"', page)
+        self.assertNotIn('aria-controls="runtimeLogDrawer"', page)
+        self.assertNotIn('role="dialog" aria-modal="true"', page)
+        self.assertNotIn('data-action="open-runtime-log"', page)
+        self.assertNotIn('data-action="close-runtime-log"', page)
+        self.assertNotIn('data-action="copy-runtime-logs"', page)
+        self.assertNotIn("class RuntimeLogView", page)
+        self.assertNotIn("class RuntimeLogResizeView", page)
+        self.assertNotIn("class RuntimeLogResizePresenter", page)
+        self.assertIn("class TerminalLogView", page)
+        self.assertIn("class TerminalLogPresenter", page)
+        self.assertIn("this.terminalLogPresenter.present(state)", page)
+        self.assertIn('id="workbenchTerminalPanel"', page)
+        self.assertIn('id="terminalPreviewTitle">终端</button>', page)
+        self.assertIn(
+            'id="terminalPreviewList" class="terminal-preview-list" role="log"', page
+        )
+        self.assertIn('data-action="toggle-terminal-preview"', page)
         self.assertIn('this.candidate("registration", "注册进程"', page)
         self.assertIn('this.candidate("browser", "浏览器任务"', page)
         self.assertIn('this.candidate("protocol", "协议注册"', page)
@@ -505,22 +638,18 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('this.candidate("pipeline", "注册提链流水线"', page)
         self.assertIn("raw.originTaskId || raw.taskId", page)
         self.assertIn("raw.originSeq || raw.originSequence", page)
-        self.assertIn("function redactRuntimeLogText", page)
-        self.assertIn("redactRuntimeLogText(raw.message)", page)
+        self.assertIn("function redactTerminalLogText", page)
+        self.assertIn("redactTerminalLogText(raw.message)", page)
         self.assertIn("REDACTED_API_KEY", page)
         self.assertIn("running ? currentLogs : historyLogs.length", page)
-        self.assertIn('{ forceList: true }', page)
-        self.assertIn('element.setAttribute("inert", "")', page)
         self.assertIn("logs.slice(-1200)", page)
         self.assertIn("formatLogTimestamp", page)
         self.assertIn("item.location", page)
         self.assertIn("item.action", page)
-        self.assertIn("item.diagnosticCode", page)
+        self.assertIn("diagnosticCode: redactTerminalLogText", page)
         self.assertIn('escapeHtml(item.message || "（无消息内容）")', page)
-        self.assertIn("打开运行日志检查失败上下文后重新注册", page)
-        self.assertIn("refreshRuntimeLogStatus", page)
-        self.assertIn("this.runtimeLogPresenter.handleKeydown(event)", page)
         self.assertIn("cursor: retainedLogs.at(-1)?.key", page)
+        self.assertNotIn("打开运行日志检查失败上下文后重新注册", page)
 
     def test_account_workspace_uses_compact_registration_launchpad(self):
         page = build_app_page()
@@ -537,19 +666,32 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("roxy-control-meta", page)
         self.assertIn("#accountsView:not([hidden])", page)
         self.assertIn("grid-template-columns: minmax(0, 1fr)", page)
-        self.assertIn("#accountsView > .table-panel { min-width: 0; grid-column: 1; margin: 0; }", page)
+        self.assertIn(
+            "#accountsView > .table-panel { min-width: 0; grid-column: 1; margin: 0; }",
+            page,
+        )
 
         runtime_start = page.index('id="registrationRuntimeControls"')
         runtime_end = page.index('id="registrationCodePanel"')
         self.assertIn('id="fetchAllButton"', page[runtime_start:runtime_end])
         for element_id in (
-            "registrationEmailProvider", "registerProviderButton",
-            "registrationProxyEnabled", "registrationProxyCountrySearch",
-            "registrationProxySetupButton", "roxyWorkspace", "roxyProfile",
-            "roxyConcurrency", "roxyTargetCount", "roxyWindowMode",
-            "registrationEmail", "registerEmailButton", "fetchAllButton",
-            "registrationRuntimeControls", "stopTaskButton",
-            "registrationCodePanel", "registrationCode",
+            "registrationEmailProvider",
+            "registerProviderButton",
+            "registrationProxyEnabled",
+            "registrationProxyCountrySearch",
+            "registrationProxySetupButton",
+            "roxyWorkspace",
+            "roxyProfile",
+            "roxyConcurrency",
+            "roxyTargetCount",
+            "roxyWindowMode",
+            "registrationEmail",
+            "registerEmailButton",
+            "fetchAllButton",
+            "registrationRuntimeControls",
+            "stopTaskButton",
+            "registrationCodePanel",
+            "registrationCode",
         ):
             self.assertEqual(page.count(f'id="{element_id}"'), 1, element_id)
 
@@ -572,13 +714,13 @@ class StructuredWebUiTests(unittest.TestCase):
         page = build_app_page()
 
         self.assertNotIn(
-            '(roxyMode && !state.roxyRegistration?.configured)',
+            "(roxyMode && !state.roxyRegistration?.configured)",
             page,
         )
         self.assertIn('profile.classList.toggle("needs-selection"', page)
         self.assertIn('profile.scrollIntoView({ behavior: "smooth"', page)
         self.assertIn(
-            '请先在上方“专用指纹环境”中选择一个 Roxy 环境，再点击注册',
+            "请先在上方“专用指纹环境”中选择一个 Roxy 环境，再点击注册",
             page,
         )
 
@@ -595,15 +737,16 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('target_count: mode === "roxy" ? roxyTargetCount', page)
         self.assertIn("同一环境不会并行执行两个账号", page)
 
-    def test_removed_inline_panel_keeps_page_context_in_runtime_logs(self):
+    def test_removed_inline_panel_keeps_page_context_in_terminal_logs(self):
         page = build_app_page()
 
         self.assertNotIn('id="taskCompletedSteps"', page)
         self.assertNotIn('id="taskNextAction"', page)
         self.assertNotIn('id="taskRecognitionMeta"', page)
         self.assertNotIn('id="taskStepLedger"', page)
-        self.assertIn('["页面位置", item.location]', page)
-        self.assertIn('["正在执行", item.action]', page)
+        self.assertIn("inferLogContext({", page)
+        self.assertIn("location: redactTerminalLogText(raw.location)", page)
+        self.assertIn("action: redactTerminalLogText(raw.action)", page)
         self.assertIn(
             'this.schedule("browser", () => this.loadBrowserTask(), 500)', page
         )
@@ -704,6 +847,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="loginForm"', page)
         self.assertIn('id="username"', page)
         self.assertIn("username: username.value", page)
+
 
 class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -842,9 +986,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
             async def complete_email(
                 self, completed_email, success, message, *, record=None
             ):
-                self.completed.append(
-                    (completed_email, success, message, record)
-                )
+                self.completed.append((completed_email, success, message, record))
 
         class ProtocolManagerStub:
             def __init__(self):
@@ -997,9 +1139,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.app["zkgmail_client"] = zkgmail
         self.app["protocol_registration_manager"] = ProtocolManagerStub()
 
-        response = await self.client.get(
-            f"/api/protocol-registration/code/{token}"
-        )
+        response = await self.client.get(f"/api/protocol-registration/code/{token}")
 
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.text(), "246810")
@@ -1140,7 +1280,10 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
                 "email": payload["email"],
                 "access_token": "header.payload.signature",
                 "session_json": json.dumps(
-                    {"accessToken": "header.payload.signature", "sessionToken": "session"}
+                    {
+                        "accessToken": "header.payload.signature",
+                        "sessionToken": "session",
+                    }
                 ),
                 "storage_state_json": json.dumps({"cookies": [], "origins": []}),
                 "session_acquisition_method": "gptfree_mail_auth",
@@ -1177,7 +1320,10 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
                 "email": payload["email"],
                 "access_token": "header.payload.signature",
                 "session_json": json.dumps(
-                    {"accessToken": "header.payload.signature", "sessionToken": "session"}
+                    {
+                        "accessToken": "header.payload.signature",
+                        "sessionToken": "session",
+                    }
                 ),
                 "storage_state_json": json.dumps({"cookies": [], "origins": []}),
                 "session_acquisition_method": "gptfree_mail_auth",
@@ -1302,9 +1448,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failures["total"], 1)
         self.assertEqual(failures["records"][0]["processId"], "failed-process-1")
         self.assertNotIn("password", failures["records"][0]["logs"][0])
-        self.assertEqual(
-            failures["summary"]["byReason"], {"email_verification": 1}
-        )
+        self.assertEqual(failures["summary"]["byReason"], {"email_verification": 1})
 
     async def test_registration_status_survives_monitor_read_failure(self):
         class BrokenMonitor:

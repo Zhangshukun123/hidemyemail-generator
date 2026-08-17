@@ -6,10 +6,63 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 from contextlib import suppress
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
+
+
+class ProtocolLogTee:
+    """Drain one child pipe into both the persistent log and parent terminal."""
+
+    def __init__(self, log_handle, terminal_stream=None) -> None:
+        self.log_handle = log_handle
+        self.terminal_stream = terminal_stream or sys.stderr
+        self.stream = None
+        self.thread: threading.Thread | None = None
+
+    def start(self, stream) -> None:
+        self.stream = stream
+        self.thread = threading.Thread(
+            target=self._forward,
+            name="paypal-protocol-log-tee",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _forward(self) -> None:
+        stream = self.stream
+        if stream is None:
+            return
+        while True:
+            chunk = stream.readline()
+            if not chunk:
+                break
+            with suppress(OSError, ValueError):
+                self.log_handle.write(chunk)
+                self.log_handle.flush()
+            try:
+                binary_terminal = getattr(self.terminal_stream, "buffer", None)
+                if binary_terminal is not None:
+                    binary_terminal.write(chunk)
+                    binary_terminal.flush()
+                else:
+                    self.terminal_stream.write(chunk.decode("utf-8", errors="replace"))
+                    self.terminal_stream.flush()
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+
+    def close(self) -> None:
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        if self.stream is not None:
+            with suppress(OSError, ValueError):
+                self.stream.close()
+        self.stream = None
+        self.thread = None
 
 
 class PayPalProtocolService:
@@ -38,6 +91,7 @@ class PayPalProtocolService:
         self.ready = False
         self._owns_process = False
         self._log_handle = None
+        self._log_forwarder: ProtocolLogTee | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -63,6 +117,7 @@ class PayPalProtocolService:
             **os.environ,
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1",
             "PAYPAL_WEB_METRICS_PATH": str(runtime / "protocol_metrics.json"),
             "PAYPAL_WEB_PAYMENT_AUDIT_PATH": str(runtime / "payment_audit.jsonl"),
             "PAYPAL_WEB_PAYMENT_AUDIT_KEY_PATH": str(runtime / ".payment_audit_hmac_key"),
@@ -109,10 +164,13 @@ class PayPalProtocolService:
                     cwd=str(self.project_dir),
                     env=self._runtime_environment(),
                     stdin=subprocess.DEVNULL,
-                    stdout=self._log_handle,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
+                    bufsize=0,
                     creationflags=creation_flags,
                 )
+                self._log_forwarder = ProtocolLogTee(self._log_handle)
+                self._log_forwarder.start(self.process.stdout)
                 self._owns_process = True
             except OSError as error:
                 self.error = f"PayPal 协议服务启动失败：{error}"
@@ -178,6 +236,62 @@ class PayPalProtocolService:
             self.error = f"PayPal 协议服务连接失败：{error}"
             return 502, {"error": self.error}
 
+    async def get_job(
+        self, job_id: str, *, device_id: str, log_offset: int = 0, log_after: int = 0
+    ) -> tuple[int, dict[str, object]]:
+        """Read one device-owned job with incremental logs."""
+        if not await self.ensure_running():
+            return 503, {"error": self.error or "PayPal 协议服务暂不可用"}
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {"Cookie": f"paypal_web_device_id={device_id}"}
+        path = quote(str(job_id or ""), safe="")
+        offset = max(0, int(log_offset or 0))
+        after = max(0, int(log_after or 0))
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{self.upstream_url}/api/jobs/{path}?log_offset={offset}&log_after={after}",
+                    headers=headers,
+                ) as response:
+                    try:
+                        data = await response.json()
+                    except (aiohttp.ContentTypeError, ValueError):
+                        data = {"error": (await response.text()).strip()}
+                    return response.status, data if isinstance(data, dict) else {}
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            self.ready = False
+            self.error = f"PayPal 协议任务状态读取失败：{error}"
+            return 502, {"error": self.error}
+
+    async def cancel_job(
+        self, job_id: str, *, device_id: str
+    ) -> tuple[int, dict[str, object]]:
+        """Cancel one device-owned protocol job."""
+        if not await self.ensure_running():
+            return 503, {"error": self.error or "PayPal 协议服务暂不可用"}
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {
+            "Cookie": f"paypal_web_device_id={device_id}",
+            "Content-Type": "application/json",
+        }
+        path = quote(str(job_id or ""), safe="")
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.upstream_url}/api/jobs/{path}/cancel",
+                    json={},
+                    headers=headers,
+                ) as response:
+                    try:
+                        data = await response.json()
+                    except (aiohttp.ContentTypeError, ValueError):
+                        data = {"error": (await response.text()).strip()}
+                    return response.status, data if isinstance(data, dict) else {}
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            self.ready = False
+            self.error = f"PayPal 协议任务取消失败：{error}"
+            return 502, {"error": self.error}
+
     async def close(self) -> None:
         async with self._lock:
             await self._stop_owned_process()
@@ -198,6 +312,9 @@ class PayPalProtocolService:
         self._close_log()
 
     def _close_log(self) -> None:
+        if self._log_forwarder is not None:
+            self._log_forwarder.close()
+            self._log_forwarder = None
         if self._log_handle is not None:
             with suppress(OSError):
                 self._log_handle.close()

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from .inbox import (
     DEFAULT_IMAP_TIMEOUT,
@@ -102,6 +102,19 @@ ZKGMAIL_RECIPIENT_HEADERS = (
 )
 
 
+class ZkgmailSyncStrategy(Protocol):
+    """Strategy interface for synchronizing verification messages."""
+
+    def __call__(
+        self,
+        config: InboxConfig,
+        db_file: Path,
+        aliases: set[str],
+        *,
+        limit: int = ZKGMAIL_MESSAGE_LIMIT,
+    ) -> int: ...
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -176,8 +189,8 @@ def _known_zkgmail_aliases(db_file: Path) -> set[str]:
     conn = connect_db(str(db_file))
     try:
         rows = conn.execute(
-            "SELECT email FROM addresses WHERE source = ? AND lower(email) LIKE ?",
-            ("zkgmail", f"%@{ZKGMAIL_DOMAIN}"),
+            "SELECT email FROM addresses WHERE lower(email) LIKE ?",
+            (f"%@{ZKGMAIL_DOMAIN}",),
         ).fetchall()
     finally:
         conn.close()
@@ -272,7 +285,7 @@ def _sync_relevant_messages(
                     "received_at": parse_received_at(message),
                     "created_at": _utc_now().isoformat(),
                 }
-                if insert_message(conn, record):
+                if insert_message(conn, record, address_source="zkgmail"):
                     inserted += 1
         return inserted
     finally:
@@ -411,6 +424,7 @@ class ZkgmailMailClient:
         config_store: ZkgmailConfigStore,
         *,
         sync_interval_seconds: float = ZKGMAIL_SYNC_INTERVAL_SECONDS,
+        sync_strategy: ZkgmailSyncStrategy | None = None,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -419,9 +433,12 @@ class ZkgmailMailClient:
         self.sync_interval_seconds = max(0.0, float(sync_interval_seconds))
         self._clock = clock or _utc_now
         self._monotonic = monotonic or time.monotonic
+        self._sync_strategy = sync_strategy
         self._acquired_at: dict[str, datetime] = {}
         self._consumed_message_ids: dict[str, set[int]] = {}
         self._next_sync_at = 0.0
+        self._sync_task: asyncio.Task[None] | None = None
+        self._sync_error: RuntimeError | None = None
         self._lock = asyncio.Lock()
 
     def _now(self) -> datetime:
@@ -437,19 +454,32 @@ class ZkgmailMailClient:
             "automaticCode": True,
         }
 
+    @property
+    def sync_task(self) -> asyncio.Task[None] | None:
+        """Expose the single-flight task for lifecycle coordination and tests."""
+
+        return self._sync_task
+
     async def configure(self, authorization_code: str | None = None) -> dict[str, Any]:
-        config = self.config_store.inbox_config(authorization_code)
-        try:
-            await asyncio.to_thread(_test_imap_connection, config)
-        except imaplib.IMAP4.error as error:
-            raise RuntimeError(
-                "QQ 邮箱 IMAP 登录失败，请检查授权码并确认 IMAP 服务已开启"
-            ) from error
-        except (OSError, TimeoutError) as error:
-            raise RuntimeError("无法连接 QQ 邮箱 IMAP 服务") from error
-        state = self.config_store.configure(authorization_code=authorization_code)
-        self._next_sync_at = 0.0
-        return {**state, "active": len(self._acquired_at), "automaticCode": True}
+        async with self._lock:
+            await self._wait_for_sync_completion()
+            config = self.config_store.inbox_config(authorization_code)
+            try:
+                await asyncio.to_thread(_test_imap_connection, config)
+            except imaplib.IMAP4.error as error:
+                raise RuntimeError(
+                    "QQ 邮箱 IMAP 登录失败，请检查授权码并确认 IMAP 服务已开启"
+                ) from error
+            except (OSError, TimeoutError) as error:
+                raise RuntimeError("无法连接 QQ 邮箱 IMAP 服务") from error
+            state = self.config_store.configure(authorization_code=authorization_code)
+            self._sync_error = None
+            self._next_sync_at = 0.0
+            return {
+                **state,
+                "active": len(self._acquired_at),
+                "automaticCode": True,
+            }
 
     @staticmethod
     def _normalize_email(email: str) -> str:
@@ -493,17 +523,18 @@ class ZkgmailMailClient:
         self._consumed_message_ids[email] = set()
         return email
 
-    async def _sync_if_due(self) -> None:
-        now = self._monotonic()
-        if now < self._next_sync_at:
-            return
-        config = self.config_store.inbox_config()
+    async def _run_sync(
+        self,
+        config: InboxConfig,
+        aliases: set[str],
+    ) -> None:
+        strategy = self._sync_strategy or _sync_relevant_messages
         try:
             await asyncio.to_thread(
-                _sync_relevant_messages,
+                strategy,
                 config,
                 self.db_file,
-                _known_zkgmail_aliases(self.db_file),
+                aliases,
                 limit=ZKGMAIL_MESSAGE_LIMIT,
             )
         except imaplib.IMAP4.error as error:
@@ -512,7 +543,42 @@ class ZkgmailMailClient:
             ) from error
         except (OSError, TimeoutError) as error:
             raise RuntimeError("无法连接 QQ 邮箱 IMAP 服务") from error
+
+    def _finish_sync(self, task: asyncio.Task[None]) -> None:
+        if self._sync_task is not task:
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            self._sync_error = None
+        except RuntimeError as error:
+            self._sync_error = error
+        except Exception as error:  # pragma: no cover - defensive adapter boundary
+            self._sync_error = RuntimeError(
+                f"QQ 邮箱同步失败：{type(error).__name__}"
+            )
+        else:
+            self._sync_error = None
+        self._sync_task = None
         self._next_sync_at = self._monotonic() + self.sync_interval_seconds
+
+    def _start_sync_if_due(self) -> bool:
+        # Single-Flight pattern: concurrent HTTP polls share one IMAP scan.
+        if self._sync_task is not None:
+            return False
+        now = self._monotonic()
+        if now < self._next_sync_at:
+            return False
+        config = self.config_store.inbox_config()
+        aliases = _known_zkgmail_aliases(self.db_file) | set(self._acquired_at)
+        self._sync_error = None
+        task = asyncio.create_task(
+            self._run_sync(config, aliases),
+            name="zkgmail-imap-sync",
+        )
+        self._sync_task = task
+        task.add_done_callback(self._finish_sync)
+        return True
 
     def _next_stored_code(self, email: str) -> str:
         acquired_at = self._acquired_at.get(email)
@@ -557,8 +623,17 @@ class ZkgmailMailClient:
     async def poll_code(self, email: str) -> str:
         target = self._normalize_email(email)
         async with self._lock:
-            await self._sync_if_due()
-            return self._next_stored_code(target)
+            # Cache-Aside pattern: a local hit must never wait behind remote IMAP.
+            code = self._next_stored_code(target)
+            if code:
+                return code
+            previous_error = self._sync_error
+            if previous_error is not None:
+                # Surface every failed scan once before starting its retry.
+                self._sync_error = None
+                raise previous_error
+            self._start_sync_if_due()
+            return ""
 
     async def poll_next_code(self, email: str) -> str:
         return await self.poll_code(email)
@@ -568,6 +643,31 @@ class ZkgmailMailClient:
 
     async def cancel_email(self, email: str, _message: str) -> None:
         self._normalize_email(email)
+
+    async def close(self) -> None:
+        """Wait for the detached IMAP adapter before application shutdown."""
+
+        await self._wait_for_sync_completion()
+
+    async def _wait_for_sync_completion(self) -> None:
+        task = self._sync_task
+        if task is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # ``to_thread`` keeps running after cancellation.  Finish the
+            # adapter so its IMAP and SQLite handles close before shutdown.
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        except Exception:
+            # The next poll exposes the normalized synchronization error.
+            pass
+        finally:
+            # A task waiter can resume before its done callback.  Finalize it
+            # here so configure/close cannot be overwritten by a stale callback.
+            if task.done() and self._sync_task is task:
+                self._finish_sync(task)
 
     async def forget_email(self, email: str) -> bool:
         target = self._normalize_email(email)

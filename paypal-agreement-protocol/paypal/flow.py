@@ -24,6 +24,7 @@ from paypal.models import (
     generate_user,
     generate_address,
 )
+from paypal.payment_completion import is_trusted_openai_checkout_url
 from paypal.session import PayPalSession, sanitize_for_log
 from paypal.proxy import build_proxy_config, ProxyConfig
 from paypal.fingerprint import (
@@ -817,9 +818,10 @@ class PayPalFlow:
 
     def _build_signup_variables(self, token: str) -> dict:
         card_type = self._card_issuer_type()
+        address_normalized = bool(getattr(self, "_address_normalized_by_paypal", False))
         address_quality = {
-            "autoCompleteType": "ANS" if self._address_normalized_by_paypal else "MANUAL",
-            "isUserModified": not self._address_normalized_by_paypal,
+            "autoCompleteType": "ANS" if address_normalized else "MANUAL",
+            "isUserModified": not address_normalized,
         }
         variables = {
             "card": {
@@ -2205,11 +2207,23 @@ class PayPalFlow:
                     final_parsed = urllib.parse.urlparse(final_redirect_url)
                     final_query = urllib.parse.parse_qs(final_parsed.query)
                     redirect_status = str((final_query.get("redirect_status") or [""])[0]).lower()
-                    verification_url = str((final_query.get("success_return_url") or [""])[0])
+                    final_host = (final_parsed.hostname or "").lower()
+                    if (
+                        final_host == "pay.openai.com"
+                        and is_trusted_openai_checkout_url(final_redirect_url)
+                    ):
+                        candidate_verification_url = str(
+                            (final_query.get("success_return_url") or [""])[0]
+                        )
+                        if is_trusted_openai_checkout_url(
+                            candidate_verification_url
+                        ):
+                            verification_url = candidate_verification_url
                     if (
                         not verification_url
-                        and (final_parsed.hostname or "").lower() == "chatgpt.com"
+                        and final_host in {"chatgpt.com", "chat.openai.com"}
                         and final_parsed.path.startswith("/checkout/verify")
+                        and is_trusted_openai_checkout_url(final_redirect_url)
                     ):
                         verification_url = final_redirect_url
                     if redirect_status in {"success", "succeeded"}:
@@ -2221,18 +2235,9 @@ class PayPalFlow:
                 except Exception as status_error:
                     logger.warning("Parsing merchant completion status failed: {}", status_error)
             for candidate_url in (verification_url, final_redirect_url):
-                try:
-                    candidate = urllib.parse.urlparse(str(candidate_url or ""))
-                    candidate_host = (candidate.hostname or "").lower()
-                    if candidate.scheme == "https" and candidate_host in {
-                        "chatgpt.com",
-                        "chat.openai.com",
-                        "pay.openai.com",
-                    }:
-                        pending_url = str(candidate_url)
-                        break
-                except Exception:
-                    continue
+                if is_trusted_openai_checkout_url(candidate_url):
+                    pending_url = str(candidate_url)
+                    break
             if settlement_status == "pending_verification":
                 logger.warning(
                     "PayPal agreement is authorized, but OpenAI/Stripe still requires checkout verification"

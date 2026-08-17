@@ -22,6 +22,7 @@
       button: "提取 PayPal 链接",
       success: "PayPal US/USD 授权链接已提取并复制",
       singleProxy: true,
+      fixedProxyCountry: true,
       createProxyPreference: "paypalUsCreate",
       createProxyCountry: "US",
       promotionProxyPreference: "paypalUsFollowup",
@@ -38,6 +39,7 @@
       button: "提取 PayPal 链接",
       success: "PayPal GB/GBP 授权链接已提取并复制",
       singleProxy: true,
+      fixedProxyCountry: true,
       createProxyPreference: "paypalGbCreate",
       createProxyCountry: "GB",
       createProxyLabel: "英国第一代理国家",
@@ -74,6 +76,45 @@
     return cardLinkExtractionModes[method] || cardLinkExtractionModes.ph_hosted;
   }
 
+  class CardLinkCountryPolicy {
+    constructor(modes) {
+      this.modes = modes;
+    }
+
+    resolve(method, candidate = "") {
+      const config = this.modes[method];
+      if (config?.fixedProxyCountry) return config.country;
+      return String(candidate || "").trim().toUpperCase();
+    }
+
+    normalizeSnapshot(snapshot = {}) {
+      const method = String(snapshot.cardLinkMethod || "");
+      const config = this.modes[method];
+      if (!config?.fixedProxyCountry) return snapshot;
+      const country = this.resolve(method);
+      return {
+        ...snapshot,
+        extractionFirstCountry: country,
+        extractionSecondCountry: country,
+      };
+    }
+  }
+
+  const cardLinkCountryPolicy = new CardLinkCountryPolicy(cardLinkExtractionModes);
+
+  class PayPalWorkspacePresenter {
+    frameUrl(baseUrl = "/paypal-pay/", jobId = "") {
+      const url = new URL(baseUrl || "/paypal-pay/", location.origin);
+      url.searchParams.set("embedded", "1");
+      url.searchParams.set("theme", document.documentElement.dataset.theme || "dark");
+      if (jobId) url.searchParams.set("job", jobId);
+      else url.searchParams.delete("job");
+      return url.origin === location.origin ? url.pathname + url.search + url.hash : url.href;
+    }
+  }
+
+  const paypalWorkspacePresenter = new PayPalWorkspacePresenter();
+
   function cardLinkPaymentPayload(method) {
     const config = cardLinkRuntimeConfig(method);
     return {
@@ -92,7 +133,7 @@
 
   function quickFlowFailureExplanation(item = {}) {
     const detail = String(item.paymentError || item.error || "").trim();
-    if (!detail) return "未记录到具体错误，请查看流水线日志";
+    if (!detail) return "未记录到具体错误，请查看下方终端日志";
     if (/chatgpt approve result:\s*['\"]?blocked/i.test(detail)) {
       return "ChatGPT Approve 返回 blocked：本次请求被服务端拦截，不代表账号无法提链；可更换请求或线路后重试";
     }
@@ -105,7 +146,7 @@
     return detail;
   }
 
-  function redactRuntimeLogText(value) {
+  function redactTerminalLogText(value) {
     return String(value ?? "")
       .replace(/([a-z][a-z0-9+.-]*:\/\/)([^@\s/:]+):([^@\s]+)@/gi,
         "$1[REDACTED]:[REDACTED]@")
@@ -596,325 +637,471 @@
     }
   }
 
-  class RuntimeLogResizeView {
-    constructor() {
-      this.drawer = $("runtimeLogDrawer");
-      this.handle = $("runtimeLogResizeHandle");
-      this.compactQuery = matchMedia("(max-width: 640px)");
+  class RegistrationConfigModel {
+    constructor(storage = localStorage) {
+      this.storage = storage;
+      this.storageKey = "hme_registration_config_collapsed";
     }
 
-    isCompact() { return this.compactQuery.matches; }
-
-    availableWidth() {
-      const activityBarWidth = Number.parseFloat(getComputedStyle(document.documentElement)
-        .getPropertyValue("--workbench-activitybar-width")) || 0;
-      const layoutWidth = document.documentElement.getBoundingClientRect().width;
-      return Math.max(1, layoutWidth - activityBarWidth);
-    }
-
-    measuredWidth() { return this.drawer.getBoundingClientRect().width; }
-
-    render({ width, min, max, compact }) {
-      const roundedWidth = Math.round(width);
-      const moveFocusInsideDialog = compact && document.activeElement === this.handle &&
-        !this.drawer.hidden;
-      this.drawer.style.setProperty("--runtime-log-drawer-width", roundedWidth + "px");
-      this.handle.hidden = compact;
-      this.handle.tabIndex = compact ? -1 : 0;
-      this.handle.setAttribute("aria-disabled", String(compact));
-      this.handle.setAttribute("aria-valuemin", String(Math.round(min)));
-      this.handle.setAttribute("aria-valuemax", String(Math.round(max)));
-      this.handle.setAttribute("aria-valuenow", String(roundedWidth));
-      this.handle.setAttribute("aria-valuetext", roundedWidth + " 像素");
-      this.handle.title = compact
-        ? "小屏幕使用全屏日志视图"
-        : "当前宽度 " + roundedWidth + " 像素；左右拖动调整，方向键微调，双击恢复默认";
-      if (moveFocusInsideDialog) $("runtimeLogCloseButton").focus();
-    }
-
-    startPointer(pointerId) {
-      document.body.classList.add("runtime-log-resizing");
-      try { this.handle.setPointerCapture(pointerId); } catch (_error) {}
-    }
-
-    stopPointer(pointerId) {
-      document.body.classList.remove("runtime-log-resizing");
+    loadCollapsed() {
       try {
-        if (this.handle.hasPointerCapture(pointerId)) this.handle.releasePointerCapture(pointerId);
-      } catch (_error) {}
+        return this.storage.getItem(this.storageKey) === "1";
+      } catch (_error) {
+        return false;
+      }
+    }
+
+    saveCollapsed(collapsed) {
+      const normalized = Boolean(collapsed);
+      try {
+        this.storage.setItem(this.storageKey, normalized ? "1" : "0");
+      } catch (_error) {
+        // The panel remains interactive when persistent storage is unavailable.
+      }
+      return normalized;
     }
   }
 
-  class RuntimeLogResizePresenter {
-    constructor(view, storage = window.localStorage) {
+  class RegistrationConfigView {
+    constructor() {
+      this.deck = document.querySelector("#accountsView .registration-command-deck");
+      this.panel = $("registrationConfigPanel");
+      this.toggleButton = $("registrationConfigToggle");
+      this.toggleLabel = this.toggleButton.querySelector("span");
+      this.toggleIcon = this.toggleButton.querySelector("b");
+    }
+
+    render(collapsed) {
+      const expanded = !collapsed;
+      this.panel.hidden = collapsed;
+      this.deck.dataset.configCollapsed = String(collapsed);
+      this.toggleButton.setAttribute("aria-expanded", String(expanded));
+      this.toggleButton.setAttribute("aria-label", collapsed ? "展开注册配置" : "收起注册配置");
+      this.toggleButton.title = collapsed ? "展开注册配置" : "收起注册配置";
+      this.toggleLabel.textContent = collapsed ? "展开配置" : "收起配置";
+      this.toggleIcon.textContent = collapsed ? "⌄" : "⌃";
+    }
+
+    focusToggle() {
+      requestAnimationFrame(() => this.toggleButton.focus());
+    }
+  }
+
+  class RegistrationConfigPresenter {
+    constructor(model, view) {
+      this.model = model;
       this.view = view;
-      this.storage = storage;
-      this.storageKey = "hme_runtime_log_width";
-      this.defaultWidth = 680;
-      this.minimumWidth = 420;
-      this.maximumWidth = 1200;
-      this.preferredWidth = this.defaultWidth;
-      this.effectiveWidth = this.defaultWidth;
-      this.drag = null;
-    }
-
-    normalizePreferred(value) {
-      if (value == null || String(value).trim() === "") return this.defaultWidth;
-      const numeric = Number(value);
-      if (!Number.isFinite(numeric)) return this.defaultWidth;
-      return Math.min(this.maximumWidth, Math.max(this.minimumWidth, numeric));
-    }
-
-    bounds() {
-      const max = Math.min(this.maximumWidth, this.view.availableWidth());
-      return { min: Math.min(this.minimumWidth, max), max };
-    }
-
-    apply() {
-      if (this.view.isCompact()) {
-        this.effectiveWidth = window.innerWidth;
-        this.view.render({
-          width: this.effectiveWidth,
-          min: this.effectiveWidth,
-          max: this.effectiveWidth,
-          compact: true,
-        });
-        return;
-      }
-      const { min, max } = this.bounds();
-      this.effectiveWidth = Math.min(max, Math.max(min, this.preferredWidth));
-      this.view.render({ width: this.effectiveWidth, min, max, compact: false });
+      this.collapsed = false;
     }
 
     restore() {
-      let saved = this.defaultWidth;
-      try { saved = this.storage.getItem(this.storageKey) ?? this.defaultWidth; } catch (_error) {}
-      this.preferredWidth = this.normalizePreferred(saved);
-      this.apply();
+      this.collapsed = this.model.loadCollapsed();
+      this.view.render(this.collapsed);
     }
 
-    persist() {
-      try { this.storage.setItem(this.storageKey, String(Math.round(this.preferredWidth))); }
-      catch (_error) {}
+    toggle() {
+      this.collapsed = this.model.saveCollapsed(!this.collapsed);
+      this.view.render(this.collapsed);
+      this.view.focusToggle();
     }
 
-    begin(event) {
-      if (this.view.isCompact() || !event.isPrimary || event.button !== 0) return;
-      event.preventDefault();
-      this.drag = {
-        pointerId: event.pointerId,
-        startX: event.clientX,
-        startWidth: this.effectiveWidth || this.view.measuredWidth(),
-        startPreferredWidth: this.preferredWidth,
-      };
-      this.view.startPointer(event.pointerId);
-    }
-
-    move(event) {
-      if (!this.drag || event.pointerId !== this.drag.pointerId) return;
-      event.preventDefault();
-      const next = this.drag.startWidth + this.drag.startX - event.clientX;
-      const { min, max } = this.bounds();
-      this.preferredWidth = Math.min(max, Math.max(min, next));
-      this.apply();
-    }
-
-    finish(event) {
-      if (!this.drag || (event?.pointerId != null && event.pointerId !== this.drag.pointerId)) return;
-      const pointerId = this.drag.pointerId;
-      this.drag = null;
-      this.view.stopPointer(pointerId);
-      this.persist();
-    }
-
-    cancel(event) {
-      if (!this.drag || (event?.pointerId != null && event.pointerId !== this.drag.pointerId)) return;
-      const { pointerId, startPreferredWidth } = this.drag;
-      this.drag = null;
-      this.preferredWidth = startPreferredWidth;
-      this.view.stopPointer(pointerId);
-      this.apply();
-    }
-
-    handleKeydown(event) {
-      if (this.view.isCompact()) return;
-      const { min, max } = this.bounds();
-      const step = event.shiftKey ? 64 : 16;
-      let next = null;
-      if (event.key === "Home") next = min;
-      if (event.key === "End") next = max;
-      if (event.key === "ArrowLeft") next = this.effectiveWidth + step;
-      if (event.key === "ArrowRight") next = this.effectiveWidth - step;
-      if (next == null) return;
-      event.preventDefault();
-      event.stopPropagation();
-      this.preferredWidth = Math.min(max, Math.max(min, next));
-      this.apply();
-      this.persist();
-    }
-
-    reset(event) {
-      if (this.view.isCompact()) return;
-      event?.preventDefault();
-      this.preferredWidth = this.defaultWidth;
-      this.apply();
-      this.persist();
-    }
-
-    handleViewportResize() {
-      if (this.drag) this.cancel();
-      this.apply();
+    present() {
+      this.view.render(this.collapsed);
     }
   }
 
-  class RuntimeLogView {
-    constructor() {
-      this.drawer = $("runtimeLogDrawer");
-      this.backdrop = $("runtimeLogBackdrop");
-      this.trigger = $("runtimeLogButton");
-      this.triggers = [...document.querySelectorAll('[data-action="open-runtime-log"]')];
-      this.list = $("runtimeLogList");
-      this.search = $("runtimeLogSearch");
-      this.level = $("runtimeLogLevel");
-      this.autoscroll = $("runtimeLogAutoscroll");
-      this.announcement = $("runtimeLogAnnouncement");
-      this.lastKnownTotal = 0;
-      this.lastKnownCursor = "";
-      this.focusFrame = 0;
+  class QuickFlowConfigModel {
+    constructor(storage = localStorage) {
+      this.storage = storage;
+      this.snapshotKey = "hme_quick_flow_config_v1";
+      this.collapsedKey = "hme_quick_flow_config_collapsed";
+      this.legacyKeys = {
+        registrationProvider: "hme_quick_registration_provider",
+        registrationMode: "hme_quick_registration_mode",
+        concurrency: "hme_quick_registration_concurrency",
+        roxyTargetCount: "hme_quick_registration_target",
+        registrationProxyMode: "hme_quick_registration_proxy_mode",
+        registrationProxyCountry: "hme_quick_registration_proxy_country",
+        cardLinkMethod: "hme_quick_card_link_method",
+        extractionCount: "hme_quick_extraction_count",
+        extractionProxyMode: "hme_quick_extraction_proxy_mode",
+        extractionFirstCountry: "hme_quick_extraction_first_country",
+        extractionSecondCountry: "hme_quick_extraction_second_country",
+        promotionProxyChoice: "hme_quick_promotion_proxy_choice",
+        targetAmount: "hme_quick_paypal_us_target_amount",
+      };
     }
 
-    isOpen() { return !this.drawer.hidden; }
+    getItem(key) {
+      try {
+        return this.storage.getItem(key);
+      } catch (_error) {
+        return null;
+      }
+    }
 
-    open(opener) {
-      this.returnFocus = opener?.closest?.("button") || document.activeElement || this.trigger;
-      document.querySelectorAll(".workbench-titlebar, .app-shell")
-        .forEach((element) => element.setAttribute("inert", ""));
-      this.drawer.hidden = false;
-      this.backdrop.hidden = false;
-      this.triggers.forEach((element) => element.setAttribute("aria-expanded", "true"));
-      document.body.classList.add("runtime-log-open");
-      this.scrollOnNextRender = true;
-      cancelAnimationFrame(this.focusFrame);
-      this.focusFrame = requestAnimationFrame(() => {
-        this.focusFrame = 0;
-        if (this.isOpen()) $("runtimeLogCloseButton").focus();
+    normalize(candidate = {}) {
+      const enumValue = (value, allowed, fallback) => allowed.includes(String(value))
+        ? String(value) : fallback;
+      const integerValue = (value, minimum, maximum, fallback) => {
+        const parsed = Number(value);
+        return String(Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum
+          ? parsed : fallback);
+      };
+      const textValue = (value, fallback = "") => String(value ?? fallback).trim();
+      const roxyTargetCount = integerValue(
+        candidate.roxyTargetCount ?? candidate.targetCount,
+        1,
+        100,
+        1,
+      );
+      const snapshot = {
+        registrationProvider: enumValue(candidate.registrationProvider, ["inventory", "zkgmail"], "inventory"),
+        registrationMode: enumValue(candidate.registrationMode, ["headless", "headed", "roxy", "protocol"], "headless"),
+        concurrency: integerValue(candidate.concurrency, 1, 10, 1),
+        targetCount: integerValue(candidate.targetCount, 1, 100, Number(roxyTargetCount)),
+        roxyTargetCount,
+        registrationProxyMode: textValue(candidate.registrationProxyMode, "direct") || "direct",
+        registrationProxyCountry: textValue(candidate.registrationProxyCountry, "NL") || "NL",
+        cardLinkMethod: enumValue(candidate.cardLinkMethod, ["de_oaics_paypal", "paypal_us", "paypal_gb"], "de_oaics_paypal"),
+        extractionCount: integerValue(candidate.extractionCount, 1, 100, 1),
+        extractionProxyMode: textValue(candidate.extractionProxyMode, "dynamic") || "dynamic",
+        extractionFirstCountry: textValue(candidate.extractionFirstCountry, "DE") || "DE",
+        extractionSecondCountry: textValue(candidate.extractionSecondCountry, "DE") || "DE",
+        promotionProxyChoice: enumValue(candidate.promotionProxyChoice, ["first", "second"], "first"),
+        targetAmount: textValue(candidate.targetAmount),
+        savedAt: textValue(candidate.savedAt),
+        collapsed: Boolean(candidate.collapsed),
+      };
+      return cardLinkCountryPolicy.normalizeSnapshot(snapshot);
+    }
+
+    load() {
+      const legacy = Object.fromEntries(Object.entries(this.legacyKeys).map(([field, key]) =>
+        [field, this.getItem(key)]
+      ));
+      let snapshot = {};
+      try {
+        snapshot = JSON.parse(this.getItem(this.snapshotKey) || "{}") || {};
+      } catch (_error) {
+        snapshot = {};
+      }
+      return this.normalize({
+        ...legacy,
+        ...snapshot,
+        collapsed: this.getItem(this.collapsedKey) === "1",
       });
     }
 
-    close() {
-      cancelAnimationFrame(this.focusFrame);
-      this.focusFrame = 0;
-      this.drawer.hidden = true;
-      this.backdrop.hidden = true;
-      this.triggers.forEach((element) => element.setAttribute("aria-expanded", "false"));
-      document.body.classList.remove("runtime-log-open");
-      document.querySelectorAll(".workbench-titlebar, .app-shell")
-        .forEach((element) => element.removeAttribute("inert"));
-      const fallback = this.triggers.find((element) => element.getClientRects().length) || this.trigger;
-      const focusTarget = this.returnFocus?.isConnected && this.returnFocus.getClientRects().length
-        ? this.returnFocus : fallback;
-      focusTarget.focus();
+    write(snapshot) {
+      try {
+        this.storage.setItem(this.snapshotKey, JSON.stringify(snapshot));
+        this.storage.setItem(this.collapsedKey, snapshot.collapsed ? "1" : "0");
+        Object.entries(this.legacyKeys).forEach(([field, key]) => {
+          this.storage.setItem(key, String(snapshot[field] ?? ""));
+        });
+      } catch (_error) {
+        // The form remains usable when persistent storage is unavailable.
+      }
+      return snapshot;
     }
 
-    trapFocus(event) {
-      if (event.key !== "Tab" || !this.isOpen()) return;
-      const focusable = [...this.drawer.querySelectorAll(
-        'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      )].filter((element) => element.getClientRects().length &&
-        !element.closest("[hidden], [inert]"));
-      if (!focusable.length) return;
-      const first = focusable[0];
-      const last = focusable.at(-1);
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
+    restore() {
+      return this.write(this.load());
     }
 
-    filters() {
-      return {
-        query: this.search.value.trim().toLocaleLowerCase("zh-CN"),
-        level: this.level.value || "all",
-      };
+    save(candidate) {
+      return this.write(this.normalize({
+        ...candidate,
+        savedAt: new Date().toISOString(),
+      }));
     }
 
-    render(model, visibleLogs, { forceList = false } = {}) {
-      const previousTotal = this.lastKnownTotal;
-      const previousCursor = this.lastKnownCursor;
-      this.lastKnownTotal = model.logs.length;
-      this.lastKnownCursor = model.cursor;
-      const wasNearBottom = this.list.scrollHeight - this.list.scrollTop -
-        this.list.clientHeight < 80;
-      const count = model.logs.length > 999 ? "999+" : String(model.logs.length);
-      $("runtimeLogTriggerCount").textContent = count;
-      this.trigger.setAttribute("aria-label", "打开运行日志，" + model.logs.length + " 条");
-      $("runtimeLogLiveDot").classList.toggle("live", model.runningCount > 0);
-      $("runtimeLogState").textContent = model.statusLabel;
-      $("runtimeLogTask").textContent = model.taskLabel;
-      $("runtimeLogStartedAt").textContent = formatLogTimestamp(model.startedAt);
-      $("runtimeLogTotal").textContent = model.logs.length + " 条";
-      $("runtimeLogSubtitle").textContent = model.subtitle;
-      $("runtimeLogVisibleCount").textContent = "显示 " + visibleLogs.length +
-        " / " + model.logs.length + " 条";
-      $("runtimeLogUpdatedAt").textContent = "界面更新 " + formatLogTimestamp(model.updatedAt);
-      if (!this.isOpen() && !forceList) return;
-      this.list.innerHTML = visibleLogs.length ? visibleLogs.map((item, index) => {
-        const levelLabels = {
-          error: "错误", warning: "警告", waiting: "等待", success: "成功",
-          active: "运行", idle: "信息",
-        };
-        const contexts = [
-          ["账号", item.email],
-          ["阶段", taskStageLabel(item.stage) + " · " + item.stage],
-          ["页面位置", item.location],
-          ["正在执行", item.action],
-          ["任务 ID", item.taskId],
-          ["进程", item.processLabel || item.processId],
-          ["诊断码", item.diagnosticCode],
-          ["事件来源", [item.source, item.eventType].filter(Boolean).join(" / ")],
-        ].filter((entry) => String(entry[1] || "").trim());
-        return '<article class="runtime-log-entry" data-level="' +
-          escapeHtml(item.status) + '"><div class="runtime-log-entry-head"><span class="runtime-log-level">' +
-          escapeHtml(levelLabels[item.status] || "信息") + '</span><span class="runtime-log-source">' +
-          escapeHtml(item.sourceLabel) + '</span><time datetime="' + escapeHtml(item.at) + '">' +
-          escapeHtml(formatLogTimestamp(item.at)) + '</time><span class="runtime-log-sequence">#' +
-          escapeHtml(item.sequence || index + 1) + '</span></div><p class="runtime-log-message">' +
-          escapeHtml(item.message || "（无消息内容）") + '</p><dl class="runtime-log-context-grid">' +
-          contexts.map((entry) => '<div><dt>' + escapeHtml(entry[0]) + '</dt><dd title="' +
-            escapeHtml(entry[1]) + '">' +
-            escapeHtml(entry[1]) + '</dd></div>').join("") + "</dl></article>";
-      }).join("") : '<div class="runtime-log-empty"><strong>没有匹配的日志</strong><span>' +
-        (model.logs.length
-          ? "请调整搜索关键词或日志级别。"
-          : "启动注册、浏览器、协议或验证任务后，详细日志会实时显示在这里。") +
-        "</span></div>";
-      if (this.isOpen() && this.autoscroll.checked && (wasNearBottom || this.scrollOnNextRender)) {
-        requestAnimationFrame(() => { this.list.scrollTop = this.list.scrollHeight; });
-      }
-      if (this.isOpen() && previousCursor && model.cursor !== previousCursor) {
-        const delta = Math.max(0, model.logs.length - previousTotal);
-        this.announcement.textContent = delta
-          ? "新增 " + delta + " 条运行日志，最新序号 " + (model.logs.at(-1)?.sequence || "—")
-          : "运行日志已更新，最新序号 " + (model.logs.at(-1)?.sequence || "—");
-      }
-      this.scrollOnNextRender = false;
+    saveCollapsed(collapsed) {
+      const snapshot = this.load();
+      snapshot.collapsed = Boolean(collapsed);
+      return this.write(snapshot);
     }
   }
 
-  class RuntimeLogPresenter {
+  class QuickFlowConfigView {
+    constructor() {
+      this.details = $("quickFlowConfigDetails");
+      this.savedState = $("quickFlowSavedConfigState");
+      this.savedSummary = $("quickFlowSavedConfigSummary");
+      this.fields = {
+        registrationProvider: $("quickRegistrationProvider"),
+        registrationMode: $("quickRegistrationMode"),
+        concurrency: $("quickRegistrationConcurrency"),
+        targetCount: $("quickRegistrationTargetCount"),
+        registrationProxyMode: $("quickRegistrationProxyMode"),
+        registrationProxyCountry: $("quickRegistrationProxyCountry"),
+        cardLinkMethod: $("quickCardLinkMethod"),
+        extractionCount: $("quickExtractionCount"),
+        extractionProxyMode: $("quickExtractionProxyMode"),
+        extractionFirstCountry: $("quickExtractionFirstProxyCountry"),
+        extractionSecondCountry: $("quickExtractionSecondProxyCountry"),
+        promotionProxyChoice: $("quickPromotionProxyChoice"),
+        targetAmount: $("quickCardLinkTargetAmount"),
+      };
+    }
+
+    read() {
+      return {
+        ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) =>
+          [field, element.value]
+        )),
+        collapsed: !this.details.open,
+      };
+    }
+
+    apply(snapshot) {
+      Object.entries(this.fields).forEach(([field, element]) => {
+        const value = String(snapshot[field] ?? "");
+        if (element.tagName !== "SELECT" || [...element.options].some((option) => option.value === value)) {
+          element.value = value;
+        }
+      });
+      this.details.open = !snapshot.collapsed;
+    }
+
+    selectedLabel(field, fallback) {
+      const element = this.fields[field];
+      return element?.selectedOptions?.[0]?.textContent?.trim() || fallback;
+    }
+
+    render(snapshot, stateLabel) {
+      const current = this.read();
+      const summary = [
+        this.selectedLabel("registrationProvider", current.registrationProvider),
+        this.selectedLabel("registrationMode", current.registrationMode),
+        "并发 " + current.concurrency + " / 目标 " + current.targetCount,
+        this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
+        "每号 " + current.extractionCount + " 次",
+        this.selectedLabel("registrationProxyMode", current.registrationProxyMode),
+        this.selectedLabel("extractionProxyMode", current.extractionProxyMode),
+      ].join(" · ");
+      this.savedSummary.textContent = summary;
+      this.savedSummary.title = summary;
+      this.savedState.textContent = snapshot.savedAt
+        ? stateLabel + " · " + formatClock(snapshot.savedAt)
+        : stateLabel;
+    }
+
+    bind(onChange, onToggle) {
+      this.details.addEventListener("change", (event) => {
+        if (Object.values(this.fields).includes(event.target)) onChange();
+      });
+      this.details.addEventListener("toggle", () => onToggle(!this.details.open));
+    }
+  }
+
+  class QuickFlowConfigPresenter {
+    constructor(model, view) {
+      this.model = model;
+      this.view = view;
+    }
+
+    restore() {
+      const snapshot = this.model.restore();
+      this.view.apply(snapshot);
+      this.view.render(snapshot, snapshot.savedAt ? "已恢复上次配置" : "配置将自动保存");
+      return snapshot;
+    }
+
+    bind() {
+      this.view.bind(
+        () => this.persist(),
+        (collapsed) => {
+          const snapshot = this.model.saveCollapsed(collapsed);
+          this.view.render(snapshot, collapsed ? "配置已保存，可直接开始" : "配置已自动保存");
+        },
+      );
+    }
+
+    persist(stateLabel = "配置已自动保存") {
+      const current = this.view.read();
+      const previous = this.model.load();
+      const snapshot = this.model.save({
+        ...current,
+        roxyTargetCount: current.registrationMode === "roxy"
+          ? current.targetCount : previous.roxyTargetCount,
+      });
+      this.view.render(snapshot, stateLabel);
+      return snapshot;
+    }
+
+    save() { return this.persist("配置已保存"); }
+
+    present() {
+      const snapshot = this.model.load();
+      this.view.render(snapshot, snapshot.savedAt ? "配置已自动保存" : "配置将自动保存");
+    }
+  }
+
+  class PayPalPaymentJobModel {
+    constructor(result) {
+      this.jobId = String(result.paymentJobId || "");
+      this.logOffset = Number(result.paymentLogCount || 0);
+      this.logSequence = Number(result.paymentLogSequence || 0);
+      this.logs = [...(result.paymentLogs || [])];
+      this.previousStage = String(result.paymentStage || "");
+      this.previousConfirmationStatus = String(result.paymentAtRefreshStatus || "");
+    }
+
+    endpoint() {
+      return "/api/account/paypal-payment/" + encodeURIComponent(this.jobId) +
+        "?log_offset=0&log_after=" + this.logSequence;
+    }
+
+    apply(job = {}) {
+      const offset = this.logOffset;
+      const incoming = Array.isArray(job.logs) ? job.logs : [];
+      const mapped = incoming.map((item, index) => ({
+        at: new Date(Number(item.time || Date.now() / 1000) * 1000).toISOString(),
+        level: String(item.level || "INFO").toLowerCase(),
+        message: String(item.message || ""),
+        source: "paypal_protocol",
+        eventType: "payment_log",
+        originTaskId: this.jobId,
+        originSequence: Number(item.sequence || offset + index + 1),
+      }));
+      this.logs = [...this.logs, ...mapped].slice(-300);
+      this.logOffset = Math.max(offset + incoming.length, Number(job.log_count || 0));
+      this.logSequence = Math.max(
+        this.logSequence,
+        Number(job.log_sequence || 0),
+        ...incoming.map((item) => Number(item.sequence || 0)),
+      );
+      const status = String(job.status || "queued");
+      const result = job.result && typeof job.result === "object" ? job.result : {};
+      const confirmation = job.account_confirmation && typeof job.account_confirmation === "object"
+        ? job.account_confirmation : {};
+      const confirmationStatus = String(confirmation.status || "");
+      const protocolSucceeded = status === "completed" && result.status === "success";
+      const protocolTerminal = ["completed", "failed", "cancelled"].includes(status);
+      const confirmationFinished = ["plus", "not_plus", "refresh_failed", "plus_sms_failed"].includes(confirmationStatus);
+      const succeeded = protocolSucceeded && confirmationStatus === "plus" &&
+        confirmation.plus_confirmed === true && confirmation.account_type === "plus";
+      const terminal = protocolTerminal && (!protocolSucceeded || confirmationFinished);
+      const error = protocolTerminal && !protocolSucceeded
+        ? String(job.error || result.error_code || result.error || "协议支付未成功")
+        : terminal && !succeeded ? String(confirmation.detail || "新 AT 未确认 Plus") : "";
+      const stage = protocolSucceeded
+        ? String(confirmation.detail || "协议已完成，正在用 Cookie 刷新新 AT")
+        : String(job.stage || status);
+      if (confirmationStatus && confirmationStatus !== this.previousConfirmationStatus) {
+        this.logs = [...this.logs, {
+          at: String(confirmation.checked_at || new Date().toISOString()),
+          level: succeeded ? "success" : ["retrying", "plus_sms"].includes(confirmationStatus) ? "info" : "error",
+          message: String(confirmation.detail || "支付后新 AT 校验状态已更新"),
+          source: "payment_at_refresh", eventType: "account_confirmation",
+          originTaskId: this.jobId, originSequence: this.logSequence + this.logs.length + 1,
+        }].slice(-300);
+      }
+      this.previousConfirmationStatus = confirmationStatus;
+      const stageChanged = stage !== this.previousStage;
+      this.previousStage = stage;
+      return {
+        terminal, stageChanged,
+        fields: {
+          paymentStatus: status,
+          paymentStage: stage,
+          paymentResult: result,
+          paymentLogs: this.logs,
+          paymentLogCount: this.logOffset,
+          paymentLogSequence: this.logSequence,
+          paymentProtocolSucceeded: protocolSucceeded,
+          paymentAtRefreshStatus: confirmationStatus,
+          paymentAtRefreshed: Boolean(confirmation.at_refreshed),
+          paymentAccountType: String(confirmation.account_type || ""),
+          paymentAtPlan: String(confirmation.plan || ""),
+          paymentSucceeded: succeeded,
+          paymentConfirmed: succeeded,
+          paymentPending: protocolSucceeded && !confirmationFinished,
+          paymentFinishedAt: job.finished_at || null,
+          paymentError: error,
+        },
+      };
+    }
+  }
+
+  class PayPalPaymentMonitorPresenter {
+    constructor(api, intervalMs = 1000) {
+      this.api = api;
+      this.intervalMs = intervalMs;
+    }
+
+    async monitor(result, onSnapshot, shouldContinue) {
+      const model = new PayPalPaymentJobModel(result);
+      if (!model.jobId) throw new Error("协议支付任务 ID 缺失");
+      while (shouldContinue()) {
+        try {
+          const payload = await this.api.get(model.endpoint());
+          const snapshot = model.apply(payload.job || {});
+          onSnapshot(snapshot);
+          if (snapshot.terminal) return snapshot;
+        } catch (error) {
+          if (error.status === 404) {
+            const snapshot = model.apply({
+              status: "failed", stage: "协议支付任务已失效", error: error.message,
+            });
+            onSnapshot(snapshot);
+            return snapshot;
+          }
+          onSnapshot({
+            terminal: false, retryError: error.message,
+            fields: { paymentStage: "状态读取暂时失败，正在自动重试" },
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, this.intervalMs));
+      }
+      return null;
+    }
+  }
+
+  class TerminalLogView {
+    constructor() {
+      this.task = $("terminalPreviewTask");
+      this.list = $("terminalPreviewList");
+      this.scrollFrame = 0;
+    }
+
+    render(model) {
+      const logs = model?.logs || [];
+      const levelLabels = {
+        error: "ERROR", warning: "WARN", waiting: "WAIT",
+        success: "INFO", active: "INFO", idle: "INFO",
+      };
+      this.task.textContent = model?.statusLabel || "等待任务";
+      this.list.innerHTML = logs.length ? logs.map((item) =>
+        '<div class="terminal-preview-row" data-level="' + escapeHtml(item.status || "idle") +
+        '"><time>' + escapeHtml(formatLogTimestamp(item.at)) + '</time><span class="terminal-preview-level">[' +
+        escapeHtml(levelLabels[item.status] || "INFO") + ']</span><span class="terminal-preview-source">[' +
+        escapeHtml(item.sourceLabel || item.source || "WORKSPACE") + ']</span><p>' +
+        escapeHtml(item.message || "（无消息内容）") + '</p></div>'
+      ).join("") : '<div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，' +
+        '完整日志会显示在这里。</div>';
+      cancelAnimationFrame(this.scrollFrame);
+      this.scrollFrame = requestAnimationFrame(() => {
+        this.scrollFrame = 0;
+        this.list.scrollTop = this.list.scrollHeight;
+      });
+    }
+  }
+
+  class TerminalLogPresenter {
     constructor(view) {
       this.view = view;
       this.model = this.buildModel({});
-      this.visibleLogs = [];
     }
 
     candidate(kind, label, task, overrides = {}) {
       if (!task || typeof task !== "object") return null;
       const status = String(task.status || (task.running ? "running" : "idle"));
-      const running = Boolean(task.running || task.starting || status === "running");
+      const running = Boolean(task.running || task.starting || [
+        "queued", "running", "awaiting_otp", "awaiting_captcha", "cancelling",
+      ].includes(status));
       const currentLogs = Array.isArray(task.logs) ? task.logs : [];
       const historyLogs = Array.isArray(task.historyLogs) ? task.historyLogs : [];
       const logs = Array.isArray(overrides.logs)
@@ -958,7 +1145,7 @@
           (record.failureReason || record.message || "注册失败"),
         stage: record.failedStage || record.currentStage || "failed",
         location: record.currentLocation || "注册失败诊断",
-        action: record.suggestedAction || "打开运行日志检查失败上下文后重新注册",
+        action: record.suggestedAction || "查看下方终端日志中的失败上下文后重新注册",
         status: "error",
         diagnosticCode: record.reasonCode || "",
         source: "registration_diagnostic",
@@ -993,6 +1180,20 @@
           processLabel: "流水线 " + (index + 1),
         });
         if (item) candidates.push(item);
+        (flow.results || []).filter((result) => result.paymentJobId).forEach((result) => {
+          const payment = this.candidate("paypal_protocol", "协议支付", {
+            id: result.paymentJobId,
+            status: result.paymentStatus || "queued",
+            startedAt: flow.startedAt,
+            finishedAt: result.paymentFinishedAt,
+            logs: result.paymentLogs || [],
+          }, {
+            id: result.paymentJobId,
+            processId: flow.runId || "",
+            processLabel: result.email || "协议支付",
+          });
+          if (payment) candidates.push(payment);
+        });
       });
 
       const active = candidates.filter((item) => item.running);
@@ -1004,10 +1205,10 @@
       selected.forEach((candidate) => {
         candidate.logs.forEach((raw, index) => {
           if (!raw || typeof raw !== "object") return;
-          const message = redactRuntimeLogText(raw.message).slice(0, 5000);
-          const at = redactRuntimeLogText(raw.at || candidate.startedAt || "");
+          const message = redactTerminalLogText(raw.message).slice(0, 5000);
+          const at = redactTerminalLogText(raw.at || candidate.startedAt || "");
           const email = String(raw.email || candidate.task.email || "");
-          const taskId = redactRuntimeLogText(raw.originTaskId || raw.taskId || candidate.id || "");
+          const taskId = redactTerminalLogText(raw.originTaskId || raw.taskId || candidate.id || "");
           const originSequence = Number(raw.originSeq || raw.originSequence ||
             (raw.originTaskId && raw.originTaskId === raw.taskId
               ? raw.sequence || raw.seq : 0));
@@ -1024,9 +1225,9 @@
           seen.add(stableKey);
           const contextual = inferLogContext({
             at, email, message,
-            stage: redactRuntimeLogText(raw.stage),
-            location: redactRuntimeLogText(raw.location),
-            action: redactRuntimeLogText(raw.action),
+            stage: redactTerminalLogText(raw.stage),
+            location: redactTerminalLogText(raw.location),
+            action: redactTerminalLogText(raw.action),
             status: normalizedStatus,
           });
           logs.push({
@@ -1034,12 +1235,12 @@
             key: stableKey,
             taskId,
             sequence: Number.isFinite(sequence) && sequence > 0 ? sequence : index + 1,
-            source: redactRuntimeLogText(raw.source || candidate.kind),
-            eventType: redactRuntimeLogText(raw.eventType || raw.event_type || "log"),
-            sourceLabel: redactRuntimeLogText(candidate.label),
-            processId: redactRuntimeLogText(raw.processId || candidate.processId || ""),
-            processLabel: redactRuntimeLogText(raw.processLabel || candidate.processLabel || ""),
-            diagnosticCode: redactRuntimeLogText(raw.diagnosticCode || raw.reasonCode || ""),
+            source: redactTerminalLogText(raw.source || candidate.kind),
+            eventType: redactTerminalLogText(raw.eventType || raw.event_type || "log"),
+            sourceLabel: redactTerminalLogText(candidate.label),
+            processId: redactTerminalLogText(raw.processId || candidate.processId || ""),
+            processLabel: redactTerminalLogText(raw.processLabel || candidate.processLabel || ""),
+            diagnosticCode: redactTerminalLogText(raw.diagnosticCode || raw.reasonCode || ""),
           });
         });
       });
@@ -1075,66 +1276,9 @@
       };
     }
 
-    filteredLogs() {
-      const filters = this.view.filters();
-      return this.model.logs.filter((item) => {
-        const levelMatches = filters.level === "all" ||
-          (filters.level === "warning"
-            ? ["warning", "waiting"].includes(item.status)
-            : item.status === filters.level);
-        if (!levelMatches) return false;
-        if (!filters.query) return true;
-        return [
-          item.message, item.email, item.taskId, item.processId, item.processLabel,
-          item.stage, item.location, item.action, item.source, item.sourceLabel,
-          item.diagnosticCode,
-        ].join(" ").toLocaleLowerCase("zh-CN").includes(filters.query);
-      });
-    }
-
     present(state) {
       this.model = this.buildModel(state);
-      this.visibleLogs = this.filteredLogs();
-      this.view.render(this.model, this.visibleLogs);
-    }
-
-    refilter() {
-      this.visibleLogs = this.filteredLogs();
-      this.view.render(this.model, this.visibleLogs, { forceList: true });
-    }
-
-    open(opener) {
-      this.view.open(opener);
-      this.view.render(this.model, this.visibleLogs, { forceList: true });
-    }
-
-    close() { this.view.close(); }
-
-    isOpen() { return this.view.isOpen(); }
-
-    handleKeydown(event) {
-      this.view.trapFocus(event);
-      if (event.key === "Escape" && this.view.isOpen()) {
-        event.preventDefault();
-        this.close();
-      }
-    }
-
-    exportText() {
-      return this.visibleLogs.map((item, index) => [
-        formatLogTimestamp(item.at),
-        "[" + (item.status || "info").toUpperCase() + "]",
-        "[" + item.sourceLabel + "]",
-        "#" + (item.sequence || index + 1),
-        item.taskId ? "task=" + item.taskId : "",
-        item.processLabel || item.processId ? "process=" + (item.processLabel || item.processId) : "",
-        item.email ? "email=" + item.email : "",
-        item.stage ? "stage=" + item.stage : "",
-        item.location ? "location=" + item.location : "",
-        item.action ? "action=" + item.action : "",
-        item.diagnosticCode ? "diagnostic=" + item.diagnosticCode : "",
-        "message=" + (item.message || ""),
-      ].filter(Boolean).join(" | ")).join("\n");
+      this.view.render(this.model);
     }
   }
 
@@ -1144,7 +1288,7 @@
       this.controlTaskFilter = "all";
     }
 
-    paypalPaymentAction(item, state) {
+    paypalPaymentAction(item, state, flow = null) {
       if (!item?.email || !item?.url) return "";
       const account = (state.accounts || []).find((candidate) =>
         String(candidate.email || "").toLowerCase() === String(item.email || "").toLowerCase()
@@ -1157,13 +1301,33 @@
       const countryItem = countries.find((candidate) => candidate.code === country) || {
         code: country, label: country,
       };
-      if (item.paymentStarted) {
+      if (item.paymentError && flow?.runId) {
+        const atFailure = Boolean(item.paymentProtocolSucceeded);
         return '<div class="quick-flow-result-actions paypal-payment-action">' +
-          '<div class="paypal-payment-auto-country"><span>协议支付</span><strong>已自动启动 · ' +
+          '<div class="paypal-payment-auto-country"><span>' + (atFailure ? 'AT 校验失败' : '支付失败') +
+          '</span><strong>' + (atFailure ? '新 AT 未确认 Plus' : '协议支付失败') + ' · ' +
           escapeHtml(countryOptionLabel(countryItem)) + '</strong></div>' +
-          '<button class="button small" data-action="open-paypal-workspace" data-job-id="' +
-          escapeHtml(item.paymentJobId || "") + '">查看 PP 支付</button>' +
-          '<small>代理与 SMSBower 手机号均已自动分配' +
+          (atFailure ? '' : '<button class="button primary small" data-action="retry-quick-payment" data-email="' +
+          escapeHtml(item.email) + '" data-run-id="' + escapeHtml(flow.runId) + '"' +
+          (flow.status === "running" ? " disabled" : "") + '>重新支付</button>') +
+          '<small>' + escapeHtml(item.paymentError) +
+          (atFailure ? ' · 协议已完成，未重复发起支付' : ' · 点击后将强制重新提链，再启动协议支付') +
+          '</small></div>';
+      }
+      if (item.paymentStarted) {
+        const status = String(item.paymentStatus || "queued");
+        const paymentLabel = item.paymentSucceeded
+          ? "支付成功 · 新 AT 已确认 Plus"
+          : item.paymentPending ? "协议已完成 · 正在刷新新 AT"
+            : status === "failed" ? "协议支付失败"
+            : status === "cancelled" ? "协议支付已停止"
+              : ["awaiting_otp", "awaiting_captcha"].includes(status)
+                ? "协议支付等待验证" : status === "queued" ? "协议支付排队中" : "协议支付进行中";
+        return '<div class="quick-flow-result-actions paypal-payment-action">' +
+          '<div class="paypal-payment-auto-country"><span>自动监听</span><strong>' +
+          escapeHtml(paymentLabel) + ' · ' +
+          escapeHtml(countryOptionLabel(countryItem)) + '</strong></div>' +
+          '<small>' + escapeHtml(item.paymentError || item.paymentStage || "任务状态正在自动更新") +
           (item.paymentJobId ? ' · 任务 ' + escapeHtml(String(item.paymentJobId).slice(0, 12)) : '') +
           '</small></div>';
       }
@@ -1176,7 +1340,7 @@
         escapeHtml(item.email) + '">' + escapeHtml(buttonLabel) + '</button>' +
         '<small>' + (item.paymentError
           ? '自动启动失败：' + escapeHtml(item.paymentError)
-          : '根据提链真实出口国家自动生成身份资料，并使用当前账号 Cookie、提链代理与 SMSBower') +
+          : '根据提链真实出口国家自动生成身份资料，并使用当前账号 Cookie、提链代理与接码平台') +
         '</small></div>';
     }
 
@@ -1329,23 +1493,6 @@
         '<span>启动注册、浏览器、协议、验证或提链流程后，这里会显示真实状态。</span></div></td></tr>';
     }
 
-    renderTerminalPreview(model) {
-      const logs = (model?.logs || []).slice(-9);
-      $("terminalPreviewTask").textContent = model?.statusLabel || "等待任务";
-      const levelLabels = {
-        error: "ERROR", warning: "WARN", waiting: "WAIT",
-        success: "INFO", active: "INFO", idle: "INFO",
-      };
-      $("terminalPreviewList").innerHTML = logs.length ? logs.map((item) =>
-        '<div class="terminal-preview-row" data-level="' + escapeHtml(item.status || "idle") +
-        '"><time>' + escapeHtml(formatLogTimestamp(item.at)) + '</time><span class="terminal-preview-level">[' +
-        escapeHtml(levelLabels[item.status] || "INFO") + ']</span><span class="terminal-preview-source">[' +
-        escapeHtml(item.sourceLabel || item.source || "WORKSPACE") + ']</span><p>' +
-        escapeHtml(item.message || "（无消息内容）") + '</p></div>'
-      ).join("") : '<div class="terminal-preview-empty">启动注册、浏览器、协议、验证或提链任务后，' +
-        '日志会显示在这里；详细上下文仍可从右侧运行日志打开。</div>';
-    }
-
     filteredAccounts(state) {
       const query = $("accountSearch")?.value.trim().toLowerCase() || "";
       const plan = $("accountPlanFilter")?.value || "all";
@@ -1456,8 +1603,8 @@
         ? (processCount > 1 ? processCount + " 个注册进程运行中" : statusMeta[0])
         : (hasRegistration ? "最近任务：" + statusMeta[0] : "当前无运行任务");
       $("registrationRuntimeMessage").textContent = runtimeRunning
-        ? "日志正在实时更新，点击“查看运行日志”查看页面、动作与诊断详情"
-        : "运行详情请打开日志界面查看";
+        ? "页面、动作与诊断详情正在实时写入下方终端日志"
+        : "运行详情请查看下方终端日志";
       $("stopTaskButton").disabled = !runtimeRunning;
       const codePanel = $("registrationCodePanel");
       const awaitingEmail = (registration.awaitingCodeEmails || [])[0] || registration.email || "";
@@ -1699,6 +1846,7 @@
         (item.hasTwoFactor ? "已开启" : "未开启") + '</code></span><span><b>注册方式</b><code>' +
         escapeHtml(item.registrationMode || "未记录") + '</code></span><span><b>注册出口</b><code>' +
         escapeHtml([item.registrationProxyMode, item.registrationProxyCountry, item.registrationProxyEndpoint, item.registrationExitIp].filter(Boolean).join(" · ") || "直连/未记录") +
+        '</code></span><span><b>Plus 接码</b><code>' + (item.plusExportReady ? "已完成 · 可导出" : item.plusCodexStatus || "尚未完成") +
         '</code></span></div><div class="credential-actions">' +
         this.credentialButton("复制密码", "copy-credential", item, "password", !item.hasPassword) +
         twoFactorPrimaryAction +
@@ -1712,6 +1860,8 @@
           : "") +
         this.credentialButton("一键导入工作台", "import-workbench", item, "", !item.hasImportableSession) +
         this.credentialButton("复制账号", "copy-account", item, "", !item.hasPassword) +
+        '<button class="button small" data-plus-export="cpa" data-email="' + escapeHtml(item.email) + '"' + (item.plusExportReady ? "" : " disabled") + '>导出 CPA</button>' +
+        '<button class="button small" data-plus-export="sub2api" data-email="' + escapeHtml(item.email) + '"' + (item.plusExportReady ? "" : " disabled") + '>导出 Sub2API</button>' +
         this.credentialButton("删除邮箱", "delete-email", item, "", false, "danger") +
         "</div></div></td></tr>";
     }
@@ -1866,6 +2016,7 @@
         registrationProxyModeSelect.value !== "clash" || item.code === "JP"
       );
       const selectedRegistrationCountry = registrationProxyCountrySelect.value ||
+        localStorage.getItem("hme_quick_registration_proxy_country") ||
         registrationProxy.country || "NL";
       registrationProxyCountrySelect.innerHTML = registrationCountries.map((item) =>
         '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(countryOptionLabel(item)) + "</option>"
@@ -1900,9 +2051,14 @@
       );
       const savedExtractionCountries = extractionProxy.cardLinkCountries || {};
       const fillExtractionCountry = (select, preferenceKey, storageKey, fallback) => {
-        const selected = select.dataset.preferenceKey === preferenceKey
-          ? select.value
-          : (savedExtractionCountries[preferenceKey] || localStorage.getItem(storageKey) || fallback);
+        const current = select.dataset.preferenceKey === preferenceKey &&
+          extractionCountries.some((item) => item.code === select.value)
+          ? select.value : "";
+        const selected = cardLinkCountryPolicy.resolve(
+          method,
+          current || savedExtractionCountries[preferenceKey] ||
+            localStorage.getItem(storageKey) || fallback,
+        );
         select.innerHTML = extractionCountries.map((item) =>
           '<option value="' + escapeHtml(item.code) + '">' + escapeHtml(countryOptionLabel(item)) + "</option>"
         ).join("");
@@ -1931,7 +2087,9 @@
           ? "second" : "first";
         promotionChoice.dataset.ready = "1";
       }
-      const paymentSmsReady = Boolean(state.smsBower?.configured);
+      const paymentSms = state.paymentSms || {};
+      const paymentSmsReady = Boolean(paymentSms.configured);
+      const paymentSmsLabel = paymentSms.label || "自动接码平台";
       const targetAmountLabel = $("quickCardLinkTargetAmountLabel");
       const targetAmountInput = $("quickCardLinkTargetAmount");
       targetAmountLabel.hidden = !config.targetAmount;
@@ -1940,18 +2098,18 @@
         targetAmountInput.dataset.method = method;
       }
       $("quickPromotionProxyChoiceLabel").hidden = method !== "de_oaics_paypal";
-      $("quickCardLinkChecks").innerHTML = [...config.checks, "✓ 自动协议支付", "✓ SMSBower 自动取号"].map((item) =>
+      $("quickCardLinkChecks").innerHTML = [...config.checks, "✓ 自动协议支付", `✓ ${paymentSmsLabel} 自动取号`].map((item) =>
         "<span>" + escapeHtml(item) + "</span>"
       ).join("");
       $("quickCardLinkHint").textContent = !paymentSmsReady
-        ? "自动协议支付需要 SMSBower API Key，请先到系统设置完成配置。"
+        ? "自动协议支付需要接码 API Key，请打开 PP 支付中的“接码配置”。"
         : extractionProxyReady
         ? (config.singleProxy
           ? "提链代理与注册代理独立。第一代理负责 " + config.country +
             " Checkout、优惠 Update、金额校验、Confirm 与 Approve；不会获取或调用第二代理。"
           : "提链代理与注册代理独立。首次提链使用第一代理出口；链接失败后重新提链使用第二代理出口。优惠更新当前使用" +
             (promotionChoice.value === "second" ? "第二 IP" : "第一 IP") + "。") +
-          "提链成功后会按链接国家自动选择支付代理，并由 SMSBower 自动取号、取码和启动协议支付。"
+          `提链成功后会按链接国家自动选择支付代理，并由 ${paymentSmsLabel} 自动取号、取码和启动协议支付。`
         : "所选提链代理尚未配置，请先到“提链代理独立配置”保存凭据。";
       $("quickRegistrationProxySummary").textContent = "注册代理：" +
         (registrationProxyModeSelect.value === "direct"
@@ -1974,12 +2132,19 @@
       const protocolMode = registrationMode === "protocol";
       const roxyMode = registrationMode === "roxy";
       $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
-      $("quickRegistrationTargetCount").disabled = !roxyMode;
+      const quickTargetCount = $("quickRegistrationTargetCount");
+      quickTargetCount.disabled = !roxyMode;
       if (!roxyMode) {
-        $("quickRegistrationTargetCount").value = protocolMode
+        quickTargetCount.value = protocolMode
           ? "1" : $("quickRegistrationConcurrency").value;
+      } else {
+        const savedTargetCount = Number(localStorage.getItem("hme_quick_registration_target") || 1);
+        quickTargetCount.value = String(
+          Number.isInteger(savedTargetCount) && savedTargetCount >= 1 && savedTargetCount <= 100
+            ? savedTargetCount : 1
+        );
       }
-      const targetCount = Number($("quickRegistrationTargetCount").value || 1);
+      const targetCount = Number(quickTargetCount.value || 1);
       const extractionCount = $("quickExtractionCount");
       extractionCount.max = "100";
       if (Number(extractionCount.value) > 100) {
@@ -2001,10 +2166,11 @@
               (registrationProvider === "zkgmail" ? " QQ 转发邮箱" : " iCloud 收件箱") + "读取。";
 
       methodSelect.disabled = false;
-      if (!roxyMode) $("quickRegistrationTargetCount").disabled = true;
+      if (!roxyMode) quickTargetCount.disabled = true;
       registrationProxyCountrySelect.disabled = registrationProxyModeSelect.value === "direct" ||
         registrationProxyModeSelect.value === "clash";
-      extractionFirstCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
+      extractionFirstCountrySelect.disabled = config.fixedProxyCountry ||
+        extractionProxyModeSelect.value === "clash";
       extractionSecondCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
       promotionChoice.disabled = method !== "de_oaics_paypal";
       const taskState = protocolMode ? state.protocolRegistrationTask : state.registrationTask;
@@ -2045,7 +2211,7 @@
           '<div class="quick-flow-run-meta"><b class="badge ' + meta[1] + '">' + meta[0] +
           '</b><small>' + Math.round(Number(item.progress || 0)) + '% · ' +
           escapeHtml(String(item.taskId || "等待分配").slice(0, 12)) + '</small>' + action + '</div></article>';
-      }).join("") : '<div class="task-log-empty">点击“启动自动流水线”可创建第一个独立注册流程；运行中的流程可继续新建。</div>';
+      }).join("") : '<div class="task-log-empty">点击“开始一键注册”可创建第一个独立注册流程；运行中的流程可继续新建。</div>';
 
       const stageOrder = ["prepare", "register", "session", "extract", "payment", "complete"];
       const activeStage = stageOrder.includes(flow.phase) ? flow.phase : "prepare";
@@ -2061,7 +2227,7 @@
       $("quickFlowProgressValue").textContent = progress + "%";
       $("quickFlowRegisteredCount").textContent = Number(flow.registered || 0);
       $("quickFlowGeneratedCount").textContent = Number(flow.generated || 0);
-      $("quickFlowPaymentCount").textContent = Number(flow.paymentStarted || 0);
+      $("quickFlowPaymentCount").textContent = Number(flow.paymentSucceeded || 0);
       $("quickFlowSkippedCount").textContent = Number(flow.skipped || 0);
       $("quickFlowFailedCount").textContent = Number(flow.failed || 0);
       $("quickFlowCurrentAccount").textContent = flow.currentEmail || "等待任务";
@@ -2098,16 +2264,19 @@
           const emailKey = email.toLowerCase();
           const result = resultByEmail.get(emailKey);
           const active = Boolean(email && currentEmailKey === emailKey && running);
+          const paymentActive = Boolean(result?.paymentStarted && !result.paymentSucceeded && !result.paymentError);
           const state = result
             ? (result.ok
-              ? (result.paymentError ? "failed" : result.skipped ? "skipped" : "done")
+              ? (result.paymentError ? "failed" : result.skipped ? "skipped" : paymentActive ? "running" : "done")
               : "failed")
             : active ? "running" : email ? "queued" : "idle";
           const label = result
             ? (result.ok
               ? (result.paymentError
-                ? "链接已生成 · 协议支付启动失败"
-                : result.skipped ? "已跳过" : result.paymentStarted ? "协议支付已自动启动" : "PayPal 链接已完成")
+                ? "链接已生成 · 协议支付失败"
+                : result.skipped ? "已跳过" : result.paymentSucceeded
+                  ? "支付成功 · 新 AT Plus"
+                  : result.paymentStarted ? (result.paymentStage || "协议支付正在自动执行") : "PayPal 链接已完成")
               : "失败原因：" + quickFlowFailureExplanation(result))
             : active ? "正在提取 PayPal 链接" : email ? "等待提链" : "启动后自动分配账号";
           const code = result?.retryable ? "RETRY" : { done: "DONE", skipped: "SKIP", failed: "FAIL", running: "LIVE", queued: "QUEUE", idle: "WAIT" }[state];
@@ -2131,35 +2300,26 @@
       $("quickFlowHeroMeta").textContent = flow.status === "completed"
         ? "注册 " + Number(flow.registered || 0) +
           (flow.method === "de_oaics_paypal" ? " · 补 OAICS " : " · 生成链接 ") + Number(flow.generated || 0) +
-          "/" + Number(flow.registered || 0) + " · 协议支付 " + Number(flow.paymentStarted || 0) +
+          "/" + Number(flow.registered || 0) + " · 协议支付成功 " + Number(flow.paymentSucceeded || 0) +
           " · 单账号最多 " +
           Number(flow.extractionCount || 1) + " 次 · 已跳过 " + Number(flow.skipped || 0)
         : flow.currentAction || "注册 → Session → 提链 → 协议支付";
       $("quickFlowNavState").textContent = running ? progress + "%" : flow.status === "completed" ? "DONE" : flow.status === "failed" ? "!" : "NEW";
 
-      const logs = flow.logs || [];
-      $("quickFlowLogCount").textContent = logs.length + " 条";
-      $("quickFlowLog").innerHTML = logs.length ? logs.map((item) => {
-        const message = redactRuntimeLogText(item.message || "");
-        const level = /失败|错误|blocked/i.test(message)
-          ? "failed" : /成功|已完成|已保存/i.test(message) ? "success" : "";
-        return '<div class="task-log-row ' + level + '"><time>' + formatClock(item.at) + "</time><span>" +
-          escapeHtml(message) + "</span></div>";
-      }
-      ).join("") : '<div class="task-log-empty">尚无流水线日志</div>';
-      $("quickFlowLog").scrollTop = $("quickFlowLog").scrollHeight;
       $("quickFlowResults").innerHTML = results.length ? results.map((item) =>
         '<div class="quick-flow-result ' + (item.ok ? (item.paymentError ? "failed" : item.skipped ? "skipped" : "") : "failed") + '"><strong>' +
         escapeHtml(item.email) + "</strong><span>" + (item.skipped
           ? (item.skipLabel || "已有同模式链接 · 已跳过")
           : item.ok
-            ? (item.paymentError ? "提取链接成功 · 协议支付启动失败" : item.paymentStarted ? "提取链接成功 · 协议支付已启动" : "提取链接成功")
+            ? (item.paymentError ? "提取链接成功 · 协议支付失败" : item.paymentSucceeded
+              ? "提取链接成功 · 新 AT 已确认 Plus"
+              : item.paymentStarted ? "提取链接成功 · 正在监听协议支付" : "提取链接成功")
             : item.retrying ? "正在重新提链" : "提链未完成 · 可重试") +
         "</span><code>" + escapeHtml(item.url || ((!item.ok || item.paymentError)
           ? "失败原因：" + quickFlowFailureExplanation(item) +
             (item.error ? " · 原始错误：" + item.error : "")
           : item.error || "—")) + "</code>" +
-        (item.ok && !item.skipped ? this.paypalPaymentAction(item, state) : "") +
+        (item.ok && !item.skipped ? this.paypalPaymentAction(item, state, flow) : "") +
         (item.retryable ? '<div class="quick-flow-result-actions"><button class="button small" data-action="retry-quick-card-link" data-email="' +
           escapeHtml(item.email) + '" data-run-id="' + escapeHtml(flow.runId || "") + '"' + (running ? " disabled" : "") + '>重新提链</button></div>' : "") +
         "</div>"
@@ -2240,9 +2400,13 @@
         proxyModeSelect.value !== "clash" || item.code === "JP"
       );
       const renderCountrySelect = (select, preferenceKey, fallbackCountry) => {
-        const selected = select.dataset.preferenceKey === preferenceKey
-          ? select.value
-          : (savedCountries[preferenceKey] || fallbackCountry);
+        const current = select.dataset.preferenceKey === preferenceKey &&
+          countries.some((item) => item.code === select.value)
+          ? select.value : "";
+        const selected = cardLinkCountryPolicy.resolve(
+          method,
+          current || savedCountries[preferenceKey] || fallbackCountry,
+        );
         select.innerHTML = countries.map((item) =>
           '<option value="' + escapeHtml(item.code) + '">' +
           escapeHtml(countryOptionLabel(item)) + "</option>"
@@ -2250,7 +2414,7 @@
         select.value = countries.some((item) => item.code === selected)
           ? selected : (countries[0]?.code || "");
         select.dataset.preferenceKey = preferenceKey;
-        select.disabled = !modeConfigured || !countries.length;
+        select.disabled = config.fixedProxyCountry || !modeConfigured || !countries.length;
       };
       $("cardLinkModeSummary").textContent = config.summary;
       $("cardLinkModeLabel").textContent = config.label;
@@ -2363,15 +2527,19 @@
         empty.hidden = true;
         frame.hidden = false;
         if (!frame.dataset.loaded) {
-          frame.src = service.url || frame.dataset.src;
+          frame.src = paypalWorkspacePresenter.frameUrl(service.url || frame.dataset.src);
           frame.dataset.loaded = "1";
         }
       } else {
-        status.className = "badge warning";
+        const failed = Boolean(service.error);
+        status.className = "badge " + (failed ? "error" : "warning");
         status.textContent = service.error ? "启动失败" : "正在启动";
-        navState.textContent = "—";
+        navState.textContent = failed ? "异常" : "—";
         frame.hidden = true;
         empty.hidden = false;
+        empty.dataset.state = failed ? "error" : "loading";
+        const title = empty.querySelector("strong");
+        if (title) title.textContent = failed ? "协议支付服务连接失败" : "正在启动协议支付服务";
         const detail = empty.querySelector("p");
         if (detail) detail.textContent = service.error || "服务就绪后会自动载入协议支付工作台。";
       }
@@ -2622,6 +2790,7 @@
         cardLinkProxy: { enabled: false, configured: false, country: "DE", countries: [], modes: [] },
         roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
+        paymentSms: { configured: false, provider: "", label: "", timeoutSeconds: 60 },
         zkgmail: { configured: false, domain: "zkgmail.com", forwardAccount: "352***4@qq.com" },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
@@ -2630,7 +2799,8 @@
         registrationMode: "headed",
         quickFlow: {
           status: "idle", phase: "prepare", progress: 0, taskId: "", manager: "browser",
-          registered: 0, generated: 0, failed: 0, emails: [], results: [], logs: [],
+          registered: 0, generated: 0, paymentStarted: 0, paymentSucceeded: 0,
+          failed: 0, emails: [], results: [], logs: [],
           message: "尚未启动流水线", currentEmail: "", currentAction: "",
         },
         quickFlows: [],
@@ -2642,10 +2812,16 @@
       });
       this.renderer = new WorkspaceRenderer(this.store);
       this.sidebarPresenter = new NavigationSidebarPresenter(new NavigationSidebarView());
-      this.runtimeLogPresenter = new RuntimeLogPresenter(new RuntimeLogView());
-      this.runtimeLogResizePresenter = new RuntimeLogResizePresenter(
-        new RuntimeLogResizeView()
+      this.registrationConfigPresenter = new RegistrationConfigPresenter(
+        new RegistrationConfigModel(),
+        new RegistrationConfigView(),
       );
+      this.quickFlowConfigPresenter = new QuickFlowConfigPresenter(
+        new QuickFlowConfigModel(),
+        new QuickFlowConfigView(),
+      );
+      this.paypalPaymentMonitorPresenter = new PayPalPaymentMonitorPresenter(this.api);
+      this.terminalLogPresenter = new TerminalLogPresenter(new TerminalLogView());
       this.router = new HashRouter({
         overview: () => this.renderer.renderOverview(this.store.state),
         accounts: () => this.renderer.renderAccounts(this.store.state),
@@ -2669,12 +2845,13 @@
       this.renderer.renderOverview(state);
       this.renderer.renderNetwork(state);
       this.renderer.renderAccounts(state);
+      this.registrationConfigPresenter.present();
       this.renderer.renderProtocolRegistration(state);
       this.renderer.renderQuickFlow(state);
+      this.quickFlowConfigPresenter.present();
       this.renderer.renderCardLinks(state);
       this.renderer.renderVerification(state);
-      this.runtimeLogPresenter.present(state);
-      this.renderer.renderTerminalPreview(this.runtimeLogPresenter.model);
+      this.terminalLogPresenter.present(state);
       if (this.router.current === "pp-payment") this.renderer.renderPayPal(state);
       if (this.router.current === "settings") this.renderer.renderSettings(state);
     }
@@ -2716,7 +2893,7 @@
         this.loadAccounts(), this.loadBrowserTask(), this.loadRegistrationTask(),
         this.loadProtocolRegistrationTask(), this.loadVerificationTask(), this.loadInbox(),
         this.loadRegistrationProxy(), this.loadCardLinkProxy(), this.loadRoxyRegistration(),
-        this.loadSmsBower(), this.loadZkgmail(), this.loadPayPal(),
+        this.loadSmsBower(), this.loadPaymentSms(), this.loadZkgmail(), this.loadPayPal(),
       ]);
       this.refreshInFlight = operation;
       try {
@@ -2745,21 +2922,9 @@
       panel.classList.toggle("is-collapsed", collapsed);
       button.textContent = collapsed ? "⌃" : "⌄";
       button.setAttribute("aria-expanded", String(!collapsed));
-      button.setAttribute("aria-label", collapsed ? "展开终端预览" : "折叠终端预览");
-      button.title = collapsed ? "展开终端预览" : "折叠终端预览";
+      button.setAttribute("aria-label", collapsed ? "展开终端日志" : "折叠终端日志");
+      button.title = collapsed ? "展开终端日志" : "折叠终端日志";
       if (persist) localStorage.setItem("hme_terminal_preview_collapsed", collapsed ? "1" : "0");
-    }
-
-    async refreshRuntimeLogStatus() {
-      await Promise.allSettled([
-        this.loadBrowserTask(),
-        this.loadRegistrationTask(),
-        this.loadProtocolRegistrationTask(),
-        this.loadVerificationTask(),
-      ]);
-      if (this.runtimeLogPresenter.isOpen()) {
-        this.schedule("runtime-log-discovery", () => this.refreshRuntimeLogStatus(), 3000);
-      }
     }
 
     async loadAccounts() {
@@ -2867,6 +3032,11 @@
     async loadSmsBower() {
       const data = await this.api.get("/api/smsbower/status");
       this.store.patch({ smsBower: data });
+    }
+
+    async loadPaymentSms() {
+      const data = await this.api.get("/api/payment-sms/status");
+      this.store.patch({ paymentSms: data });
     }
 
     async loadZkgmail() {
@@ -3044,18 +3214,22 @@
           ? $("quickCardLinkMethod").value : "de_oaics_paypal";
       const config = cardLinkExtractionModes[method];
       const singleProxy = Boolean(config.singleProxy);
+      const firstProxyCountry = cardLinkCountryPolicy.resolve(
+        method,
+        snapshot.extractionFirstProxyCountry || $("quickExtractionFirstProxyCountry").value,
+      );
+      const secondProxyCountry = singleProxy ? firstProxyCountry : cardLinkCountryPolicy.resolve(
+        method,
+        snapshot.extractionSecondProxyCountry || $("quickExtractionSecondProxyCountry").value,
+      );
       return {
         email,
         method,
         country: config.country,
         proxy_mode: snapshot.extractionProxyMode || $("quickExtractionProxyMode").value,
-        create_proxy_country: snapshot.extractionFirstProxyCountry || $("quickExtractionFirstProxyCountry").value,
-        promotion_proxy_country: singleProxy
-          ? snapshot.extractionFirstProxyCountry || $("quickExtractionFirstProxyCountry").value
-          : snapshot.extractionSecondProxyCountry || $("quickExtractionSecondProxyCountry").value,
-        secondary_proxy_country: singleProxy
-          ? snapshot.extractionFirstProxyCountry || $("quickExtractionFirstProxyCountry").value
-          : snapshot.extractionSecondProxyCountry || $("quickExtractionSecondProxyCountry").value,
+        create_proxy_country: firstProxyCountry,
+        promotion_proxy_country: secondProxyCountry,
+        secondary_proxy_country: secondProxyCountry,
         reuse_registration_proxy: false,
         independent_proxy_pair: !singleProxy,
         use_secondary_proxy: !singleProxy && Boolean(forceRetry),
@@ -3079,7 +3253,7 @@
         phase: "payment",
         progress: Math.max(0, Math.min(99, Number(progress || 96))),
         currentEmail: email,
-        currentAction: "正在自动选择代理、获取 SMSBower 手机号并启动协议支付",
+        currentAction: "正在自动选择代理、获取接码手机号并启动协议支付",
         results: [...results],
       }, "PayPal 链接已生成，自动启动协议支付：" + email);
       try {
@@ -3087,14 +3261,27 @@
         result.paymentStarted = true;
         result.paymentError = "";
         result.paymentJobId = String(data.job?.id || "");
+        if (!result.paymentJobId) throw new Error("协议服务未返回任务 ID");
+        result.paymentStatus = String(data.job?.status || "queued");
+        result.paymentStage = String(data.job?.stage || "协议支付任务已排队");
+        result.paymentSucceeded = false;
+        result.paymentConfirmed = false;
+        result.paymentPending = false;
+        result.paymentAtRefreshStatus = "";
+        result.paymentAtRefreshed = false;
+        result.paymentAccountType = "";
+        result.paymentLogs = [];
+        result.paymentLogCount = 0;
         result.paymentCountry = String(data.country || result.country || "").toUpperCase();
         result.paymentProxyMode = String(data.proxyMode || "");
         result.paymentProxySource = String(data.proxySource || "");
+        result.paymentSmsProvider = String(data.smsProviderLabel || data.smsProvider || "接码平台");
         this.patchQuickFlow(runId, {
           results: [...results],
           paymentStarted: results.filter((item) => item.paymentStarted).length,
           currentAction: "协议支付任务已自动启动",
-        }, "协议支付已启动：" + email + " · 自动代理 · SMSBower 自动取号" +
+        }, "协议支付已启动：" + email + " · 自动代理 · " +
+          String(data.smsProviderLabel || data.smsProvider || "接码平台") + " 自动取号" +
           (result.paymentJobId ? " · 任务 " + result.paymentJobId.slice(0, 12) : ""));
         return true;
       } catch (error) {
@@ -3108,16 +3295,41 @@
       }
     }
 
+    async monitorQuickFlowPaypalPayment(runId, result, results) {
+      const email = String(result.email || "");
+      await this.paypalPaymentMonitorPresenter.monitor(
+        result,
+        (snapshot) => {
+          Object.assign(result, snapshot.fields || {});
+          const currentAction = snapshot.retryError
+            ? "协议支付状态读取失败，正在自动重试"
+            : result.paymentSucceeded
+              ? "新 AT 已确认 Plus，协议支付成功"
+              : result.paymentAtRefreshStatus === "retrying"
+                ? "协议已完成，正在用 Cookie 刷新新 AT 并确认 Plus"
+              : result.paymentError ? "协议支付失败" : result.paymentStage;
+          const logMessage = snapshot.retryError
+            ? "协议支付状态暂时读取失败，稍后自动重试：" + snapshot.retryError
+            : snapshot.stageChanged || snapshot.terminal
+              ? "[协议支付] " + email + " · " + currentAction : "";
+          this.patchQuickFlow(runId, {
+            phase: "payment", progress: 99, results: [...results],
+            paymentSucceeded: results.filter((item) => item.paymentSucceeded).length,
+            paymentPending: results.filter((item) => item.paymentPending).length,
+            currentEmail: email, currentAction,
+          }, logMessage);
+        },
+        () => this.quickFlowById(runId)?.status === "running",
+      );
+      return Boolean(result.paymentSucceeded);
+    }
+
     async retryQuickCardLink(email, runId = "") {
       const target = String(email || "").trim().toLowerCase();
       if (!target) throw new Error("缺少需要重新提链的账号");
       const flow = this.quickFlowById(runId) || this.activeQuickFlow();
       if (!flow?.runId) throw new Error("未找到该账号对应的流水线");
       if (flow.status === "running") throw new Error("该流水线正在运行，请完成后再重试");
-      await this.loadAccounts();
-      const account = this.selectedAccount(target);
-      if (!account) throw new Error("账号不存在，请刷新后重试");
-      if (account.sessionStatus !== "ready") throw new Error("该账号 Session / AT 尚未就绪");
       const previousResults = [...(flow.results || [])];
       const existingIndex = previousResults.findIndex((item) =>
         String(item.email || "").trim().toLowerCase() === target
@@ -3140,6 +3352,10 @@
         message: "正在对失败账号重新提链", results: previousResults,
       }, "重新提链已启动：" + target);
       try {
+        await this.loadAccounts();
+        const account = this.selectedAccount(target);
+        if (!account) throw new Error("账号不存在，请刷新后重试");
+        if (account.sessionStatus !== "ready") throw new Error("该账号 Session / AT 尚未就绪");
         const data = await this.api.post(
           "/api/account/card-link", this.quickCardLinkPayload(target, true, flow),
         );
@@ -3168,33 +3384,39 @@
           paymentReady = await this.startQuickFlowPaypalPayment(
             flow.runId, nextResult, nextResults, 98,
           );
+          if (paymentReady) {
+            paymentReady = await this.monitorQuickFlowPaypalPayment(
+              flow.runId, nextResult, nextResults,
+            );
+          }
         }
         const generated = nextResults.filter((item) => item.ok && !item.skipped).length;
         const paymentStarted = nextResults.filter((item) => item.paymentStarted).length;
+        const paymentSucceeded = nextResults.filter((item) => item.paymentSucceeded).length;
         const skipped = nextResults.filter((item) => item.skipped).length;
         const failed = nextResults.filter((item) => !item.ok || item.paymentError).length;
         this.patchQuickFlow(flow.runId, {
           status: failed ? "failed" : "completed",
           phase: classified ? "extract" : paymentReady ? "complete" : "payment",
-          progress: 100, results: nextResults, generated, paymentStarted, skipped, failed,
+          progress: 100, results: nextResults, generated, paymentStarted, paymentSucceeded, skipped, failed,
           currentEmail: "",
           currentAction: classified
             ? "提链次数已用完，仍未获得 OAICS"
-            : paymentReady ? "重新提链并启动协议支付成功" : "重新提链成功，但协议支付启动失败",
+            : paymentReady ? "重新提链并完成协议支付" : "重新提链成功，但协议支付失败",
           message: classified
             ? "已连续尝试 " + attemptCount + " 次，均返回 cs_live"
             : paymentReady
-              ? "第 " + attemptCount + " 次提链成功，协议支付已自动启动"
-              : "第 " + attemptCount + " 次提链成功，但协议支付启动失败",
+              ? "第 " + attemptCount + " 次提链成功，协议支付已完成"
+              : "第 " + attemptCount + " 次提链成功，但协议支付失败",
         }, classified
           ? "cs_live 重试次数已用完：" + target
-          : paymentReady ? "重新提链并启动协议支付成功：" + target : "重新提链成功，协议支付启动失败：" + target);
+          : paymentReady ? "重新提链并完成协议支付：" + target : "重新提链成功，协议支付失败：" + target);
         await this.loadAccounts();
         return classified
           ? "已用完 " + attemptCount + " 次提链，结果仍为 cs_live"
           : paymentReady
-            ? "第 " + attemptCount + " 次提链成功并已启动协议支付：" + target
-            : "第 " + attemptCount + " 次提链成功，但协议支付启动失败：" + target;
+            ? "第 " + attemptCount + " 次提链成功并完成协议支付：" + target
+            : "第 " + attemptCount + " 次提链成功，但协议支付失败：" + target;
       } catch (error) {
         for (const message of error.logs || []) {
           this.patchQuickFlow(flow.runId, {}, "[直卡提链] " + message);
@@ -3340,9 +3562,25 @@
           );
         }
       }
+      const monitorTargets = results.filter((item) => item.paymentStarted && item.paymentJobId);
+      if (monitorTargets.length) {
+        this.patchQuickFlow(runId, {
+          phase: "payment", progress: 97, results: [...results],
+          currentEmail: monitorTargets[0].email,
+          currentAction: "正在自动监听 " + monitorTargets.length + " 个协议支付任务",
+        }, "协议支付任务均已启动，开始自动监听最终结果");
+        await Promise.all(monitorTargets.map((item) =>
+          this.monitorQuickFlowPaypalPayment(runId, item, results)
+        ));
+      }
       const completedFlow = this.quickFlowById(runId);
       if (!completedFlow || completedFlow.status !== "running") return;
       await this.loadAccounts();
+      const paymentSucceeded = results.filter((item) => item.paymentSucceeded).length;
+      const paymentPending = results.filter((item) => item.paymentPending).length;
+      failed = results.filter((item) =>
+        !item.ok || (item.ok && !item.skipped && !item.paymentSucceeded)
+      ).length;
       const completed = results.length > 0 && failed === 0;
       const paymentFailed = results.some((item) => Boolean(item.paymentError));
       this.patchQuickFlow(runId, {
@@ -3352,15 +3590,18 @@
         results,
         generated,
         paymentStarted,
+        paymentSucceeded,
+        paymentPending,
         skipped,
         failed,
         currentEmail: "",
-        currentAction: completed ? "注册、提链与协议支付启动流水线已完成" : "注册或提链成功，但自动协议支付未全部启动",
+        currentAction: completed ? "注册、提链与协议支付已全部完成" : "注册或提链成功，但协议支付未全部成功",
         message: "流水线完成：注册 " + uniqueEmails.length + "，提链调用 " + attempted +
           " 次（单账号上限 " + extractionCount + "），" +
           (method === "de_oaics_paypal" ? "补 OAICS " : "生成链接 ") + generated +
-          "，启动协议支付 " + paymentStarted + "，跳过 " + skipped + "，失败 " + failed,
-      }, completed ? "一键注册、提链并启动协议支付完成" : "流水线结束，但提链或协议支付未全部完成");
+          "，新 AT 确认 Plus " + paymentSucceeded + "（AT 确认中 " + paymentPending +
+          "），跳过 " + skipped + "，失败 " + failed,
+      }, completed ? "一键注册、提链并协议支付完成" : "流水线结束，但提链或协议支付未全部完成");
     }
 
     async pollQuickFlow(runId) {
@@ -3447,21 +3688,12 @@
       this.commands.register("toggle-sidebar", async () => {
         this.sidebarPresenter.toggle();
       });
-      this.commands.register("open-runtime-log", async ({ element }) => {
-        this.runtimeLogResizePresenter.handleViewportResize();
-        this.runtimeLogPresenter.open(element);
-        void this.refreshRuntimeLogStatus();
+      this.commands.register("toggle-registration-config", async () => {
+        this.registrationConfigPresenter.toggle();
       });
-      this.commands.register("close-runtime-log", async () => {
-        clearTimeout(this.pollTimers["runtime-log-discovery"]);
-        this.runtimeLogResizePresenter.cancel();
-        this.runtimeLogPresenter.close();
-      });
-      this.commands.register("copy-runtime-logs", async () => {
-        const output = this.runtimeLogPresenter.exportText();
-        if (!output) throw new Error("当前没有可复制的运行日志");
-        await this.copyText(output);
-        return "已复制 " + this.runtimeLogPresenter.visibleLogs.length + " 条详细日志";
+      this.commands.register("save-quick-flow-config", async () => {
+        this.quickFlowConfigPresenter.save();
+        return "任务配置已保存，可直接开始一键注册";
       });
       this.commands.register("toggle-terminal-preview", async () => {
         const collapsed = !$("workbenchTerminalPanel").classList.contains("is-collapsed");
@@ -3483,7 +3715,7 @@
           throw new Error(this.store.state.paypal.error || "PP 支付服务尚未就绪");
         }
         const frame = $("paypalPaymentFrame");
-        frame.src = this.store.state.paypal.url || frame.dataset.src;
+        frame.src = paypalWorkspacePresenter.frameUrl(this.store.state.paypal.url || frame.dataset.src);
         frame.dataset.loaded = "1";
         return "PP 支付工作台已刷新";
       });
@@ -3496,7 +3728,7 @@
         const frame = $("paypalPaymentFrame");
         const jobId = String(element?.dataset.jobId || "");
         const baseUrl = this.store.state.paypal.url || frame.dataset.src;
-        frame.src = baseUrl + (jobId ? "?job=" + encodeURIComponent(jobId) : "");
+        frame.src = paypalWorkspacePresenter.frameUrl(baseUrl, jobId);
         frame.dataset.loaded = "1";
         return "已打开 PP 协议支付工作台";
       });
@@ -3512,10 +3744,11 @@
           this.router.navigate("pp-payment");
           const frame = $("paypalPaymentFrame");
           const jobId = data.job?.id || "";
-          frame.src = (data.url || "/paypal-pay/") + "?job=" + encodeURIComponent(jobId);
+          frame.src = paypalWorkspacePresenter.frameUrl(data.url, jobId);
           frame.dataset.loaded = "1";
           return "协议支付已启动：自动匹配 " + data.country + " · Cookie " + data.cookieCount +
-            " 条 · " + (data.proxySource === "card_link" ? "提链代理" : "注册代理") + " · SMSBower";
+            " 条 · " + (data.proxySource === "card_link" ? "提链代理" : "注册代理") + " · " +
+            String(data.smsProviderLabel || data.smsProvider || "接码平台");
         } finally {
           element.disabled = false;
           element.textContent = idleLabel;
@@ -3547,8 +3780,8 @@
         if (registrationProvider === "zkgmail" && !this.store.state.zkgmail?.configured) {
           throw new Error("请先在账号管理中设置 QQ 邮箱授权码");
         }
-        if (!this.store.state.smsBower?.configured) {
-          throw new Error("请先在系统设置配置 SMSBower API Key，自动协议支付需要自动取号与取码");
+        if (!this.store.state.paymentSms?.configured) {
+          throw new Error("请先打开 PP 支付中的“接码配置”，自动协议支付需要自动取号与取码");
         }
         const protocol = mode === "protocol";
         const roxy = mode === "roxy";
@@ -3581,15 +3814,21 @@
         if (targetAmount && !/^\d+$/.test(targetAmount)) {
           throw new Error("目标金额必须是非负整数，留空表示不校验");
         }
+        const configSnapshot = this.quickFlowConfigPresenter.persist();
+        const firstProxyCountry = cardLinkCountryPolicy.resolve(
+          method, configSnapshot.extractionFirstCountry,
+        );
+        const secondProxyCountry = methodConfig.singleProxy ? firstProxyCountry :
+          cardLinkCountryPolicy.resolve(method, configSnapshot.extractionSecondCountry);
         const cardLinkCountries = {
-          [methodConfig.createProxyPreference]: $("quickExtractionFirstProxyCountry").value,
+          [methodConfig.createProxyPreference]: firstProxyCountry,
         };
         if (methodConfig.promotionProxyPreference) {
           cardLinkCountries[methodConfig.promotionProxyPreference] =
-            $("quickExtractionSecondProxyCountry").value;
+            secondProxyCountry;
         }
         const savedExtractionProxy = await this.api.post("/api/card-link-proxy/config", {
-          cardLinkModes: { [method]: $("quickExtractionProxyMode").value },
+          cardLinkModes: { [method]: configSnapshot.extractionProxyMode },
           cardLinkCountries,
         });
         this.store.patch({ cardLinkProxy: savedExtractionProxy });
@@ -3608,13 +3847,15 @@
           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
           registrationProvider, targetAmount,
           registrationMode: mode,
-          registrationProxyMode: $("quickRegistrationProxyMode").value,
-          registrationProxyCountry: $("quickRegistrationProxyCountry").value,
-          extractionProxyMode: $("quickExtractionProxyMode").value,
-          extractionFirstProxyCountry: $("quickExtractionFirstProxyCountry").value,
-          extractionSecondProxyCountry: $("quickExtractionSecondProxyCountry").value,
-          promotionProxyChoice: $("quickPromotionProxyChoice").value || "first",
-          registered: 0, generated: 0, paymentStarted: 0, skipped: 0, failed: 0, emails: [], results: [],
+          registrationProxyMode: configSnapshot.registrationProxyMode,
+          registrationProxyCountry: configSnapshot.registrationProxyCountry,
+          extractionProxyMode: configSnapshot.extractionProxyMode,
+          extractionFirstProxyCountry: firstProxyCountry,
+          extractionSecondProxyCountry: secondProxyCountry,
+          promotionProxyChoice: configSnapshot.promotionProxyChoice || "first",
+          configSnapshot,
+          registered: 0, generated: 0, paymentStarted: 0, paymentSucceeded: 0,
+          paymentPending: 0, skipped: 0, failed: 0, emails: [], results: [],
           message: "正在检查邮箱来源、注册方式、提链代理与协议支付配置",
           currentEmail: "正在获取" + registrationProviderLabel + "邮箱", currentAction: "准备一键流水线",
           startedAt, lastTaskMessage: "",
@@ -3680,6 +3921,16 @@
             ? { protocolRegistrationTask: data.task || {} }
             : { registrationTask: data.task || {} });
         }
+        const activePaymentJobs = (flow.results || []).filter((item) =>
+          item.paymentJobId && !["completed", "failed", "cancelled"].includes(item.paymentStatus)
+        );
+        if (activePaymentJobs.length) {
+          await Promise.allSettled(activePaymentJobs.map((item) =>
+            this.api.post(
+              "/api/account/paypal-payment/" + encodeURIComponent(item.paymentJobId) + "/cancel"
+            )
+          ));
+        }
         this.patchQuickFlow(flow.runId, {
           status: "cancelled",
           message: "该注册、提链并协议支付流程已停止",
@@ -3692,7 +3943,8 @@
         const flows = this.quickFlowList().filter((item) => item.runId !== runId);
         const active = flows.find((item) => item.runId === this.store.state.activeQuickFlowId) || flows.at(-1) || {
           status: "idle", phase: "prepare", progress: 0, taskId: "", manager: "browser",
-          registered: 0, generated: 0, paymentStarted: 0, skipped: 0, failed: 0, emails: [], results: [], logs: [],
+          registered: 0, generated: 0, paymentStarted: 0, paymentSucceeded: 0,
+          paymentPending: 0, skipped: 0, failed: 0, emails: [], results: [], logs: [],
           message: "尚未启动流水线", currentEmail: "", currentAction: "",
         };
         this.store.patch({
@@ -3703,6 +3955,9 @@
         return "已关闭该流程记录";
       });
       this.commands.register("retry-quick-card-link", async ({ element }) =>
+        this.retryQuickCardLink(element.dataset.email, element.dataset.runId)
+      );
+      this.commands.register("retry-quick-payment", async ({ element }) =>
         this.retryQuickCardLink(element.dataset.email, element.dataset.runId)
       );
       this.commands.register("register", async () => {
@@ -4269,31 +4524,6 @@
         localStorage.setItem("hme_workspace_refresh_interval", value);
         this.scheduleWorkspaceRefresh();
       });
-      $("runtimeLogSearch").addEventListener("input", () => this.runtimeLogPresenter.refilter());
-      $("runtimeLogLevel").addEventListener("change", () => this.runtimeLogPresenter.refilter());
-      $("runtimeLogAutoscroll").addEventListener("change", () => this.runtimeLogPresenter.refilter());
-      const resizeHandle = $("runtimeLogResizeHandle");
-      resizeHandle.addEventListener("pointerdown", (event) =>
-        this.runtimeLogResizePresenter.begin(event));
-      resizeHandle.addEventListener("pointermove", (event) =>
-        this.runtimeLogResizePresenter.move(event));
-      resizeHandle.addEventListener("pointerup", (event) =>
-        this.runtimeLogResizePresenter.finish(event));
-      resizeHandle.addEventListener("pointercancel", (event) =>
-        this.runtimeLogResizePresenter.cancel(event));
-      resizeHandle.addEventListener("lostpointercapture", (event) =>
-        this.runtimeLogResizePresenter.finish(event));
-      resizeHandle.addEventListener("keydown", (event) =>
-        this.runtimeLogResizePresenter.handleKeydown(event));
-      resizeHandle.addEventListener("dblclick", (event) =>
-        this.runtimeLogResizePresenter.reset(event));
-      window.addEventListener("resize", () =>
-        this.runtimeLogResizePresenter.handleViewportResize());
-      window.addEventListener("blur", () => this.runtimeLogResizePresenter.cancel());
-      document.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") this.runtimeLogResizePresenter.cancel();
-        this.runtimeLogPresenter.handleKeydown(event);
-      });
       ["cardSearch", "cardStatusFilter"].forEach((id) => {
         $(id).addEventListener(id === "cardSearch" ? "input" : "change", () => this.renderer.renderCardLinks(this.store.state));
       });
@@ -4735,13 +4965,15 @@
       const savedQuickCardLinkMethod = localStorage.getItem("hme_quick_card_link_method");
       $("quickCardLinkMethod").value = ["de_oaics_paypal", "paypal_us", "paypal_gb"].includes(savedQuickCardLinkMethod)
         ? savedQuickCardLinkMethod : "de_oaics_paypal";
+      this.quickFlowConfigPresenter.restore();
       this.applyTheme(savedTheme, false);
       this.sidebarPresenter.restore();
-      this.runtimeLogResizePresenter.restore();
+      this.registrationConfigPresenter.restore();
       this.store.patch({ registrationMode });
       $("accountsView").insertBefore($("protocolRegistrationPanel"), $("accountsView").querySelector(".table-panel"));
       this.store.subscribe((state) => this.render(state));
       this.bindEvents();
+      this.quickFlowConfigPresenter.bind();
       this.router.start();
       const results = await this.refreshWorkspaceData();
       const failure = results.find((result) => result.status === "rejected");
