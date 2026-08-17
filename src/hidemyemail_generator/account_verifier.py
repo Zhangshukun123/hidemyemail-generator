@@ -646,6 +646,7 @@ class AccountVerificationManager:
                     "_account_type_source": account_type_source,
                     "_session_email": "",
                     "_session_plan": "",
+                    "_proxy_url": account_registration_proxy_url(record),
                 }
             ],
             "logs": [],
@@ -1316,6 +1317,7 @@ class AccountVerificationManager:
         )
         self._append_log(item["message"], email=email)
         password = str(item.get("_password") or "")
+        proxy_url = str(item.get("_proxy_url") or "").strip()
         env = os.environ.copy()
         env.update(
             {
@@ -1328,6 +1330,9 @@ class AccountVerificationManager:
             }
         )
         self._protocol_environment_proxy(env)
+        if proxy_url:
+            env["HTTP_PROXY"] = proxy_url
+            env["HTTPS_PROXY"] = proxy_url
         command = [str(self.node_executable)]
         if self.node_executable and self.node_executable.name.casefold() in {
             "node",
