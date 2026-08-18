@@ -827,7 +827,7 @@
       const snapshot = {
         registrationProvider: enumValue(candidate.registrationProvider, ["inventory", "zkgmail"], "inventory"),
         registrationMode: enumValue(candidate.registrationMode, ["headless", "headed", "roxy", "protocol"], "headless"),
-        protocolSetupCredentials: booleanValue(candidate.protocolSetupCredentials, false),
+        protocolSetupCredentials: true,
         concurrency: integerValue(candidate.concurrency, 1, 10, 1),
         targetCount: integerValue(candidate.targetCount, 1, 100, Number(roxyTargetCount)),
         roxyTargetCount,
@@ -916,7 +916,7 @@
     read() {
       return {
         ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) => [field, element.value])),
-        protocolSetupCredentials: Boolean(this.protocolSetupCredentials.checked),
+        protocolSetupCredentials: true,
         postPaymentPhoneBinding: Boolean(this.postPaymentPhoneBinding.checked),
         collapsed: !this.details.open,
       };
@@ -928,7 +928,8 @@
           element.value = value;
         }
       });
-      this.protocolSetupCredentials.checked = snapshot.protocolSetupCredentials === true;
+      this.protocolSetupCredentials.checked = true;
+      this.protocolSetupCredentials.disabled = true;
       this.postPaymentPhoneBinding.checked = snapshot.postPaymentPhoneBinding === true;
       this.details.open = !snapshot.collapsed;
     }
@@ -943,7 +944,7 @@
       const summary = [
         this.selectedLabel("registrationProvider", current.registrationProvider),
         this.selectedLabel("registrationMode", current.registrationMode),
-        current.registrationMode === "protocol" ? (current.protocolSetupCredentials ? "密码 + 2FA" : "仅 Session") : "",
+        current.registrationMode === "protocol" ? "密码 + 2FA" : "",
         "并发 " + current.concurrency + " / 目标 " + current.targetCount,
         this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
         "每号 " + current.extractionCount + " 次",
@@ -1722,33 +1723,27 @@
       const task = state.protocolRegistrationTask || {};
       const protocolBusy = Boolean(task.running || task.starting);
       const credentialToggle = $("protocolSetupCredentials");
-      const setupCredentials = protocolBusy
-        ? Boolean(task.setupCredentials)
-        : credentialToggle.checked;
-      credentialToggle.disabled = protocolBusy;
-      const pending = state.accounts.filter((item) =>
-        setupCredentials ? !item.protocolReady : !item.registrationComplete
-      );
-      const registered = state.accounts.filter((item) =>
-        setupCredentials ? item.protocolReady : item.registrationComplete
-      );
+      credentialToggle.checked = true;
+      credentialToggle.disabled = true;
+      const pending = state.accounts.filter((item) => !item.protocolReady);
+      const registered = state.accounts.filter((item) => item.protocolReady);
       const passwordReady = state.accounts.filter((item) => item.hasPassword);
       const twoFactorReady = state.accounts.filter((item) => item.hasTwoFactor);
       $("protocolMetrics").innerHTML = [
         metricCard(
-          setupCredentials ? "待协议补全" : "待协议注册",
+          "待完整注册",
           pending.length,
-          setupCredentials ? "密码、Session 或 TOTP 仍待完成" : "Session/Cookie 仍待获取",
+          "密码、Session 或 TOTP 仍待完成",
           "amber", "◷"
         ),
         metricCard(
-          setupCredentials ? "完整凭据就绪" : "Session 已保存",
+          "完整凭据就绪",
           registered.length,
-          setupCredentials ? "密码、Session 与 TOTP 均已完成" : "协议注册已完成",
+          "密码、Session 与 TOTP 均已完成",
           "green", "✓"
         ),
-        metricCard("密码（可选）", passwordReady.length, "已确认并保存", "green", "K"),
-        metricCard("2FA（可选）", twoFactorReady.length, "TOTP 验证器已激活", "purple", "2"),
+        metricCard("密码已确认", passwordReady.length, "注册成功必需", "green", "K"),
+        metricCard("2FA 已开启", twoFactorReady.length, "注册成功必需", "purple", "2"),
       ].join("");
 
       $("stopProtocolButton").disabled = !task.running;
@@ -1768,12 +1763,10 @@
       $("protocolTaskFailed").textContent = Number(task.failed || 0);
       $("protocolTaskElapsed").textContent = formatElapsed(task.startedAt, task.finishedAt);
 
-      const stageOrder = task.setupCredentials
-        ? ["password", "email_verification", "session", "two_factor", "completed"]
-        : ["email_verification", "session", "password", "two_factor", "completed"];
+      const stageOrder = ["password", "email_verification", "session", "two_factor", "completed"];
       let activeStage = task.phase || "";
       if (activeStage === "protocol_auth") {
-        activeStage = task.setupCredentials ? "password" : "email_verification";
+        activeStage = "password";
       }
       const activeIndex = stageOrder.indexOf(activeStage);
       document.querySelectorAll("[data-protocol-stage]").forEach((element) => {
@@ -1977,7 +1970,8 @@
 
       const registrationMode = $("quickRegistrationMode").value || "headless";
       const protocolMode = registrationMode === "protocol";
-      const protocolSetupCredentials = protocolMode && Boolean($("quickProtocolSetupCredentials").checked);
+      $("quickProtocolSetupCredentials").checked = true;
+      $("quickProtocolSetupCredentials").disabled = true;
       const roxyMode = registrationMode === "roxy";
       $("quickProtocolSetupCredentialsLabel").hidden = !protocolMode;
       $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
@@ -2004,9 +1998,8 @@
         : protocolMode
         ? "Mail Auth 协议将获取 1 个" + (registrationProvider === "zkgmail"
           ? " " + (state.zkgmail?.domain || "cclgmail.com") + " 邮箱并从 QQ 邮箱自动取码"
-          : " iCloud 库存邮箱") + (protocolSetupCredentials
-            ? "，并设置密码与 TOTP 2FA，无需启动浏览器。"
-            : "，仅保存 Session/Cookie，无需启动浏览器。")
+          : " iCloud 库存邮箱") +
+          "，并强制设置密码与 TOTP 2FA，无需启动浏览器。"
         : roxyMode
           ? "Roxy 使用账号管理中已保存的专用环境，最多 5 个并发窗口并按目标数分轮；" +
             (registrationProvider === "zkgmail" ? "验证码从 QQ 转发邮箱读取。" : "验证码从 iCloud 收件箱读取。")
@@ -2574,7 +2567,7 @@
         '<label><input type="radio" name="settingsRegistrationMode" value="headless" ' + (mode === "headless" ? "checked" : "") + '><span><b>无头浏览器</b><small>后台运行 Camoufox</small></span></label>' +
         '<label><input type="radio" name="settingsRegistrationMode" value="headed" ' + (mode === "headed" ? "checked" : "") + (runtime.forceHeadless ? " disabled" : "") + '><span><b>有头浏览器</b><small>显示前台浏览器窗口</small></span></label>' +
         '<label><input type="radio" name="settingsRegistrationMode" value="roxy" ' + (mode === "roxy" ? "checked" : "") + '><span><b>Roxy 注册</b><small>专用环境 · 随机指纹</small></span></label>' +
-        '<label><input type="radio" name="settingsRegistrationMode" value="protocol" ' + (mode === "protocol" ? "checked" : "") + '><span><b>协议注册</b><small>Mail Auth · 默认仅 Session</small></span></label></div>' +
+        '<label><input type="radio" name="settingsRegistrationMode" value="protocol" ' + (mode === "protocol" ? "checked" : "") + '><span><b>协议注册</b><small>Mail Auth · 密码 + 2FA</small></span></label></div>' +
         '<label class="field-label" style="margin-top:14px">验证并发<input id="settingsConcurrency" type="number" min="1" max="10" value="' +
         escapeHtml($("concurrency").value) + '"></label></section><section class="form-section"><h3>运行环境</h3><div class="connection-card"><strong>' +
         (runtime.available ? "✓ Camoufox 运行环境已连接" : "× Camoufox 运行环境不可用") +
@@ -2624,7 +2617,7 @@
         roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         paymentSms: { configured: false, provider: "", label: "", timeoutSeconds: 60, routing: {} },
-        zkgmail: { configured: false, domain: "cclgmail.com", domains: ["cclgmail.com", "zkgmail.com"], forwardAccount: "352***4@qq.com" },
+        zkgmail: { configured: false, domain: "cclgmail.com", domains: ["cclgmail.com", "zkgmail.com", "shukunlabs.xyz"], forwardAccount: "352***4@qq.com" },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
         inbox: { configured: false, codeCount: 0 },
@@ -3848,7 +3841,7 @@
           status: "running", phase: "prepare", progress: 5, taskId: "",
           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
           registrationProvider, targetAmount,
-          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true, protocolSetupCredentials: protocol && configSnapshot.protocolSetupCredentials === true,
+          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true, protocolSetupCredentials: protocol,
           registrationMode: mode,
           registrationProxyMode: configSnapshot.registrationProxyMode,
           registrationProxyCountry: configSnapshot.registrationProxyCountry,
@@ -3872,7 +3865,7 @@
           await this.quickFlowHistoryPresenter.persist(flow);
           const data = protocol
             ? await this.api.post("/api/protocol-registration/start", {
-                provider: registrationProvider, concurrency: 1, setup_credentials: configSnapshot.protocolSetupCredentials === true,
+                provider: registrationProvider, concurrency: 1, setup_credentials: true,
               })
             : await this.api.post("/api/registration/start", {
                 label: registrationProviderLabel + "一键注册、提链并协议支付",
@@ -3996,7 +3989,8 @@
           }
           this.assertProtocolRuntime();
           const previousTask = this.store.state.protocolRegistrationTask || {};
-          const setupCredentials = $("protocolSetupCredentials").checked;
+          const setupCredentials = true;
+          $("protocolSetupCredentials").checked = true;
           const protocolProvider = source === "zkgmail" ? "zkgmail" : "inventory";
           const protocolSourceLabel = source === "zkgmail" ? (zkgmail.domain || "cclgmail.com") : "iCloud 库存";
           const startedAt = new Date().toISOString();
@@ -4024,7 +4018,7 @@
             const data = await this.api.post("/api/protocol-registration/start", {
               provider: protocolProvider,
               concurrency: 1,
-              setup_credentials: setupCredentials,
+              setup_credentials: true,
             });
             this.store.patch({
               protocolRegistrationTask: { ...data.task, starting: false },
@@ -4747,16 +4741,6 @@
             : mode === "headless" ? "已切换为无头浏览器注册" : "已切换为有头浏览器注册");
         });
       });
-      $("protocolSetupCredentials").addEventListener("change", (event) => {
-        localStorage.setItem(
-          "hme_protocol_setup_credentials",
-          event.target.checked ? "1" : "0"
-        );
-        this.toast(event.target.checked
-          ? "协议注册将同时设置密码与 TOTP 2FA"
-          : "协议注册将仅保存 Session/Cookie");
-        this.renderer.renderProtocolRegistration(this.store.state);
-      });
       $("roxyWorkspace").addEventListener("change", async (event) => {
         try {
           const data = await this.api.post("/api/roxy-registration/config", {
@@ -4941,8 +4925,8 @@
       const savedRegistrationMode = localStorage.getItem("hme_registration_mode");
       const registrationMode = ["headless", "headed", "roxy", "protocol"].includes(savedRegistrationMode)
         ? savedRegistrationMode : "headed";
-      $("protocolSetupCredentials").checked =
-        localStorage.getItem("hme_protocol_setup_credentials") === "1";
+      $("protocolSetupCredentials").checked = true;
+      $("protocolSetupCredentials").disabled = true;
       const savedRoxyWindowMode = localStorage.getItem("hme_roxy_window_mode");
       $("roxyWindowMode").value = savedRoxyWindowMode === "headed" ? "headed" : "background";
       const savedRoxyConcurrency = Number(localStorage.getItem("hme_roxy_concurrency") || 5);

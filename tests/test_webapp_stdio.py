@@ -36,6 +36,7 @@ from hidemyemail_generator.webapp import (
     WORKBENCH_OPENAI_CODE_PATH,
     _configured_inventory_service_token,
     _configured_workbench_import_token,
+    _active_protocol_code_emails,
     _configure_utf8_stdio,
     _generation_failure_message,
     _latest_code_for_email,
@@ -48,6 +49,44 @@ from hidemyemail_generator.liandong_shop import LiandongShopError
 
 
 class WebAppStdioTests(unittest.TestCase):
+    def test_protocol_code_waiters_include_every_concurrent_task(self):
+        waiting = _active_protocol_code_emails(
+            {
+                "running": True,
+                "tasks": [
+                    {
+                        "running": True,
+                        "phase": "email_verification",
+                        "currentEmail": "first@icloud.com",
+                        "accounts": [
+                            {
+                                "email": "first@icloud.com",
+                                "status": "running",
+                                "stage": "email_verification",
+                            }
+                        ],
+                    },
+                    {
+                        "running": True,
+                        "phase": "email_verification",
+                        "currentEmail": "second@icloud.com",
+                        "accounts": [
+                            {
+                                "email": "second@icloud.com",
+                                "status": "running",
+                                "stage": "email_verification",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            waiting,
+            {"first@icloud.com", "second@icloud.com"},
+        )
+
     def test_workbench_import_uses_dedicated_local_token(self):
         with mock.patch.dict(
             os.environ,
@@ -3202,13 +3241,21 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verify_reuses_valid_session_or_relogs_when_missing(self):
         class ManagerStub:
-            def __init__(self, *, allow_protocol=False, allow_verify=False):
+            def __init__(
+                self,
+                *,
+                allow_protocol=False,
+                allow_verify=False,
+                allow_registration=False,
+            ):
                 self.allow_protocol = allow_protocol
                 self.allow_verify = allow_verify
+                self.allow_registration = allow_registration
                 self.protocol_emails = []
                 self.browser_refresh_starts = []
                 self.cookie_refresh_starts = []
                 self.verify_starts = []
+                self.registration_starts = []
                 self.browser_starts = 0
 
             def snapshot(self):
@@ -3246,6 +3293,12 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                 if self.allow_verify:
                     self.verify_starts.append(kwargs)
                     return {"running": True, "accounts": []}
+                if self.allow_registration:
+                    self.registration_starts.append(kwargs)
+                    return {
+                        "running": True,
+                        "emails": [kwargs["email"]],
+                    }
                 self.browser_starts += 1
                 raise AssertionError("browser must not start during account verification")
 
@@ -3306,6 +3359,13 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                                 ]
                             ),
                         },
+                        password="Existing!Password123",
+                        password_confirmed=True,
+                        two_factor={
+                            "enabled": True,
+                            "status": "enabled",
+                            "secret": "JBSWY3DPEHPK3PXP",
+                        },
                     )
                     if marked_invalid:
                         mark_account_session_invalid(
@@ -3318,8 +3378,10 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                     allow_verify=True,
                 )
                 browser_manager = ManagerStub()
+                registration_manager = ManagerStub(allow_registration=True)
                 app["verification_manager"] = verification_manager
                 app["browser_manager"] = browser_manager
+                app["registration_manager"] = registration_manager
                 client = TestClient(TestServer(app))
                 with (
                     mock.patch(
@@ -3346,11 +3408,21 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
                         payload = await response.json()
                     finally:
                         await client.close()
-                return response, payload, verification_manager, browser_manager
+                return (
+                    response,
+                    payload,
+                    verification_manager,
+                    browser_manager,
+                    registration_manager,
+                )
 
-        response, payload, verification_manager, browser_manager = await run_case(
-            has_valid_session=True
-        )
+        (
+            response,
+            payload,
+            verification_manager,
+            browser_manager,
+            registration_manager,
+        ) = await run_case(has_valid_session=True)
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["mode"], "verify")
         self.assertEqual(
@@ -3360,27 +3432,40 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verification_manager.protocol_emails, [])
         self.assertEqual(verification_manager.browser_refresh_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
+        self.assertEqual(registration_manager.registration_starts, [])
 
-        response, payload, verification_manager, browser_manager = await run_case(
-            has_valid_session=False
-        )
+        (
+            response,
+            payload,
+            verification_manager,
+            browser_manager,
+            registration_manager,
+        ) = await run_case(has_valid_session=False)
         self.assertEqual(response.status, 200)
-        self.assertEqual(payload["mode"], "refresh_session")
+        self.assertEqual(payload["mode"], "register_credentials")
         self.assertEqual(verification_manager.protocol_emails, [])
         self.assertEqual(
-            verification_manager.browser_refresh_starts,
+            registration_manager.registration_starts,
             [
                 {
-                    "emails": ["protocol@icloud.com"],
-                    "concurrency": 1,
-                    "force_refresh": False,
+                    "label": "账号库存注册（密码 + 2FA）",
+                    "email": "protocol@icloud.com",
+                    "provider": "manual",
+                    "headless": False,
                 }
             ],
         )
         self.assertEqual(verification_manager.verify_starts, [])
+        self.assertEqual(verification_manager.browser_refresh_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
 
-        response, payload, verification_manager, browser_manager = await run_case(
+        (
+            response,
+            payload,
+            verification_manager,
+            browser_manager,
+            registration_manager,
+        ) = await run_case(
             has_valid_session=True,
             refresh_with_cookie=True,
             email="protocol@gmail.com",
@@ -3398,10 +3483,13 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(verification_manager.browser_refresh_starts, [])
 
-        response, payload, verification_manager, browser_manager = await run_case(
-            has_valid_session=True,
-            marked_invalid=True,
-        )
+        (
+            response,
+            payload,
+            verification_manager,
+            browser_manager,
+            registration_manager,
+        ) = await run_case(has_valid_session=True, marked_invalid=True)
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["mode"], "refresh_session")
         self.assertEqual(
@@ -3416,11 +3504,15 @@ class VerifyAccountEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(verification_manager.verify_starts, [])
         self.assertEqual(browser_manager.browser_starts, 0)
+        self.assertEqual(registration_manager.registration_starts, [])
 
-        response, payload, verification_manager, browser_manager = await run_case(
-            has_valid_session=True,
-            refresh_with_cookie=True,
-        )
+        (
+            response,
+            payload,
+            verification_manager,
+            browser_manager,
+            registration_manager,
+        ) = await run_case(has_valid_session=True, refresh_with_cookie=True)
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["mode"], "refresh_cookie")
         self.assertEqual(

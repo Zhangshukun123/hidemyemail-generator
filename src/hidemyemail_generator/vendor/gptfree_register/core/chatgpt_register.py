@@ -118,6 +118,14 @@ def auth_step_requires_mfa(continue_url: str, page_type: str) -> bool:
     return "mfa_challenge" in marker or "/mfa" in marker
 
 
+def auth_step_requires_sso(continue_url: str, page_type: str) -> bool:
+    """Return whether the server requires an organization SSO branch."""
+
+    marker = f"{continue_url or ''} {page_type or ''}".lower()
+    path = urlparse(str(continue_url or "")).path.rstrip("/").lower()
+    return path == "/sso" or "sso" in marker.split()
+
+
 def auth_mfa_details(result: Any) -> tuple[str, str, str]:
     """Extract the selected MFA factor from current auth response shapes."""
     if not isinstance(result, dict):
@@ -328,10 +336,17 @@ class _SentinelWithProxy:
             async def _get_session(self):
                 if not self._session:
                     from curl_cffi import requests as _req
+                    from hidemyemail_generator.protocol_browser import (
+                        ProtocolBrowserPersona,
+                    )
+
+                    persona = ProtocolBrowserPersona.from_impersonate(
+                        self.impersonate
+                    )
                     kwargs: dict[str, Any] = {
                         "impersonate": self.impersonate,
                         "timeout": 60,
-                        "headers": {"accept-language": _accept_language(self._language)},
+                        "headers": persona.session_headers(self._language),
                     }
                     if self._proxy:
                         kwargs["proxies"] = {"http": self._proxy, "https": self._proxy}
@@ -398,10 +413,15 @@ class OpenAIAuthClient:
     async def _get_session(self):
         if not self._session:
             from curl_cffi import requests as _req
+            from hidemyemail_generator.protocol_browser import (
+                ProtocolBrowserPersona,
+            )
+
+            persona = ProtocolBrowserPersona.from_impersonate(self.impersonate)
             kwargs: dict[str, Any] = {
                 "impersonate": self.impersonate,
                 "timeout": 60,
-                "headers": {"accept-language": _accept_language(self.language)},
+                "headers": persona.session_headers(self.language),
             }
             if self.proxy:
                 kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
@@ -1605,6 +1625,10 @@ class ChatGPTRegister:
                     raise RuntimeError(
                         f"password_page_failed: {password_page_status}"
                     )
+                if auth_step_requires_sso(password_page.get("url", ""), ""):
+                    raise RuntimeError(
+                        "sso_required: 该邮箱域名或账号要求通过组织 SSO 登录"
+                    )
 
             self._l(
                 f"  {_ts()} [..] {timing_label}提交账号密码 "
@@ -1720,6 +1744,10 @@ class ChatGPTRegister:
                     "account_auth_init_error_page: "
                     f"status={int(init.get('status', 0) or 0)}"
                 )
+            if init_page_path == "/sso" or init_page_path.startswith("/sso/"):
+                return self._failed(
+                    "sso_required: 该邮箱域名或账号要求通过组织 SSO 登录"
+                )
             password_page_ready = False
             password_after_otp_required = bool(
                 password_signup_first
@@ -1771,6 +1799,10 @@ class ChatGPTRegister:
                     signup_url,
                     signup_page_type,
                 )
+                if auth_step_requires_sso(signup_url, signup_page_type):
+                    return self._failed(
+                        "sso_required: 该邮箱域名或账号要求通过组织 SSO 登录"
+                    )
                 if not password_step_selected and not otp_step_selected:
                     return self._failed(
                         "account_password_signup_step_required: "

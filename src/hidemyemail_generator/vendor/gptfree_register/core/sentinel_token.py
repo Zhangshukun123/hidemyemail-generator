@@ -703,26 +703,14 @@ class SentinelTokenProvider:
 
     def _browser_profile(self, device_id: str):
         from gpt_trial_protocol.models import BrowserProfile
+        from hidemyemail_generator.protocol_browser import ProtocolBrowserPersona
 
-        firefox = str(self.impersonate or "").casefold().startswith("firefox")
+        persona = ProtocolBrowserPersona.from_impersonate(self.impersonate)
         return BrowserProfile(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
-                "Gecko/20100101 Firefox/144.0"
-                if firefox
-                else (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.0.0 Safari/537.36"
-                )
-            ),
-            sec_ch_ua=(
-                ""
-                if firefox
-                else '"Chromium";v="136", "Not=A?Brand";v="24", "Google Chrome";v="136"'
-            ),
-            sec_ch_ua_platform="" if firefox else '"Windows"',
-            sec_ch_ua_mobile="" if firefox else "?0",
+            user_agent=persona.user_agent,
+            sec_ch_ua=persona.sec_ch_ua,
+            sec_ch_ua_platform=persona.sec_ch_ua_platform,
+            sec_ch_ua_mobile=persona.sec_ch_ua_mobile,
             language=self.language,
             timezone=self.timezone_name,
             device_id=device_id,
@@ -745,7 +733,7 @@ class SentinelTokenProvider:
             profile = self._browser_profile(self._device_id or str(uuid.uuid4()))
             self._session = requests.AsyncSession(
                 impersonate=self.impersonate,
-                headers={"accept-language": profile.language_header()},
+                headers=profile.browser_headers(),
             )
         return self._session
 

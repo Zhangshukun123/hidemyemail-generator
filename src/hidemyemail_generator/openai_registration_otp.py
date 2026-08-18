@@ -81,7 +81,9 @@ def _is_qq_forwarded_email(email: str) -> bool:
             return ZkgmailConfigStore(db_file).supports_email(target)
     except (ImportError, OSError, RuntimeError, ValueError):
         pass
-    return target.endswith(("@cclgmail.com", "@zkgmail.com"))
+    return target.endswith(
+        ("@cclgmail.com", "@zkgmail.com", "@shukunlabs.xyz")
+    )
 
 
 def _icloud_code_since(min_timestamp: float) -> str:

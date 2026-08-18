@@ -101,6 +101,7 @@ from .protocol_registration import (
     ConcurrentProtocolRegistrationManager,
     PROTOCOL_CODE_PREFIX,
     ProtocolRegistrationManager,
+    _protocol_failure_details,
 )
 from .quick_flow_history import setup_quick_flow_history_routes
 from .registration_inventory import (
@@ -3589,6 +3590,37 @@ def _effective_gpt_code_since(
     return effective_since
 
 
+def _active_protocol_code_emails(snapshot: dict | None) -> set[str]:
+    """Collect every protocol account currently waiting for an email code."""
+
+    root = snapshot if isinstance(snapshot, dict) else {}
+    tasks = root.get("tasks")
+    candidates = (
+        [item for item in tasks if isinstance(item, dict)]
+        if isinstance(tasks, list) and tasks
+        else [root]
+    )
+    waiting: set[str] = set()
+    for state in candidates:
+        if not state.get("running"):
+            continue
+        for account in state.get("accounts", []):
+            if not isinstance(account, dict):
+                continue
+            if str(account.get("status") or "").casefold() != "running":
+                continue
+            if str(account.get("stage") or "").casefold() != "email_verification":
+                continue
+            email = str(account.get("email") or "").strip().lower()
+            if email:
+                waiting.add(email)
+        if str(state.get("phase") or "").casefold() == "email_verification":
+            email = str(state.get("currentEmail") or "").strip().lower()
+            if email:
+                waiting.add(email)
+    return waiting
+
+
 def _latest_gpt_code(
     db_file: Path,
     email: str,
@@ -4500,6 +4532,8 @@ def create_app(
         email: str, success: bool, message: str
     ) -> None:
         target = str(email or "").strip().lower()
+        terminal_failure = not _protocol_failure_details(message)["retryable"]
+        inventory_success = bool(success or terminal_failure)
         record = (
             await asyncio.to_thread(
                 export_inventory_record, app["db_file"], email
@@ -4514,7 +4548,7 @@ def create_app(
                 app["db_file"],
                 lease_id=local_lease["leaseId"],
                 email=target,
-                success=success,
+                success=inventory_success,
                 message=message,
                 record=record,
             )
@@ -4523,7 +4557,7 @@ def create_app(
             app["local_registration_leases"].pop(target, None)
             return
         await app["inventory_client"].complete_email(
-            email, success, message, record=record
+            email, inventory_success, message, record=record
         )
 
     async def confirm_registration_email(email: str) -> None:
@@ -5724,15 +5758,8 @@ def create_app(
             if waiting_email:
                 waiting_emails.add(waiting_email)
         protocol_snapshot = app["protocol_registration_manager"].snapshot()
-        protocol_waiting_email = str(
-            protocol_snapshot.get("currentEmail") or ""
-        ).strip().lower()
-        if (
-            protocol_snapshot.get("running")
-            and protocol_snapshot.get("phase") == "email_verification"
-            and protocol_waiting_email
-        ):
-            waiting_emails.add(protocol_waiting_email)
+        protocol_waiting_emails = _active_protocol_code_emails(protocol_snapshot)
+        waiting_emails.update(protocol_waiting_emails)
         if (
             (
                 (
@@ -5740,8 +5767,7 @@ def create_app(
                     and registration_snapshot.get("phase") == "email_verification"
                 )
                 or (
-                    protocol_snapshot.get("running")
-                    and protocol_snapshot.get("phase") == "email_verification"
+                    protocol_waiting_emails
                 )
             )
             and waiting_emails == {email}
@@ -6902,9 +6928,11 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "协议注册并发必须是 1–5"}, status=400
             )
-        setup_credentials = payload.get(
-            "setup_credentials", payload.get("setupCredentials", False)
-        ) is True
+        # Every user-facing protocol registration must finish with a confirmed
+        # password and an enabled TOTP factor.  Older clients may still send
+        # setup_credentials=false; keep accepting the field for compatibility,
+        # but never downgrade a registration to Session-only mode.
+        setup_credentials = True
         provider = str(payload.get("provider") or "").strip().lower()
         if provider not in {"", "inventory", "zkgmail"}:
             return web.json_response(
@@ -7354,6 +7382,11 @@ def create_app(
             if isinstance(record.get("two_factor"), dict)
             else {}
         )
+        credentials_complete = bool(
+            _account_has_confirmed_password(record)
+            and saved_two_factor.get("enabled")
+            and str(saved_two_factor.get("secret") or "").strip()
+        )
         if refresh_with_cookie and not reset_password:
             if not account_saved_cookies(record):
                 return web.json_response(
@@ -7386,6 +7419,7 @@ def create_app(
             and access_token
             and not access_token_is_expired(access_token)
             and not record.get("session_invalid_at")
+            and credentials_complete
         ):
             try:
                 task = app["verification_manager"].start(
@@ -7436,6 +7470,27 @@ def create_app(
                     "deleted": True,
                     "mode": "deleted_invalid",
                     "message": detail,
+                    "task": task,
+                }
+            )
+        if not reset_password and not credentials_complete:
+            try:
+                task = app["registration_manager"].start(
+                    label="账号库存注册（密码 + 2FA）",
+                    email=email,
+                    provider="manual",
+                    headless=bool(payload.get("headless", False)),
+                )
+            except (RuntimeError, ValueError) as error:
+                return web.json_response(
+                    {"ok": False, "error": str(error)}, status=409
+                )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "started": True,
+                    "mode": "register_credentials",
+                    "message": "正在完成账号注册、确认密码并开启 TOTP 2FA",
                     "task": task,
                 }
             )

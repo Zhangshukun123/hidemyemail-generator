@@ -31,7 +31,12 @@ from .inbox import (
 ZKGMAIL_SETTING_KEY = "zkgmail_qq_inbox_config_v1"
 ZKGMAIL_DOMAIN = "zkgmail.com"
 CCLGMAIL_DOMAIN = "cclgmail.com"
-DEFAULT_QQ_FORWARD_DOMAINS = (CCLGMAIL_DOMAIN, ZKGMAIL_DOMAIN)
+SHUKUNLABS_DOMAIN = "shukunlabs.xyz"
+DEFAULT_QQ_FORWARD_DOMAINS = (
+    CCLGMAIL_DOMAIN,
+    ZKGMAIL_DOMAIN,
+    SHUKUNLABS_DOMAIN,
+)
 ZKGMAIL_FORWARD_ACCOUNT = "352121354@qq.com"
 ZKGMAIL_IMAP_HOST = "imap.qq.com"
 ZKGMAIL_IMAP_PORT = 993
@@ -663,9 +668,9 @@ class ZkgmailMailClient:
         acquired_at = self._acquired_at.get(email)
         requested_at = _parse_utc(since)
         if acquired_at is None and requested_at is None:
-            raise RuntimeError("未找到该 zkgmail.com 注册邮箱的本机取码记录")
+            raise RuntimeError("未找到该 QQ 转发注册邮箱的本机取码记录")
         if acquired_at is None and email not in _known_zkgmail_aliases(self.db_file):
-            raise RuntimeError("未找到该 zkgmail.com 注册邮箱的本机取码记录")
+            raise RuntimeError("未找到该 QQ 转发注册邮箱的本机取码记录")
         # Mail-server clocks can differ slightly from the workstation clock.
         anchors = [item for item in (acquired_at, requested_at) if item is not None]
         earliest = max(anchors) - timedelta(minutes=5)
@@ -721,8 +726,39 @@ class ZkgmailMailClient:
     async def poll_next_code(self, email: str, *, since: str = "") -> str:
         return await self.poll_code(email, since=since)
 
-    async def complete_email(self, email: str, _success: bool, _message: str) -> None:
-        self._normalize_email(email)
+    async def complete_email(self, email: str, success: bool, message: str) -> None:
+        target = self._normalize_email(email)
+        normalized_message = str(message or "").casefold()
+        terminal_failure = any(
+            marker in normalized_message
+            for marker in (
+                "不可自动重试",
+                "account_deactivated",
+                "account_deleted",
+                "account_banned",
+                "sso_required",
+            )
+        )
+        state = "used" if success else "trash" if terminal_failure else "unused"
+        async with self._lock:
+            conn = connect_db(str(self.db_file))
+            try:
+                conn.execute(
+                    """
+                    UPDATE addresses
+                    SET state = ?, note = ?, updated_at = ?
+                    WHERE lower(email) = ? AND source = 'zkgmail'
+                    """,
+                    (
+                        state,
+                        str(message or "")[:500],
+                        _utc_now().isoformat(),
+                        target,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     async def cancel_email(self, email: str, _message: str) -> None:
         self._normalize_email(email)
@@ -762,6 +798,7 @@ class ZkgmailMailClient:
 __all__ = [
     "CCLGMAIL_DOMAIN",
     "DEFAULT_QQ_FORWARD_DOMAINS",
+    "SHUKUNLABS_DOMAIN",
     "ZKGMAIL_DOMAIN",
     "ZKGMAIL_FORWARD_ACCOUNT",
     "ZKGMAIL_IMAP_HOST",

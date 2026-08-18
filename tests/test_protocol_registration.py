@@ -17,13 +17,20 @@ from hidemyemail_generator.protocol_credentials import (
 from hidemyemail_generator.protocol_registration import (
     ConcurrentProtocolRegistrationManager,
     ProtocolRegistrationManager,
+    _protocol_failure_details,
 )
 from hidemyemail_generator.protocol_registration_worker import (
+    CHROME_IMPERSONATE_PROFILES,
+    FIREFOX_IMPERSONATE_PROFILES,
+    PROTOCOL_IMPERSONATE_PROFILES,
+    _choose_protocol_impersonate,
     _configure_utf8_stdio,
     _load_core,
     _proxy_fingerprint_profile,
+    _tls_fallback_impersonate,
     run,
 )
+from hidemyemail_generator.protocol_browser import ProtocolBrowserPersona
 
 
 class FakeResponse:
@@ -109,6 +116,47 @@ class ProtocolCredentialTests(unittest.TestCase):
             logs,
         )
         self.assertIn("当前认证会话已确认密码添加成功", logs)
+
+    def test_totp_activation_retries_once_after_code_window_failure(self):
+        class RetrySession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.activation_attempts = 0
+
+            def post(self, url, *, headers, data, timeout, allow_redirects=True):
+                if url == f"{MFA_BASE_URL}/user/activate_enrollment":
+                    payload = json.loads(data)
+                    self.posts.append((url, payload, headers, timeout))
+                    self.redirect_flags.append(allow_redirects)
+                    self.activation_attempts += 1
+                    if self.activation_attempts == 1:
+                        return FakeResponse(400, {"detail": "invalid totp code"})
+                    return FakeResponse(200, {"recovery_codes": ["RECOVERY-1"]})
+                return super().post(
+                    url,
+                    headers=headers,
+                    data=data,
+                    timeout=timeout,
+                    allow_redirects=allow_redirects,
+                )
+
+        session = RetrySession()
+        times = iter((10.0, 10.0, 10.0, 40.0))
+        sleeps = []
+
+        result = complete_protocol_credentials(
+            email="protocol@icloud.com",
+            access_token="access-token",
+            generated_password="GeneratedPassword!1",
+            password_set=True,
+            request_session=session,
+            now=lambda: next(times),
+            sleep=sleeps.append,
+        )
+
+        self.assertTrue(result["two_factor"]["server_verified"])
+        self.assertEqual(session.activation_attempts, 2)
+        self.assertEqual(sleeps, [20.25])
 
     def test_password_add_reuses_registration_session_without_login_token(self):
         class RegistrationSession(FakeSession):
@@ -214,6 +262,11 @@ class ProtocolCredentialTests(unittest.TestCase):
         self.assertEqual(session.posts, [])
         self.assertTrue(result["password_set"])
         self.assertTrue(result["two_factor"]["enabled"])
+        self.assertFalse(result["two_factor"]["server_verified"])
+        self.assertEqual(
+            result["two_factor"]["verification_source"],
+            "saved_record",
+        )
 
     def test_verifier_without_token_stops_before_new_totp_enrollment(self):
         class RefreshTrackingSession(FakeSession):
@@ -353,6 +406,53 @@ class ProtocolCredentialTests(unittest.TestCase):
 
 
 class ProtocolRegistrationWorkerTests(unittest.TestCase):
+    def test_terminal_protocol_failures_are_not_marked_retryable(self):
+        details = _protocol_failure_details(
+            "RuntimeError: account_unusable: account_deactivated"
+        )
+
+        self.assertEqual(details["code"], "account_unusable")
+        self.assertFalse(details["retryable"])
+        self.assertIn("隔离", details["next_action"])
+
+    def test_every_protocol_persona_uses_matching_windows_headers(self):
+        for impersonate in PROTOCOL_IMPERSONATE_PROFILES:
+            with self.subTest(impersonate=impersonate):
+                persona = ProtocolBrowserPersona.from_impersonate(impersonate)
+                headers = persona.session_headers("en-US")
+                self.assertIn("Windows NT 10.0", headers["user-agent"])
+                self.assertNotIn("Macintosh", headers["user-agent"])
+                if impersonate.startswith("chrome"):
+                    self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
+                    self.assertIn(
+                        f'"Google Chrome";v="{persona.major_version}"',
+                        headers["sec-ch-ua"],
+                    )
+                else:
+                    self.assertNotIn("sec-ch-ua", headers)
+
+    def test_new_registration_device_profile_is_randomly_selected(self):
+        with patch(
+            "hidemyemail_generator.protocol_registration_worker.secrets.choice",
+            return_value="chrome136",
+        ) as choice:
+            selected = _choose_protocol_impersonate()
+
+        self.assertEqual(selected, "chrome136")
+        choice.assert_called_once_with(PROTOCOL_IMPERSONATE_PROFILES)
+        self.assertEqual(len(PROTOCOL_IMPERSONATE_PROFILES), 8)
+        self.assertEqual(len(set(PROTOCOL_IMPERSONATE_PROFILES)), 8)
+
+    def test_tls_fallback_switches_to_the_other_browser_family(self):
+        self.assertIn(
+            _tls_fallback_impersonate("firefox144"),
+            CHROME_IMPERSONATE_PROFILES,
+        )
+        self.assertIn(
+            _tls_fallback_impersonate("chrome136"),
+            FIREFOX_IMPERSONATE_PROFILES,
+        )
+
     def test_proxy_country_selects_matching_language_and_timezone(self):
         self.assertEqual(
             _proxy_fingerprint_profile("JP"),
@@ -422,7 +522,6 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                             "path": "/",
                         }
                     ],
-                    "impersonate": "firefox144",
                     "password": "GeneratedPassword!1",
                     "password_set": True,
                 }
@@ -448,6 +547,10 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 "hidemyemail_generator.protocol_credentials.complete_protocol_credentials",
                 side_effect=complete,
             ),
+            patch(
+                "hidemyemail_generator.protocol_registration_worker._choose_protocol_impersonate",
+                return_value="chrome136",
+            ),
         ):
             result = run(
                 {
@@ -466,7 +569,11 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
         self.assertEqual(
             credential_call["session_cookies"][0]["name"], "__cf_bm"
         )
-        self.assertEqual(credential_call["impersonate"], "firefox144")
+        self.assertEqual(constructor["impersonate"], "chrome136")
+        self.assertEqual(credential_call["impersonate"], "chrome136")
+        self.assertEqual(
+            result["registration_diagnostics"]["impersonate"], "chrome136"
+        )
         self.assertEqual(result["password"], "GeneratedPassword!1")
 
     def test_registration_can_stop_after_passwordless_session(self):
@@ -950,17 +1057,17 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             result["registration_diagnostics"]["resumed_from_password_checkpoint"]
         )
 
-    def test_invalid_auth_step_stops_without_full_replay(self):
-        constructor_passwords = []
+    def test_invalid_auth_step_switches_to_one_login_recovery(self):
+        constructor_accounts = []
 
         class FakeRegister:
             def __init__(self, account, **kwargs):
-                constructor_passwords.append(account["password"])
+                constructor_accounts.append(dict(account))
                 self.password_checkpoint = kwargs["password_checkpoint_fn"]
                 self.password = account["password"] or "StableCandidate!1"
 
             def register(self):
-                if len(constructor_passwords) == 1:
+                if len(constructor_accounts) == 1:
                     self.password_checkpoint(self.password, False)
                     return {
                         "status": "failed",
@@ -1001,20 +1108,31 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 "hidemyemail_generator.protocol_registration_worker._emit_event"
             ) as emit,
         ):
-            with self.assertRaisesRegex(RuntimeError, "invalid_auth_step"):
-                run(
-                    {
-                        "email": "protocol@icloud.com",
-                        "code_url": "http://127.0.0.1/code",
-                        "project_root": ".",
-                        "source_root": ".",
-                    }
-                )
+            result = run(
+                {
+                    "email": "protocol@icloud.com",
+                    "code_url": "http://127.0.0.1/code",
+                    "project_root": ".",
+                    "source_root": ".",
+                }
+            )
 
-        self.assertEqual(constructor_passwords, [""])
+        self.assertEqual(len(constructor_accounts), 2)
+        self.assertFalse(constructor_accounts[0]["password_verification_only"])
+        self.assertTrue(constructor_accounts[1]["password_verification_only"])
+        self.assertTrue(constructor_accounts[1]["password_confirmed"])
+        self.assertTrue(
+            result["registration_diagnostics"]["invalid_auth_step_recovered"]
+        )
+        self.assertEqual(
+            result["registration_diagnostics"][
+                "invalid_auth_step_recovery_attempts"
+            ],
+            1,
+        )
         self.assertTrue(
             any(
-                len(call.args) > 1 and "停止自动重放" in str(call.args[1])
+                len(call.args) > 1 and "登录/密码重置恢复" in str(call.args[1])
                 for call in emit.call_args_list
             )
         )
@@ -1401,6 +1519,10 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 "hidemyemail_generator.protocol_credentials.complete_protocol_credentials",
                 side_effect=complete,
             ),
+            patch(
+                "hidemyemail_generator.protocol_registration_worker._choose_protocol_impersonate",
+                return_value="firefox144",
+            ),
             patch("hidemyemail_generator.protocol_registration_worker.time.sleep") as sleep,
         ):
             result = run(
@@ -1542,6 +1664,39 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
             "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
         )
         self.assertEqual(headers["oai-language"], "ja-JP")
+
+    async def test_sso_step_is_classified_as_terminal_sso_requirement(self):
+        module = self._core_module()
+
+        self.assertTrue(module.auth_step_requires_sso("/sso", "sso"))
+        self.assertFalse(
+            module.auth_step_requires_sso(
+                "/email-verification",
+                "email_otp_verification",
+            )
+        )
+
+    async def test_sentinel_firefox_profile_tracks_selected_version(self):
+        module = self._core_module()
+        provider = module._SentinelWithProxy(impersonate="firefox147")
+
+        profile = provider._impl._browser_profile("device-id")
+
+        self.assertIn("Firefox/147.0", profile.user_agent)
+        self.assertIn("rv:147.0", profile.user_agent)
+        self.assertNotIn("sec-ch-ua", profile.browser_headers())
+
+    async def test_sentinel_chrome_profile_tracks_selected_version(self):
+        module = self._core_module()
+        provider = module._SentinelWithProxy(impersonate="chrome145")
+
+        profile = provider._impl._browser_profile("device-id")
+        headers = profile.browser_headers()
+
+        self.assertIn("Chrome/145.0.0.0", profile.user_agent)
+        self.assertIn('"Chromium";v="145"', headers["sec-ch-ua"])
+        self.assertIn('"Google Chrome";v="145"', headers["sec-ch-ua"])
+        self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
 
     async def test_register_stages_supplied_password_before_network_flow(self):
         checkpoints = []
@@ -2932,10 +3087,16 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "curl_cffi.requests.AsyncSession",
             return_value=fake_session,
-        ):
+        ) as constructor:
             session = await client._get_session()
 
         self.assertIs(session, fake_session)
+        constructor_headers = constructor.call_args.kwargs["headers"]
+        self.assertIn("Windows NT 10.0", constructor_headers["user-agent"])
+        self.assertEqual(
+            constructor_headers["sec-ch-ua-platform"],
+            '"Windows"',
+        )
         self.assertEqual(client.device_id, "saved-device-id")
         self.assertIn(
             (
@@ -3626,6 +3787,30 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pythonioencoding"], "utf-8")
         self.assertEqual(result["pythonutf8"], "1")
 
+    async def test_protocol_worker_timeout_terminates_child_process(self):
+        worker_script = self.base_dir / "slow_worker.py"
+        worker_script.write_text(
+            "import time\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        manager = ProtocolRegistrationManager(
+            base_dir=self.base_dir,
+            db_file=self.db_file,
+            worker_runner=lambda payload, on_event: None,
+        )
+        manager.worker_script = worker_script
+        manager.python_executable = Path(sys.executable)
+
+        with patch(
+            "hidemyemail_generator.protocol_registration."
+            "PROTOCOL_WORKER_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "已安全终止"):
+                await manager._run_worker({}, lambda _event: None)
+
+        self.assertEqual(manager._active_processes, set())
+
     async def test_bundled_core_loads_dynamic_sentinel_protocol_modules(self):
         manager = ProtocolRegistrationManager(
             base_dir=self.base_dir,
@@ -4195,6 +4380,43 @@ class ProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("protocol rejected", failures[0]["failureContext"]["message"])
         self.assertTrue(failures[0]["logs"])
 
+    async def test_terminal_account_failure_is_not_offered_for_retry(self):
+        failures = []
+
+        async def runner(_payload, on_event):
+            on_event(
+                {
+                    "stage": "password_checkpoint",
+                    "message": "注册密码候选值已保存",
+                    "password_checkpoint": {
+                        "password": "GeneratedPassword!1",
+                        "password_confirmed": False,
+                        "result": {},
+                    },
+                }
+            )
+            raise RuntimeError("account_unusable: account_deactivated")
+
+        manager = ProtocolRegistrationManager(
+            base_dir=self.base_dir,
+            db_file=self.db_file,
+            worker_runner=runner,
+            record_failure=failures.append,
+        )
+        manager.start(
+            emails=["deactivated@icloud.com"],
+            base_url="http://127.0.0.1:8080",
+        )
+
+        final = await manager.wait()
+        account = final["accounts"][0]
+
+        self.assertFalse(account["retryable"])
+        self.assertEqual(account["failureCode"], "account_unusable")
+        self.assertIn("不可自动重试", account["message"])
+        self.assertNotIn("下次将复用", account["message"])
+        self.assertFalse(failures[0]["failureContext"]["retryable"])
+
     async def test_proxy_setup_failure_reaches_monitor_and_terminal_state(self):
         failures = []
 
@@ -4323,6 +4545,12 @@ class ConcurrentProtocolRegistrationManagerTests(unittest.IsolatedAsyncioTestCas
             emails=["second@icloud.com"],
             base_url="http://127.0.0.1:8080",
         )
+
+        with self.assertRaisesRegex(RuntimeError, "邮箱正在协议注册中"):
+            coordinator.start(
+                emails=["first@icloud.com"],
+                base_url="http://127.0.0.1:8080",
+            )
 
         self.assertEqual(second["runningCount"], 2)
         self.assertEqual(second["processCount"], 2)

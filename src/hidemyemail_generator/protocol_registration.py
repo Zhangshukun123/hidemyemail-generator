@@ -29,6 +29,8 @@ from .browser_tasks import (
 EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
 RESULT_PREFIX = "HME_PROTOCOL_RESULT:"
 PROTOCOL_CODE_PREFIX = "/api/protocol-registration/code/"
+PROTOCOL_WORKER_TIMEOUT_SECONDS = 15 * 60
+PROTOCOL_WORKER_TERMINATE_GRACE_SECONDS = 5
 WorkerRunner = Callable[
     [dict[str, Any], Callable[[dict[str, Any]], None]],
     Awaitable[dict[str, Any]],
@@ -58,6 +60,36 @@ def _sanitize_message(value: Any) -> str:
         text,
     )
     return text[:500]
+
+
+def _protocol_failure_details(value: Any) -> dict[str, Any]:
+    message = _sanitize_message(value)
+    normalized = message.casefold()
+    code_match = re.search(
+        r"(?:runtimeerror:\s*)?([a-z][a-z0-9_]+)\s*:",
+        normalized,
+    )
+    code = code_match.group(1) if code_match else "protocol_registration_failed"
+    terminal = any(
+        marker in normalized
+        for marker in (
+            "account_unusable:",
+            "account_deactivated",
+            "account_deleted",
+            "account_banned",
+            "sso_required:",
+        )
+    )
+    return {
+        "code": code,
+        "message": message,
+        "retryable": not terminal,
+        "next_action": (
+            "从自动注册库存隔离并人工检查账号状态"
+            if terminal
+            else "从保存的协议检查点继续，避免重新生成密码"
+        ),
+    }
 
 
 class ProtocolRegistrationManager:
@@ -366,11 +398,31 @@ class ProtocolRegistrationManager:
         self._state["phase"] = "cancelling"
         self._state["message"] = "正在停止协议注册任务"
         self._append_log(self._state["message"], stage="cancelling", status="warning")
-        for process in list(self._active_processes):
-            if process.returncode is None:
-                process.terminate()
+        await asyncio.gather(
+            *(
+                self._terminate_worker_process(process)
+                for process in list(self._active_processes)
+            )
+        )
         await self._task
         return self.snapshot()
+
+    @staticmethod
+    async def _terminate_worker_process(
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        if process.returncode is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=PROTOCOL_WORKER_TERMINATE_GRACE_SECONDS,
+            )
+        except TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
 
     async def close(self) -> None:
         if self._task is not None and not self._task.done():
@@ -687,6 +739,7 @@ class ProtocolRegistrationManager:
             completion_message = account_state["message"]
             raise
         except Exception as error:
+            failure_details = _protocol_failure_details(error)
             account_state["status"] = "failed"
             failed_stage = (
                 "two_factor"
@@ -694,34 +747,36 @@ class ProtocolRegistrationManager:
                 else "password" if password_candidate_saved else setup_stage
             )
             account_state["stage"] = failed_stage
-            account_state["message"] = (
-                "账号注册和密码已保存；TOTP 2FA 待补跑："
-                + _sanitize_message(error)
-                if session_checkpoint_saved
-                else (
-                    "已保留同一注册密码；下次将复用，不会重新生成："
-                    + _sanitize_message(error)
-                    if password_candidate_saved
-                    else _sanitize_message(error)
+            if not failure_details["retryable"]:
+                account_state["message"] = (
+                    "账号不可自动重试，已停止协议注册："
+                    + failure_details["message"]
                 )
-            )
+            elif session_checkpoint_saved:
+                account_state["message"] = (
+                    "账号注册和密码已保存；TOTP 2FA 待补跑："
+                    + failure_details["message"]
+                )
+            elif password_candidate_saved:
+                account_state["message"] = (
+                    "已保留同一注册密码；下次将复用，不会重新生成："
+                    + failure_details["message"]
+                )
+            else:
+                account_state["message"] = failure_details["message"]
+            account_state["failureCode"] = failure_details["code"]
+            account_state["retryable"] = failure_details["retryable"]
+            account_state["nextAction"] = failure_details["next_action"]
             completion_message = account_state["message"]
             self._state["failed"] += 1
             self._append_log(
-                (
-                    f"账号注册和密码已保存；TOTP 2FA 待补跑：{error}"
-                    if session_checkpoint_saved
-                    else (
-                        f"已保留同一注册密码；下次将复用，不会重新生成：{error}"
-                        if password_candidate_saved
-                        else f"失败：{error}"
-                    )
-                ),
+                account_state["message"],
                 email=email,
                 stage=failed_stage,
                 status=(
                     "warning"
-                    if session_checkpoint_saved or password_candidate_saved
+                    if failure_details["retryable"]
+                    and (session_checkpoint_saved or password_candidate_saved)
                     else "error"
                 ),
             )
@@ -749,6 +804,9 @@ class ProtocolRegistrationManager:
                     "recordedAt": _utc_now(),
                     "logs": failure_logs,
                     "failureContext": {
+                        "failureCode": failure_details["code"],
+                        "retryable": failure_details["retryable"],
+                        "nextAction": failure_details["next_action"],
                         "message": account_state["message"],
                         "currentStage": failed_stage,
                         "currentLocation": "Mail Auth 协议注册",
@@ -819,8 +877,9 @@ class ProtocolRegistrationManager:
         with __import__("contextlib").suppress(Exception):
             await process.stdin.wait_closed()
         stderr_task = asyncio.create_task(process.stderr.read())
-        result: dict[str, Any] = {}
-        try:
+
+        async def consume_worker() -> dict[str, Any]:
+            result: dict[str, Any] = {}
             async for raw_line in process.stdout:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if line.startswith(EVENT_PREFIX):
@@ -845,6 +904,18 @@ class ProtocolRegistrationManager:
                 error = str(result.get("error") or stderr or f"子进程退出 {return_code}")
                 raise RuntimeError(_sanitize_message(error))
             return result
+
+        try:
+            return await asyncio.wait_for(
+                consume_worker(),
+                timeout=PROTOCOL_WORKER_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as error:
+            await self._terminate_worker_process(process)
+            raise RuntimeError(
+                f"协议注册子进程超过 {PROTOCOL_WORKER_TIMEOUT_SECONDS // 60} 分钟，"
+                "已安全终止；可从保存的检查点继续"
+            ) from error
         finally:
             self._active_processes.discard(process)
             if not stderr_task.done():
@@ -994,11 +1065,25 @@ class ConcurrentProtocolRegistrationManager:
         return self.token_record(token) is not None
 
     def start(self, **kwargs: Any) -> dict[str, Any]:
-        active_count = sum(
-            bool(state.get("running")) for _, state in self._process_snapshots()
-        )
+        snapshots = self._process_snapshots()
+        active_count = sum(bool(state.get("running")) for _, state in snapshots)
         if active_count >= self.max_processes:
             raise RuntimeError(f"协议注册流程已达到上限 {self.max_processes}")
+        requested_emails = {
+            str(value or "").strip().lower()
+            for value in kwargs.get("emails", [])
+            if str(value or "").strip()
+        }
+        active_emails = {
+            str(account.get("email") or "").strip().lower()
+            for _process_id, state in snapshots
+            if state.get("running")
+            for account in state.get("accounts", [])
+            if isinstance(account, dict) and str(account.get("email") or "").strip()
+        }
+        overlap = sorted(requested_emails & active_emails)
+        if overlap:
+            raise RuntimeError(f"邮箱正在协议注册中：{overlap[0]}")
         manager = self._new_process()
         task = manager.start(**kwargs)
         process_id = str(task.get("id") or secrets.token_hex(8))

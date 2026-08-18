@@ -31,7 +31,10 @@ class ZkgmailConfigTests(unittest.TestCase):
 
             self.assertTrue(state["configured"])
             self.assertEqual(state["domain"], "cclgmail.com")
-            self.assertEqual(state["domains"], ["cclgmail.com", "zkgmail.com"])
+            self.assertEqual(
+                state["domains"],
+                ["cclgmail.com", "zkgmail.com", "shukunlabs.xyz"],
+            )
             self.assertEqual(store.load()["authorizationCode"], "local-qq-auth-code")
             self.assertNotIn("authorizationCode", state)
 
@@ -45,6 +48,12 @@ class ZkgmailConfigTests(unittest.TestCase):
             self.assertEqual(state["domain"], "mail.example.net")
             self.assertIn("cclgmail.com", state["domains"])
             self.assertEqual(state["forwardAccount"], "35***4@qq.com")
+
+    def test_shukunlabs_domain_is_supported_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ZkgmailConfigStore(Path(temp_dir) / "mail.db")
+
+            self.assertTrue(store.supports_email("gpt-account@shukunlabs.xyz"))
 
     def test_browser_otp_reader_recognizes_a_saved_custom_forward_domain(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -73,6 +82,37 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(local_part, "emilyjohnson27")
         self.assertTrue(local_part.isalnum())
+
+    async def test_completion_updates_generated_address_inventory_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            client = ZkgmailMailClient(store)
+
+            succeeded = await client.acquire_email("OpenAI 注册")
+            await client.complete_email(succeeded, True, "协议注册完成")
+            terminal = await client.acquire_email("OpenAI 注册")
+            await client.complete_email(
+                terminal,
+                False,
+                "账号不可自动重试：account_deactivated",
+            )
+
+            conn = connect_db(str(db_file))
+            try:
+                states = {
+                    row["email"]: row["state"]
+                    for row in conn.execute(
+                        "SELECT email, state FROM addresses WHERE email IN (?, ?)",
+                        (succeeded, terminal),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+
+        self.assertEqual(states[succeeded], "used")
+        self.assertEqual(states[terminal], "trash")
 
     def test_sync_stores_only_openai_code_for_known_zkgmail_alias(self):
         class MailboxStub:

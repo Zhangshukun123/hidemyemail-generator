@@ -171,7 +171,9 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         page.locator("#quickRegistrationMode").select_option("protocol")
         credential_option = page.locator("#quickProtocolSetupCredentialsLabel")
         assert credential_option.is_visible()
-        page.locator("#quickProtocolSetupCredentials").check()
+        credential_toggle = page.locator("#quickProtocolSetupCredentials")
+        assert credential_toggle.is_checked()
+        assert credential_toggle.is_disabled()
         assert page.evaluate(
             "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).protocolSetupCredentials"
         ) is True
@@ -251,6 +253,7 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         assert page.locator("#quickExtractionFirstProxyCountry").input_value() == "GB"
         assert page.locator("#quickExtractionCount").input_value() == "6"
         assert page.locator("#quickProtocolSetupCredentials").is_checked()
+        assert page.locator("#quickProtocolSetupCredentials").is_disabled()
         assert page.locator("#catchAllDomainSelect").input_value() == "cclgmail.com"
         catch_all_options = page.locator(
             "#quickRegistrationProvider option[data-catchall-domain]"

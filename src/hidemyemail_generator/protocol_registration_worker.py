@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import secrets
 import sys
 import time
 from types import ModuleType
@@ -14,15 +15,28 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+try:
+    from hidemyemail_generator.protocol_browser import (
+        CHROME_IMPERSONATE_PROFILES,
+        FIREFOX_IMPERSONATE_PROFILES,
+        PROTOCOL_IMPERSONATE_PROFILES,
+        normalize_protocol_impersonate,
+    )
+except ModuleNotFoundError:  # Direct script launch before src is on sys.path.
+    from protocol_browser import (  # type: ignore[no-redef]
+        CHROME_IMPERSONATE_PROFILES,
+        FIREFOX_IMPERSONATE_PROFILES,
+        PROTOCOL_IMPERSONATE_PROFILES,
+        normalize_protocol_impersonate,
+    )
+
 
 EVENT_PREFIX = "HME_PROTOCOL_EVENT:"
 RESULT_PREFIX = "HME_PROTOCOL_RESULT:"
 INVALID_STATE_FULL_RETRY_LIMIT = 1
+INVALID_AUTH_STEP_RECOVERY_LIMIT = 1
 PASSWORD_RESET_LOGIN_RETRY_LIMIT = 1
-PASSWORDLESS_SESSION_RECOVERY_LIMIT = 1
 TRANSIENT_INIT_FULL_RETRY_LIMIT = 2
-DEFAULT_IMPERSONATE = "firefox144"
-TLS_FALLBACK_IMPERSONATE = "chrome136"
 
 PROXY_FINGERPRINT_PROFILES = {
     "NL": ("nl-NL", "Europe/Amsterdam"),
@@ -63,6 +77,19 @@ PROXY_FINGERPRINT_PROFILES = {
     "CO": ("es-CO", "America/Bogota"),
     "ZA": ("en-ZA", "Africa/Johannesburg"),
 }
+
+
+def _choose_protocol_impersonate() -> str:
+    """Choose one supported device profile for a new registration session."""
+    return secrets.choice(PROTOCOL_IMPERSONATE_PROFILES)
+
+
+def _tls_fallback_impersonate(current: str) -> str:
+    """Switch a failed TLS session to a profile from the other browser family."""
+    normalized = str(current or "").strip().casefold()
+    if normalized.startswith("chrome"):
+        return FIREFOX_IMPERSONATE_PROFILES[0]
+    return CHROME_IMPERSONATE_PROFILES[0]
 
 
 def _proxy_fingerprint_profile(country: Any) -> dict[str, str]:
@@ -370,9 +397,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     existing_session = _json_object(payload.get("existing_session_json"))
     existing_session_cookies = payload.get("existing_session_cookies")
     existing_device_id = str(payload.get("existing_device_id") or "").strip()
-    existing_impersonate = str(
-        payload.get("existing_impersonate") or DEFAULT_IMPERSONATE
+    raw_existing_impersonate = str(
+        payload.get("existing_impersonate") or ""
     ).strip()
+    existing_impersonate = normalize_protocol_impersonate(
+        raw_existing_impersonate
+    )
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         raise RuntimeError("协议注册邮箱无效")
     if not code_url.startswith(("http://", "https://")):
@@ -401,12 +431,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             else "启动 Mail Auth：CSRF → 邮箱 OTP → OAuth callback → Session/Cookie"
         ),
     )
-    _emit_event(
-        "network",
-        "协议指纹已跟随代理地区："
-        f"{fingerprint_country} / {fingerprint_language} / {fingerprint_timezone}",
-    )
-
     def log(message: Any) -> None:
         text = str(message or "").strip()
         lower = text.casefold()
@@ -446,14 +470,29 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     bot = None
     raw: Any = None
     invalid_state_retries = 0
+    invalid_auth_step_recovery_attempts = 0
+    invalid_auth_step_recovered = False
     invalid_auth_step_replay_stopped = False
     password_reset_login_retries = 0
     password_add_attempts = 0
     password_login_verification_attempts = 0
-    passwordless_session_retries = 0
     transient_init_retries = 0
     full_attempts = 0
-    impersonate = DEFAULT_IMPERSONATE
+    impersonate = existing_impersonate or _choose_protocol_impersonate()
+    if raw_existing_impersonate and not existing_impersonate:
+        _emit_event(
+            "network",
+            f"已保存的协议指纹不受支持：{raw_existing_impersonate}；"
+            f"已重新选择 {impersonate}",
+            "warning",
+        )
+    impersonate_source = "复用已保存" if existing_impersonate else "随机选择"
+    _emit_event(
+        "network",
+        f"协议设备指纹已{impersonate_source}并锁定本次会话：{impersonate}；"
+        "代理地区："
+        f"{fingerprint_country} / {fingerprint_language} / {fingerprint_timezone}",
+    )
     resumed_passwordless_session = bool(
         len(password) >= 12 and existing_access_token and not password_confirmed
     )
@@ -465,6 +504,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     )
     password_reset_required = False
     recovery_session_raw: dict[str, Any] | None = None
+    auth_recovery_mode = False
     if resumed_passwordless_session:
         recovery_session_raw = {
             "status": "success",
@@ -473,7 +513,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             "session_json": existing_session,
             "session_cookies": existing_session_cookies,
             "device_id": existing_device_id,
-            "impersonate": existing_impersonate or DEFAULT_IMPERSONATE,
+            "impersonate": existing_impersonate or impersonate,
             "password": "",
             "password_set": False,
         }
@@ -487,7 +527,6 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         )
     )
     if resumed_from_checkpoint:
-        impersonate = existing_impersonate or DEFAULT_IMPERSONATE
         raw = {
             "status": "success",
             "access_token": existing_access_token,
@@ -519,13 +558,18 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         # a fresh OpenAIAuthClient, device id, cookie jar, OAuth state, and OTP
         # request for every full attempt.
         full_attempts += 1
+        if auth_recovery_mode or recent_auth_login_required:
+            password_login_verification_attempts += 1
         bot = register_class(
             {
                 "email": email,
                 # Reuse even an unconfirmed staged candidate. The previous POST
                 # may have succeeded server-side before its response was lost.
                 "password": password,
-                "password_confirmed": password_confirmed,
+                "password_confirmed": (
+                    password_confirmed or auth_recovery_mode
+                ),
+                "password_verification_only": auth_recovery_mode,
                 "force_password_reset": password_reset_required,
                 "fingerprint_country": fingerprint_country,
                 "language": fingerprint_language,
@@ -543,6 +587,12 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             password_checkpoint_fn=password_checkpoint,
         )
         raw = bot.register()
+        if (
+            auth_recovery_mode
+            and isinstance(raw, dict)
+            and str(raw.get("status") or "").strip().casefold() == "success"
+        ):
+            invalid_auth_step_recovered = True
         if _is_password_reset_completed(raw):
             if password_reset_login_retries >= PASSWORD_RESET_LOGIN_RETRY_LIMIT:
                 break
@@ -577,11 +627,25 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             )
             continue
         if _is_invalid_auth_step_failure(raw):
+            if (
+                invalid_auth_step_recovery_attempts
+                < INVALID_AUTH_STEP_RECOVERY_LIMIT
+                and len(password) >= 12
+            ):
+                invalid_auth_step_recovery_attempts += 1
+                auth_recovery_mode = True
+                _emit_event(
+                    "password",
+                    "OpenAI 当前认证步骤已变化；正在停止创建账号并切换到"
+                    "现有账号登录/密码重置恢复（1/1）",
+                    "warning",
+                )
+                continue
             invalid_auth_step_replay_stopped = True
             _emit_event(
                 "password",
-                "OpenAI 当前认证步骤与密码注册不匹配；已停止自动重放，避免重复提交。"
-                "该邮箱可能已开始注册，应按服务端 OTP/登录流程恢复",
+                "OpenAI 当前认证步骤与密码注册不匹配，且一次登录恢复未成功；"
+                "已停止自动处理，避免重复提交密码或创建账号",
                 "error",
             )
             break
@@ -589,10 +653,15 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             if transient_init_retries >= TRANSIENT_INIT_FULL_RETRY_LIMIT:
                 break
             transient_init_retries += 1
-            impersonate = TLS_FALLBACK_IMPERSONATE
+            if transient_init_retries == 1:
+                impersonate = _tls_fallback_impersonate(impersonate)
+                retry_profile_message = f"切换 TLS 指纹为 {impersonate}"
+            else:
+                retry_profile_message = f"继续使用 TLS 指纹 {impersonate}"
             _emit_event(
                 "network",
-                "init_page_email TLS 连接中断；正在创建全新会话并切换 TLS 指纹"
+                "init_page_email TLS 连接中断；正在创建全新会话并"
+                f"{retry_profile_message}"
                 f"（{transient_init_retries}/{TRANSIENT_INIT_FULL_RETRY_LIMIT}）",
                 "warning",
             )
@@ -628,15 +697,18 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             full_attempts
         ),
         "invalid_state_recovered": bool(invalid_state_retries),
-        "invalid_auth_step_recovered": False,
+        "invalid_auth_step_recovered": invalid_auth_step_recovered,
+        "invalid_auth_step_recovery_attempts": invalid_auth_step_recovery_attempts,
         "invalid_auth_step_replay_stopped": invalid_auth_step_replay_stopped,
         "password_reset_recovered": bool(password_reset_login_retries),
         "password_add_reauth_recovered": False,
-        "passwordless_signup_recovered": bool(passwordless_session_retries),
+        "passwordless_signup_recovered": resumed_passwordless_session,
         "password_add_from_session": not password_was_set,
         "password_add_attempts": 0,
         "password_login_verified": False,
-        "password_login_verification_attempts": 0,
+        "password_login_verification_attempts": (
+            password_login_verification_attempts
+        ),
         "recent_auth_login": recent_auth_login_required,
         "setup_credentials": setup_credentials,
         "transient_init_recovered": bool(transient_init_retries),
@@ -808,7 +880,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         session_token=session_token,
         device_id=device_id,
         session_cookies=raw.get("session_cookies"),
-        impersonate=str(raw.get("impersonate") or "firefox144"),
+        impersonate=str(raw.get("impersonate") or impersonate),
         language=fingerprint_language,
         existing_totp_secret=totp_secret,
         on_password_confirmed=(
@@ -857,13 +929,16 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
                 full_attempts
             ),
             "invalid_state_recovered": bool(invalid_state_retries),
-            "invalid_auth_step_recovered": False,
+            "invalid_auth_step_recovered": invalid_auth_step_recovered,
+            "invalid_auth_step_recovery_attempts": (
+                invalid_auth_step_recovery_attempts
+            ),
             "invalid_auth_step_replay_stopped": invalid_auth_step_replay_stopped,
             "password_reset_recovered": bool(password_reset_login_retries),
             "password_add_reauth_recovered": bool(
                 checkpoint_diagnostics.get("password_add_reauth_recovered")
             ),
-            "passwordless_signup_recovered": bool(passwordless_session_retries),
+            "passwordless_signup_recovered": resumed_passwordless_session,
             "password_add_from_session": not password_was_set,
             "password_add_attempts": password_add_attempts,
             "password_login_verified": bool(

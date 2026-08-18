@@ -141,9 +141,9 @@
             <div id="registrationConfigPanel" class="registration-config-panel">
             <div class="command-block command-source" id="registrationSourceBlock">
               <div class="command-heading"><span>02 · SOURCE</span><strong>注册来源</strong></div>
-              <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="zkgmail" data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option><option value="gmail">Gmail · SMSBower</option></select></label>
+              <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="zkgmail" data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="shukunlabs.xyz">shukunlabs.xyz · QQ 接码</option><option value="gmail">Gmail · SMSBower</option></select></label>
               <div id="smsbowerControls" class="command-subcontrols" hidden><span id="smsbowerStatus" class="badge warning">SMSBower 未配置</span><label class="command-field smsbower-price-field" for="smsbowerMaxPrice"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="10" step="0.001" value="0.05"></label><button class="button" data-action="set-smsbower-key">SMSBower API</button></div>
-              <div id="zkgmailControls" class="command-subcontrols" hidden><span id="zkgmailStatus" class="badge warning">QQ 接码未配置</span><label class="command-field" for="catchAllDomainSelect"><span>生成域名</span><select id="catchAllDomainSelect"><option value="cclgmail.com">cclgmail.com</option><option value="zkgmail.com">zkgmail.com</option></select></label><button id="addCatchAllDomain" class="button" type="button">添加邮箱域名</button><button class="button" data-action="set-zkgmail-auth">QQ 邮箱授权码</button></div>
+              <div id="zkgmailControls" class="command-subcontrols" hidden><span id="zkgmailStatus" class="badge warning">QQ 接码未配置</span><label class="command-field" for="catchAllDomainSelect"><span>生成域名</span><select id="catchAllDomainSelect"><option value="cclgmail.com">cclgmail.com</option><option value="zkgmail.com">zkgmail.com</option><option value="shukunlabs.xyz">shukunlabs.xyz</option></select></label><button id="addCatchAllDomain" class="button" type="button">添加邮箱域名</button><button class="button" data-action="set-zkgmail-auth">QQ 邮箱授权码</button></div>
             </div>
             <div class="command-block command-network" id="registrationNetworkBlock">
               <div class="command-heading"><span>03 · NETWORK</span><strong>注册网络</strong></div>
@@ -158,7 +158,7 @@
                 <label><input type="radio" name="registrationMode" value="headless"><span><b>无头浏览器</b><small>后台自动运行</small></span></label>
                 <label><input type="radio" name="registrationMode" value="headed" checked><span><b>有头浏览器</b><small>显示前台窗口</small></span></label>
                 <label><input type="radio" name="registrationMode" value="roxy"><span><b>Roxy 注册</b><small>随机指纹 · 本地机场</small></span></label>
-                <label><input type="radio" name="registrationMode" value="protocol"><span><b>协议注册</b><small>Mail Auth · 默认仅 Session</small></span></label>
+                <label><input type="radio" name="registrationMode" value="protocol"><span><b>协议注册</b><small>Mail Auth · 密码 + 2FA</small></span></label>
               </div>
               <div id="roxyRegistrationControls" class="roxy-registration-controls" hidden>
                 <label class="command-field"><span>Roxy 工作区</span><select id="roxyWorkspace"></select></label>
@@ -209,9 +209,9 @@
         </article>
       <div class="protocol-registration-view account-protocol-panel" id="protocolRegistrationPanel" hidden>
         <article class="panel protocol-registration-toolbar">
-          <div class="protocol-heading"><span class="protocol-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></svg></span><div><h2>Mail Auth 协议注册</h2><p>无浏览器完成邮箱验证并保存 Session/Cookie；密码与 TOTP 2FA 可选</p></div></div>
+          <div class="protocol-heading"><span class="protocol-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z"/><path d="M9 12.2 11.2 14 15.5 9.5"/></svg></span><div><h2>Mail Auth 协议注册</h2><p>无浏览器完成邮箱验证、密码确认、Session/Cookie 保存与 TOTP 2FA</p></div></div>
           <div class="protocol-actions">
-            <label class="switch protocol-credential-toggle"><input id="protocolSetupCredentials" type="checkbox"><span></span>同时设置密码与 2FA</label>
+            <label class="switch protocol-credential-toggle"><input id="protocolSetupCredentials" type="checkbox" checked disabled><span></span>强制设置密码与 2FA</label>
             <button id="stopProtocolButton" class="button danger" type="button" data-action="stop-protocol-registration" disabled>停止</button>
           </div>
         </article>
@@ -220,7 +220,7 @@
           <aside class="panel protocol-task-panel">
             <div class="panel-head"><div><h2>协议任务</h2><p id="protocolTaskMessage">等待开始</p></div><span id="protocolTaskBadge" class="badge">空闲</span></div>
             <div class="protocol-flow" aria-label="协议注册步骤">
-              <span data-protocol-stage="email_verification"><i>1</i>邮箱 OTP</span><span data-protocol-stage="session"><i>2</i>保存 Session</span><span data-protocol-stage="password"><i>3</i>密码（可选）</span><span data-protocol-stage="two_factor"><i>4</i>2FA（可选）</span><span data-protocol-stage="completed"><i>5</i>完成</span>
+              <span data-protocol-stage="email_verification"><i>1</i>邮箱 OTP</span><span data-protocol-stage="session"><i>2</i>保存 Session</span><span data-protocol-stage="password"><i>3</i>确认密码</span><span data-protocol-stage="two_factor"><i>4</i>开启 2FA</span><span data-protocol-stage="completed"><i>5</i>完成</span>
             </div>
             <div class="protocol-current"><small>当前账号</small><strong id="protocolCurrentEmail">尚未开始</strong><span id="protocolCurrentStage">等待任务</span></div>
             <div class="protocol-progress-row"><progress id="protocolTaskProgress" value="0" max="100"></progress><strong id="protocolTaskProgressValue">0 / 0</strong></div>
@@ -259,7 +259,7 @@
               <section class="quick-flow-form-section">
                 <div class="quick-flow-section-title"><i>01</i><div><strong>注册账号</strong><small id="quickRegistrationSourceDescription">领取远端 iCloud 未注册库存并创建账号</small></div><span>ACCOUNT</span></div>
                 <div class="quick-flow-field-grid quick-flow-payment-grid quick-flow-registration-grid">
-                  <label class="field-label">邮箱来源<select id="quickRegistrationProvider"><option value="inventory">iCloud 库存邮箱</option><option value="zkgmail" data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option></select></label>
+                  <label class="field-label">邮箱来源<select id="quickRegistrationProvider"><option value="inventory">iCloud 库存邮箱</option><option value="zkgmail" data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="shukunlabs.xyz">shukunlabs.xyz · QQ 接码</option></select></label>
                   <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议</option></select></label>
                   <label class="field-label">并发窗口<input id="quickRegistrationConcurrency" type="number" min="1" max="10" step="1" value="1"></label>
                   <label class="field-label">目标账号数<input id="quickRegistrationTargetCount" type="number" min="1" max="100" step="1" value="1"></label>
@@ -268,7 +268,7 @@
                   <label class="field-label">注册代理<select id="quickRegistrationProxyMode"><option value="direct">本机 IP 直连</option></select></label>
                   <label class="field-label">注册代理出口<select id="quickRegistrationProxyCountry"></select></label>
                 </div>
-                <label id="quickProtocolSetupCredentialsLabel" class="quick-flow-post-payment-option quick-flow-protocol-credential-option" for="quickProtocolSetupCredentials" hidden><input id="quickProtocolSetupCredentials" type="checkbox"><span><strong>同时设置密码与 TOTP 2FA</strong><small>仅 Mail Auth 协议生效；开启后完成 Session/Cookie、密码和 2FA，关闭则只保存 Session/Cookie</small></span></label>
+                <label id="quickProtocolSetupCredentialsLabel" class="quick-flow-post-payment-option quick-flow-protocol-credential-option" for="quickProtocolSetupCredentials" hidden><input id="quickProtocolSetupCredentials" type="checkbox" checked disabled><span><strong>强制设置密码与 TOTP 2FA</strong><small>Mail Auth 协议只有在 Session/Cookie、密码和 2FA 全部完成后才判定注册成功</small></span></label>
                 <div class="quick-flow-context-group"><div id="quickRegistrationHint" class="mode-label">无头浏览器将在后台完成注册；验证码自动从 iCloud 收件箱读取。</div><div id="quickRegistrationProxySummary" class="mode-label">第一 IP：注册与首次提链共用</div></div>
               </section>
               <section class="quick-flow-form-section">

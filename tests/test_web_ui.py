@@ -121,8 +121,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("/api/protocol-registration/start", page)
         self.assertIn("/api/protocol-registration/status", page)
         self.assertIn("renderProtocolRegistration", page)
-        self.assertIn("密码（可选）", page)
-        self.assertIn("2FA（可选）", page)
+        self.assertIn("密码已确认", page)
+        self.assertIn("2FA 已开启", page)
         self.assertNotIn("badge(checkoutLabel, checkoutKind)", page)
         self.assertNotIn('"重新检测 Checkout"', page)
         self.assertNotIn('this.commands.register("retry-checkout-probe"', page)
@@ -162,23 +162,25 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('name="registrationMode" value="protocol"', page)
         self.assertIn("无头浏览器", page)
         self.assertIn("有头浏览器", page)
-        self.assertIn("Mail Auth · 默认仅 Session", page)
+        self.assertIn("Mail Auth · 密码 + 2FA", page)
         self.assertIn('<option value="protocol">Mail Auth 协议</option>', page)
-        self.assertIn("密码与 TOTP 2FA 可选", page)
+        self.assertIn("密码确认、Session/Cookie 保存与 TOTP 2FA", page)
         otp_step = page.index('data-protocol-stage="email_verification"')
         session_step = page.index('data-protocol-stage="session"')
         password_step = page.index('data-protocol-stage="password"')
         self.assertLess(otp_step, session_step)
         self.assertLess(session_step, password_step)
         self.assertIn(
-            '? ["password", "email_verification", "session", "two_factor", "completed"]',
+            'const stageOrder = ["password", "email_verification", "session", "two_factor", "completed"]',
             page,
         )
-        self.assertIn('id="protocolSetupCredentials" type="checkbox"', page)
-        self.assertIn("同时设置密码与 2FA", page)
-        self.assertIn("credentialToggle.disabled = protocolBusy", page)
-        self.assertIn("Session/Cookie 仍待获取", page)
-        self.assertIn("Session 已保存", page)
+        self.assertIn(
+            'id="protocolSetupCredentials" type="checkbox" checked disabled', page
+        )
+        self.assertIn("强制设置密码与 2FA", page)
+        self.assertIn("credentialToggle.disabled = true", page)
+        self.assertNotIn("Session/Cookie 仍待获取", page)
+        self.assertIn('const pending = state.accounts.filter((item) => !item.protocolReady)', page)
         self.assertIn('$("protocolRegistrationPanel").hidden = !protocolMode', page)
         self.assertNotIn('$("taskPanel")', page)
         inventory_panel = page.index(
@@ -315,12 +317,16 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("paymentProxyBackupCount", page)
         self.assertIn("个实测出口（", page)
         self.assertIn('id="quickRegistrationMode"', page)
-        self.assertIn('id="quickProtocolSetupCredentials" type="checkbox"', page)
-        self.assertIn("同时设置密码与 TOTP 2FA", page)
+        self.assertIn(
+            'id="quickProtocolSetupCredentials" type="checkbox" checked disabled',
+            page,
+        )
+        self.assertIn("强制设置密码与 TOTP 2FA", page)
         self.assertIn('id="quickRegistrationProvider"', page)
         self.assertIn('<option value="inventory">iCloud 库存邮箱</option>', page)
         self.assertIn('data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option>', page)
         self.assertIn('data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option>', page)
+        self.assertIn('data-catchall-domain="shukunlabs.xyz">shukunlabs.xyz · QQ 接码</option>', page)
         self.assertIn('id="catchAllDomainSelect"', page)
         self.assertIn('id="addCatchAllDomain"', page)
         self.assertIn("class CatchAllMailboxPresenter", page)
@@ -437,7 +443,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("configSnapshot,", page)
         self.assertIn("hme_quick_protocol_setup_credentials", page)
         self.assertIn(
-            "setup_credentials: configSnapshot.protocolSetupCredentials === true",
+            "setup_credentials: true",
             page,
         )
         self.assertIn(
@@ -625,7 +631,7 @@ class StructuredWebUiTests(unittest.TestCase):
             command.index("const options = this.browserOptions();"),
         )
         self.assertIn("已切换为协议注册，可选择 iCloud 或 QQ 转发自有域名邮箱", page)
-        self.assertIn("setup_credentials: setupCredentials", page)
+        self.assertIn("setup_credentials: true", page)
 
     def test_app_page_uses_frontend_design_patterns(self):
         page = build_app_page()
@@ -887,6 +893,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('<option value="icloud">iCloud 库存邮箱</option>', page)
         self.assertIn('data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option>', page)
         self.assertIn('data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option>', page)
+        self.assertIn('data-catchall-domain="shukunlabs.xyz">shukunlabs.xyz · QQ 接码</option>', page)
         self.assertIn('<option value="gmail">Gmail · SMSBower</option>', page)
         self.assertIn('id="registerProviderButton"', page)
         self.assertIn("开始 Gmail 注册", page)
@@ -1119,7 +1126,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["provider"], "inventory")
         self.assertEqual(payload["email"], email)
         self.assertEqual(manager.options["emails"], [email])
-        self.assertFalse(manager.options["setup_credentials"])
+        self.assertTrue(manager.options["setup_credentials"])
         self.assertTrue(callable(manager.options["on_account_finished"]))
         await manager.options["on_account_finished"](email, True, "registered")
         self.assertEqual(inventory.completed[0][:3], (email, True, "registered"))
@@ -1171,7 +1178,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["email"], email)
         self.assertTrue(zkgmail.label.startswith("QQ 转发邮箱协议注册"))
         self.assertEqual(manager.options["emails"], [email])
-        self.assertFalse(manager.options["setup_credentials"])
+        self.assertTrue(manager.options["setup_credentials"])
         self.assertTrue(callable(manager.options["on_account_finished"]))
         await manager.options["on_account_finished"](email, True, "registered")
         self.assertEqual(zkgmail.completed, [(email, True, "registered")])
@@ -1373,14 +1380,14 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["started"])
         self.assertEqual(manager.options["emails"], [email])
 
-    async def test_protocol_registration_api_defaults_to_session_only(self):
-        email = "api-session-only@icloud.com"
+    async def test_protocol_registration_api_rejects_session_only_downgrade(self):
+        email = "api-complete-credentials@icloud.com"
         _save_account_record(self.app["db_file"], email)
         captured = []
 
         async def runner(payload, on_event):
             captured.append(payload)
-            on_event({"stage": "session", "message": "Session/Cookie 已获取"})
+            on_event({"stage": "two_factor", "message": "TOTP 2FA 已激活"})
             return {
                 "status": "success",
                 "email": payload["email"],
@@ -1393,6 +1400,13 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 "storage_state_json": json.dumps({"cookies": [], "origins": []}),
                 "session_acquisition_method": "gptfree_mail_auth",
+                "password": "GeneratedPassword!1",
+                "two_factor": {
+                    "enabled": True,
+                    "status": "enabled",
+                    "type": "totp",
+                    "secret": "JBSWY3DPEHPK3PXP",
+                },
             }
 
         manager = self.app["protocol_registration_manager"]
@@ -1401,7 +1415,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/api/protocol-registration/start",
             headers={"X-Local-Token": self.app["local_token"]},
-            json={"emails": [email], "concurrency": 1},
+            json={"emails": [email], "concurrency": 1, "setup_credentials": False},
         )
         payload = await response.json()
 
@@ -1409,11 +1423,11 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["started"])
         final = await manager.wait()
         self.assertEqual(final["succeeded"], 1)
-        self.assertFalse(captured[0]["setup_credentials"])
+        self.assertTrue(captured[0]["setup_credentials"])
         record = load_account_record(self.app["db_file"], email)
         self.assertEqual(record["session"]["sessionToken"], "session")
-        self.assertNotIn("password", record)
-        self.assertNotIn("two_factor", record)
+        self.assertEqual(record["password"], "GeneratedPassword!1")
+        self.assertTrue(record["two_factor"]["enabled"])
 
     async def test_protocol_registration_api_persists_complete_credentials(self):
         email = "api-protocol@icloud.com"

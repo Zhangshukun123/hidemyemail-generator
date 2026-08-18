@@ -110,22 +110,21 @@ def _new_session(
     impersonate: str = "firefox144",
     language: str = "en-US",
 ) -> Any:
+    from .protocol_browser import ProtocolBrowserPersona
+
+    persona = ProtocolBrowserPersona.from_impersonate(impersonate)
     try:
         from curl_cffi.requests import Session
 
-        session = Session(impersonate=str(impersonate or "firefox144"))
+        session = Session(impersonate=persona.impersonate)
     except ImportError:
         import requests
 
         session = requests.Session()
     if not hasattr(session, "headers"):
         session.headers = {}
-    session.headers.update(
-        {
-            "Accept-Language": _language_header(language),
-            "oai-language": str(language or "en-US"),
-        }
-    )
+    session.headers.update(persona.session_headers(language))
+    session.headers["oai-language"] = str(language or "en-US")
     proxy = str(proxy_url or "").strip()
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
@@ -223,6 +222,23 @@ def _recovery_codes(payload: dict[str, Any]) -> list[str]:
     return []
 
 
+def _totp_activation_retryable(response: Any) -> bool:
+    status = _status(response)
+    if status not in {400, 409, 422}:
+        return False
+    detail = _detail(response).casefold()
+    return any(
+        marker in detail
+        for marker in (
+            "invalid code",
+            "invalid totp",
+            "expired code",
+            "incorrect code",
+            "verification code",
+        )
+    )
+
+
 def complete_protocol_credentials(
     *,
     email: str,
@@ -268,6 +284,8 @@ def complete_protocol_credentials(
                 "type": "totp",
                 "secret": saved_secret,
                 "recovery_codes": [],
+                "server_verified": False,
+                "verification_source": "saved_record",
             },
         }
 
@@ -329,6 +347,8 @@ def complete_protocol_credentials(
                     "type": "totp",
                     "secret": saved_secret,
                     "recovery_codes": [],
+                    "server_verified": False,
+                    "verification_source": "saved_record",
                 },
             }
 
@@ -377,8 +397,24 @@ def complete_protocol_credentials(
         remaining = 30 - (now() % 30)
         if remaining < 4:
             sleep(remaining + 0.25)
-        activated = _require_success(
-            _post_json(
+        activation_response = _post_json(
+            session,
+            f"{MFA_BASE_URL}/user/activate_enrollment",
+            token,
+            {
+                "factor_id": factor_id,
+                "factor_type": "totp",
+                "session_id": session_id,
+                "code": generate_totp(secret, now=now()),
+            },
+            device_id=device_id,
+            language=language,
+        )
+        if _totp_activation_retryable(activation_response):
+            wait_seconds = 30 - (now() % 30) + 0.25
+            logger("TOTP 验证码跨时间窗口失效；等待下一组验证码重试（1/1）")
+            sleep(wait_seconds)
+            activation_response = _post_json(
                 session,
                 f"{MFA_BASE_URL}/user/activate_enrollment",
                 token,
@@ -390,9 +426,8 @@ def complete_protocol_credentials(
                 },
                 device_id=device_id,
                 language=language,
-            ),
-            "激活 2FA",
-        )
+            )
+        activated = _require_success(activation_response, "激活 2FA")
         logger("TOTP 2FA 已激活")
         return {
             "password": password,
@@ -404,6 +439,7 @@ def complete_protocol_credentials(
                 "status": "enabled",
                 "type": "totp",
                 "secret": secret,
+                "server_verified": True,
                 "factor_id": factor_id,
                 "session_id": session_id,
                 "recovery_codes": _recovery_codes(activated),
