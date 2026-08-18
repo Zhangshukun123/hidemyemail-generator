@@ -75,6 +75,7 @@ class ProtocolRegistrationManager:
         on_account_saved: AccountSaved | None = None,
         verify_account_plan: AccountPlanVerifier | None = None,
         record_failure: RecordFailure | None = None,
+        max_concurrency: int = 5,
     ) -> None:
         self.base_dir = Path(base_dir).resolve()
         self.db_file = Path(db_file).resolve()
@@ -83,6 +84,9 @@ class ProtocolRegistrationManager:
         self.on_account_saved = on_account_saved
         self.verify_account_plan = verify_account_plan
         self.record_failure = record_failure
+        if isinstance(max_concurrency, bool) or not 1 <= int(max_concurrency) <= 10:
+            raise ValueError("协议注册最大并发必须是 1–10")
+        self.max_concurrency = int(max_concurrency)
         self.worker_script = Path(__file__).with_name(
             "protocol_registration_worker.py"
         ).resolve()
@@ -305,8 +309,8 @@ class ProtocolRegistrationManager:
         if not unique:
             raise ValueError("请选择至少一个待协议注册账号")
         concurrency = int(concurrency)
-        if not 1 <= concurrency <= 5:
-            raise ValueError("协议注册并发必须是 1–5")
+        if not 1 <= concurrency <= self.max_concurrency:
+            raise ValueError(f"协议注册并发必须是 1–{self.max_concurrency}")
         origin = str(base_url or "").strip().rstrip("/")
         if not origin.startswith(("http://", "https://")):
             raise ValueError("协议注册本地服务地址无效")

@@ -1,0 +1,87 @@
+LOCAL OVERWRITE UPDATE VERIFICATION
+
+CHANGED_BRANCH=codex/registration-reliability-98
+SOURCE_BRANCH=fork/main
+CHANGED_BRANCH_STATE=fast-forward
+CHANGED_BRANCH_REVISION=031c7e22e36e100b4d74a1daefbc672027d6585e -> 2e926b8f15cde78b823c3f25aa3e6c9a6cc73983
+CHANGED_FIELD=start-web-ui.ps1 environment forwarding list: absent -> LIANDONG_SHOP_MERCHANT_TOKEN
+BASELINE_TREE=5dca3c0d351163ecf007b9fdd5f29f04a74a2f7f
+UPDATED_TREE=717cffcedb6dfb385e4631aed4d1f930c9ef4c36
+BASELINE_COMMIT=031c7e22e36e100b4d74a1daefbc672027d6585e
+UPDATED_COMMIT=2e926b8f15cde78b823c3f25aa3e6c9a6cc73983
+
+ARTIFACT_MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\MODIFIED_FILE
+ARTIFACT_DIFF_FILE=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\DIFF_FILE
+ARTIFACT_VERIFICATION=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\VERIFICATION.txt
+ARTIFACT_ROLLBACK=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\ROLLBACK.sh
+ARTIFACT_ORIGINAL_FILE=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\ORIGINAL_FILE
+ARTIFACT_ROLLBACK_COPY=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\ROLLBACK_COPY
+
+UPDATE_COMMAND=git fetch --all --prune
+UPDATE_INPUT=remote refs for fork and origin
+UPDATE_LITERAL_OUTPUT=From https://github.com/Zhangshukun123/hidemyemail-generator; 031c7e2..2e926b8 main -> fork/main
+UPDATE_EXIT_STATUS=0
+
+FAST_FORWARD_COMMAND=git merge --ff-only fork/main
+FAST_FORWARD_INPUT=HEAD 031c7e22e36e100b4d74a1daefbc672027d6585e with fork/main 2e926b8f15cde78b823c3f25aa3e6c9a6cc73983
+FAST_FORWARD_LITERAL_OUTPUT=Updating 031c7e2..2e926b8; Fast-forward; 58 files changed, 5741 insertions(+), 572 deletions(-)
+FAST_FORWARD_EXIT_STATUS=0
+
+INSTALL_COMMAND=uv sync --frozen --extra capture --reinstall-package hidemyemail-generator
+INSTALL_INPUT=D:\AI\hidemyemail-generator\.venv editable project; Python 3.13.0; capture extra retained
+INSTALL_LITERAL_OUTPUT=Building hidemyemail-generator @ file:///D:/AI/hidemyemail-generator; Installed 1 package; ~ hidemyemail-generator==2.1.0 (from file:///D:/AI/hidemyemail-generator)
+INSTALL_EXIT_STATUS=0
+INSTALL_RESULT=editable project points to D:\AI\hidemyemail-generator
+
+BASELINE_COMMAND=uv run pytest -q
+BASELINE_INPUT=pre-update checkout at 031c7e22e36e100b4d74a1daefbc672027d6585e
+BASELINE_LITERAL_OUTPUT=FAILED tests/test_account_actions.py::CookieStorageStateTests::test_keeps_login_identity_and_drops_edge_expired_and_foreign_cookies; FAILED tests/test_account_actions.py::AccountBrowserPresenterTests::test_model_and_presenter_pass_cookie_state_to_chrome_and_roxy; FAILED tests/test_web_ui.py::StructuredWebUiTests::test_selected_account_refresh_uses_saved_cookie; 3 failed, 891 passed, 8482 warnings, 26 subtests passed in 112.81s (0:01:52)
+BASELINE_EXIT_STATUS=1
+BASELINE_OUTPUT_FILE=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\baseline-output.txt
+
+MODIFIED_COMMAND=uv run --frozen --extra capture pytest -q
+MODIFIED_INPUT=updated checkout at 2e926b8f15cde78b823c3f25aa3e6c9a6cc73983 after editable overwrite
+MODIFIED_LITERAL_OUTPUT=942 passed, 9977 warnings, 28 subtests passed in 122.75s (0:02:02)
+MODIFIED_EXIT_STATUS=0
+MODIFIED_OUTPUT_FILE=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\modified-output.txt
+
+TARGETED_RUFF_COMMAND=uv run --frozen --extra capture ruff check src/hidemyemail_generator/account_actions.py src/hidemyemail_generator/browser_tasks.py src/hidemyemail_generator/card_link_bridge_service.py src/hidemyemail_generator/liandong_shop.py src/hidemyemail_generator/payment_sms.py src/hidemyemail_generator/plus_codex.py src/hidemyemail_generator/plus_codex_browser.py src/hidemyemail_generator/plus_codex_worker.py src/hidemyemail_generator/plus_sms.py src/hidemyemail_generator/web_ui/page_builder.py src/hidemyemail_generator/webapp.py src/hidemyemail_generator/zkgmail.py tests/test_account_actions.py tests/test_card_link_bridge_service.py tests/test_liandong_shop.py tests/test_payment_sms.py tests/test_plus_codex.py tests/test_plus_sms.py tests/test_web_ui.py tests/test_webapp_stdio.py tests/test_zkgmail.py
+TARGETED_RUFF_INPUT=all updated non-vendor Python files
+TARGETED_RUFF_LITERAL_OUTPUT=All checks passed!
+TARGETED_RUFF_EXIT_STATUS=0
+FULL_RUFF_COMMAND=uv run --frozen --extra capture ruff check
+FULL_RUFF_INPUT=complete repository
+FULL_RUFF_LITERAL_OUTPUT=Found 12 errors (vendor/gptfree_register files)
+FULL_RUFF_EXIT_STATUS=1
+FULL_RUFF_OUTPUT_FILE=D:\AI\hidemyemail-generator\verification\local-overwrite-update-20260818\ruff-output.txt
+
+NODE_COMMAND=node --test zkgmail-code-server/tests/frontend_second_code.test.mjs
+NODE_INPUT=updated zkgmail frontend polling suite
+NODE_LITERAL_OUTPUT=tests 4; pass 4; fail 0; duration_ms 158.901
+NODE_EXIT_STATUS=0
+
+CLI_COMMAND=.\.venv\Scripts\python.exe -m hidemyemail_generator.main --help
+CLI_INPUT=installed editable package
+CLI_LITERAL_OUTPUT=Usage: python -m hidemyemail_generator.main [OPTIONS] COMMAND [ARGS]...
+CLI_EXIT_STATUS=0
+
+RESTART_COMMAND=Start-ScheduledTask -TaskName "HideMyEmailGenerator Web UI"
+RESTART_INPUT=local web UI service after overwrite
+RESTART_LITERAL_OUTPUT=HEALTH_ATTEMPT=3; STATUS=200; BODY=ok; LISTEN_PID=34076
+RESTART_EXIT_STATUS=0
+HEALTH_COMMAND=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/healthz
+HEALTH_INPUT=running updated web UI
+HEALTH_LITERAL_OUTPUT=HEALTH_STATUS=200; HEALTH_BODY=ok
+HEALTH_EXIT_STATUS=0
+
+ROLLBACK_COMMAND=Copy-Item verification/local-overwrite-update-20260818/MODIFIED_FILE verification/local-overwrite-update-20260818/ROLLBACK_COPY -Force; & "C:\Program Files\Git\bin\bash.exe" -lc "/d/AI/hidemyemail-generator/verification/local-overwrite-update-20260818/ROLLBACK.sh /d/AI/hidemyemail-generator/verification/local-overwrite-update-20260818/ROLLBACK_COPY"
+ROLLBACK_INPUT=ROLLBACK_COPY initially containing MODIFIED_FILE bytes
+ROLLBACK_LITERAL_OUTPUT=ROLLBACK_RESULT=restored-original; RESTORED_FILE=/d/AI/hidemyemail-generator/verification/local-overwrite-update-20260818/ROLLBACK_COPY; RESTORED_SHA256=80cc66fdfdeed377dc1faea9973335c151613aaa356563ffc6e2e4d3d0052996; RESTORED_BEHAVIOR=start-web-ui.ps1;LIANDONG_SHOP_MERCHANT_TOKEN=not-forwarded;status=baseline
+ROLLBACK_EXIT_STATUS=0
+ORIGINAL_FILE_SHA256=80CC66FDFDEED377DC1FAEA9973335C151613AAA356563FFC6E2E4D3D0052996
+MODIFIED_FILE_SHA256=AE92B702FB1CEC5265C28916A4280C6920CECA4547DA9E5738014E89ECD886FC
+ROLLBACK_COPY_SHA256=80CC66FDFDEED377DC1FAEA9973335C151613AAA356563FFC6E2E4D3D0052996
+ROLLBACK_HASH_MATCH=true
+MODIFIED_FILE_LEFT_CHANGED=true
+ROLLBACK_EXECUTABLE=true
+RESTORED_STATUS=baseline start-web-ui.ps1 restored on ROLLBACK_COPY; running installation remains updated

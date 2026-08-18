@@ -1,0 +1,236 @@
+diff --git a/src/hidemyemail_generator/zkgmail.py b/src/hidemyemail_generator/zkgmail.py
+index 15fa795..2b878f6 100644
+--- a/src/hidemyemail_generator/zkgmail.py
++++ b/src/hidemyemail_generator/zkgmail.py
+@@ -30,6 +30,8 @@ from .inbox import (
+ 
+ ZKGMAIL_SETTING_KEY = "zkgmail_qq_inbox_config_v1"
+ ZKGMAIL_DOMAIN = "zkgmail.com"
++CCLGMAIL_DOMAIN = "cclgmail.com"
++DEFAULT_QQ_FORWARD_DOMAINS = (CCLGMAIL_DOMAIN, ZKGMAIL_DOMAIN)
+ ZKGMAIL_FORWARD_ACCOUNT = "352121354@qq.com"
+ ZKGMAIL_IMAP_HOST = "imap.qq.com"
+ ZKGMAIL_IMAP_PORT = 993
+@@ -102,6 +104,19 @@ ZKGMAIL_RECIPIENT_HEADERS = (
+ )
+ 
+ 
++def _normalize_domain(value: Any) -> str:
++    domain = str(value or "").strip().lower().lstrip("@")
++    if "@" in domain:
++        domain = domain.rsplit("@", 1)[-1]
++    if len(domain) > 253 or not re.fullmatch(
++        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
++        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
++        domain,
++    ):
++        raise ValueError("请输入有效的邮箱域名，例如 cclgmail.com")
++    return domain
++
++
+ class ZkgmailSyncStrategy(Protocol):
+     """Strategy interface for synchronizing verification messages."""
+ 
+@@ -189,8 +204,11 @@ def _known_zkgmail_aliases(db_file: Path) -> set[str]:
+     conn = connect_db(str(db_file))
+     try:
+         rows = conn.execute(
+-            "SELECT email FROM addresses WHERE lower(email) LIKE ?",
+-            (f"%@{ZKGMAIL_DOMAIN}",),
++            """
++            SELECT email FROM addresses
++            WHERE source = ? OR lower(email) LIKE ? OR lower(email) LIKE ?
++            """,
++            ("zkgmail", f"%@{ZKGMAIL_DOMAIN}", f"%@{CCLGMAIL_DOMAIN}"),
+         ).fetchall()
+     finally:
+         conn.close()
+@@ -316,6 +334,8 @@ class ZkgmailConfigStore:
+             "authorizationCode": "",
+             "folder": ZKGMAIL_FOLDER,
+             "useSsl": True,
++            "domains": list(DEFAULT_QQ_FORWARD_DOMAINS),
++            "activeDomain": CCLGMAIL_DOMAIN,
+             "updatedAt": "",
+         }
+ 
+@@ -343,6 +363,27 @@ class ZkgmailConfigStore:
+         state["authorizationCode"] = str(state.get("authorizationCode") or "").strip()
+         state["folder"] = ZKGMAIL_FOLDER
+         state["useSsl"] = True
++        raw_domains = state.get("domains")
++        domains: list[str] = []
++        if isinstance(raw_domains, list):
++            for candidate in raw_domains:
++                try:
++                    domain = _normalize_domain(candidate)
++                except ValueError:
++                    continue
++                if domain not in domains:
++                    domains.append(domain)
++        for domain in DEFAULT_QQ_FORWARD_DOMAINS:
++            if domain not in domains:
++                domains.append(domain)
++        try:
++            active_domain = _normalize_domain(state.get("activeDomain"))
++        except ValueError:
++            active_domain = CCLGMAIL_DOMAIN
++        if active_domain not in domains:
++            domains.append(active_domain)
++        state["domains"] = domains[:20]
++        state["activeDomain"] = active_domain
+         return state
+ 
+     def _save(self, state: dict[str, Any]) -> None:
+@@ -380,7 +421,12 @@ class ZkgmailConfigStore:
+             use_ssl=True,
+         )
+ 
+-    def configure(self, *, authorization_code: str | None = None) -> dict[str, Any]:
++    def configure(
++        self,
++        *,
++        authorization_code: str | None = None,
++        domain: str | None = None,
++    ) -> dict[str, Any]:
+         state = self.load()
+         if authorization_code is not None:
+             code = str(authorization_code or "").strip()
+@@ -389,7 +435,16 @@ class ZkgmailConfigStore:
+             if len(code) > 1024:
+                 raise ValueError("QQ 邮箱授权码长度无效")
+             state["authorizationCode"] = code
+-        if not str(state.get("authorizationCode") or "").strip():
++        if domain is not None:
++            active_domain = _normalize_domain(domain)
++            domains = list(state["domains"])
++            if active_domain not in domains:
++                if len(domains) >= 20:
++                    raise ValueError("最多可配置 20 个 QQ 转发邮箱域名")
++                domains.append(active_domain)
++            state["domains"] = domains
++            state["activeDomain"] = active_domain
++        if not str(state.get("authorizationCode") or "").strip() and domain is None:
+             raise ValueError("请填写 QQ 邮箱 IMAP/SMTP 授权码")
+         state.update(
+             host=ZKGMAIL_IMAP_HOST,
+@@ -406,7 +461,8 @@ class ZkgmailConfigStore:
+         state = self.load()
+         return {
+             "configured": bool(state["authorizationCode"]),
+-            "domain": ZKGMAIL_DOMAIN,
++            "domain": state["activeDomain"],
++            "domains": list(state["domains"]),
+             "forwardAccount": mask_account(state["username"]),
+             "host": state["host"],
+             "port": state["port"],
+@@ -415,6 +471,15 @@ class ZkgmailConfigStore:
+             "updatedAt": state["updatedAt"],
+         }
+ 
++    def supports_email(self, email: str) -> bool:
++        target = str(email or "").strip().lower()
++        local, separator, domain = target.rpartition("@")
++        return bool(
++            separator
++            and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", local)
++            and domain in self.load()["domains"]
++        )
++
+ 
+ class ZkgmailMailClient:
+     """Generate catch-all addresses and read their codes from the QQ mailbox."""
+@@ -460,9 +525,20 @@ class ZkgmailMailClient:
+ 
+         return self._sync_task
+ 
+-    async def configure(self, authorization_code: str | None = None) -> dict[str, Any]:
++    async def configure(
++        self,
++        authorization_code: str | None = None,
++        domain: str | None = None,
++    ) -> dict[str, Any]:
+         async with self._lock:
+             await self._wait_for_sync_completion()
++            if authorization_code is None and domain is not None:
++                state = self.config_store.configure(domain=domain)
++                return {
++                    **state,
++                    "active": len(self._acquired_at),
++                    "automaticCode": True,
++                }
+             config = self.config_store.inbox_config(authorization_code)
+             try:
+                 await asyncio.to_thread(_test_imap_connection, config)
+@@ -472,7 +548,10 @@ class ZkgmailMailClient:
+                 ) from error
+             except (OSError, TimeoutError) as error:
+                 raise RuntimeError("无法连接 QQ 邮箱 IMAP 服务") from error
+-            state = self.config_store.configure(authorization_code=authorization_code)
++            state = self.config_store.configure(
++                authorization_code=authorization_code,
++                domain=domain,
++            )
+             self._sync_error = None
+             self._next_sync_at = 0.0
+             return {
+@@ -481,24 +560,24 @@ class ZkgmailMailClient:
+                 "automaticCode": True,
+             }
+ 
+-    @staticmethod
+-    def _normalize_email(email: str) -> str:
++    def supports_email(self, email: str) -> bool:
++        return self.config_store.supports_email(email)
++
++    def _normalize_email(self, email: str) -> str:
+         target = str(email or "").strip().lower()
+-        if not re.fullmatch(
+-            rf"[a-z0-9][a-z0-9._-]{{0,62}}@{re.escape(ZKGMAIL_DOMAIN)}",
+-            target,
+-        ):
+-            raise RuntimeError("zkgmail.com 注册邮箱地址无效")
++        if not self.supports_email(target):
++            raise RuntimeError("QQ 转发注册邮箱地址无效或域名未配置")
+         return target
+ 
+     async def acquire_email(self, label: str = "") -> str:
+         self.config_store.inbox_config()
++        domain = str(self.config_store.load()["activeDomain"])
+         async with self._lock:
+             conn = connect_db(str(self.db_file))
+             try:
+                 for _attempt in range(100):
+                     local_part = _generate_human_local_part()
+-                    email = f"{local_part}@{ZKGMAIL_DOMAIN}"
++                    email = f"{local_part}@{domain}"
+                     exists = conn.execute(
+                         "SELECT 1 FROM addresses WHERE lower(email) = ?",
+                         (email,),
+@@ -508,7 +587,7 @@ class ZkgmailMailClient:
+                     upsert_address(
+                         conn,
+                         email,
+-                        label=str(label or "zkgmail.com 注册")[:200],
++                        label=str(label or f"{domain} 注册")[:200],
+                         state="unused",
+                         source="zkgmail",
+                         note=f"Catch-all 转发至 {ZKGMAIL_FORWARD_ACCOUNT}",
+@@ -516,7 +595,7 @@ class ZkgmailMailClient:
+                     )
+                     break
+                 else:
+-                    raise RuntimeError("无法生成未使用的 zkgmail.com 人名邮箱")
++                    raise RuntimeError(f"无法生成未使用的 {domain} 人名邮箱")
+             finally:
+                 conn.close()
+         self._acquired_at[email] = self._now()
+@@ -681,6 +760,8 @@ class ZkgmailMailClient:
+ 
+ 
+ __all__ = [
++    "CCLGMAIL_DOMAIN",
++    "DEFAULT_QQ_FORWARD_DOMAINS",
+     "ZKGMAIL_DOMAIN",
+     "ZKGMAIL_FORWARD_ACCOUNT",
+     "ZKGMAIL_IMAP_HOST",

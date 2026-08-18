@@ -1,0 +1,136 @@
+PayPal US email-first onboarding verification
+=============================================
+
+Checked at: 2026-08-18T17:43:30+08:00
+
+Changed branch/field
+--------------------
+git branch: codex/registration-reliability-98
+protocol branch: US
+field: onboarding_order
+original behavior: phone OTP -> SignUpNewMember(email + phone + card) -> authorize
+modified behavior: submit email -> phone verification/member login -> authenticated card binding -> Buyer/Funding verification -> authorize
+
+Upstream/version evidence
+-------------------------
+command: git ls-remote https://github.com/1537271403/paypal-agreement-protocol.git HEAD
+literal result: 4719066ec6fd56b57a5bd9599758366836c9dc0a HEAD
+result: the public upstream still has 9 commits and does not contain a newer US split-flow implementation.
+Official PayPal US guidance separates account creation from linking a card in Wallet. No public consumer-wallet GraphQL operation for the private phone-login/add-card UI was found, so the adapter uses PayPal's official member page for those private UI steps and then verifies the resulting protocol state.
+
+MVP/Strategy design
+-------------------
+Model: paypal/us_email_first.py stores email, phone-verification, buyer, EUAT, funding and ordered-event facts.
+Presenter: UsEmailFirstPresenter enforces create_email_account -> request_phone_otp -> confirm_phone_otp -> hydrate_authenticated_buyer -> bind_card -> authorize.
+Strategy: EmailFirstAuthorizationStrategy gates every downstream step and retries only authenticated card binding.
+View: PayPalFlow owns protocol orchestration; WebPayPalFlow owns deferred phone acquisition, official-page member login/card binding, private autofill and automatic OTP bridging.
+
+Protocol gates
+--------------
+1. A bootstrap EC no longer counts as the US email step. Phase 2 must run Pay_With_Card and Continue_To_Payment with _1_login_email.
+2. The email request contains no phone/card field and must return a successful action redirect, onboarding URL or explicit EC token.
+3. Automatic US phone acquisition happens only after email_submitted=true.
+4. US Phase 3 does not call the legacy combined SignUpNewMember path.
+5. Browser completion rejects /checkoutweb/signup and /signin; it accepts only an authenticated PayPal review route with EUAT.
+6. authorize requires buyer userId, EUAT and selected fundingOptions.fundingInstrument.id. allPlans-only availability is insufficient.
+7. IdentityElevation preserves an already authenticated US member/funding context and skips destructive signup re-entry.
+8. Non-US countries retain the legacy OTP + SignUpNewMember order.
+
+Hashes
+------
+ORIGINAL flow.py SHA256: 0A27C9373A8C83295EC2C63786FEEE08531945BB0ABB544742DB525308F7AAB1
+MODIFIED flow.py SHA256: 6F78EC6E804679B54CDF537833DC982EB398D954669010DA5352B8E5FEA832DF
+DIFF_FILE SHA256: 9E05A50E8C9196E12E2C90AF29F250FE0A9B43D391F8288645BE5A3788F1FCDA
+
+Four artifact paths
+-------------------
+MODIFIED_FILE: D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/flow.py
+DIFF_FILE: D:/AI/hidemyemail-generator/verification/paypal-us-email-first-20260818/DIFF_FILE.diff
+VERIFICATION: D:/AI/hidemyemail-generator/verification/paypal-us-email-first-20260818/VERIFICATION.txt
+ROLLBACK: D:/AI/hidemyemail-generator/verification/paypal-us-email-first-20260818/ROLLBACK.sh
+
+Supplemental changed files
+--------------------------
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/models.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/elevation_flow.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/manual_browser.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/us_email_first.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/web.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/tests/test_us_email_first_flow.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/tests/test_us_email_first_integration.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+
+BASELINE
+--------
+command: $env:HME_DB_FILE='D:\AI\hidemyemail-generator\verification\paypal-us-email-first-20260818\baseline-test-clean.db'; $files=@('paypal\flow.py','paypal\models.py','paypal\elevation_flow.py','paypal\manual_browser.py','web.py'); foreach($file in $files){$h=Get-FileHash -Algorithm SHA256 -LiteralPath $file; Write-Output ($h.Path+'|'+$h.Hash)}; python -m pytest -q
+working directory/input: D:/AI/hidemyemail-generator/paypal-agreement-protocol; preserved pre-change files; isolated empty SMS settings database
+literal output/result:
+D:\AI\hidemyemail-generator\paypal-agreement-protocol\paypal\flow.py|0A27C9373A8C83295EC2C63786FEEE08531945BB0ABB544742DB525308F7AAB1
+D:\AI\hidemyemail-generator\paypal-agreement-protocol\paypal\models.py|064A9239A28EAB6C2CDBC6CD4C78FEAAE8042E95BBCE8CF2305F7113DC6788F6
+D:\AI\hidemyemail-generator\paypal-agreement-protocol\paypal\elevation_flow.py|B731679953286B1FE5D6B8AEAF72B62B9BE6B76BE9077509A81A1483BED4AA34
+D:\AI\hidemyemail-generator\paypal-agreement-protocol\paypal\manual_browser.py|58162F69596D831A67DCD46021003ED1D110D95231188D67A920579B7A67C770
+D:\AI\hidemyemail-generator\paypal-agreement-protocol\web.py|64342C792155B40690AA11C117940D931564B726ADFA8081B1220161D45ED5EE
+........................................................................ [ 77%]
+.....................                                                    [100%]
+93 passed in 5.02s
+exit status: 0
+
+MODIFIED
+--------
+command: $env:HME_DB_FILE='D:\AI\hidemyemail-generator\verification\paypal-us-email-first-20260818\modified-final-empty.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw "Modified DB already exists" }; python -m pytest -q; $code=$LASTEXITCODE; Write-Output "MODIFIED_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator/paypal-agreement-protocol; US email-first branch enabled; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 5.06s
+MODIFIED_EXIT=0
+exit status: 0
+
+Supplemental integration verification
+-------------------------------------
+command: & .\.venv\Scripts\python.exe -m pytest -q tests/test_paypal_protocol_integration.py tests/test_payment_completion.py tests/test_paypal_workspace_adaptive_ui.py tests/test_webapp_stdio.py; $code=$LASTEXITCODE; Write-Output "MODIFIED_INTEGRATION_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator; main app protocol proxy/payment monitor/one-click flow tests
+literal result: 104 passed, 5433 warnings in 17.86s; MODIFIED_INTEGRATION_EXIT=0
+exit status: 0
+
+ROLLBACK
+--------
+preparation input: complete modified paypal-agreement-protocol copied to C:/Users/29070/AppData/Local/Temp/paypal-us-email-first-rollback-20260818-1742; modified flow SHA256 6F78EC6E804679B54CDF537833DC982EB398D954669010DA5352B8E5FEA832DF
+command: & 'C:\Program Files\Git\bin\bash.exe' 'D:/AI/hidemyemail-generator/verification/paypal-us-email-first-20260818/ROLLBACK.sh' 'C:/Users/29070/AppData/Local/Temp/paypal-us-email-first-rollback-20260818-1742'; $code=$LASTEXITCODE; Write-Output "ROLLBACK_EXIT=$code"; exit $code
+literal output/result:
+ROLLBACK_RESULT=restored
+ROLLBACK_BRANCH=US
+ROLLBACK_FIELD=onboarding_order
+ROLLBACK_BEHAVIOR=phone_otp_then_combined_signup
+ROLLBACK_FLOW_SHA256=0A27C9373A8C83295EC2C63786FEEE08531945BB0ABB544742DB525308F7AAB1
+ROLLBACK_EXIT=0
+exit status: 0
+
+ROLLBACK TEST
+-------------
+command: $env:HME_DB_FILE='C:\Users\29070\AppData\Local\Temp\paypal-us-email-first-rollback-empty-20260818.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw 'Rollback DB already exists' }; python -m pytest -q; $code=$LASTEXITCODE; Write-Output "ROLLBACK_TEST_EXIT=$code"; exit $code
+working directory/input: C:/Users/29070/AppData/Local/Temp/paypal-us-email-first-rollback-20260818-1742; independent restored copy; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 77%]
+.....................                                                    [100%]
+93 passed in 5.87s
+ROLLBACK_TEST_EXIT=0
+exit status: 0
+restored behavior/status: the independent copy restored US onboarding_order to phone_otp_then_combined_signup, all six preserved hashes matched, the three email-first files were removed, and all original 93 tests passed. The workspace MODIFIED_FILE remains changed.
+
+Runtime smoke test
+------------------
+service: http://127.0.0.1:18097
+restart result: previous PID 41440 stopped; modified service listener PID 24116 started at 2026-08-18 17:43:16+08:00
+literal health result: HEALTH_AFTER={"ok":true,"time":1787046209.9981623}
+literal jobs result: JOBS_AFTER={"jobs":[]}
+
+File-size rule
+--------------
+flow.py: 2791 lines
+web.py: 3572 lines
+models.py: 1099 lines
+manual_browser.py: 689 lines
+elevation_flow.py: 419 lines
+us_email_first.py: 277 lines
+All changed code files remain below 10000 lines.

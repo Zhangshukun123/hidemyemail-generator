@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import secrets
 import string
 import time
@@ -163,7 +164,7 @@ class RegistrationTaskManager:
         if provider == "smsbower" and self.acquire_provider_email is None:
             raise RuntimeError("SMSBower Gmail 获取服务未配置")
         if provider == "zkgmail" and self.acquire_zkgmail_email is None:
-            raise RuntimeError("zkgmail.com 邮箱服务未配置")
+            raise RuntimeError("QQ 转发邮箱域名服务未配置")
         selected_browser_engine = str(browser_engine or "camoufox").strip().lower()
         if selected_browser_engine not in {"camoufox", "roxy"}:
             raise ValueError("不支持的注册浏览器引擎")
@@ -222,7 +223,7 @@ class RegistrationTaskManager:
             "message": (
                 "正在通过 SMSBower API 获取 Gmail"
                 if provider == "smsbower"
-                else f"正在生成 {target_count} 个 zkgmail.com 注册邮箱"
+                else f"正在生成 {target_count} 个 QQ 转发域名注册邮箱"
                 if provider == "zkgmail"
                 else f"正在准备使用 {manual_email} 注册"
                 if manual_email
@@ -242,7 +243,7 @@ class RegistrationTaskManager:
             self._append_log("正在向 SMSBower 购买 OpenAI Gmail 激活")
         elif provider == "zkgmail":
             self._append_log(
-                f"正在生成 {target_count} 个 zkgmail.com catch-all 地址；"
+                f"正在生成 {target_count} 个 QQ 转发 catch-all 地址；"
                 "验证码将从 QQ 转发邮箱自动读取"
             )
         elif manual_email:
@@ -511,9 +512,9 @@ class RegistrationTaskManager:
         if provider not in {"smsbower", "zkgmail"}:
             return self.poll_verification_code(target)
         zkgmail_provider = provider == "zkgmail"
-        provider_name = "zkgmail.com / QQ 邮箱" if zkgmail_provider else "SMSBower"
+        provider_name = "自有域名 / QQ 邮箱" if zkgmail_provider else "SMSBower"
         timeout_provider_name = (
-            "zkgmail.com / QQ 邮箱" if zkgmail_provider else "SMSBower Gmail"
+            "自有域名 / QQ 邮箱" if zkgmail_provider else "SMSBower Gmail"
         )
         provider_poller = (
             self.poll_zkgmail_code if zkgmail_provider else self.poll_provider_code
@@ -746,7 +747,7 @@ class RegistrationTaskManager:
                     message or "OpenAI 注册失败",
                 )
                 self._append_log(
-                    f"已完成 zkgmail.com 地址注册状态记录（{target}）："
+                    f"已完成 QQ 转发地址注册状态记录（{target}）："
                     f"{'注册成功' if success else '注册未完成'}"
                 )
             elif provider == "inventory" and self.complete_email is not None:
@@ -781,20 +782,24 @@ class RegistrationTaskManager:
                     email = str(
                         await self.acquire_zkgmail_email(label)
                     ).strip().lower()
-                    if not email.endswith("@zkgmail.com"):
-                        raise RuntimeError("未生成有效的 zkgmail.com 注册邮箱")
+                    if not re.fullmatch(
+                        r"[a-z0-9][a-z0-9._-]{0,62}@[a-z0-9-]+(?:\.[a-z0-9-]+)+",
+                        email,
+                    ):
+                        raise RuntimeError("未生成有效的 QQ 转发注册邮箱")
+                    catch_all_domain = email.rsplit("@", 1)[1]
                     claimed_emails.append(email)
                     self._state.update(
                         email=claimed_emails[0],
                         emails=list(claimed_emails),
                         claimed=len(claimed_emails),
                         message=(
-                            f"正在生成 zkgmail.com 注册邮箱："
+                            f"正在生成 {catch_all_domain} 注册邮箱："
                             f"{len(claimed_emails)}/{target_count}"
                         ),
                     )
                     self._append_log(
-                        f"已生成 zkgmail.com catch-all 地址"
+                        f"已生成 {catch_all_domain} catch-all 地址"
                         f"（{len(claimed_emails)}/{target_count}）：{email}"
                     )
             elif manual_email:
@@ -845,7 +850,7 @@ class RegistrationTaskManager:
                         f"SMSBower Gmail 已获取，正在准备 OpenAI 注册：{claimed_emails[0]}"
                         if provider == "smsbower"
                         else (
-                            f"已生成 {effective_concurrency} 个 zkgmail.com 邮箱，"
+                            f"已生成 {effective_concurrency} 个 QQ 转发邮箱，"
                             "验证码将从 QQ 转发邮箱自动读取"
                         )
                         if provider == "zkgmail"
@@ -956,7 +961,7 @@ class RegistrationTaskManager:
                         else "；自有邮箱不连接 IMAP，验证码由你在浏览器中手动输入"
                     )
                     if provider == "manual"
-                    else "；zkgmail.com 验证码将从 QQ 转发邮箱自动读取"
+                    else "；验证码将从 QQ 转发邮箱自动读取"
                     if provider == "zkgmail"
                     else ""
                 )
@@ -1264,7 +1269,7 @@ class RegistrationTaskManager:
                             + (
                                 " SMSBower 激活"
                                 if provider == "smsbower"
-                                else " zkgmail.com 地址"
+                                else " QQ 转发地址"
                                 if provider == "zkgmail"
                                 else "库存"
                             )

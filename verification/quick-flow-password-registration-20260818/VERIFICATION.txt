@@ -1,0 +1,39 @@
+BRANCH=codex/registration-reliability-98
+FIELD=quick-flow.config.protocolSetupCredentials -> POST /api/protocol-registration/start.setup_credentials
+SOURCE_STATE=MODIFIED_FILE remains changed; workspace source remains changed
+
+ORIGINAL_APP_JS_GIT_HASH=289d67be33823c26ced8558be122f4ef814dc510
+MODIFIED_APP_JS_GIT_HASH=cefcd8ede6fee82da0759f70e8abfa1007a91c58
+MODIFIED_APP_JS_SHA256=E440AAF4AD44346207B4AEADC2B5BADC155BD70C6119E9B3C27393B9B0EDB964
+MODIFIED_APP_JS_LINES=4999
+
+MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\quick-flow-password-registration-20260818\MODIFIED_FILE
+DIFF_FILE=D:\AI\hidemyemail-generator\verification\quick-flow-password-registration-20260818\DIFF_FILE.patch
+VERIFICATION=D:\AI\hidemyemail-generator\verification\quick-flow-password-registration-20260818\VERIFICATION.txt
+ROLLBACK=D:\AI\hidemyemail-generator\verification\quick-flow-password-registration-20260818\ROLLBACK.sh
+
+BASELINE_COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_web_ui.py tests/test_quick_flow_config_ui.py -q
+BASELINE_INPUT=pre-change quick-flow UI; working tree already contained unrelated liandong-shop edits
+BASELINE_OUTPUT=.....F............................................ [100%] | FAILED tests/test_web_ui.py::StructuredWebUiTests::test_app_page_contains_all_designed_views | 1 failed, 49 passed, 1397 warnings in 6.80s
+BASELINE_EXIT=1
+
+MODIFIED_COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_web_ui.py tests/test_quick_flow_config_ui.py -q --tb=short
+MODIFIED_INPUT=Mail Auth selected; quickProtocolSetupCredentials visible, persisted, summarized, and bound to setup_credentials
+MODIFIED_OUTPUT=.....F............................................ [100%] | FAILED tests/test_web_ui.py::StructuredWebUiTests::test_app_page_contains_all_designed_views | 1 failed, 49 passed, 1397 warnings in 5.77s
+MODIFIED_EXIT=1
+MODIFIED_RETAINED_FAILURE=pre-existing unrelated assertion expects PLUS--质保首登--未接码 after another working-tree change removed that text
+
+FOCUSED_COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_quick_flow_config_ui.py tests/test_web_ui.py::StructuredWebUiTests::test_account_management_selects_browser_or_protocol_registration tests/test_web_ui.py::StructuredWebUiTests::test_one_click_registration_and_card_link_is_a_separate_pipeline_module tests/test_web_ui.py::StructuredWebUiTests::test_quick_flow_config_uses_mvp_persistence_and_keeps_start_outside_details -q
+FOCUSED_INPUT=quick-flow password-registration entry, MVP persistence, responsive Playwright render, and protocol request binding
+FOCUSED_OUTPUT=.... [100%] | 4 passed in 2.79s
+FOCUSED_EXIT=0
+
+ROLLBACK_COMMAND="C:\Program Files\Git\bin\bash.exe" verification/quick-flow-password-registration-20260818/ROLLBACK.sh C:/Users/29070/AppData/Local/Temp/codex-quick-flow-password-rollback-test2
+ROLLBACK_INPUT=isolated copy of all five modified implementation/test files; workspace source excluded
+ROLLBACK_OUTPUT=ROLLBACK_RESULT=restored quick-flow protocolSetupCredentials to fixed setup_credentials=false | ROLLBACK_EXIT=0 | ROLLBACK_HASH=1613385874194065FBF6B918920A917EF7601F212A8C677ECCB0C28182824BDF | ROLLBACK_LINES=4995 | QUICK_FIELD_PRESENT=False | FIXED_FALSE_PRESENT=True
+ROLLBACK_EXIT=0
+RESTORED_BEHAVIOR=isolated copy no longer exposes quickProtocolSetupCredentials and again sends setup_credentials:false; workspace and MODIFIED_FILE retain the new selectable password+2FA behavior
+
+DIFF_CHECK_COMMAND=git diff --check -- src/hidemyemail_generator/web_ui/static/app.js src/hidemyemail_generator/web_ui/static/app.css src/hidemyemail_generator/web_ui/templates/app.html tests/test_web_ui.py tests/test_quick_flow_config_ui.py
+DIFF_CHECK_OUTPUT=no whitespace errors
+DIFF_CHECK_EXIT=0

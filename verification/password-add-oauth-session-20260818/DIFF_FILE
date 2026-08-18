@@ -1,0 +1,248 @@
+diff --git a/verification/password-add-oauth-session-20260818/chatgpt_register.py.baseline b/src/hidemyemail_generator/vendor/gptfree_register/core/chatgpt_register.py
+index 862fb90..6f0f627 100644
+--- a/verification/password-add-oauth-session-20260818/chatgpt_register.py.baseline
++++ b/src/hidemyemail_generator/vendor/gptfree_register/core/chatgpt_register.py
+@@ -1102,6 +1102,9 @@ class ChatGPTRegister:
+         self.reauth_session_token = str(
+             self.outlook.get("reauth_session_token") or ""
+         ).strip()
++        self.reauth_access_token = str(
++            self.outlook.get("reauth_access_token") or ""
++        ).strip()
+         self.reauth_session_cookies = self.outlook.get("reauth_session_cookies")
+         self.reauth_device_id = str(
+             self.outlook.get("reauth_device_id") or ""
+@@ -1274,17 +1277,17 @@ class ChatGPTRegister:
+         password: str,
+         client_id: str,
+         refresh_token: str,
+-    ) -> tuple[str, str]:
++    ) -> tuple[str, str, dict[str, Any]]:
+         """Finish MFA and run the add-password/reset Strategy chain."""
+         next_url, next_page_type = auth_next_step(auth_result)
+         if auth_step_requires_mfa(next_url, next_page_type):
+             factor_id, factor_type, mfa_request_id = auth_mfa_details(auth_result)
+             if not factor_id:
+-                return "", "password_add_mfa_factor_missing"
++                return "", "password_add_mfa_factor_missing", {}
+             if factor_type != "totp":
+-                return "", f"password_add_mfa_factor_unsupported: {factor_type}"
++                return "", f"password_add_mfa_factor_unsupported: {factor_type}", {}
+             if not self.totp_secret:
+-                return "", "password_add_totp_secret_missing"
++                return "", "password_add_totp_secret_missing", {}
+             issue_result = await auth.issue_mfa_challenge(
+                 factor_id,
+                 factor_type=factor_type,
+@@ -1297,7 +1300,7 @@ class ChatGPTRegister:
+                     "password_add_mfa_issue_failed: "
+                     f"{issue_code or issue_status or issue_result}"
+                     + (f" ({issue_message})" if issue_message else "")
+-                )
++                ), {}
+             from hidemyemail_generator.openai_mfa import generate_totp
+ 
+             verify_result: dict[str, Any] = {}
+@@ -1324,7 +1327,7 @@ class ChatGPTRegister:
+                         "password_add_mfa_verify_failed: "
+                         f"{verify_code or verify_status or verify_result}"
+                         + (f" ({verify_message})" if verify_message else "")
+-                    )
++                    ), {}
+                 await asyncio.sleep(min(31, max(1, remaining + 0.25)))
+             auth_result = verify_result
+             next_url, next_page_type = auth_next_step(auth_result)
+@@ -1337,7 +1340,7 @@ class ChatGPTRegister:
+             return "", (
+                 "password_add_reauth_unexpected_step: "
+                 f"{next_page_type or next_url or auth_result}"
+-            )
++            ), {}
+         s = await auth._get_session()
+         target = next_url or "/reset-password/new-password"
+         page_response = await s.get(
+@@ -1347,7 +1350,7 @@ class ChatGPTRegister:
+         )
+         page_status = int(getattr(page_response, "status_code", 0) or 0)
+         if page_status >= 400:
+-            return "", f"password_add_page_failed: {page_status}"
++            return "", f"password_add_page_failed: {page_status}", {}
+         add_result: dict[str, Any] = {}
+         add_failure = "password_add_reauth_failed: unknown"
+         for add_attempt in range(2):
+@@ -1363,7 +1366,7 @@ class ChatGPTRegister:
+                     f"{type(exc).__name__}: {exc}"
+                 )
+                 if add_attempt >= 1:
+-                    return "", add_failure
++                    return "", add_failure, add_result
+                 self._l(
+                     "  [策略] password/add 连接异常；"
+                     "刷新 Sentinel 后重试同一密码..."
+@@ -1379,7 +1382,7 @@ class ChatGPTRegister:
+             ):
+                 self.password_confirmed = True
+                 self._l("  [+] 当前登录复核流程已添加密码；返回注册 Session 继续配置 2FA")
+-                return PASSWORD_WRITE_ADDED, ""
++                return PASSWORD_WRITE_ADDED, "", add_result
+ 
+             add_failure = (
+                 "password_add_reauth_failed: "
+@@ -1400,18 +1403,65 @@ class ChatGPTRegister:
+                         "  [+] password/add 回退策略已通过邮箱 OTP 重置密码；"
+                         "返回注册 Session 继续配置 2FA"
+                     )
+-                    return PASSWORD_WRITE_RESET, ""
+-                return "", reset_error
++                    return PASSWORD_WRITE_RESET, "", add_result
++                return "", reset_error, add_result
+ 
+             retryable = add_status in PASSWORD_ADD_RETRYABLE_HTTP_STATUSES
+             if add_attempt >= 1 or not retryable:
+-                return "", add_failure
++                return "", add_failure, add_result
+             self._l(
+                 f"  [策略] password/add 暂时失败 HTTP {add_status or '-'}；"
+                 "刷新 Sentinel 后重试..."
+             )
+             await asyncio.sleep(1)
+-        return "", add_failure
++        return "", add_failure, add_result
++
++    async def _recover_password_add_session(
++        self,
++        auth: OpenAIAuthClient,
++        *,
++        add_result: dict[str, Any],
++    ) -> tuple[str, str, dict, str]:
++        """Finish password/add OAuth continuation without starting another login."""
++        continue_url, page_type = auth_next_step(add_result)
++        if not continue_url:
++            return "", "", {}, "password_add_callback_missing"
++
++        self._l(
++            "  [..] 密码已添加；沿用本次复核会话完成 OAuth callback "
++            f"page={page_type or '-'} path={urlparse(continue_url).path or '-'}"
++        )
++        s = await auth._get_session()
++        callback_response = await s.get(
++            urljoin(auth.BASE_URL, continue_url),
++            headers={"referer": f"{auth.BASE_URL}/reset-password/new-password"},
++            allow_redirects=True,
++        )
++        callback_status = int(
++            getattr(callback_response, "status_code", 0) or 0
++        )
++        if callback_status >= 400:
++            return (
++                "",
++                "",
++                {},
++                f"password_add_callback_failed: {callback_status}",
++            )
++
++        stale_token_seen = False
++        for session_attempt in range(3):
++            access_token, session_token, session_json = (
++                await self._read_existing_session(auth)
++            )
++            if access_token and access_token != self.reauth_access_token:
++                self._l("  [+] 同一添加密码复核会话已返回新的 Access Token")
++                return access_token, session_token, session_json, ""
++            stale_token_seen = stale_token_seen or bool(access_token)
++            if session_attempt < 2:
++                await asyncio.sleep(0.5 * (session_attempt + 1))
++        if stale_token_seen:
++            return "", "", {}, "password_add_callback_session_stale"
++        return "", "", {}, "password_add_callback_session_missing"
+ 
+     def _recovered_success(
+         self,
+@@ -1973,7 +2023,7 @@ class ChatGPTRegister:
+                         f"path={urlparse(authorize_url).path or '-'}"
+                     )
+                     if self.password_add_reauth:
+-                        password_write_strategy, add_error = (
++                        password_write_strategy, add_error, add_result = (
+                             await self._complete_password_add_reauth(
+                                 auth,
+                                 auth_result=login_otp_result,
+@@ -1983,8 +2033,28 @@ class ChatGPTRegister:
+                             )
+                         )
+                         if password_write_strategy == PASSWORD_WRITE_ADDED:
+-                            return self._failed(
+-                                "account_password_add_completed_use_current_session"
++                            (
++                                access_token,
++                                session_token,
++                                session_json,
++                                session_error,
++                            ) = await self._recover_password_add_session(
++                                auth,
++                                add_result=add_result,
++                            )
++                            if not access_token:
++                                return self._failed(session_error)
++                            self._checkpoint_password(password, True)
++                            return self._recovered_success(
++                                password=password,
++                                password_set=True,
++                                access_token=access_token,
++                                session_token=session_token,
++                                session_json=session_json,
++                                name=name,
++                                birthdate=birthdate,
++                                reason="password_add_same_session_callback",
++                                session_cookies=session_cookie_records(s),
+                             )
+                         if password_write_strategy == PASSWORD_WRITE_RESET:
+                             return self._failed(
+
+diff --git a/verification/password-add-oauth-session-20260818/protocol_registration_worker.py.baseline b/src/hidemyemail_generator/protocol_registration_worker.py
+index 32a8355..ad6f27e 100644
+--- a/verification/password-add-oauth-session-20260818/protocol_registration_worker.py.baseline
++++ b/src/hidemyemail_generator/protocol_registration_worker.py
+@@ -702,6 +702,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
+         """Add the staged password once, reusing the registration Session."""
+         nonlocal password_confirmed
+         nonlocal password_add_attempts
++        nonlocal session_token
+ 
+         def verified_password_checkpoint(
+             candidate_password: str,
+@@ -725,6 +726,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
+                 "password_confirmed": False,
+                 "password_verification_only": True,
+                 "password_add_reauth": True,
++                "reauth_access_token": access_token,
+                 "reauth_session_token": session_token,
+                 "reauth_session_cookies": raw.get("session_cookies") or [],
+                 "reauth_device_id": device_id,
+@@ -764,6 +766,18 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
+         ).strip().casefold() == "success":
+             password_confirmed = True
+             access_token_from_add = str(added_raw.get("access_token") or "").strip()
++            session_token_from_add = str(
++                added_raw.get("session_token") or ""
++            ).strip()
++            session_payload_from_add = added_raw.get("session_json")
++            session_cookies_from_add = added_raw.get("session_cookies")
++            if isinstance(session_payload_from_add, dict):
++                session.update(session_payload_from_add)
++            if session_token_from_add:
++                session_token = session_token_from_add
++                session["sessionToken"] = session_token_from_add
++            if isinstance(session_cookies_from_add, list):
++                raw["session_cookies"] = session_cookies_from_add
+             _emit_event(
+                 "password",
+                 "当前认证会话已添加密码并返回可用 Session；正在配置 2FA",
+@@ -773,6 +787,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
+                 "verified": True,
+                 "password_added": True,
+                 "access_token": access_token_from_add,
++                "session_token": session_token_from_add,
+                 "reuse_registration_session": not access_token_from_add,
+             }
+         return {

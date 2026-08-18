@@ -141,9 +141,9 @@
             <div id="registrationConfigPanel" class="registration-config-panel">
             <div class="command-block command-source" id="registrationSourceBlock">
               <div class="command-heading"><span>02 · SOURCE</span><strong>注册来源</strong></div>
-              <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="zkgmail">zkgmail.com · QQ 接码</option><option value="gmail">Gmail · SMSBower</option></select></label>
+              <label class="command-field" for="registrationEmailProvider"><span>注册账号邮箱</span><select id="registrationEmailProvider"><option value="icloud">iCloud 库存邮箱</option><option value="zkgmail" data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option><option value="gmail">Gmail · SMSBower</option></select></label>
               <div id="smsbowerControls" class="command-subcontrols" hidden><span id="smsbowerStatus" class="badge warning">SMSBower 未配置</span><label class="command-field smsbower-price-field" for="smsbowerMaxPrice"><span>最高价 $</span><input id="smsbowerMaxPrice" type="number" min="0.001" max="10" step="0.001" value="0.05"></label><button class="button" data-action="set-smsbower-key">SMSBower API</button></div>
-              <div id="zkgmailControls" class="command-subcontrols" hidden><span id="zkgmailStatus" class="badge warning">QQ 接码未配置</span><button class="button" data-action="set-zkgmail-auth">QQ 邮箱授权码</button></div>
+              <div id="zkgmailControls" class="command-subcontrols" hidden><span id="zkgmailStatus" class="badge warning">QQ 接码未配置</span><label class="command-field" for="catchAllDomainSelect"><span>生成域名</span><select id="catchAllDomainSelect"><option value="cclgmail.com">cclgmail.com</option><option value="zkgmail.com">zkgmail.com</option></select></label><button id="addCatchAllDomain" class="button" type="button">添加邮箱域名</button><button class="button" data-action="set-zkgmail-auth">QQ 邮箱授权码</button></div>
             </div>
             <div class="command-block command-network" id="registrationNetworkBlock">
               <div class="command-heading"><span>03 · NETWORK</span><strong>注册网络</strong></div>
@@ -203,7 +203,7 @@
           <div class="panel-head account-list-head">
             <div class="account-list-heading"><div><h2>邮箱账号</h2><p id="accountSummary">正在加载…</p></div><div id="accountMetrics" class="metric-grid compact account-inline-metrics"></div></div>
             <div class="filter-bar"><input id="accountSearch" type="search" placeholder="搜索邮箱账号"><select id="accountPlanFilter"><option value="all">套餐：全部</option><option value="plus">Plus</option><option value="free">Free</option><option value="unverified">待验证</option></select><select id="accountSessionFilter"><option value="all">Session：全部</option><option value="ready">可用</option><option value="expired">已过期</option><option value="pending">未获取</option></select><select id="accountLiandongFilter"><option value="all">联动小铺：全部</option><option value="uploaded">已上传</option><option value="pending">未上传</option></select></div>
-            <div class="filter-bar liandong-shop-config"><span id="liandongShopConfigStatus" class="badge warning">正在检查小铺配置</span><input id="liandongShopMerchantToken" type="password" autocomplete="off" placeholder="输入 Merchant-Token"><button id="liandongShopSaveToken" class="button small" type="button" data-action="save-liandong-shop-config">保存小铺 Token</button><small>未接码 → PLUS--质保首登--未接码；已接码 → PLUS--质保首登--已接码</small></div>
+            <div class="filter-bar liandong-shop-config"><span id="liandongShopConfigStatus" class="badge warning">正在检查小铺配置</span><input id="liandongShopMerchantToken" type="password" autocomplete="off" placeholder="输入 Merchant-Token"><button id="liandongShopSaveToken" class="button small" type="button" data-action="save-liandong-shop-config">保存小铺 Token</button><small>有密码：邮箱-----------密码----------2FA码；无密码：邮箱--------接码地址</small></div>
           </div>
           <div class="table-scroll"><table><thead><tr><th>邮箱账号</th><th>注册状态</th><th>套餐</th><th>Session 状态</th><th>联动小铺</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
         </article>
@@ -237,7 +237,7 @@
           <div class="quick-flow-hero-copy">
             <span class="quick-flow-kicker"><i></i>AUTOMATION STUDIO</span>
             <h2>从邮箱到协议支付，交给一条自动化流水线</h2>
-            <p>领取 iCloud 库存或生成 zkgmail.com 邮箱、完成账号注册并保存 Session，生成所选 PayPal 链接后自动选代理、取手机号并启动协议支付。</p>
+            <p>领取 iCloud 库存或生成自有域名邮箱、完成账号注册并保存 Session，生成所选 PayPal 链接后自动选代理、取手机号并启动协议支付。</p>
             <div class="quick-flow-hero-tags"><span id="quickFlowSourceTag">iCloud 库存</span><span>自动选择代理</span><span>接码平台自动取号</span><span>协议支付</span></div>
           </div>
           <div class="quick-flow-hero-state">
@@ -259,8 +259,8 @@
               <section class="quick-flow-form-section">
                 <div class="quick-flow-section-title"><i>01</i><div><strong>注册账号</strong><small id="quickRegistrationSourceDescription">领取远端 iCloud 未注册库存并创建账号</small></div><span>ACCOUNT</span></div>
                 <div class="quick-flow-field-grid quick-flow-payment-grid quick-flow-registration-grid">
-                  <label class="field-label">邮箱来源<select id="quickRegistrationProvider"><option value="inventory">iCloud 库存邮箱</option><option value="zkgmail">zkgmail.com · QQ 接码</option></select></label>
-                  <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议（仅 Session）</option></select></label>
+                  <label class="field-label">邮箱来源<select id="quickRegistrationProvider"><option value="inventory">iCloud 库存邮箱</option><option value="zkgmail" data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option><option value="zkgmail" data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option></select></label>
+                  <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议</option></select></label>
                   <label class="field-label">并发窗口<input id="quickRegistrationConcurrency" type="number" min="1" max="10" step="1" value="1"></label>
                   <label class="field-label">目标账号数<input id="quickRegistrationTargetCount" type="number" min="1" max="100" step="1" value="1"></label>
                 </div>
@@ -268,6 +268,7 @@
                   <label class="field-label">注册代理<select id="quickRegistrationProxyMode"><option value="direct">本机 IP 直连</option></select></label>
                   <label class="field-label">注册代理出口<select id="quickRegistrationProxyCountry"></select></label>
                 </div>
+                <label id="quickProtocolSetupCredentialsLabel" class="quick-flow-post-payment-option quick-flow-protocol-credential-option" for="quickProtocolSetupCredentials" hidden><input id="quickProtocolSetupCredentials" type="checkbox"><span><strong>同时设置密码与 TOTP 2FA</strong><small>仅 Mail Auth 协议生效；开启后完成 Session/Cookie、密码和 2FA，关闭则只保存 Session/Cookie</small></span></label>
                 <div class="quick-flow-context-group"><div id="quickRegistrationHint" class="mode-label">无头浏览器将在后台完成注册；验证码自动从 iCloud 收件箱读取。</div><div id="quickRegistrationProxySummary" class="mode-label">第一 IP：注册与首次提链共用</div></div>
               </section>
               <section class="quick-flow-form-section">

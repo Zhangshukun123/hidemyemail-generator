@@ -137,9 +137,13 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("item.liandongShopUploaded", page)
         self.assertIn('id="liandongShopMerchantToken"', page)
         self.assertIn("/api/liandong-shop/config", page)
+        self.assertIn(
+            'item.accountType === "plus" && (!item.hasPassword || item.hasTwoFactor)',
+            page,
+        )
+        self.assertIn("邮箱-----------密码----------2FA码", page)
+        self.assertIn("邮箱--------接码地址", page)
         self.assertIn("window.HmeLiandongShop", page)
-        self.assertIn("PLUS--质保首登--未接码", page)
-        self.assertIn("PLUS--质保首登--已接码", page)
         self.assertNotIn("item.checkoutExitIp", page)
         self.assertIn('id="registrationProxyMode"', page)
         self.assertIn("Clash 日本轮询", page)
@@ -159,7 +163,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("无头浏览器", page)
         self.assertIn("有头浏览器", page)
         self.assertIn("Mail Auth · 默认仅 Session", page)
-        self.assertIn("Mail Auth 协议（仅 Session）", page)
+        self.assertIn('<option value="protocol">Mail Auth 协议</option>', page)
         self.assertIn("密码与 TOTP 2FA 可选", page)
         otp_step = page.index('data-protocol-stage="email_verification"')
         session_step = page.index('data-protocol-stage="session"')
@@ -311,9 +315,15 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("paymentProxyBackupCount", page)
         self.assertIn("个实测出口（", page)
         self.assertIn('id="quickRegistrationMode"', page)
+        self.assertIn('id="quickProtocolSetupCredentials" type="checkbox"', page)
+        self.assertIn("同时设置密码与 TOTP 2FA", page)
         self.assertIn('id="quickRegistrationProvider"', page)
         self.assertIn('<option value="inventory">iCloud 库存邮箱</option>', page)
-        self.assertIn('<option value="zkgmail">zkgmail.com · QQ 接码</option>', page)
+        self.assertIn('data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option>', page)
+        self.assertIn('data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option>', page)
+        self.assertIn('id="catchAllDomainSelect"', page)
+        self.assertIn('id="addCatchAllDomain"', page)
+        self.assertIn("class CatchAllMailboxPresenter", page)
         self.assertIn('id="quickRegistrationProxyMode"', page)
         self.assertIn('id="quickRegistrationProxyCountry"', page)
         self.assertIn('<option value="direct">本机 IP 直连</option>', page)
@@ -425,6 +435,11 @@ class StructuredWebUiTests(unittest.TestCase):
             "const configSnapshot = this.quickFlowConfigPresenter.persist()", page
         )
         self.assertIn("configSnapshot,", page)
+        self.assertIn("hme_quick_protocol_setup_credentials", page)
+        self.assertIn(
+            "setup_credentials: configSnapshot.protocolSetupCredentials === true",
+            page,
+        )
         self.assertIn(
             "postPaymentPhoneBinding: booleanValue(candidate.postPaymentPhoneBinding, false)",
             page,
@@ -590,7 +605,7 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn("gmailProviderOption.disabled = protocolMode", page)
         self.assertIn("registrationProviderSelect.disabled = false", page)
         self.assertIn('"开始 iCloud 协议注册"', page)
-        self.assertIn('"开始 zkgmail.com 协议注册"', page)
+        self.assertIn('"开始 " + (zkgmail.domain || "cclgmail.com") + " 协议注册"', page)
         self.assertIn('["icloud", "zkgmail"].includes(registrationProvider)', page)
         self.assertIn('registrationProvider === "zkgmail" && !zkgmail.configured', page)
         self.assertIn(
@@ -604,12 +619,12 @@ class StructuredWebUiTests(unittest.TestCase):
         )
         self.assertIn("provider: protocolProvider", command)
         self.assertIn("已从库存领取 iCloud 邮箱并启动协议注册", command)
-        self.assertIn("已生成 zkgmail.com 邮箱并启动协议注册", command)
+        self.assertIn('"已生成 " + (zkgmail.domain || "cclgmail.com")', command)
         self.assertLess(
             command.index("if (protocolMode)"),
             command.index("const options = this.browserOptions();"),
         )
-        self.assertIn("已切换为协议注册，可选择 iCloud 或 zkgmail.com 邮箱", page)
+        self.assertIn("已切换为协议注册，可选择 iCloud 或 QQ 转发自有域名邮箱", page)
         self.assertIn("setup_credentials: setupCredentials", page)
 
     def test_app_page_uses_frontend_design_patterns(self):
@@ -870,7 +885,8 @@ class StructuredWebUiTests(unittest.TestCase):
         self.assertIn('id="smsbowerMaxPrice"', page)
         self.assertIn('id="registrationEmailProvider"', page)
         self.assertIn('<option value="icloud">iCloud 库存邮箱</option>', page)
-        self.assertIn('<option value="zkgmail">zkgmail.com · QQ 接码</option>', page)
+        self.assertIn('data-catchall-domain="zkgmail.com">zkgmail.com · QQ 接码</option>', page)
+        self.assertIn('data-catchall-domain="cclgmail.com">cclgmail.com · QQ 接码</option>', page)
         self.assertIn('<option value="gmail">Gmail · SMSBower</option>', page)
         self.assertIn('id="registerProviderButton"', page)
         self.assertIn("开始 Gmail 注册", page)
@@ -1153,7 +1169,7 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["provider"], "zkgmail")
         self.assertEqual(payload["email"], email)
-        self.assertEqual(zkgmail.label, "zkgmail.com 协议注册")
+        self.assertTrue(zkgmail.label.startswith("QQ 转发邮箱协议注册"))
         self.assertEqual(manager.options["emails"], [email])
         self.assertFalse(manager.options["setup_credentials"])
         self.assertTrue(callable(manager.options["on_account_finished"]))

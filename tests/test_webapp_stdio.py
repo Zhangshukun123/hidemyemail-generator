@@ -477,7 +477,7 @@ class LiandongShopUploadEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["goods"].goods_id, 698207)
         self.assertEqual(
             call["content"],
-            f"{self.email}----Account-Password----JBSWY3DPEHPK3PXP",
+            f"{self.email}-----------Account-Password----------JBSWY3DPEHPK3PXP",
         )
         stored = load_account_record(self.app["db_file"], self.email)
         self.assertTrue(stored["liandong_shop"]["uploaded"])
@@ -490,6 +490,25 @@ class LiandongShopUploadEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(listed_account["liandongShopUploaded"])
         self.assertEqual(listed_account["liandongShopGoodsLabel"], "未接码商品")
+
+    async def test_uploads_passwordless_account_with_code_portal(self):
+        self.set_account_fields(
+            password="",
+            password_confirmed=False,
+            two_factor={},
+        )
+        with mock.patch.dict(os.environ, {"LIANDONG_SHOP_CODE_URL": ""}):
+            response = await self.client.post(
+                "/api/account/liandong-shop-upload",
+                json={"email": self.email},
+                headers={"X-Local-Token": self.app["local_token"]},
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.upload_card.await_args.kwargs["content"],
+            f"{self.email}--------https://icloud-code.8-208-13-52.sslip.io/code",
+        )
 
     async def test_routes_phone_bound_account_to_bound_goods(self):
         self.set_account_fields(plus_sms={"status": "completed", "phone_bound": True})

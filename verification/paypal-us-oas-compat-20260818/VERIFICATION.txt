@@ -1,0 +1,107 @@
+PayPal US createMemberAccount compatibility verification
+========================================================
+
+Checked at: 2026-08-18T16:52:39.6142246+08:00
+
+Changed branch/field
+--------------------
+branch: US
+field: createMemberAccount/OAS_ERROR
+original behavior: terminal_error
+modified behavior: official_member_handoff -> EUAT + review route -> Buyer Context sync -> Phase 4
+
+Observed failure evidence
+-------------------------
+Two persisted US payment histories reached Phase 3, confirmed the PayPal OTP,
+then received HTTP 200 GraphQL errors with message OAS_ERROR, checkpoint
+createMemberAccount, path onboardAccount. Both stopped before Phase 4.
+
+Design
+------
+Model: paypal/onboarding_compat.py normalizes country, messages and checkpoints.
+Presenter/Strategy: UsMemberRiskReviewStrategy matches only US + OAS_ERROR + createMemberAccount.
+View: WebPayPalFlow opens the official PayPal member page, synchronizes cookies,
+and verifies Buyer Context before returning to the existing authorization flow.
+Browser adapter: detects member completion from EUAT plus a PayPal review route;
+supports Windows Chrome and Linux Chromium/Xvfb or Playwright fallback.
+
+Hashes
+------
+ORIGINAL flow.py SHA256: 47312BB6E6498F925CE3C1694EF8EBD98CBE095ADB5E420C5E210950483D8651
+MODIFIED flow.py SHA256: 0A27C9373A8C83295EC2C63786FEEE08531945BB0ABB544742DB525308F7AAB1
+
+Four artifact paths
+-------------------
+MODIFIED_FILE: D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/flow.py
+DIFF_FILE: D:/AI/hidemyemail-generator/verification/paypal-us-oas-compat-20260818/DIFF_FILE.diff
+VERIFICATION: D:/AI/hidemyemail-generator/verification/paypal-us-oas-compat-20260818/VERIFICATION.txt
+ROLLBACK: D:/AI/hidemyemail-generator/verification/paypal-us-oas-compat-20260818/ROLLBACK.sh
+
+Supplemental changed files
+--------------------------
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/onboarding_compat.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/paypal/manual_browser.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/web.py
+D:/AI/hidemyemail-generator/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+
+BASELINE
+--------
+command: $env:HME_DB_FILE='C:\Users\29070\AppData\Local\Temp\paypal-us-oas-baseline-empty-20260818.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw "Baseline DB already exists: $env:HME_DB_FILE" }; python -m pytest -q; $code=$LASTEXITCODE; Write-Output "BASELINE_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator/paypal-agreement-protocol; original files; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 83%]
+..............                                                           [100%]
+86 passed in 4.83s
+BASELINE_EXIT=0
+exit status: 0
+
+MODIFIED
+--------
+command: $env:HME_DB_FILE='C:\Users\29070\AppData\Local\Temp\paypal-us-oas-modified-final-empty-20260818.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw "Modified final DB already exists: $env:HME_DB_FILE" }; python -m pytest -q; $code=$LASTEXITCODE; Write-Output "MODIFIED_FINAL_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator/paypal-agreement-protocol; US OAS compatibility branch enabled; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 77%]
+.....................                                                    [100%]
+93 passed in 5.00s
+MODIFIED_FINAL_EXIT=0
+exit status: 0
+
+Supplemental integration verification
+-------------------------------------
+command: & .\.venv\Scripts\python.exe -m pytest -q tests/test_paypal_protocol_integration.py tests/test_payment_completion.py tests/test_paypal_workspace_adaptive_ui.py tests/test_webapp_stdio.py; $code=$LASTEXITCODE; Write-Output "MODIFIED_INTEGRATION_VENV_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator; main app protocol proxy/payment monitor/one-click flow tests
+literal result: 104 passed, 5433 warnings in 10.17s; MODIFIED_INTEGRATION_VENV_EXIT=0
+exit status: 0
+
+ROLLBACK
+--------
+preparation input: complete modified paypal-agreement-protocol copied to C:/Users/29070/AppData/Local/Temp/paypal-us-oas-rollback-20260818
+command: & 'C:\Program Files\Git\bin\bash.exe' 'D:/AI/hidemyemail-generator/verification/paypal-us-oas-compat-20260818/ROLLBACK.sh' 'C:/Users/29070/AppData/Local/Temp/paypal-us-oas-rollback-20260818'; $code=$LASTEXITCODE; Write-Output "ROLLBACK_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator; independent modified copy; modified flow SHA256 0A27C9373A8C83295EC2C63786FEEE08531945BB0ABB544742DB525308F7AAB1
+literal output/result:
+ROLLBACK_RESULT=restored
+ROLLBACK_BRANCH=US
+ROLLBACK_FIELD=createMemberAccount/OAS_ERROR
+ROLLBACK_BEHAVIOR=terminal_error
+ROLLBACK_FLOW_SHA256=47312BB6E6498F925CE3C1694EF8EBD98CBE095ADB5E420C5E210950483D8651
+ROLLBACK_EXIT=0
+exit status: 0
+
+ROLLBACK TEST
+-------------
+command: $env:HME_DB_FILE='C:\Users\29070\AppData\Local\Temp\paypal-us-oas-rollback-empty-20260818.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw "Rollback DB already exists: $env:HME_DB_FILE" }; & 'D:\AI\hidemyemail-generator\.venv\Scripts\python.exe' -m pytest -q; $code=$LASTEXITCODE; Write-Output "ROLLBACK_TEST_EXIT=$code"; exit $code
+working directory/input: C:/Users/29070/AppData/Local/Temp/paypal-us-oas-rollback-20260818/paypal-agreement-protocol; restored source; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 83%]
+..............                                                           [100%]
+86 passed in 4.24s
+ROLLBACK_TEST_EXIT=0
+exit status: 0
+restored behavior/status: the independent copy restored US createMemberAccount/OAS_ERROR to terminal_error, all original hashes matched, both added files were removed, and all original 86 tests passed. The workspace MODIFIED_FILE remains changed.
+
+Runtime smoke test
+------------------
+service: http://127.0.0.1:18097
+restart result: previous empty service stopped; modified service started at 2026-08-18 16:52:07
+literal health result: HEALTH={"ok":true,"time":1787043140.6382859}
+jobs after restart: 0

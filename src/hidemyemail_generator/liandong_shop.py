@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import aiohttp
 
@@ -23,7 +23,12 @@ from .inbox import connect_db
 
 LIANDONG_SHOP_API_URL = "https://pay.ldxp.cn/merchantApi/GoodsCardStorage/add"
 LIANDONG_SHOP_TOKEN_ENV = "LIANDONG_SHOP_MERCHANT_TOKEN"
+LIANDONG_SHOP_CODE_URL_ENV = "LIANDONG_SHOP_CODE_URL"
 LIANDONG_SHOP_CONFIG_KEY = "liandong_shop:config"
+DEFAULT_LIANDONG_SHOP_CODE_URL = "https://icloud-code.8-208-13-52.sslip.io/code"
+PASSWORD_EMAIL_SEPARATOR = "-----------"
+TWO_FACTOR_SEPARATOR = "----------"
+CODE_URL_SEPARATOR = "--------"
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,56 @@ BOUND_GOODS = LiandongShopGoods(
 
 class LiandongShopError(RuntimeError):
     """A safe user-facing configuration, validation, or upload failure."""
+
+
+class CardContentStrategy(Protocol):
+    """Serialize an account with the format required by one credential state."""
+
+    def serialize(self, email: str, record: dict[str, Any]) -> str: ...
+
+
+class PasswordCardContentStrategy:
+    """Serialize password accounts with their required TOTP seed."""
+
+    def serialize(self, email: str, record: dict[str, Any]) -> str:
+        password = str(record.get("password") or "").strip()
+        if record.get("password_confirmed") is False:
+            raise LiandongShopError("该账号尚未保存已确认的密码")
+        two_factor = record.get("two_factor")
+        two_factor = two_factor if isinstance(two_factor, dict) else {}
+        secret = str(two_factor.get("secret") or "").strip()
+        if not two_factor.get("enabled") or not secret:
+            raise LiandongShopError("有密码的账号必须启用并保存 2FA 密钥")
+        normalized_password = password.replace("\r", "").replace("\n", "")
+        normalized_secret = secret.replace("\r", "").replace("\n", "")
+        return (
+            f"{email}{PASSWORD_EMAIL_SEPARATOR}{normalized_password}"
+            f"{TWO_FACTOR_SEPARATOR}{normalized_secret}"
+        )
+
+
+class PasswordlessCardContentStrategy:
+    """Serialize passwordless accounts with the buyer-facing code portal."""
+
+    def serialize(self, email: str, record: dict[str, Any]) -> str:
+        del record
+        code_url = str(
+            os.environ.get(LIANDONG_SHOP_CODE_URL_ENV)
+            or DEFAULT_LIANDONG_SHOP_CODE_URL
+        ).strip()
+        if (
+            not code_url.startswith(("https://", "http://"))
+            or "\r" in code_url
+            or "\n" in code_url
+        ):
+            raise LiandongShopError("联动小铺接码地址格式无效")
+        return f"{email}{CODE_URL_SEPARATOR}{code_url}"
+
+
+def _content_strategy(record: dict[str, Any]) -> CardContentStrategy:
+    if str(record.get("password") or "").strip():
+        return PasswordCardContentStrategy()
+    return PasswordlessCardContentStrategy()
 
 
 class LiandongShopConfigStore:
@@ -209,20 +264,10 @@ def card_upload_for_account(
         raise LiandongShopError("邮箱地址无效")
     if str(record.get("account_type") or "").strip().lower() != "plus":
         raise LiandongShopError("只有已确认的 Plus 账号可以上传到联动小铺")
-    password = str(record.get("password") or "").strip()
-    if not password or record.get("password_confirmed") is False:
-        raise LiandongShopError("该账号尚未保存已确认的密码")
-    two_factor = record.get("two_factor")
-    two_factor = two_factor if isinstance(two_factor, dict) else {}
-    secret = str(two_factor.get("secret") or "").strip()
-    if not two_factor.get("enabled") or not secret:
-        raise LiandongShopError("该账号尚未启用并保存 2FA 密钥")
-    password = password.replace("\r", "").replace("\n", "")
-    secret = secret.replace("\r", "").replace("\n", "")
     goods = (
         BOUND_GOODS if account_phone_binding_state(record)["bound"] else UNBOUND_GOODS
     )
-    return goods, f"{target}----{password}----{secret}"
+    return goods, _content_strategy(record).serialize(target, record)
 
 
 def uploaded_marker(record: dict[str, Any]) -> dict[str, Any]:
@@ -277,7 +322,9 @@ def persist_uploaded_account(
 
 __all__ = [
     "BOUND_GOODS",
+    "DEFAULT_LIANDONG_SHOP_CODE_URL",
     "LIANDONG_SHOP_API_URL",
+    "LIANDONG_SHOP_CODE_URL_ENV",
     "LIANDONG_SHOP_TOKEN_ENV",
     "LiandongShopClient",
     "LiandongShopConfigStore",

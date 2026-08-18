@@ -444,6 +444,7 @@ Python 运行时。项目依赖已包含 `curl-cffi`；`start-web-ui.ps1` 首次
 | `HIDEMYEMAIL_INVENTORY_USERNAME` | 账号 | 登录远端库存服务的账号。 |
 | `HIDEMYEMAIL_INVENTORY_PASSWORD` | 密码 | 登录远端库存服务的密码；只保存在客户端环境配置中。 |
 | `HIDEMYEMAIL_INVENTORY_TOKEN` | 令牌 | 旧版共享令牌兼容项；配置账号密码后不再使用。 |
+| `LIANDONG_SHOP_CODE_URL` | URL | 无密码账号上传联动小铺时附带的接码地址；默认使用项目的公网 iCloud 接码页。 |
 | `HIDEMYEMAIL_INVENTORY_SYNC_INTERVAL_SECONDS` | 秒数 | 完整邮箱和账号记录的补偿同步间隔，默认 `300` 秒。 |
 | `SMSBOWER_API_KEY` | 令牌 | 可选的 SMSBower API Key；也可在邮箱账号页点击「SMSBower API」保存在本地数据库。 |
 | `SMSBOWER_MAIL_SERVICE` | 服务代码 | SMSBower 邮件服务代码，OpenAI (ChatGPT) 默认为 `dr`。 |

@@ -80,6 +80,7 @@ class ProtocolCredentialTests(unittest.TestCase):
             password_verifier=lambda: {
                 "verified": True,
                 "access_token": "verified-access-token",
+                "reuse_registration_session": False,
             },
             language="ja-JP",
             now=lambda: 1_700_000_010.0,
@@ -104,13 +105,99 @@ class ProtocolCredentialTests(unittest.TestCase):
         activation = session.posts[-1][1]
         self.assertRegex(activation["code"], r"^\d{6}$")
         self.assertIn(
-            "账号尚无可验证密码；将通过当前添加密码复核流程设置并验证",
+            "账号尚无密码；将使用当前注册 Session 直接添加密码",
             logs,
         )
-        self.assertIn("全新认证会话已接受保存密码", logs)
+        self.assertIn("当前认证会话已确认密码添加成功", logs)
+
+    def test_password_add_reuses_registration_session_without_login_token(self):
+        class RegistrationSession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.gets = []
+
+            def get(self, url, **kwargs):
+                self.gets.append((url, kwargs))
+                return FakeResponse(200, {"accessToken": "refreshed-registration-token"})
+
+        session = RegistrationSession()
+        logs = []
+
+        result = complete_protocol_credentials(
+            email="protocol@icloud.com",
+            access_token="registration-access-token",
+            generated_password="GeneratedPassword!1",
+            password_set=False,
+            session_token="registration-session-token",
+            request_session=session,
+            password_verifier=lambda: {
+                "verified": True,
+                "password_added": True,
+                "reuse_registration_session": True,
+            },
+            log=logs.append,
+            now=lambda: 1_700_000_010.0,
+        )
+
+        self.assertEqual(len(session.gets), 1)
+        self.assertEqual(result["access_token"], "refreshed-registration-token")
+        self.assertEqual(
+            [headers["Authorization"] for _, _, headers, _ in session.posts],
+            [
+                "Bearer refreshed-registration-token",
+                "Bearer refreshed-registration-token",
+            ],
+        )
+        self.assertIn("添加密码后已刷新当前注册 Session 的 Access Token", logs)
+        self.assertNotIn("全新认证会话", " ".join(logs))
+
+    def test_verified_password_token_is_not_replaced_by_old_session_refresh(self):
+        class StaleRegistrationSession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.gets = []
+
+            def get(self, url, **kwargs):
+                self.gets.append((url, kwargs))
+                return FakeResponse(200, {"accessToken": "invalidated-old-token"})
+
+        session = StaleRegistrationSession()
+
+        result = complete_protocol_credentials(
+            email="protocol@icloud.com",
+            access_token="registration-access-token",
+            generated_password="GeneratedPassword!1",
+            password_set=False,
+            session_token="old-registration-session",
+            request_session=session,
+            password_verifier=lambda: {
+                "verified": True,
+                "access_token": "verified-password-login-token",
+            },
+            now=lambda: 1_700_000_010.0,
+        )
+
+        self.assertEqual(session.gets, [])
+        self.assertEqual(result["access_token"], "verified-password-login-token")
+        self.assertEqual(
+            [headers["Authorization"] for _, _, headers, _ in session.posts],
+            [
+                "Bearer verified-password-login-token",
+                "Bearer verified-password-login-token",
+            ],
+        )
 
     def test_existing_totp_still_adds_missing_password_without_reenrolling(self):
-        session = FakeSession()
+        class RefreshTrackingSession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.gets = []
+
+            def get(self, url, **kwargs):
+                self.gets.append((url, kwargs))
+                return FakeResponse(200, {"accessToken": "stale-token"})
+
+        session = RefreshTrackingSession()
 
         result = complete_protocol_credentials(
             email="partial@icloud.com",
@@ -118,19 +205,47 @@ class ProtocolCredentialTests(unittest.TestCase):
             generated_password="GeneratedPassword!1",
             password_set=False,
             existing_totp_secret="JBSWY3DPEHPK3PXP",
+            session_token="old-registration-session",
             password_verifier=lambda: {"verified": True},
             request_session=session,
         )
 
+        self.assertEqual(session.gets, [])
         self.assertEqual(session.posts, [])
         self.assertTrue(result["password_set"])
         self.assertTrue(result["two_factor"]["enabled"])
 
-    def test_passwordless_account_without_login_proof_stops_before_totp(self):
+    def test_verifier_without_token_stops_before_new_totp_enrollment(self):
+        class RefreshTrackingSession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.gets = []
+
+            def get(self, url, **kwargs):
+                self.gets.append((url, kwargs))
+                return FakeResponse(200, {"accessToken": "stale-token"})
+
+        session = RefreshTrackingSession()
+
+        with self.assertRaisesRegex(RuntimeError, "未返回可用于创建 2FA"):
+            complete_protocol_credentials(
+                email="protocol@icloud.com",
+                access_token="registration-access-token",
+                generated_password="GeneratedPassword!1",
+                password_set=True,
+                session_token="old-registration-session",
+                password_verifier=lambda: {"verified": True},
+                request_session=session,
+            )
+
+        self.assertEqual(session.gets, [])
+        self.assertEqual(session.posts, [])
+
+    def test_passwordless_account_stops_when_password_add_fails(self):
         session = FakeSession()
         confirmed = []
 
-        with self.assertRaisesRegex(RuntimeError, "尚未通过独立登录验证"):
+        with self.assertRaisesRegex(RuntimeError, "当前认证会话添加密码失败"):
             complete_protocol_credentials(
                 email="protocol@icloud.com",
                 access_token="access-token",
@@ -147,10 +262,10 @@ class ProtocolCredentialTests(unittest.TestCase):
         self.assertEqual(confirmed, [])
         self.assertEqual(session.posts, [])
 
-    def test_saved_password_and_totp_are_not_trusted_without_login_proof(self):
+    def test_explicit_password_add_failure_is_not_ignored(self):
         session = FakeSession()
 
-        with self.assertRaisesRegex(RuntimeError, "尚未通过独立登录验证"):
+        with self.assertRaisesRegex(RuntimeError, "当前认证会话添加密码失败"):
             complete_protocol_credentials(
                 email="protocol@icloud.com",
                 access_token="access-token",
@@ -476,7 +591,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             any(event["stage"] == "password_checkpoint" for event in events)
         )
 
-    def test_saved_complete_credentials_resume_requires_clean_password_proof(self):
+    def test_saved_complete_credentials_resume_skips_password_login(self):
         constructor_calls = []
         credential_call = {}
         events = []
@@ -496,9 +611,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
 
         def complete(**kwargs):
             credential_call.update(kwargs)
-            verification = kwargs["password_verifier"]()
-            self.assertTrue(verification["verified"])
-            self.assertTrue(verification["mfa_required"])
+            self.assertIsNone(kwargs["password_verifier"])
             kwargs["on_password_confirmed"]()
             return {
                 "access_token": "refreshed-access-token",
@@ -552,9 +665,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(len(constructor_calls), 1)
-        self.assertTrue(constructor_calls[0][0]["password_verification_only"])
-        self.assertFalse(constructor_calls[0][0]["password_confirmed"])
+        self.assertEqual(constructor_calls, [])
         self.assertTrue(credential_call["password_set"])
         self.assertEqual(credential_call["generated_password"], "ExistingPassword!1")
         self.assertEqual(credential_call["session_token"], "saved-session-token")
@@ -563,14 +674,12 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
         self.assertTrue(
             result["registration_diagnostics"]["resumed_from_password_checkpoint"]
         )
-        self.assertTrue(
-            result["registration_diagnostics"]["password_login_verified"]
-        )
+        self.assertFalse(result["registration_diagnostics"]["password_login_verified"])
         self.assertEqual(
             result["registration_diagnostics"][
                 "password_login_verification_attempts"
             ],
-            1,
+            0,
         )
         self.assertEqual(
             sum(stage == "password_checkpoint" for stage, *_rest in events),
@@ -578,7 +687,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
         )
         self.assertTrue(any(stage == "two_factor" for stage, *_rest in events))
 
-    def test_passwordless_saved_account_adds_password_via_reauth_then_proves_login(self):
+    def test_saved_password_account_skips_add_and_login_reauth(self):
         constructor_accounts = []
         events = []
 
@@ -608,8 +717,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 }
 
         def complete(**kwargs):
-            verification = kwargs["password_verifier"]()
-            self.assertTrue(verification["verified"])
+            self.assertIsNone(kwargs["password_verifier"])
             kwargs["on_password_confirmed"]()
             return {
                 "access_token": kwargs["access_token"],
@@ -673,40 +781,109 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(
-            [item["password_add_reauth"] for item in constructor_accounts],
-            [False, True, False],
-        )
-        self.assertEqual(
-            {item["totp_secret"] for item in constructor_accounts},
-            {"JBSWY3DPEHPK3PXP"},
-        )
-        self.assertEqual(
-            constructor_accounts[1]["reauth_session_token"],
-            "saved-session-token",
-        )
-        self.assertEqual(
-            constructor_accounts[1]["reauth_device_id"],
-            "saved-device-id",
-        )
-        self.assertEqual(
-            [
-                item["name"]
-                for item in constructor_accounts[1]["reauth_session_cookies"]
-            ],
-            ["__Secure-next-auth.session-token", "oai-did"],
-        )
-        self.assertEqual(constructor_accounts[0]["reauth_session_token"], "")
-        self.assertEqual(constructor_accounts[2]["reauth_session_token"], "")
+        self.assertEqual(constructor_accounts, [])
         diagnostics = result["registration_diagnostics"]
-        self.assertTrue(diagnostics["password_login_verified"])
-        self.assertTrue(diagnostics["password_add_reauth_recovered"])
-        self.assertEqual(diagnostics["password_login_verification_attempts"], 3)
+        self.assertFalse(diagnostics["password_login_verified"])
+        self.assertFalse(diagnostics["password_add_reauth_recovered"])
+        self.assertEqual(diagnostics["password_add_attempts"], 0)
+        self.assertEqual(diagnostics["password_login_verification_attempts"], 0)
         self.assertEqual(
             sum(stage == "password_checkpoint" for stage, *_rest in events),
             1,
         )
-        sleep_mock.assert_called_once_with(45.0)
+        sleep_mock.assert_not_called()
+
+    def test_password_add_reset_completion_reuses_current_session_without_login(self):
+        constructor_accounts = []
+
+        class FakeRegister:
+            def __init__(self, account, **_kwargs):
+                constructor_accounts.append(dict(account))
+                self.password = account["password"]
+                self.index = len(constructor_accounts)
+
+            def register(self):
+                return {
+                    "status": "failed",
+                    "error": "account_password_reset_completed_use_current_session",
+                }
+
+        def complete(**kwargs):
+            verification = kwargs["password_verifier"]()
+            self.assertTrue(verification["verified"])
+            self.assertTrue(verification["reuse_registration_session"])
+            kwargs["on_password_confirmed"]()
+            return {
+                "access_token": kwargs["access_token"],
+                "password": kwargs["generated_password"],
+                "two_factor": {
+                    "enabled": True,
+                    "secret": kwargs["existing_totp_secret"],
+                },
+            }
+
+        module = SimpleNamespace(ChatGPTRegister=FakeRegister)
+        with (
+            patch(
+                "hidemyemail_generator.protocol_registration_worker._load_core",
+                return_value=module,
+            ),
+            patch(
+                "hidemyemail_generator.protocol_registration_worker._emit_event"
+            ),
+            patch(
+                "hidemyemail_generator.protocol_credentials.complete_protocol_credentials",
+                side_effect=complete,
+            ),
+        ):
+            result = run(
+                {
+                    "email": "protocol@icloud.com",
+                    "code_url": "http://127.0.0.1/code",
+                    "project_root": ".",
+                    "source_root": ".",
+                    "existing_password": "ExistingPassword!1",
+                    "existing_password_confirmed": False,
+                    "existing_access_token": "saved-access-token",
+                    "existing_session_token": "saved-session-token",
+                    "existing_session_json": {
+                        "accessToken": "saved-access-token",
+                        "sessionToken": "saved-session-token",
+                    },
+                    "existing_session_cookies": [
+                        {
+                            "name": "__Secure-next-auth.session-token",
+                            "value": "saved-session-token",
+                            "domain": "chatgpt.com",
+                            "path": "/",
+                        }
+                    ],
+                    "existing_device_id": "saved-device-id",
+                    "existing_totp_secret": "JBSWY3DPEHPK3PXP",
+                }
+            )
+
+        self.assertEqual(
+            [item["password_add_reauth"] for item in constructor_accounts],
+            [True],
+        )
+        self.assertEqual(
+            [bool(item["reauth_session_token"]) for item in constructor_accounts],
+            [True],
+        )
+        self.assertEqual(
+            [bool(item["reauth_session_cookies"]) for item in constructor_accounts],
+            [True],
+        )
+        self.assertEqual(
+            [bool(item["reauth_device_id"]) for item in constructor_accounts],
+            [True],
+        )
+        diagnostics = result["registration_diagnostics"]
+        self.assertFalse(diagnostics["password_login_verified"])
+        self.assertTrue(diagnostics["password_add_reauth_recovered"])
+        self.assertEqual(diagnostics["password_add_attempts"], 1)
+        self.assertEqual(diagnostics["password_login_verification_attempts"], 0)
 
     def test_saved_password_session_reauthenticates_before_missing_totp(self):
         constructor_calls = []
@@ -914,7 +1091,7 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             any("重新登录" in message for _stage, message, _status in events)
         )
 
-    def test_server_selected_otp_session_adds_and_proves_staged_password(self):
+    def test_server_selected_otp_session_adds_password_once_without_login(self):
         constructor_accounts = []
         complete_calls = []
         events = []
@@ -931,7 +1108,18 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                     self.password_checkpoint(self.password, True)
                     return {
                         "status": "success",
-                        "access_token": "verified-access-token",
+                        "access_token": "fresh-password-add-token",
+                        "session_token": "fresh-password-add-session-token",
+                        "session_json": {
+                            "accessToken": "fresh-password-add-token",
+                            "sessionToken": "fresh-password-add-session-token",
+                        },
+                        "session_cookies": [
+                            {
+                                "name": "__Secure-next-auth.session-token",
+                                "value": "fresh-password-add-session-token",
+                            }
+                        ],
                         "password": self.password,
                         "password_set": True,
                     }
@@ -953,11 +1141,15 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             complete_calls.append(kwargs)
             verification = kwargs["password_verifier"]()
             self.assertTrue(verification["verified"])
+            self.assertFalse(verification["reuse_registration_session"])
+            self.assertEqual(
+                verification["access_token"], "fresh-password-add-token"
+            )
             on_password_confirmed = kwargs.get("on_password_confirmed")
             if callable(on_password_confirmed):
                 on_password_confirmed()
             return {
-                "access_token": kwargs["access_token"],
+                "access_token": verification["access_token"],
                 "password": kwargs["generated_password"],
                 "two_factor": {
                     "enabled": True,
@@ -981,7 +1173,9 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
                 "hidemyemail_generator.protocol_credentials.complete_protocol_credentials",
                 side_effect=complete,
             ),
-            patch("hidemyemail_generator.protocol_registration_worker.time.sleep"),
+            patch(
+                "hidemyemail_generator.protocol_registration_worker.time.sleep"
+            ) as sleep_mock,
         ):
             result = run(
                 {
@@ -1002,6 +1196,11 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             ["", "StableCandidate!1"],
         )
         self.assertTrue(constructor_accounts[1]["password_verification_only"])
+        self.assertTrue(constructor_accounts[1]["password_add_reauth"])
+        self.assertEqual(
+            constructor_accounts[1]["reauth_access_token"],
+            "passwordless-access-token",
+        )
         self.assertFalse(constructor_accounts[1]["password_confirmed"])
         self.assertEqual(len(complete_calls), 1)
         self.assertFalse(complete_calls[0]["password_set"])
@@ -1010,18 +1209,25 @@ class ProtocolRegistrationWorkerTests(unittest.TestCase):
             "StableCandidate!1",
         )
         self.assertEqual(result["password"], "StableCandidate!1")
+        self.assertEqual(result["access_token"], "fresh-password-add-token")
+        self.assertEqual(
+            result["session_token"], "fresh-password-add-session-token"
+        )
         self.assertTrue(
             result["registration_diagnostics"]["password_add_from_session"]
         )
-        self.assertTrue(
-            result["registration_diagnostics"]["password_login_verified"]
+        self.assertFalse(result["registration_diagnostics"]["password_login_verified"])
+        self.assertEqual(
+            result["registration_diagnostics"]["password_add_attempts"],
+            1,
         )
         self.assertEqual(
             result["registration_diagnostics"][
                 "password_login_verification_attempts"
             ],
-            1,
+            0,
         )
+        sleep_mock.assert_not_called()
         self.assertTrue(
             any(
                 stage == "password_checkpoint"
@@ -1551,6 +1757,57 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sentinel.flows, ["password_reset"])
 
+    async def test_password_add_protocol_uses_auth_endpoint_and_sentinel_flow(self):
+        module = self._core_module()
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {"continue_url": "/reset-password/success"}
+
+        class FakeSession:
+            def __init__(self):
+                self.posts = []
+
+            async def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                return FakeResponse()
+
+        class FakeSentinel:
+            def __init__(self):
+                self.flows = []
+
+            async def get_token(self, flow, _device_id, **_kwargs):
+                self.flows.append(flow)
+                return {"p": "proof", "t": "turnstile"}
+
+            async def get_so_token(self, _flow, _device_id):
+                return None
+
+        sentinel = FakeSentinel()
+        session = FakeSession()
+        client = module.OpenAIAuthClient(sentinel=sentinel)
+        client._session = session
+
+        result = await client.add_password_after_reauth("StableCandidate!1")
+
+        self.assertEqual(result["_http_status"], 200)
+        self.assertEqual(sentinel.flows, ["password_reset"])
+        url, kwargs = session.posts[0]
+        self.assertEqual(
+            url,
+            "https://auth.openai.com/api/accounts/password/add",
+        )
+        self.assertEqual(kwargs["json"], {"password": "StableCandidate!1"})
+        self.assertEqual(
+            kwargs["headers"]["referer"],
+            "https://auth.openai.com/reset-password/new-password",
+        )
+        self.assertIn("openai-sentinel-token", kwargs["headers"])
+
     async def test_password_login_mfa_challenge_proves_saved_password(self):
         checkpoints = []
         created = []
@@ -1755,14 +2012,15 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         created = []
 
         class FakeResponse:
-            status_code = 200
-            url = "https://auth.openai.com/reset-password/new-password"
-            headers = {}
-            text = ""
+            def __init__(self, payload=None, *, url="https://auth.openai.com/"):
+                self.status_code = 200
+                self.url = url
+                self.headers = {}
+                self.text = ""
+                self.payload = payload or {}
 
-            @staticmethod
-            def json():
-                return {}
+            def json(self):
+                return self.payload
 
         class FakeSession:
             def __init__(self):
@@ -1771,7 +2029,15 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
 
             async def get(self, url, **kwargs):
                 self.gets.append((url, kwargs))
-                return FakeResponse()
+                if url == "https://chatgpt.com/api/auth/session":
+                    return FakeResponse(
+                        {
+                            "accessToken": "fresh-password-add-token",
+                            "sessionToken": "fresh-session-token",
+                        },
+                        url=url,
+                    )
+                return FakeResponse(url=url)
 
         class FakeAuth:
             BASE_URL = "https://auth.openai.com"
@@ -1845,7 +2111,11 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
 
             async def add_password_after_reauth(self, password, **_kwargs):
                 self.added_passwords.append(password)
-                return {"_http_status": 200}
+                return {
+                    "continue_url": "https://auth.openai.com/authorize/continue",
+                    "page": {"type": "external_url"},
+                    "_http_status": 200,
+                }
 
             async def close(self):
                 return None
@@ -1857,6 +2127,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                 "password": "StableCandidate!1",
                 "password_verification_only": True,
                 "password_add_reauth": True,
+                "reauth_access_token": "stale-passwordless-token",
                 "totp_secret": "JBSWY3DPEHPK3PXP",
                 "refresh_token": "http://127.0.0.1/code",
             },
@@ -1873,11 +2144,11 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                 refresh_token="http://127.0.0.1/code",
             )
 
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(
-            result["error"],
-            "account_password_add_completed_retry_login",
-        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["access_token"], "fresh-password-add-token")
+        self.assertEqual(result["session_token"], "fresh-session-token")
+        self.assertTrue(result["password_set"])
+        self.assertEqual(len(created), 1)
         self.assertEqual(
             created[0].init_kwargs,
             {"prefer_login": True, "post_login_add_password": True},
@@ -1886,6 +2157,209 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created[0].issued, [("factor-id", "totp", "")])
         self.assertEqual(len(created[0].verified), 1)
         self.assertEqual(created[0].added_passwords, ["StableCandidate!1"])
+
+    async def test_password_add_reauth_409_falls_back_to_email_reset_strategy(self):
+        class FakeResponse:
+            status_code = 200
+
+        class FakeSession:
+            async def get(self, _url, **_kwargs):
+                return FakeResponse()
+
+        class FakeAuth:
+            BASE_URL = "https://auth.openai.com"
+
+            def __init__(self):
+                self.session = FakeSession()
+                self.add_force_refresh_flags = []
+
+            async def _get_session(self):
+                return self.session
+
+            async def add_password_after_reauth(
+                self, _password, *, force_refresh_sentinel, log_fn
+            ):
+                self.add_force_refresh_flags.append(force_refresh_sentinel)
+                self.assert_log = log_fn
+                return {"_http_status": 409}
+
+        module = self._core_module()
+        bot = module.ChatGPTRegister(
+            {
+                "email": "protocol@zkgmail.com",
+                "password": "StableCandidate!1",
+                "refresh_token": "zkg-code-url",
+            }
+        )
+        auth = FakeAuth()
+        reset_calls = []
+
+        async def reset_password(
+            _auth,
+            *,
+            password,
+            client_id,
+            refresh_token,
+            recovery_reason="password_mismatch",
+        ):
+            reset_calls.append(
+                (password, client_id, refresh_token, recovery_reason)
+            )
+            return True, ""
+
+        bot._reset_existing_password = reset_password
+        strategy, error, add_result = await bot._complete_password_add_reauth(
+            auth,
+            auth_result={
+                "continue_url": "/reset-password/new-password",
+                "page": {"type": "password_reset"},
+            },
+            password="StableCandidate!1",
+            client_id="zkg-client",
+            refresh_token="zkg-code-url",
+        )
+
+        self.assertEqual(strategy, module.PASSWORD_WRITE_RESET)
+        self.assertEqual(error, "")
+        self.assertEqual(add_result, {"_http_status": 409})
+        self.assertEqual(auth.add_force_refresh_flags, [False])
+        self.assertEqual(
+            reset_calls,
+            [
+                (
+                    "StableCandidate!1",
+                    "zkg-client",
+                    "zkg-code-url",
+                    "password_add_conflict",
+                )
+            ],
+        )
+        self.assertTrue(bot.password_confirmed)
+
+    async def test_password_add_reauth_401_and_403_do_not_fallback_to_reset(self):
+        class FakeResponse:
+            status_code = 200
+
+        class FakeSession:
+            async def get(self, _url, **_kwargs):
+                return FakeResponse()
+
+        async def no_sleep(_seconds):
+            return None
+
+        module = self._core_module()
+        for status in (401, 403):
+            with self.subTest(status=status):
+                class FakeAuth:
+                    BASE_URL = "https://auth.openai.com"
+
+                    def __init__(self):
+                        self.session = FakeSession()
+                        self.add_force_refresh_flags = []
+
+                    async def _get_session(self):
+                        return self.session
+
+                    async def add_password_after_reauth(
+                        self, _password, *, force_refresh_sentinel, log_fn
+                    ):
+                        self.add_force_refresh_flags.append(force_refresh_sentinel)
+                        self.assert_log = log_fn
+                        return {
+                            "_http_status": status,
+                            "error": {
+                                "code": "unauthorized",
+                                "message": "password already exists",
+                            },
+                        }
+
+                bot = module.ChatGPTRegister(
+                    {
+                        "email": "protocol@zkgmail.com",
+                        "password": "StableCandidate!1",
+                    }
+                )
+                auth = FakeAuth()
+                reset_calls = []
+
+                async def reset_password(*_args, **_kwargs):
+                    reset_calls.append(True)
+                    return True, ""
+
+                bot._reset_existing_password = reset_password
+                with patch.object(module.asyncio, "sleep", new=no_sleep):
+                    strategy, error, add_result = (
+                        await bot._complete_password_add_reauth(
+                        auth,
+                        auth_result={
+                            "continue_url": "/reset-password/new-password",
+                            "page": {"type": "password_reset"},
+                        },
+                        password="StableCandidate!1",
+                        client_id="",
+                        refresh_token="zkg-code-url",
+                        )
+                    )
+
+                self.assertEqual(strategy, "")
+                self.assertEqual(reset_calls, [])
+                self.assertFalse(bot.password_confirmed)
+                self.assertIn("password_add_reauth_failed", error)
+                self.assertIn(str(status), error)
+                self.assertEqual(add_result["_http_status"], status)
+                self.assertEqual(
+                    auth.add_force_refresh_flags,
+                    [False, True] if status == 403 else [False],
+                )
+
+    async def test_password_add_409_reset_failure_preserves_detail(self):
+        class FakeResponse:
+            status_code = 200
+
+        class FakeSession:
+            async def get(self, _url, **_kwargs):
+                return FakeResponse()
+
+        class FakeAuth:
+            BASE_URL = "https://auth.openai.com"
+
+            async def _get_session(self):
+                return FakeSession()
+
+            async def add_password_after_reauth(self, _password, **_kwargs):
+                return {"_http_status": 409}
+
+        module = self._core_module()
+        bot = module.ChatGPTRegister(
+            {
+                "email": "protocol@zkgmail.com",
+                "password": "StableCandidate!1",
+            }
+        )
+        reset_detail = (
+            "password_reset_failed: password_policy_violation "
+            "(Password rejected by server)"
+        )
+
+        async def reset_password(*_args, **_kwargs):
+            return False, reset_detail
+
+        bot._reset_existing_password = reset_password
+        strategy, error, add_result = await bot._complete_password_add_reauth(
+            FakeAuth(),
+            auth_result={
+                "continue_url": "/reset-password/new-password",
+                "page": {"type": "password_reset"},
+            },
+            password="StableCandidate!1",
+            client_id="",
+            refresh_token="zkg-code-url",
+        )
+
+        self.assertEqual(strategy, "")
+        self.assertEqual(error, reset_detail)
+        self.assertEqual(add_result, {"_http_status": 409})
+        self.assertFalse(bot.password_confirmed)
 
     async def test_existing_password_page_verifies_saved_candidate_instead_of_registering(self):
         checkpoints = []
@@ -2427,7 +2901,10 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         )
         reauth_url = reauth_session.posts[0][0]
         self.assertIn("post_login_add_password=true", reauth_url)
-        self.assertNotIn("login_hint=", reauth_url)
+        self.assertIn("connection=password", reauth_url)
+        self.assertIn("login_hint=protocol%40icloud.com", reauth_url)
+        self.assertIn("reauth=password", reauth_url)
+        self.assertIn("max_age=0", reauth_url)
         self.assertIn("screen_hint=login", reauth_url)
 
     async def test_add_password_reauth_seeds_logged_in_session_cookies(self):

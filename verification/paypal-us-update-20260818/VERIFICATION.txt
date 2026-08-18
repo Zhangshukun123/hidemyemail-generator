@@ -1,0 +1,67 @@
+PayPal US protocol update verification
+======================================
+
+Changed branch/field
+--------------------
+branch: US
+field: upstream_update_detected
+original value: null (pending)
+modified value: false (not_updated_no_code_change)
+
+Version evidence
+----------------
+local imported revision: 4719066ec6fd56b57a5bd9599758366836c9dc0a
+GitHub main HEAD:        4719066ec6fd56b57a5bd9599758366836c9dc0a
+GitHub HEAD commit date: 2026-08-10T13:45:34+08:00
+GitHub HEAD subject:     Sync production PayPal protocol updates (exclude Grok)
+result: no upstream update; no PayPal payment-flow source file was changed.
+
+Hashes
+------
+ORIGINAL_FILE SHA256: 4CA4D04F56800E837314C15DA40C9B7D24D122DF53116A442C5A3EB9C07ABFFC
+MODIFIED_FILE SHA256: 18A8119CEF8542DB24177F4BD985661DF5932261085024075C5813AF839FAE69
+
+Four artifact paths
+-------------------
+MODIFIED_FILE: D:/AI/hidemyemail-generator/verification/paypal-us-update-20260818/MODIFIED_FILE.json
+DIFF_FILE: D:/AI/hidemyemail-generator/verification/paypal-us-update-20260818/DIFF_FILE.diff
+VERIFICATION: D:/AI/hidemyemail-generator/verification/paypal-us-update-20260818/VERIFICATION.txt
+ROLLBACK: D:/AI/hidemyemail-generator/verification/paypal-us-update-20260818/ROLLBACK.sh
+
+BASELINE
+--------
+command: $env:HME_DB_FILE='C:\Users\29070\AppData\Local\Temp\paypal-us-baseline-empty-20260818.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw "Baseline DB already exists: $env:HME_DB_FILE" }; python -m pytest -q; $code=$LASTEXITCODE; Write-Output "BASELINE_ISOLATED_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator/paypal-agreement-protocol; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 83%]
+..............                                                           [100%]
+86 passed in 5.57s
+BASELINE_ISOLATED_EXIT=0
+exit status: 0
+
+MODIFIED
+--------
+command: $env:HME_DB_FILE='C:\Users\29070\AppData\Local\Temp\paypal-us-modified-final-empty-20260818.db'; if (Test-Path -LiteralPath $env:HME_DB_FILE) { throw "Modified DB already exists: $env:HME_DB_FILE" }; python -m pytest -q; $code=$LASTEXITCODE; Write-Output "MODIFIED_FINAL_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator/paypal-agreement-protocol; MODIFIED_FILE has US/upstream_update_detected=false; isolated empty SMS settings database
+literal output/result:
+........................................................................ [ 83%]
+..............                                                           [100%]
+86 passed in 5.47s
+MODIFIED_FINAL_EXIT=0
+exit status: 0
+
+ROLLBACK
+--------
+preparation command: Copy-Item -LiteralPath 'D:\AI\hidemyemail-generator\verification\paypal-us-update-20260818\MODIFIED_FILE.json' -Destination 'C:\Users\29070\AppData\Local\Temp\paypal-us-rollback-final-copy-20260818.json'
+command: & 'C:\Program Files\Git\bin\bash.exe' 'D:/AI/hidemyemail-generator/verification/paypal-us-update-20260818/ROLLBACK.sh' 'C:/Users/29070/AppData/Local/Temp/paypal-us-rollback-final-copy-20260818.json'; $code=$LASTEXITCODE; Write-Output "ROLLBACK_FINAL_EXIT=$code"; exit $code
+working directory/input: D:/AI/hidemyemail-generator; rollback copy in modified state; SHA256 18A8119CEF8542DB24177F4BD985661DF5932261085024075C5813AF839FAE69
+literal output/result:
+ROLLBACK_INPUT=C:/Users/29070/AppData/Local/Temp/paypal-us-rollback-final-copy-20260818.json
+ROLLBACK_RESULT=restored
+ROLLBACK_BRANCH=US
+ROLLBACK_FIELD=upstream_update_detected
+ROLLBACK_VALUE=null
+ROLLBACK_SHA256=4CA4D04F56800E837314C15DA40C9B7D24D122DF53116A442C5A3EB9C07ABFFC
+ROLLBACK_FINAL_EXIT=0
+exit status: 0
+restored behavior/status: rollback copy restored US/upstream_update_detected to null (pending), with the exact original SHA256; MODIFIED_FILE remains false (not_updated_no_code_change).

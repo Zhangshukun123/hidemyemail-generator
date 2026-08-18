@@ -1,0 +1,34 @@
+TARGET: QQ 转发 catch-all 邮箱域名配置
+BRANCH: codex/registration-reliability-98
+CHANGED_FIELDS: settings.domains; settings.activeDomain
+ORIGINAL_BLOB: 15fa7950e43615f640f57249d8eddf912c594cec
+MODIFIED_BLOB: 2b878f6b300e46b82fbe05d47dcf3cd7dced690e
+
+ARTIFACTS:
+MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\cclgmail-domain-config-20260818\MODIFIED_FILE
+DIFF_FILE=D:\AI\hidemyemail-generator\verification\cclgmail-domain-config-20260818\DIFF_FILE
+VERIFICATION.txt=D:\AI\hidemyemail-generator\verification\cclgmail-domain-config-20260818\VERIFICATION.txt
+ROLLBACK.sh=D:\AI\hidemyemail-generator\verification\cclgmail-domain-config-20260818\ROLLBACK.sh
+
+BASELINE:
+Command: .\.venv\Scripts\python.exe -m pytest tests/test_zkgmail.py -q
+Input: task-start src/hidemyemail_generator/zkgmail.py, Git blob 15fa7950e43615f640f57249d8eddf912c594cec
+Literal result: 13 passed, 73 warnings in 1.26s
+Exit status: 0
+
+MODIFIED:
+Command: .\.venv\Scripts\python.exe -m pytest tests/test_zkgmail.py tests/test_registration_tasks.py tests/test_quick_flow_config_ui.py tests/test_gpt_emails.py::GptEmailTests::test_workbench_import_accepts_supported_account_email_providers tests/test_web_ui.py::StructuredWebUiTests::test_icloud_and_zkgmail_can_start_protocol_registration tests/test_web_ui.py::StructuredWebUiTests::test_one_click_registration_and_card_link_is_a_separate_pipeline_module tests/test_web_ui.py::StructuredWebUiTests::test_registration_can_buy_smsbower_gmail_and_poll_code_automatically tests/test_web_ui.py::StructuredWebUiRouteTests::test_protocol_registration_can_generate_one_zkgmail_email -q --disable-warnings
+Input: modified multi-domain model, QQ polling route, registration integration, API and Chromium UI
+Literal result: 57 passed, 230 warnings in 13.99s
+Exit status: 0
+State command: .\.venv\Scripts\python.exe -c "from pathlib import Path; from hidemyemail_generator.zkgmail import ZkgmailConfigStore; state=ZkgmailConfigStore(Path('hidemyemail.db')).configure(domain='cclgmail.com'); print({'configured': state['configured'], 'domain': state['domain'], 'domains': state['domains'], 'forwardAccount': state['forwardAccount']})"
+State input: hidemyemail.db
+State literal result: {'configured': True, 'domain': 'cclgmail.com', 'domains': ['cclgmail.com', 'zkgmail.com'], 'forwardAccount': '35***4@qq.com'}
+State exit status: 0
+
+ROLLBACK:
+Command: & 'C:\Program Files\Git\bin\bash.exe' -lc "'/d/AI/hidemyemail-generator/verification/cclgmail-domain-config-20260818/ROLLBACK.sh'"
+Input: MODIFIED_FILE copied to verification/cclgmail-domain-config-20260818/ROLLBACK_COPY
+Literal result: ROLLBACK restored src/hidemyemail_generator/zkgmail.py blob=15fa7950e43615f640f57249d8eddf912c594cec
+Exit status: 0
+Restored behavior/status: the rollback copy has the original single zkgmail.com domain behavior and original Git blob; MODIFIED_FILE and the workspace remain on the multi-domain implementation.

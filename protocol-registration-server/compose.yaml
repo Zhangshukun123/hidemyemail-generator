@@ -1,0 +1,69 @@
+name: protocol-registration-server
+
+services:
+  protocol-registration-clash:
+    image: metacubex/mihomo:latest
+    container_name: protocol-registration-clash
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    command:
+      - -f
+      - /root/.config/mihomo/config.yaml
+    volumes:
+      - ./clash:/root/.config/mihomo
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  protocol-registration-server:
+    image: protocol-registration-server:1.0.0
+    build:
+      context: ..
+      dockerfile: protocol-registration-server/Dockerfile
+    container_name: protocol-registration-server
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - protocol-registration-clash
+    env_file:
+      - .env
+    command:
+      - --host
+      - 127.0.0.1
+      - --port
+      - "18769"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    volumes:
+      - ${PROTOCOL_SERVER_SHARED_DATA_DIR:-/opt/icloud-code-server/data}:/shared-data
+      - ./data:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:18769/healthz', timeout=3).read(2)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"

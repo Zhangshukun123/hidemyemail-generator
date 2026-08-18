@@ -1,0 +1,12 @@
+✔ same mailbox submits its opaque cursor and polls until the next code (63.9545ms)
+✔ cursor remains scoped to the mailbox that produced it (3.7759ms)
+✔ lookup keeps polling for three minutes before timing out (2.6424ms)
+✔ lookup retries a transient network failure during server restart (2.0812ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 158.901

@@ -71,6 +71,19 @@ _SEMANTIC_EMAIL_OTP_INPUT_SELECTORS = (
 ICLOUD_CODE_TIMESTAMP_SKEW_SECONDS = 30.0
 
 
+def _is_qq_forwarded_email(email: str) -> bool:
+    target = str(email or "").strip().lower()
+    db_file = str(os.environ.get("HME_BROWSER_DB_FILE") or "").strip()
+    try:
+        from .zkgmail import ZkgmailConfigStore
+
+        if db_file:
+            return ZkgmailConfigStore(db_file).supports_email(target)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        pass
+    return target.endswith(("@cclgmail.com", "@zkgmail.com"))
+
+
 def _icloud_code_since(min_timestamp: float) -> str:
     return iso_timestamp(
         max(0.0, float(min_timestamp or 0) - ICLOUD_CODE_TIMESTAMP_SKEW_SECONDS)
@@ -151,7 +164,7 @@ class ManualOtpReader:
 
         self.email = str(account.email or "").strip().lower()
         self.icloud_inbox = self.email.endswith("@icloud.com")
-        self.zkgmail_inbox = self.email.endswith("@zkgmail.com")
+        self.zkgmail_inbox = _is_qq_forwarded_email(self.email)
         self.log = log
         self.service_url = os.environ.get(
             "HME_BROWSER_SERVICE_URL", "http://127.0.0.1:8765"
@@ -172,12 +185,12 @@ class ManualOtpReader:
             self, "icloud_inbox", self.email.endswith("@icloud.com")
         )
         zkgmail_inbox = getattr(
-            self, "zkgmail_inbox", self.email.endswith("@zkgmail.com")
+            self, "zkgmail_inbox", _is_qq_forwarded_email(self.email)
         )
         self.log(
             "iCloud 验证码通道已连接；将自动扫描收件箱与垃圾邮件"
             if icloud_inbox
-            else "zkgmail.com 验证码通道已连接；将从 QQ 转发邮箱自动取码"
+            else f"{self.email.rsplit('@', 1)[-1]} 验证码通道已连接；将从 QQ 转发邮箱自动取码"
             if zkgmail_inbox
             else "手动验证码通道已连接；需要验证码时请在工作台输入"
         )
@@ -191,7 +204,7 @@ class ManualOtpReader:
             self, "icloud_inbox", self.email.endswith("@icloud.com")
         )
         zkgmail_inbox = getattr(
-            self, "zkgmail_inbox", self.email.endswith("@zkgmail.com")
+            self, "zkgmail_inbox", _is_qq_forwarded_email(self.email)
         )
         while time.time() < deadline:
             try:
@@ -269,10 +282,11 @@ class ManualOtpReader:
 def configure_registration_otp_reader(app_backend, registration_email: str) -> bool:
     """Route supported registration mail through the local code APIs."""
     target_email = str(registration_email or "").strip().lower()
-    if not target_email.endswith(("@gmail.com", "@icloud.com", "@zkgmail.com")):
+    if not target_email.endswith(("@gmail.com", "@icloud.com")) and not _is_qq_forwarded_email(target_email):
         return False
     icloud_inbox = target_email.endswith("@icloud.com")
-    zkgmail_inbox = target_email.endswith("@zkgmail.com")
+    zkgmail_inbox = _is_qq_forwarded_email(target_email)
+    forwarded_domain = target_email.rsplit("@", 1)[-1]
 
     worker_type = app_backend.OpenAIRegisterPayLinkWorker
     original_preconnect = worker_type._preconnect_otp_reader
@@ -297,7 +311,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
         worker.log(
             "iCloud 邮箱自动扫描 INBOX 与垃圾邮件取码"
             if icloud_inbox
-            else "zkgmail.com 邮箱从 352121354@qq.com 自动取码"
+            else f"{forwarded_domain} 邮箱从 352121354@qq.com 自动取码"
             if zkgmail_inbox
             else "Gmail 账号使用 SMSBower API 自动取码，不连接 Outlook Graph/IMAP"
         )
@@ -312,7 +326,7 @@ def configure_registration_otp_reader(app_backend, registration_email: str) -> b
         worker.log(
             "正在从 iCloud 转发收件箱与垃圾邮件等待验证码"
             if icloud_inbox
-            else "正在从 QQ 转发邮箱等待 zkgmail.com 验证码"
+            else f"正在从 QQ 转发邮箱等待 {forwarded_domain} 验证码"
             if zkgmail_inbox
             else "正在等待 SMSBower 返回 Gmail 验证码"
         )

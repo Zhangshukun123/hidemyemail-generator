@@ -1,0 +1,4 @@
+ROLLBACK_RESULT=restored-original
+RESTORED_FILE=/d/AI/hidemyemail-generator/verification/local-overwrite-update-20260818/ROLLBACK_COPY
+RESTORED_SHA256=80cc66fdfdeed377dc1faea9973335c151613aaa356563ffc6e2e4d3d0052996
+RESTORED_BEHAVIOR=start-web-ui.ps1;LIANDONG_SHOP_MERCHANT_TOKEN=not-forwarded;status=baseline

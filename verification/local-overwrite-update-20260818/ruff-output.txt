@@ -1,0 +1,141 @@
+F401 [*] `re` imported but unused
+  --> src\hidemyemail_generator\vendor\gptfree_register\core\codex_oauth.py:37:8
+   |
+35 | import json
+36 | import logging
+37 | import re
+   |        ^^
+38 | import secrets
+39 | import ssl
+   |
+help: Remove unused import: `re`
+
+F401 [*] `typing.Any` imported but unused
+  --> src\hidemyemail_generator\vendor\gptfree_register\core\codex_oauth.py:43:20
+   |
+41 | import urllib.parse
+42 | import urllib.request
+43 | from typing import Any
+   |                    ^^^
+44 |
+45 | log = logging.getLogger("codex_oauth")
+   |
+help: Remove unused import: `typing.Any`
+
+F541 [*] f-string without any placeholders
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\codex_oauth.py:515:21
+    |
+513 |             if consent_seen_at == 0.0:
+514 |                 consent_seen_at = time.time()
+515 |                 say(f"[codex-oauth] 进 consent 页，等 3s 看是否自动 redirect")
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+516 |                 time.sleep(3)
+517 |                 continue
+    |
+help: Remove extraneous `f` prefix
+
+F401 [*] `.sms.SmsActivation` imported but unused
+  --> src\hidemyemail_generator\vendor\gptfree_register\core\gpt_trial_protocol\flows.py:18:18
+   |
+16 | from .models import AccountInput, CheckoutInput, CheckoutLink, PhoneBindResult, SessionInfo
+17 | from .risk_tokens import RiskTokenProvider
+18 | from .sms import SmsActivation, SmsProvider
+   |                  ^^^^^^^^^^^^^
+   |
+help: Remove unused import: `.sms.SmsActivation`
+
+F821 Undefined name `EmailCodeResult`
+  --> src\hidemyemail_generator\vendor\gptfree_register\core\gpt_trial_protocol\local_email_code.py:51:11
+   |
+49 |         timeout: float = 90.0,
+50 |         **_unused: object,
+51 |     ) -> "EmailCodeResult":
+   |           ^^^^^^^^^^^^^^^
+52 |         from email_provider import fetch_otp  # type: ignore[import-not-found]
+   |
+
+F401 [*] `math` imported but unused
+  --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:25:8
+   |
+23 | import random
+24 | import time
+25 | import math
+   |        ^^^^
+26 | import asyncio
+27 | from datetime import datetime, timezone
+   |
+help: Remove unused import: `math`
+
+F401 [*] `base64` imported but unused
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:566:12
+    |
+564 |     key: cachedProof (requirements token)
+565 |     """
+566 |     import base64
+    |            ^^^^^^
+567 |     # 获取 XOR key (从 WeakMap 中获取, 对应 cachedProof)
+568 |     # 在 _init 中 cachedProof 被设置为 requirements token
+    |
+help: Remove unused import: `base64`
+
+E401 [*] Multiple imports on one line
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:584:5
+    |
+582 | def _run_vm_via_node(chat_req: dict, xor_key: str, vm_type: str, flow: str = "oauth_create_account") -> Optional[str]:
+583 |     """通过 Node.js 运行 sentinel SDK VM, 返回 t 或 so"""
+584 |     import subprocess, os, tempfile
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+585 |
+586 |     base_dir = os.path.dirname(os.path.abspath(__file__))
+    |
+help: Split imports
+
+F541 [*] f-string without any placeholders
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:932:11
+    |
+930 |     device_id = str(uuid.uuid4())
+931 |
+932 |     print(f"[1] 生成 requirements token...")
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+933 |     proof = generate_requirements_token(provider.sid)
+934 |     print(f"    ✓ proof: {proof[:60]}...")
+    |
+help: Remove extraneous `f` prefix
+
+F541 [*] f-string without any placeholders
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:936:11
+    |
+934 |     print(f"    ✓ proof: {proof[:60]}...")
+935 |
+936 |     print(f"\n[2] POST 到 sentinel backend...")
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+937 |     provider._device_id = device_id
+938 |     chat_req = await provider._post_proof(proof, "authorize_continue")
+    |
+help: Remove extraneous `f` prefix
+
+F541 [*] f-string without any placeholders
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:949:15
+    |
+948 |     if chat_req.get("proofofwork"):
+949 |         print(f"\n[3] 生成 enforcement token...")
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+950 |         p_token = generate_enforcement_token(chat_req, provider.sid)
+951 |         print(f"    ✓ p_token: {p_token[:60]}...")
+    |
+help: Remove extraneous `f` prefix
+
+F541 [*] f-string without any placeholders
+   --> src\hidemyemail_generator\vendor\gptfree_register\core\sentinel_token.py:953:15
+    |
+951 |         print(f"    ✓ p_token: {p_token[:60]}...")
+952 |
+953 |         print(f"\n[4] 构造完整 sentinel token...")
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+954 |         token = {
+955 |             "p": p_token,
+    |
+help: Remove extraneous `f` prefix
+
+Found 12 errors.
+[*] 11 fixable with the `--fix` option.

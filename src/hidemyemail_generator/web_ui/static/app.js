@@ -785,6 +785,7 @@
       this.legacyKeys = {
         registrationProvider: "hme_quick_registration_provider",
         registrationMode: "hme_quick_registration_mode",
+        protocolSetupCredentials: "hme_quick_protocol_setup_credentials",
         concurrency: "hme_quick_registration_concurrency",
         roxyTargetCount: "hme_quick_registration_target",
         registrationProxyMode: "hme_quick_registration_proxy_mode",
@@ -798,7 +799,6 @@
         targetAmount: "hme_quick_paypal_us_target_amount", postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
       };
     }
-
     getItem(key) {
       try {
         return this.storage.getItem(key);
@@ -827,6 +827,7 @@
       const snapshot = {
         registrationProvider: enumValue(candidate.registrationProvider, ["inventory", "zkgmail"], "inventory"),
         registrationMode: enumValue(candidate.registrationMode, ["headless", "headed", "roxy", "protocol"], "headless"),
+        protocolSetupCredentials: booleanValue(candidate.protocolSetupCredentials, false),
         concurrency: integerValue(candidate.concurrency, 1, 10, 1),
         targetCount: integerValue(candidate.targetCount, 1, 100, Number(roxyTargetCount)),
         roxyTargetCount,
@@ -845,7 +846,6 @@
       };
       return cardLinkCountryPolicy.normalizeSnapshot(snapshot);
     }
-
     load() {
       const legacy = Object.fromEntries(Object.entries(this.legacyKeys).map(([field, key]) =>
         [field, this.getItem(key)]
@@ -875,7 +875,6 @@
       }
       return snapshot;
     }
-
     restore() {
       return this.write(this.load());
     }
@@ -886,7 +885,6 @@
         savedAt: new Date().toISOString(),
       }));
     }
-
     saveCollapsed(collapsed) {
       const snapshot = this.load();
       snapshot.collapsed = Boolean(collapsed);
@@ -898,7 +896,7 @@
     constructor() {
       this.details = $("quickFlowConfigDetails");
       this.savedState = $("quickFlowSavedConfigState");
-      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding");
+      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding"); this.protocolSetupCredentials = $("quickProtocolSetupCredentials");
       this.fields = {
         registrationProvider: $("quickRegistrationProvider"),
         registrationMode: $("quickRegistrationMode"),
@@ -915,15 +913,14 @@
         targetAmount: $("quickCardLinkTargetAmount"),
       };
     }
-
     read() {
       return {
         ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) => [field, element.value])),
+        protocolSetupCredentials: Boolean(this.protocolSetupCredentials.checked),
         postPaymentPhoneBinding: Boolean(this.postPaymentPhoneBinding.checked),
         collapsed: !this.details.open,
       };
     }
-
     apply(snapshot) {
       Object.entries(this.fields).forEach(([field, element]) => {
         const value = String(snapshot[field] ?? "");
@@ -931,6 +928,7 @@
           element.value = value;
         }
       });
+      this.protocolSetupCredentials.checked = snapshot.protocolSetupCredentials === true;
       this.postPaymentPhoneBinding.checked = snapshot.postPaymentPhoneBinding === true;
       this.details.open = !snapshot.collapsed;
     }
@@ -945,13 +943,14 @@
       const summary = [
         this.selectedLabel("registrationProvider", current.registrationProvider),
         this.selectedLabel("registrationMode", current.registrationMode),
+        current.registrationMode === "protocol" ? (current.protocolSetupCredentials ? "密码 + 2FA" : "仅 Session") : "",
         "并发 " + current.concurrency + " / 目标 " + current.targetCount,
         this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
         "每号 " + current.extractionCount + " 次",
         current.postPaymentPhoneBinding ? "确认 Plus 后接码" : "确认 Plus 即结束",
         this.selectedLabel("registrationProxyMode", current.registrationProxyMode),
         this.selectedLabel("extractionProxyMode", current.extractionProxyMode),
-      ].join(" · ");
+      ].filter(Boolean).join(" · ");
       this.savedSummary.textContent = summary;
       this.savedSummary.title = summary;
       this.savedState.textContent = snapshot.savedAt
@@ -960,7 +959,7 @@
     }
 
     bind(onChange, onToggle) {
-      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.postPaymentPhoneBinding) onChange(); });
+      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.protocolSetupCredentials || event.target === this.postPaymentPhoneBinding) onChange(); });
       this.details.addEventListener("toggle", () => onToggle(!this.details.open));
     }
   }
@@ -1384,8 +1383,8 @@
       const zkgmailStatus = $("zkgmailStatus");
       zkgmailStatus.className = "badge " + (zkgmail.configured ? "success" : "warning");
       zkgmailStatus.textContent = zkgmail.configured
-        ? "QQ 自动取码已启用 · " + (zkgmail.forwardAccount || "352***4@qq.com")
-        : "QQ 接码未配置";
+        ? "QQ 自动取码 · " + (zkgmail.domain || "cclgmail.com") + " · " + (zkgmail.forwardAccount || "352***4@qq.com")
+        : (zkgmail.domain || "cclgmail.com") + " 已添加 · 待配置 QQ 授权码";
       const registration = state.registrationTask || {};
       const canStartNextRegistration = registration.canStartNext !== false;
       const activeRegistrationProcesses = Number(registration.runningCount || 0);
@@ -1403,16 +1402,16 @@
       $("zkgmailControls").hidden = registrationProvider !== "zkgmail";
       $("registerProviderButton").textContent = protocolMode
         ? registrationProvider === "zkgmail"
-          ? (protocolRegistration.starting ? "正在生成 zkgmail.com 邮箱…"
-            : protocolRegistration.running ? "zkgmail.com 协议注册运行中"
-            : "开始 zkgmail.com 协议注册")
+          ? (protocolRegistration.starting ? "正在生成 " + (zkgmail.domain || "cclgmail.com") + " 邮箱…"
+            : protocolRegistration.running ? (zkgmail.domain || "cclgmail.com") + " 协议注册运行中"
+            : "开始 " + (zkgmail.domain || "cclgmail.com") + " 协议注册")
           : (protocolRegistration.starting ? "正在领取 iCloud 库存邮箱…"
             : protocolRegistration.running ? "iCloud 协议注册运行中"
             : "开始 iCloud 协议注册")
         : registrationProvider === "gmail"
         ? (activeRegistrationProcesses ? "启动下一个 Gmail 注册进程" : "开始 Gmail 注册")
         : registrationProvider === "zkgmail"
-        ? (activeRegistrationProcesses ? "启动下一个 zkgmail.com 注册进程" : "开始 zkgmail.com 注册")
+        ? (activeRegistrationProcesses ? "启动下一个 " + (zkgmail.domain || "cclgmail.com") + " 注册进程" : "开始 " + (zkgmail.domain || "cclgmail.com") + " 注册")
         : (activeRegistrationProcesses ? "启动下一个 iCloud 注册进程" : "开始 iCloud 注册");
       if (roxyMode && registrationProvider === "icloud") {
         const roxyWindows = Number($("roxyConcurrency").value || 1);
@@ -1669,7 +1668,7 @@
       const planKind = item.accountType === "plus" ? "plus" : item.accountType === "free" ? "" : "warning";
       const sessionKind = item.sessionStatus === "ready" ? "success" : item.sessionStatus === "expired" ? "error" : "warning";
       const liandongUploaded = Boolean(item.liandongShopUploaded);
-      const liandongEligible = item.accountType === "plus" && item.hasPassword && item.hasTwoFactor;
+      const liandongEligible = item.accountType === "plus" && (!item.hasPassword || item.hasTwoFactor);
       const liandongLabel = liandongUploaded && item.liandongShopGoodsLabel ? "已上传 · " + item.liandongShopGoodsLabel : liandongUploaded ? "已上传" : "未上传";
       const main = '<tr data-selectable data-action="select-account" data-email="' + escapeHtml(item.email) +
         '" class="' + (selected ? "selected" : "") + '"><td><div class="identity-cell"><span class="avatar">' +
@@ -1680,7 +1679,7 @@
         badge(sessionName(item.sessionStatus), sessionKind) + '</td><td>' +
         badge(liandongLabel, liandongUploaded ? "success" : "warning") + '</td><td>' +
         formatDate(item.lastActivity || item.createdAt) + '</td><td><div class="row-actions"><button class="row-action" data-action="copy-email" data-email="' +
-        escapeHtml(item.email) + '">复制邮箱</button><button class="row-action" data-action="upload-liandong-shop" data-email="' + escapeHtml(item.email) + '" title="' + (liandongUploaded ? "该账号已经上传过" : liandongEligible ? "自动按接码状态添加到对应商品库存" : "需要 Plus、已确认密码和 2FA 密钥") + '"' + (liandongUploaded || !liandongEligible ? " disabled" : "") + '>' + (liandongUploaded ? "已上传" : "上传到小铺") + '</button><button class="row-action" data-action="select-account" data-email="' +
+        escapeHtml(item.email) + '">复制邮箱</button><button class="row-action" data-action="upload-liandong-shop" data-email="' + escapeHtml(item.email) + '" title="' + (liandongUploaded ? "该账号已经上传过" : liandongEligible ? "有密码上传密码和 2FA；无密码上传接码地址" : "需要 Plus；有密码时还必须启用 2FA") + '"' + (liandongUploaded || !liandongEligible ? " disabled" : "") + '>' + (liandongUploaded ? "已上传" : "上传到小铺") + '</button><button class="row-action" data-action="select-account" data-email="' +
         escapeHtml(item.email) + '">' + (selected ? "收起" : "更多") + "</button></div></td></tr>";
       if (!selected) return main;
       const twoFactorPrimaryAction = item.hasTwoFactor
@@ -1809,14 +1808,14 @@
       const zkgmailReady = Boolean(state.zkgmail?.configured);
       const registrationProviderReady = registrationProvider !== "zkgmail" || zkgmailReady;
       const registrationProviderLabel = registrationProvider === "zkgmail"
-        ? "zkgmail.com · QQ 接码" : "iCloud 库存";
+        ? (state.zkgmail?.domain || "cclgmail.com") + " · QQ 接码" : "iCloud 库存";
       $("quickFlowConfigBadge").textContent = registrationProviderLabel;
       $("quickFlowConfigBadge").className = registrationProviderReady
         ? "badge blue" : "badge warning";
       $("quickFlowSourceTag").textContent = registrationProviderLabel;
       $("quickRegistrationSourceDescription").textContent = registrationProvider === "zkgmail"
         ? registrationProviderReady
-          ? "生成 zkgmail.com catch-all 邮箱并从 QQ 转发邮箱自动取码"
+          ? "生成 " + (state.zkgmail?.domain || "cclgmail.com") + " catch-all 邮箱并从 QQ 转发邮箱自动取码"
           : "尚未配置：请先在账号管理设置 QQ 邮箱授权码"
         : "领取远端 iCloud 未注册库存并创建账号";
       const methodSelect = $("quickCardLinkMethod");
@@ -1978,7 +1977,9 @@
 
       const registrationMode = $("quickRegistrationMode").value || "headless";
       const protocolMode = registrationMode === "protocol";
+      const protocolSetupCredentials = protocolMode && Boolean($("quickProtocolSetupCredentials").checked);
       const roxyMode = registrationMode === "roxy";
+      $("quickProtocolSetupCredentialsLabel").hidden = !protocolMode;
       $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
       const quickTargetCount = $("quickRegistrationTargetCount");
       quickTargetCount.disabled = !roxyMode;
@@ -1999,11 +2000,13 @@
         extractionCount.value = "100";
       }
       $("quickRegistrationHint").textContent = !registrationProviderReady
-        ? "zkgmail.com 需要 QQ 邮箱授权码，请先在账号管理中完成配置。"
+        ? (state.zkgmail?.domain || "cclgmail.com") + " 需要 QQ 邮箱授权码，请先在账号管理中完成配置。"
         : protocolMode
         ? "Mail Auth 协议将获取 1 个" + (registrationProvider === "zkgmail"
-          ? " zkgmail.com 邮箱并从 QQ 邮箱自动取码"
-          : " iCloud 库存邮箱") + "，仅保存 Session/Cookie，无需启动浏览器。"
+          ? " " + (state.zkgmail?.domain || "cclgmail.com") + " 邮箱并从 QQ 邮箱自动取码"
+          : " iCloud 库存邮箱") + (protocolSetupCredentials
+            ? "，并设置密码与 TOTP 2FA，无需启动浏览器。"
+            : "，仅保存 Session/Cookie，无需启动浏览器。")
         : roxyMode
           ? "Roxy 使用账号管理中已保存的专用环境，最多 5 个并发窗口并按目标数分轮；" +
             (registrationProvider === "zkgmail" ? "验证码从 QQ 转发邮箱读取。" : "验证码从 iCloud 收件箱读取。")
@@ -2621,7 +2624,7 @@
         roxyRegistration: { available: false, configured: false, workspaces: [], profiles: [] },
         smsBower: { configured: false, service: "dr", domain: "gmail.com", maxPrice: 0.05 },
         paymentSms: { configured: false, provider: "", label: "", timeoutSeconds: 60, routing: {} },
-        zkgmail: { configured: false, domain: "zkgmail.com", forwardAccount: "352***4@qq.com" },
+        zkgmail: { configured: false, domain: "cclgmail.com", domains: ["cclgmail.com", "zkgmail.com"], forwardAccount: "352***4@qq.com" },
         verificationTask: { status: "idle", runtime: {} },
         paypal: { available: false, running: false, error: "", url: "/paypal-pay/" },
         inbox: { configured: false, codeCount: 0 },
@@ -3637,7 +3640,7 @@
           progress: Math.max(Number(flow.progress || 0), 10 + registrationProgress),
           currentEmail: task.currentEmail || taskEmails[0] ||
             (flow.registrationProvider === "zkgmail"
-              ? "正在生成 zkgmail.com 邮箱" : "正在领取 iCloud 库存邮箱"),
+              ? "正在生成 " + (this.store.state.zkgmail?.domain || "cclgmail.com") + " 邮箱" : "正在领取 iCloud 库存邮箱"),
           currentAction: latestMessage,
           message: latestMessage,
           lastTaskMessage: latestMessage,
@@ -3775,7 +3778,7 @@
         const registrationProvider = $("quickRegistrationProvider").value === "zkgmail"
           ? "zkgmail" : "inventory";
         const registrationProviderLabel = registrationProvider === "zkgmail"
-          ? "zkgmail.com" : "iCloud 库存";
+          ? (this.store.state.zkgmail?.domain || "cclgmail.com") : "iCloud 库存";
         if (registrationProvider === "zkgmail" && !this.store.state.zkgmail?.configured) {
           throw new Error("请先在账号管理中设置 QQ 邮箱授权码");
         }
@@ -3845,7 +3848,7 @@
           status: "running", phase: "prepare", progress: 5, taskId: "",
           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
           registrationProvider, targetAmount,
-          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true,
+          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true, protocolSetupCredentials: protocol && configSnapshot.protocolSetupCredentials === true,
           registrationMode: mode,
           registrationProxyMode: configSnapshot.registrationProxyMode,
           registrationProxyCountry: configSnapshot.registrationProxyCountry,
@@ -3869,7 +3872,7 @@
           await this.quickFlowHistoryPresenter.persist(flow);
           const data = protocol
             ? await this.api.post("/api/protocol-registration/start", {
-                provider: registrationProvider, concurrency: 1, setup_credentials: false,
+                provider: registrationProvider, concurrency: 1, setup_credentials: configSnapshot.protocolSetupCredentials === true,
               })
             : await this.api.post("/api/registration/start", {
                 label: registrationProviderLabel + "一键注册、提链并协议支付",
@@ -3986,7 +3989,7 @@
         const protocolMode = this.store.state.registrationMode === "protocol";
         if (protocolMode) {
           if (!["icloud", "zkgmail"].includes(source)) {
-            throw new Error("协议注册当前仅支持 iCloud 或 zkgmail.com 邮箱");
+            throw new Error("协议注册当前仅支持 iCloud 或 QQ 转发自有域名邮箱");
           }
           if (source === "zkgmail" && !zkgmail.configured) {
             throw new Error("请先设置 QQ 邮箱授权码");
@@ -3995,7 +3998,7 @@
           const previousTask = this.store.state.protocolRegistrationTask || {};
           const setupCredentials = $("protocolSetupCredentials").checked;
           const protocolProvider = source === "zkgmail" ? "zkgmail" : "inventory";
-          const protocolSourceLabel = source === "zkgmail" ? "zkgmail.com" : "iCloud 库存";
+          const protocolSourceLabel = source === "zkgmail" ? (zkgmail.domain || "cclgmail.com") : "iCloud 库存";
           const startedAt = new Date().toISOString();
           this.store.patch({
             protocolRegistrationTask: {
@@ -4028,7 +4031,7 @@
             });
             this.schedule("protocol-registration", () => this.loadProtocolRegistrationTask(), 500);
             return source === "zkgmail"
-              ? "已生成 zkgmail.com 邮箱并启动协议注册，验证码将从 QQ 邮箱自动读取"
+              ? "已生成 " + (zkgmail.domain || "cclgmail.com") + " 邮箱并启动协议注册，验证码将从 QQ 邮箱自动读取"
               : "已从库存领取 iCloud 邮箱并启动协议注册";
           } catch (error) {
             const finishedAt = new Date().toISOString();
@@ -4071,7 +4074,7 @@
           ? "smsbower" : source === "zkgmail" ? "zkgmail" : "inventory";
         const data = await this.api.post("/api/registration/start", {
           label: source === "gmail" ? "SMSBower Gmail 注册"
-            : source === "zkgmail" ? "zkgmail.com 邮箱注册" : "iCloud 邮箱注册",
+            : source === "zkgmail" ? (zkgmail.domain || "cclgmail.com") + " 邮箱注册" : "iCloud 邮箱注册",
           provider,
           ...options,
           concurrency: source === "gmail" ? 1 : options.concurrency,
@@ -4081,7 +4084,7 @@
         return source === "gmail"
           ? "已启动 SMSBower Gmail 获取与自动注册（" + (options.headless ? "无头" : "前台窗口") + "）"
           : source === "zkgmail"
-          ? "已启动 zkgmail.com 地址生成与 QQ 邮箱自动取码"
+          ? "已启动 " + (zkgmail.domain || "cclgmail.com") + " 地址生成与 QQ 邮箱自动取码"
           : "已启动 iCloud 库存邮箱注册";
       });
       this.commands.register("stop-protocol-registration", async () => {
@@ -4113,7 +4116,7 @@
           authorizationCode: authorizationCode.trim(),
         });
         this.store.patch({ zkgmail: data });
-        return "QQ 邮箱 IMAP 已连接，zkgmail.com 自动取码可用";
+        return "QQ 邮箱 IMAP 已连接，" + (data.domain || "cclgmail.com") + " 自动取码可用";
       });
       this.commands.register("submit-registration-code", async () => {
         const task = this.store.state.registrationTask;
@@ -4583,11 +4586,12 @@
         localStorage.setItem("hme_quick_registration_mode", event.target.value);
         this.renderer.renderQuickFlow(this.store.state);
       });
+      $("quickProtocolSetupCredentials").addEventListener("change", () => this.renderer.renderQuickFlow(this.store.state));
       $("quickRegistrationProvider").addEventListener("change", (event) => {
         localStorage.setItem("hme_quick_registration_provider", event.target.value);
         this.renderer.renderQuickFlow(this.store.state);
         this.toast(event.target.value === "zkgmail"
-          ? "一键流水线邮箱来源已切换为 zkgmail.com"
+          ? "一键流水线邮箱来源已切换为 " + (this.store.state.zkgmail?.domain || "cclgmail.com")
           : "一键流水线邮箱来源已切换为 iCloud 库存");
       });
       $("quickRegistrationProxyMode").addEventListener("change", async (event) => {
@@ -4738,7 +4742,7 @@
             setTimeout(() => $("roxyProfile").focus(), 0);
           }
           this.toast(mode === "protocol"
-            ? "已切换为协议注册，可选择 iCloud 或 zkgmail.com 邮箱"
+            ? "已切换为协议注册，可选择 iCloud 或 QQ 转发自有域名邮箱"
             : mode === "roxy" ? "已切换为 Roxy 随机指纹注册"
             : mode === "headless" ? "已切换为无头浏览器注册" : "已切换为有头浏览器注册");
         });

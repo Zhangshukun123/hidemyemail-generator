@@ -155,7 +155,11 @@ from .smsbower import (
     SMSBowerMailClient,
 )
 from .web_ui import build_app_page, build_login_page
-from .zkgmail import ZKGMAIL_DOMAIN, ZkgmailConfigStore, ZkgmailMailClient
+from .zkgmail import (
+    DEFAULT_QQ_FORWARD_DOMAINS,
+    ZkgmailConfigStore,
+    ZkgmailMailClient,
+)
 
 
 SESSION_COOKIE_NAME = "hme_session"
@@ -3083,7 +3087,10 @@ def _gpt_account_export(db_file: Path, email: str = "") -> list[str]:
     return lines
 
 
-def _valid_supported_account_email(email: str) -> bool:
+def _valid_supported_account_email(
+    email: str,
+    extra_domains: tuple[str, ...] | list[str] = (),
+) -> bool:
     target = str(email or "").strip().lower()
     if len(target) > 320 or not re.fullmatch(
         r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}"
@@ -3091,12 +3098,18 @@ def _valid_supported_account_email(email: str) -> bool:
         target,
     ):
         return False
-    return target.rsplit("@", 1)[1] in {"icloud.com", "gmail.com", ZKGMAIL_DOMAIN}
+    supported_domains = {"icloud.com", "gmail.com", *DEFAULT_QQ_FORWARD_DOMAINS}
+    supported_domains.update(str(domain or "").strip().lower() for domain in extra_domains)
+    return target.rsplit("@", 1)[1] in supported_domains
 
 
-def _workbench_import_payload(record: dict, email: str) -> dict:
+def _workbench_import_payload(
+    record: dict,
+    email: str,
+    extra_domains: tuple[str, ...] | list[str] = (),
+) -> dict:
     target = str(email or "").strip().lower()
-    if not _valid_supported_account_email(target):
+    if not _valid_supported_account_email(target, extra_domains):
         raise RuntimeError("邮箱地址无效")
     session = account_session(record)
     access_token = account_session_access_token(record)
@@ -4295,6 +4308,11 @@ def create_app(
     app["plus_account_exporter"] = AccountExportPresenter(app["db_file"])
     app["zkgmail_config_store"] = ZkgmailConfigStore(app["db_file"])
     app["zkgmail_client"] = ZkgmailMailClient(app["zkgmail_config_store"])
+
+    def valid_account_email(email: str) -> bool:
+        domains = app["zkgmail_config_store"].public_state().get("domains", [])
+        return _valid_supported_account_email(email, domains)
+
     paypal_source = (
         Path(paypal_project_dir).resolve()
         if paypal_project_dir
@@ -5259,7 +5277,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -5468,7 +5486,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -5488,7 +5506,7 @@ def create_app(
             )
 
         async with app["delete_lock"]:
-            if email.endswith(("@gmail.com", f"@{ZKGMAIL_DOMAIN}")):
+            if email.endswith("@gmail.com") or getattr(app["zkgmail_client"], "supports_email", lambda value: value.endswith("@zkgmail.com"))(email):
                 gmail_account = email.endswith("@gmail.com")
                 if gmail_account:
                     await app["smsbower_client"].forget_email(email)
@@ -5503,7 +5521,7 @@ def create_app(
                         "message": (
                             "Gmail 本地账号凭据及 SMSBower 激活记录已删除"
                             if gmail_account
-                            else "zkgmail.com 本地账号凭据已删除"
+                            else "QQ 转发邮箱本地账号凭据已删除"
                         ),
                     }
                 )
@@ -5629,7 +5647,7 @@ def create_app(
                 "code": code,
                 "receivedAt": datetime.now(timezone.utc).isoformat(),
             }, "", 200
-        if email.endswith(f"@{ZKGMAIL_DOMAIN}") and len(email) <= 320:
+        if getattr(app["zkgmail_client"], "supports_email", lambda value: value.endswith("@zkgmail.com"))(email) and len(email) <= 320:
             try:
                 code = await app["zkgmail_client"].poll_next_code(
                     email,
@@ -5638,7 +5656,7 @@ def create_app(
             except RuntimeError as error:
                 return None, str(error), 502
             if not code:
-                return None, "QQ 邮箱中的 zkgmail.com 验证码尚未到达", 404
+                return None, "QQ 转发邮箱中的验证码尚未到达", 404
             return {
                 "code": code,
                 "receivedAt": datetime.now(timezone.utc).isoformat(),
@@ -5894,7 +5912,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(body.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -5907,7 +5925,11 @@ def create_app(
             load_account_record, app["db_file"], email
         )
         try:
-            payload = _workbench_import_payload(record, email)
+            payload = _workbench_import_payload(
+                record,
+                email,
+                app["zkgmail_config_store"].public_state().get("domains", []),
+            )
         except RuntimeError as error:
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
@@ -6034,7 +6056,7 @@ def create_app(
                 {"ok": False, "error": "目标金额必须是非负整数，留空表示不校验"},
                 status=400,
             )
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -6613,7 +6635,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(body.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email) or not email.endswith(
+        if not valid_account_email(email) or not email.endswith(
             "@icloud.com"
         ):
             return web.json_response(
@@ -6807,7 +6829,7 @@ def create_app(
                     "error": (
                         "SMSBower Gmail 验证码尚未到达"
                         if provider == "smsbower"
-                        else "正在从 QQ 邮箱等待 zkgmail.com 验证码"
+                        else "正在从 QQ 邮箱等待转发验证码"
                         if provider == "zkgmail"
                         else "等待手动输入验证码"
                     ),
@@ -6883,7 +6905,6 @@ def create_app(
         setup_credentials = payload.get(
             "setup_credentials", payload.get("setupCredentials", False)
         ) is True
-
         provider = str(payload.get("provider") or "").strip().lower()
         if provider not in {"", "inventory", "zkgmail"}:
             return web.json_response(
@@ -6913,22 +6934,19 @@ def create_app(
             try:
                 zkgmail_email = str(
                     await app["zkgmail_client"].acquire_email(
-                        "zkgmail.com 协议注册"
+                        "QQ 转发邮箱协议注册"
                     )
                 ).strip().lower()
             except (ValueError, RuntimeError) as error:
                 return web.json_response(
                     {"ok": False, "error": str(error)}, status=409
                 )
-            if not re.fullmatch(
-                rf"[a-z0-9][a-z0-9._-]{{0,62}}@{re.escape(ZKGMAIL_DOMAIN)}",
-                zkgmail_email,
-            ):
+            if not valid_account_email(zkgmail_email):
                 return web.json_response(
                     {
                         "ok": False,
                         "code": "zkgmail_generation_failed",
-                        "error": "未生成有效的 zkgmail.com 注册邮箱",
+                        "error": "未生成有效的 QQ 转发注册邮箱",
                     },
                     status=409,
                 )
@@ -7202,9 +7220,12 @@ def create_app(
         try:
             payload = await request.json()
             state = await app["zkgmail_client"].configure(
-                payload.get("authorizationCode")
-                if "authorizationCode" in payload
-                else None
+                authorization_code=(
+                    payload.get("authorizationCode")
+                    if "authorizationCode" in payload
+                    else None
+                ),
+                domain=payload.get("domain") if "domain" in payload else None,
             )
         except (json.JSONDecodeError, web.HTTPBadRequest):
             return web.json_response(
@@ -7215,7 +7236,7 @@ def create_app(
         except RuntimeError as error:
             return web.json_response({"ok": False, "error": str(error)}, status=502)
         return web.json_response(
-            {"ok": True, **state, "message": "QQ 邮箱 IMAP 登录成功，zkgmail.com 自动取码已启用"}
+            {"ok": True, **state, "message": f"QQ 邮箱 IMAP 登录成功，{state['domain']} 自动取码已启用"}
         )
 
     async def verification_status(_: web.Request) -> web.Response:
@@ -7264,7 +7285,7 @@ def create_app(
             emails = []
             for value in raw_emails:
                 email = str(value or "").strip().lower()
-                if not _valid_supported_account_email(email):
+                if not valid_account_email(email):
                     return web.json_response(
                         {"ok": False, "error": "验证账号列表包含无效邮箱"},
                         status=400,
@@ -7304,7 +7325,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -7494,7 +7515,7 @@ def create_app(
                 {"ok": False, "error": "请求格式无效"}, status=400
             )
         email = str(payload.get("email") or "").strip().lower()
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )
@@ -8517,7 +8538,7 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "支付后接码选项必须是布尔值"}, status=400
             )
-        if not _valid_supported_account_email(email):
+        if not valid_account_email(email):
             return web.json_response(
                 {"ok": False, "error": "邮箱地址无效"}, status=400
             )

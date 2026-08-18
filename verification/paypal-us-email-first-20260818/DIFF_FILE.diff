@@ -1,0 +1,2496 @@
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__elevation_flow.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__elevation_flow.py"
+index a7940be..232f786 100644
+--- "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__elevation_flow.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__elevation_flow.py"
+@@ -33,12 +33,19 @@ class IdentityElevationPayPalFlow(PayPalFlow):
+         # downgrade the same checkout back to ANONYMOUS. Keep the established
+         # member session and let the final BuyerContext/authorize calls proceed
+         # against the existing EC cookies instead of navigating again.
+-        if (
+-            str(getattr(self.address, "country", "") or "").upper() in {"AE", "BA"}
++        country = str(getattr(self.address, "country", "") or "").upper()
++        preserve_pre_hydrated = bool(
++            country in {"AE", "BA"}
+             and getattr(self, "_ae_pre_hydrated", False)
+-        ):
++        )
++        preserve_us_email_first = bool(
++            country == "US"
++            and getattr(self.state, "member_authenticated", False)
++            and getattr(self.state, "funding_selected", False)
++        )
++        if preserve_pre_hydrated or preserve_us_email_first:
+             logger.info(
+-                "AE/BA pre-hydrated member session preserved; skipping destructive review navigation"
++                "Pre-hydrated member session preserved; skipping destructive review navigation"
+             )
+             return SimpleNamespace(
+                 status_code=204,
+@@ -243,6 +250,30 @@ class IdentityElevationPayPalFlow(PayPalFlow):
+         logger.info("--- Identity elevation: guest checkout -> member checkout ---")
+         self.session.set_euat_token(self.state.euat_token)
+ 
++        country = str(getattr(self.address, "country", "") or "").upper()
++        if (
++            country == "US"
++            and self.state.member_authenticated
++            and self.state.funding_selected
++        ):
++            logger.info(
++                "US email-first member/funding context is already hydrated; validating without signup re-entry"
++            )
++            immediate_context = self._query_elevated_context(
++                token,
++                self._build_member_review_url(),
++            )
++            if not immediate_context["buyer_ready"]:
++                raise RuntimeError(
++                    "IDENTITY_ELEVATION_FAILED: US buyer context was lost"
++                )
++            if not immediate_context["funding_selected"]:
++                raise RuntimeError(
++                    "US_FUNDING_INSTRUMENT_MISSING: selected funding was lost"
++                )
++            self._last_elevation_context = immediate_context
++            return immediate_context
++
+         # Re-enter checkoutweb as an authenticated member on the exact EC token.
+         signup_url = self.state.signup_url or (
+             "https://www.paypal.com/checkoutweb/signup?" + urllib.parse.urlencode({
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__flow.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__flow.py"
+index 625d902..51bd765 100644
+--- "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__flow.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__flow.py"
+@@ -4,8 +4,8 @@ Implements the complete protocol:
+   Phase 0: DataDome verification + initial page load
+   Phase 1: Device fingerprint + Tealeaf + hCaptcha
+   Phase 2: Create account (email submission → signup page)
+-  Phase 3: Fill signup form + submit (triggers 2FA SMS)
+-  Phase 4: OTP verification + final authorize mutation
++  Phase 3: US email-first member login/card binding, or legacy signup + 2FA
++  Phase 4: buyer/funding verification + final authorize mutation
+ """
+ import re
+ import time
+@@ -26,6 +26,11 @@ from paypal.models import (
+ )
+ from paypal.payment_completion import is_trusted_openai_checkout_url
+ from paypal.onboarding_compat import OnboardingCompatibilityPresenter
++from paypal.us_email_first import (
++    MemberAuthenticationResult,
++    UsEmailFirstModel,
++    UsEmailFirstPresenter,
++)
+ from paypal.session import PayPalSession, sanitize_for_log
+ from paypal.proxy import build_proxy_config, ProxyConfig
+ from paypal.fingerprint import (
+@@ -45,6 +50,7 @@ from paypal.runtime_country_resolver import augment_dynamic_kyc_from_errors
+ from paypal.graphql import (
+     CHECKOUT_SESSION_DATA_QUERY,
+     BUYER_CONTEXT_QUERY,
++    BUYER_FUNDING_CONTEXT_QUERY,
+     GRIFFIN_METADATA_QUERY,
+     SUPPORTED_FUNDING_SOURCES_QUERY,
+     DEFERRED_FEATURE_QUERY,
+@@ -191,6 +197,11 @@ class PayPalFlow:
+             country=self.country,
+             locale=self.locale,
+         )
++        self.us_email_first_model = UsEmailFirstModel()
++        self.us_email_first_presenter = UsEmailFirstPresenter(
++            self.us_email_first_model,
++            self,
++        )
+ 
+     def close(self):
+         self.session.close()
+@@ -476,11 +487,12 @@ class PayPalFlow:
+ 
+     def _extract_modxo_action_ids(self, html: str, base_url: str):
+         """Discover deployment-specific Next server-action IDs from page chunks."""
++        self._sync_submit_email_action_id()
+         action_aliases = {
+             "show_create_account_action_id": (
+                 "showCreateAccountAction", "showCreateAccount", "createAccountAction",
+             ),
+-            "create_user_action_id": (
++            "submit_email_action_id": (
+                 "createUserAction", "createUser", "continueToPaymentAction",
+             ),
+         }
+@@ -502,12 +514,15 @@ class PayPalFlow:
+                 if candidates:
+                     action_id = min(candidates, key=lambda item: item[0])[1]
+                     setattr(self.state, attr, action_id)
++                    if attr == "submit_email_action_id":
++                        self.state.create_user_action_id = action_id
+                     logger.info("ModXO action {} discovered", attr)
+                     changed = True
+             return changed
+ 
+         scan(html or "")
+-        if self.state.show_create_account_action_id and self.state.create_user_action_id:
++        self._sync_submit_email_action_id()
++        if self.state.show_create_account_action_id and self.state.submit_email_action_id:
+             return
+ 
+         script_urls: list[str] = []
+@@ -533,11 +548,161 @@ class PayPalFlow:
+                 )
+                 if js_resp.status_code == 200:
+                     scan(js_resp.text)
+-                if self.state.show_create_account_action_id and self.state.create_user_action_id:
++                    self._sync_submit_email_action_id()
++                if self.state.show_create_account_action_id and self.state.submit_email_action_id:
+                     return
+             except Exception as e:
+                 logger.debug("Failed to inspect ModXO chunk {}: {}", script_url, e)
+ 
++    def _sync_submit_email_action_id(self) -> str:
++        """Keep the renamed ModXO email action and its legacy alias aligned."""
++        action_id = str(
++            getattr(self.state, "submit_email_action_id", "")
++            or getattr(self.state, "create_user_action_id", "")
++            or ""
++        )
++        self.state.submit_email_action_id = action_id
++        self.state.create_user_action_id = action_id
++        return action_id
++
++    @staticmethod
++    def _extract_ec_token_from_action_response(response) -> str:
++        """Return an EC token explicitly emitted by one ModXO action response."""
++        decoded_url = urllib.parse.unquote(str(getattr(response, "url", "") or ""))
++        decoded_text = urllib.parse.unquote(str(getattr(response, "text", "") or ""))
++        for value in (decoded_url, decoded_text):
++            match = re.search(
++                r'(?:token=|[?&]token%3D|\\?"ecToken\\?"\s*:\s*\\?"?)(EC-[A-Za-z0-9_-]+)',
++                value,
++                re.I,
++            ) or re.search(r"EC-[A-Za-z0-9_-]+", value, re.I)
++            if match:
++                return match.group(1) if match.lastindex else match.group(0)
++        return ""
++
++    @classmethod
++    def _email_action_evidence(cls, response) -> dict[str, str | bool]:
++        """Normalize evidence proving PayPal accepted the email server action."""
++        headers = getattr(response, "headers", {}) or {}
++
++        def header(name: str) -> str:
++            return str(
++                headers.get(name)
++                or headers.get(name.lower())
++                or headers.get(name.title())
++                or ""
++            )
++
++        action_redirect = header("x-action-redirect") or header("Location")
++        onboarding_url = cls._extract_onboarding_redirect(
++            str(getattr(response, "text", "") or "")
++        )
++        ec_token = cls._extract_ec_token_from_action_response(response)
++        try:
++            status_accepted = 200 <= int(getattr(response, "status_code", 0)) < 400
++        except (TypeError, ValueError):
++            status_accepted = False
++        return {
++            "verified": bool(
++                status_accepted and (action_redirect or onboarding_url or ec_token)
++            ),
++            "action_redirect": action_redirect,
++            "onboarding_url": onboarding_url,
++            "ec_token": ec_token,
++        }
++
++    def _submit_us_email_server_actions(self, pay_url: str):
++        """Submit the US ModXO email-first actions and return verified context."""
++        submit_email_action_id = self._sync_submit_email_action_id()
++        if not self.state.show_create_account_action_id or not submit_email_action_id:
++            return None
++
++        logger.info("Submitting US email-first Pay_With_Card server action...")
++        pay_with_card_url = (
++            f"{pay_url}&paypal_client_cfci="
++            "modxo_vaulted_not_recurring-Pay_With_Card"
++        )
++        pay_resp = self.session.post(
++            pay_with_card_url,
++            files=[
++                ("_1_ctxId", (None, self.state.ctx_id)),
++                ("_1_formName", (None, "createAccountAction")),
++                ("0", (None, '["$K1"]')),
++            ],
++            headers={
++                "Accept": "text/x-component",
++                "Origin": "https://www.paypal.com",
++                "Referer": pay_url,
++                "Next-Action": self.state.show_create_account_action_id,
++            },
++        )
++        if not 200 <= int(pay_resp.status_code) < 400:
++            raise RuntimeError(
++                f"US Pay_With_Card action returned HTTP {pay_resp.status_code}"
++            )
++        if (
++            pay_resp.status_code in (301, 302, 303, 307, 308)
++            or pay_resp.headers.get("x-action-redirect")
++        ):
++            self._follow_modxo_action_redirect(pay_resp, pay_url)
++
++        logger.info("Submitting US email-first Continue_To_Payment server action...")
++        continue_url = (
++            f"{pay_url}&paypal_client_cfci="
++            "modxo_vaulted_not_recurring-Continue_To_Payment"
++        )
++        rsc_resp = self.session.post(
++            continue_url,
++            files=[
++                ("_1_ctxId", (None, self.state.ctx_id)),
++                ("_1_token", (None, self.ba_token)),
++                ("_1_login_email", (None, self.user.email)),
++                ("_1_formName", (None, "createAccount")),
++                (
++                    "0",
++                    (
++                        None,
++                        f'["$K1",{{"emailSubmitTime":{int(time.time() * 1000)}}}]',
++                    ),
++                ),
++            ],
++            headers={
++                "Accept": "text/x-component",
++                "Origin": "https://www.paypal.com",
++                "Referer": pay_with_card_url,
++                "Next-Action": submit_email_action_id,
++            },
++        )
++        evidence = self._email_action_evidence(rsc_resp)
++        if not evidence["verified"]:
++            logger.warning(
++                "US email action returned no redirect, onboarding route, or EC evidence"
++            )
++            return None
++
++        self.state.email_submitted = True
++        self.state.us_onboarding_stage = "email_submitted"
++        emitted_ec_token = str(evidence["ec_token"] or "")
++        if emitted_ec_token:
++            self.state.ec_token = emitted_ec_token
++
++        onboarding_url = str(evidence["onboarding_url"] or "")
++        if onboarding_url:
++            onboarding_url = urllib.parse.urljoin(
++                str(getattr(rsc_resp, "url", "") or pay_url), onboarding_url
++            )
++            return self.session.get(
++                onboarding_url,
++                headers={
++                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
++                    "Referer": pay_url,
++                    "Upgrade-Insecure-Requests": "1",
++                },
++            )
++        if evidence["action_redirect"]:
++            return self._follow_modxo_action_redirect(rsc_resp, continue_url)
++        return rsc_resp
++
+     def _card_issuer_type(self) -> str:
+         """PayPal GraphQL CardIssuerType enum."""
+         prefix2 = int(self.card.number[:2]) if self.card.number[:2].isdigit() else 0
+@@ -1581,20 +1746,68 @@ class PayPalFlow:
+         """Submit 'Create Account' action to get to the signup page."""
+         logger.info("--- Phase 2: Create account flow ---")
+ 
+-        resp = getattr(self, "_approve_response", None) if self.state.ec_token else None
+-        compact_fallback_used = bool(resp is not None and self.state.ec_token)
++        us_email_first = self.country == "US"
++        bootstrap_response = getattr(self, "_approve_response", None)
++        resp = (
++            bootstrap_response
++            if self.state.ec_token
++            and (not us_email_first or self.state.email_submitted)
++            else None
++        )
++        compact_fallback_used = bool(
++            not us_email_first and resp is not None and self.state.ec_token
++        )
+         if resp is not None and self.state.ec_token:
+             logger.info("Using EC Token from the pure-protocol Next.js/RSC bootstrap")
++        elif us_email_first and self.state.ec_token and not self.state.email_submitted:
++            logger.info(
++                "US bootstrap EC found; email action is still required before signup"
++            )
+         pay_url = (
+             f"https://www.paypal.com/pay/?ssrt={self.state.ssrt}"
+             f"&token={self.ba_token}&ul=1&ctxId={self.state.ctx_id}"
+             f"&country.x={self.address.country}"
+         )
+ 
++        # A bootstrap EC proves only that the checkout exists.  It does not
++        # prove that the current US email was submitted through ModXO.  Always
++        # discover and run the two email-first server actions before accepting
++        # that EC as signup context.
++        if us_email_first and not self.state.email_submitted:
++            try:
++                self._extract_modxo_action_ids(
++                    getattr(self, "_approve_html", ""),
++                    getattr(self, "_approve_url", pay_url),
++                )
++            except Exception as action_scan_error:
++                logger.warning(
++                    "US email-first ModXO action scan failed: {}", action_scan_error
++                )
++            if not (
++                self.state.show_create_account_action_id
++                and self._sync_submit_email_action_id()
++            ):
++                raise RuntimeError(
++                    "US_EMAIL_ACTION_DISCOVERY_FAILED: PayPal did not expose the "
++                    "email-first ModXO server actions"
++                )
++            try:
++                resp = self._submit_us_email_server_actions(pay_url)
++            except Exception as email_action_error:
++                raise RuntimeError(
++                    "US_EMAIL_ACTION_FAILED: PayPal rejected the email-first "
++                    "ModXO server-action sequence"
++                ) from email_action_error
++            if resp is None or not self.state.email_submitted:
++                raise RuntimeError(
++                    "US_EMAIL_ACTION_NOT_VERIFIED: no action redirect, RSC "
++                    "onboarding route, or EC response was returned"
++                )
++
+         # Prefer the server-provided guest onboarding route. This matches the
+         # current PayPal flow and avoids depending on rotating Next-Action IDs.
+         try:
+-            if self.state.onboarding_url:
++            if not us_email_first and self.state.onboarding_url:
+                 logger.info("Following server-provided guest onboarding route...")
+                 resp = self.session.get(
+                     self.state.onboarding_url,
+@@ -1620,7 +1833,14 @@ class PayPalFlow:
+ 
+         # Only crawl Next.js chunks if the server-provided onboarding route
+         # failed. Normal tasks avoid those extra requests entirely.
+-        if resp is None and not (self.state.show_create_account_action_id and self.state.create_user_action_id):
++        if (
++            not us_email_first
++            and resp is None
++            and not (
++                self.state.show_create_account_action_id
++                and self.state.create_user_action_id
++            )
++        ):
+             try:
+                 self._extract_modxo_action_ids(
+                     getattr(self, "_approve_html", ""),
+@@ -1631,7 +1851,12 @@ class PayPalFlow:
+ 
+         # Fallback to browser-like Next server actions when the direct route is
+         # unavailable but fresh action IDs were discovered.
+-        if resp is None and self.state.show_create_account_action_id and self.state.create_user_action_id:
++        if (
++            not us_email_first
++            and resp is None
++            and self.state.show_create_account_action_id
++            and self.state.create_user_action_id
++        ):
+             try:
+                 logger.info("Submitting browser-like Pay_With_Card server action...")
+                 pay_with_card_url = f"{pay_url}&paypal_client_cfci=modxo_vaulted_not_recurring-Pay_With_Card"
+@@ -1684,6 +1909,11 @@ class PayPalFlow:
+                 logger.warning("Browser-like ModXO server-action path failed: {}", e)
+                 resp = None
+ 
++        if resp is None and us_email_first:
++            raise RuntimeError(
++                "US_EMAIL_ACTION_NOT_VERIFIED: compact onboarding without email "
++                "is disabled for US"
++            )
+         if resp is None:
+             logger.warning("Using compact guest onboarding fallback")
+             compact_fallback_used = True
+@@ -1736,7 +1966,11 @@ class PayPalFlow:
+         # before the EC checkout is created. Previously that response prevented
+         # the compact form fallback from running at all. Retry the compact
+         # create-account route once, then re-check both redirects and content.
+-        if not self.state.ec_token and not compact_fallback_used:
++        if (
++            not us_email_first
++            and not self.state.ec_token
++            and not compact_fallback_used
++        ):
+             logger.warning("Guest onboarding page contained no EC token; retrying compact create-account route")
+             compact_url = (
+                 f"https://www.paypal.com/pay?ssrt={self.state.ssrt}"
+@@ -1916,6 +2150,117 @@ class PayPalFlow:
+         except Exception as e:
+             logger.warning(f"AddressAutocompleteFromPostalCodeQuery failed: {e}")
+ 
++    def _build_member_review_url(self) -> str:
++        """Build the clean authenticated review route for the current EC."""
++
++        params = {
++            "ssrt": self.state.ssrt,
++            "ul": "1",
++            "locale.x": self.locale,
++            "country.x": self.address.country,
++            "ba_token": self.ba_token,
++            "token": self.state.ec_token,
++            "rcache": "1",
++            "cookieBannerVariant": "hidden",
++            "fromSignupLite": "true",
++            "billingLite": "1",
++        }
++        return (
++            "https://www.paypal.com/webapps/hermes?"
++            + urllib.parse.urlencode(params)
++            + "#/billingweb/review"
++        )
++
++    def acquire_phone_after_email(self) -> str:
++        """View hook: CLI callers must already provide the post-email phone."""
++
++        if not self.state.email_submitted:
++            raise RuntimeError(
++                "US_EMAIL_NOT_SUBMITTED: phone acquisition requires the email step"
++            )
++        return str(self.user.phone or "")
++
++    def authenticate_member_with_phone(
++        self, signup_url: str
++    ) -> MemberAuthenticationResult:
++        """View hook: synchronize an authenticated official-member session."""
++
++        recovered = bool(self.complete_member_onboarding(signup_url))
++        return MemberAuthenticationResult(
++            phone_verified=bool(recovered and self.user.phone),
++            user_id=str(self.state.user_id or ""),
++            euat_token=str(self.state.euat_token or ""),
++        )
++
++    def bind_card_in_authenticated_session(self, review_url: str) -> str:
++        """View hook: verify a selected funding instrument in member context."""
++
++        context = self._sync_buyer_funding_context(
++            self.state.ec_token or self.ba_token,
++            review_url,
++        )
++        return str(context.get("funding_instrument_id") or "")
++
++    def _us_onboarding_updated(self, model: UsEmailFirstModel) -> None:
++        """Optional View hook for publishing non-secret onboarding progress."""
++
++        return None
++
++    def _phase3_us_email_first(self) -> None:
++        """Prepare US authorization with the explicit email-first MVP."""
++
++        logger.info("--- Phase 3: US email-first member onboarding ---")
++        model = getattr(self, "us_email_first_model", None)
++        if not isinstance(model, UsEmailFirstModel):
++            model = UsEmailFirstModel()
++            self.us_email_first_model = model
++        presenter = getattr(self, "us_email_first_presenter", None)
++        if not isinstance(presenter, UsEmailFirstPresenter):
++            presenter = UsEmailFirstPresenter(model, self)
++            self.us_email_first_presenter = presenter
++
++        model.email_submitted = bool(self.state.email_submitted)
++        model.phone = str(model.phone or self.user.phone or "")
++        model.phone_verified = bool(
++            model.phone_verified or self.state.phone_login_verified
++        )
++        model.buyer_user_id = str(
++            model.buyer_user_id or self.state.user_id or ""
++        )
++        model.euat_token = str(
++            model.euat_token or self.state.euat_token or ""
++        )
++        model.funding_instrument_id = str(
++            model.funding_instrument_id
++            or self.state.funding_instrument_id
++            or ""
++        )
++
++        try:
++            prepared = presenter.prepare_authorization(
++                signup_url=self.state.signup_url or self._build_signup_url(),
++                review_url=self._build_member_review_url(),
++            )
++        finally:
++            self._us_onboarding_updated(model)
++        self.state.phone_login_verified = prepared.phone_verified
++        self.state.member_authenticated = bool(
++            prepared.buyer_user_id and prepared.euat_token
++        )
++        self.state.member_created = bool(prepared.buyer_user_id)
++        self.state.user_id = prepared.buyer_user_id
++        self.session.set_euat_token(prepared.euat_token)
++        self.state.funding_instrument_id = prepared.funding_instrument_id
++        self.state.funding_selected = bool(prepared.funding_instrument_id)
++        self.state.us_onboarding_stage = prepared.stage
++        send_analytics_ts(
++            self.session,
++            "main:billing:hagrid:billingwithoutpurchase:member:review",
++            self.ba_token,
++            ec_token=self.state.ec_token,
++            user_id=self.state.user_id,
++        )
++
+     def _phase3_signup_and_2fa(self):
+         """Submit the signup form and trigger 2FA SMS.
+ 
+@@ -1926,6 +2271,9 @@ class PayPalFlow:
+         """
+         logger.info("--- Phase 3: Signup form + 2FA ---")
+ 
++        if self.country == "US":
++            return self._phase3_us_email_first()
++
+         # Send Tealeaf to simulate form interaction
+         signup_url = self.state.signup_url or "https://www.paypal.com/checkoutweb/signup"
+         send_tealeaf_data(self.session, signup_url)
+@@ -2010,6 +2358,114 @@ class PayPalFlow:
+         logger.warning("Buyer-context refresh completed without a buyer userId")
+         return False
+ 
++    def _sync_buyer_funding_context(self, token: str, referer: str) -> dict:
++        """Refresh buyer and selected funding facts for authorization gating."""
++
++        empty = {
++            "buyer_ready": False,
++            "funding_selected": False,
++            "funding_instrument_id": "",
++            "funding_last_digits": "",
++            "funding_type": "",
++            "available_instrument_ids": [],
++            "errors": [],
++        }
++        if not self.state.euat_token:
++            logger.warning(
++                "Buyer/funding sync skipped because the member access token is missing"
++            )
++            return empty
++
++        self.session.set_euat_token(self.state.euat_token)
++        try:
++            result = self.session.graphql(
++                "BuyerFundingContextQuery",
++                BUYER_FUNDING_CONTEXT_QUERY,
++                {"token": token},
++                extra_headers={
++                    "Referer": referer,
++                    "X-App-Name": "checkoutuinodeweb",
++                    "X-PayPal-Internal-EUAT": self.state.euat_token,
++                    "PayPal-Client-Context": token,
++                    "PayPal-Client-Metadata-Id": self.state.paypal_client_metadata_id,
++                    "X-Country": self.address.country,
++                    "X-Locale": self.locale,
++                },
++                endpoint="https://www.paypal.com/graphql/",
++            )
++        except Exception as sync_error:
++            logger.warning("Buyer/funding GraphQL refresh failed: {}", sync_error)
++            return empty
++
++        result_obj = result[0] if isinstance(result, list) and result else result
++        if not isinstance(result_obj, dict):
++            logger.warning(
++                "Buyer/funding refresh returned type {}",
++                type(result_obj).__name__,
++            )
++            return empty
++        errors = [
++            str(item.get("message") or item.get("name") or "")
++            for item in (result_obj.get("errors") or [])
++            if isinstance(item, dict)
++            and str(item.get("message") or item.get("name") or "")
++        ]
++        data = result_obj.get("data")
++        data = data if isinstance(data, dict) else {}
++        checkout = data.get("checkoutSession")
++        checkout = checkout if isinstance(checkout, dict) else {}
++        buyer = checkout.get("buyer")
++        buyer = buyer if isinstance(buyer, dict) else {}
++        auth = buyer.get("auth")
++        auth = auth if isinstance(auth, dict) else {}
++        refreshed_euat = str(auth.get("accessToken") or "")
++        if refreshed_euat:
++            self.session.set_euat_token(refreshed_euat)
++        user_id = str(buyer.get("userId") or "")
++        if user_id:
++            self.state.user_id = user_id
++
++        options = checkout.get("fundingOptions")
++        options = options if isinstance(options, dict) else {}
++        selected = options.get("fundingInstrument")
++        selected = selected if isinstance(selected, dict) else {}
++        instrument_id = str(selected.get("id") or "")
++        last_digits = str(selected.get("lastDigits") or "")
++        funding_type = str(selected.get("type") or "")
++        available_ids: list[str] = []
++        for plan in options.get("allPlans") or []:
++            if not isinstance(plan, dict):
++                continue
++            for source in plan.get("fundingSources") or []:
++                if not isinstance(source, dict):
++                    continue
++                instrument = source.get("fundingInstrument")
++                instrument = instrument if isinstance(instrument, dict) else {}
++                candidate_id = str(instrument.get("id") or "")
++                if candidate_id and candidate_id not in available_ids:
++                    available_ids.append(candidate_id)
++
++        buyer_ready = bool(self.state.user_id and self.state.euat_token)
++        self.state.member_authenticated = buyer_ready
++        self.state.funding_instrument_id = instrument_id
++        self.state.funding_last_digits = last_digits
++        self.state.funding_selected = bool(instrument_id)
++        logger.info(
++            "Buyer/funding context synchronized: buyer={} selected={} available={}",
++            buyer_ready,
++            bool(instrument_id),
++            len(available_ids),
++        )
++        return {
++            "buyer_ready": buyer_ready,
++            "funding_selected": bool(instrument_id),
++            "funding_instrument_id": instrument_id,
++            "funding_last_digits": last_digits,
++            "funding_type": funding_type,
++            "available_instrument_ids": available_ids,
++            "errors": errors,
++        }
++
+     def _load_review_context(self, url: str, referer: str, max_redirects: int = 8):
+         """Load the full Hermes/Hagrid redirect chain and preserve the final session cookies."""
+         current = url
+@@ -2039,31 +2495,44 @@ class PayPalFlow:
+         """Send the final authorize mutation to approve the billing agreement."""
+         logger.info("--- Phase 4: Final authorization ---")
+ 
+-        hermes_base_url = (
+-            f"https://www.paypal.com/webapps/hermes?"
+-            f"ssrt={self.state.ssrt}&ul=1&modxo_redirect_reason=guest_user"
+-            f"&locale.x={self.locale}&country.x={self.address.country}"
+-            f"&ba_token={self.ba_token}&token={self.state.ec_token}"
+-            f"&rcache=1&cookieBannerVariant=hidden&fromSignupLite=true"
+-            f"&fallback=1&reason=Q0FSRF9HRU5FUklDX0VSUk9S"
+-        )
+-        hermes_contingency_url = (
+-            f"https://www.paypal.com/webapps/hermes?"
+-            f"ssrt={self.state.ssrt}&ul=1&modxo_redirect_reason=guest_user"
+-            f"&locale.x={self.locale}&country.x={self.address.country}"
+-            f"&ba_token={self.ba_token}&token={self.state.ec_token}"
+-            f"&rcache=1&cookieBannerVariant=hidden&fromSignupLite=true"
+-            f"&addFIContingency=noretry&redirectToHermes=true"
+-            f"&fallback=1&reason=Q0FSRF9HRU5FUklDX0VSUk9S"
+-        )
+-        review_referer = f"{hermes_base_url}&billingLite=1"
+-        review_url = f"{review_referer}#/billingweb/review"
++        if self.country == "US":
++            # The email-first branch already has an authenticated buyer and a
++            # selected card. Re-entering the legacy addFI/card-error fallback
++            # can downgrade or detach that member context.
++            review_url = self._build_member_review_url()
++            review_referer = review_url.split("#", 1)[0]
++            hermes_base_url = review_referer
++            hermes_contingency_url = review_referer
++        else:
++            hermes_base_url = (
++                f"https://www.paypal.com/webapps/hermes?"
++                f"ssrt={self.state.ssrt}&ul=1&modxo_redirect_reason=guest_user"
++                f"&locale.x={self.locale}&country.x={self.address.country}"
++                f"&ba_token={self.ba_token}&token={self.state.ec_token}"
++                f"&rcache=1&cookieBannerVariant=hidden&fromSignupLite=true"
++                f"&fallback=1&reason=Q0FSRF9HRU5FUklDX0VSUk9S"
++            )
++            hermes_contingency_url = (
++                f"https://www.paypal.com/webapps/hermes?"
++                f"ssrt={self.state.ssrt}&ul=1&modxo_redirect_reason=guest_user"
++                f"&locale.x={self.locale}&country.x={self.address.country}"
++                f"&ba_token={self.ba_token}&token={self.state.ec_token}"
++                f"&rcache=1&cookieBannerVariant=hidden&fromSignupLite=true"
++                f"&addFIContingency=noretry&redirectToHermes=true"
++                f"&fallback=1&reason=Q0FSRF9HRU5FUklDX0VSUk9S"
++            )
++            review_referer = f"{hermes_base_url}&billingLite=1"
++            review_url = f"{review_referer}#/billingweb/review"
+ 
+         # Load the exact billingLite review context and follow the complete
+         # redirect chain so EUAT, buyer and checkout cookies belong to one session.
+         try:
+             logger.info("Loading Hermes/Hagrid review context...")
+-            self._load_review_context(hermes_contingency_url, self.state.signup_url)
++            if self.country != "US":
++                self._load_review_context(
++                    hermes_contingency_url,
++                    self.state.signup_url,
++                )
+             review_resp = self._load_review_context(review_referer, hermes_contingency_url)
+             logger.info(
+                 "Hermes/Hagrid review loaded: {} bytes={}",
+@@ -2090,7 +2559,22 @@ class PayPalFlow:
+ 
+         # The critical authorize mutation
+         billing_agreement_id = self.state.ec_token or self.ba_token
+-        buyer_synced = self._sync_buyer_context(billing_agreement_id, review_referer)
++        if self.country == "US":
++            funding_context = self._sync_buyer_funding_context(
++                billing_agreement_id,
++                review_referer,
++            )
++            buyer_synced = bool(funding_context["buyer_ready"])
++            if not funding_context["funding_selected"]:
++                raise RuntimeError(
++                    "US_FUNDING_INSTRUMENT_MISSING: authorization requires a "
++                    "selected funding instrument"
++                )
++        else:
++            buyer_synced = self._sync_buyer_context(
++                billing_agreement_id,
++                review_referer,
++            )
+         if getattr(self, "_strict_buyer_context", False) and not buyer_synced:
+             raise RuntimeError(
+                 "BUYER_CONTEXT_SYNC_FAILED: member identity is not attached to the billing checkout"
+@@ -2278,6 +2762,13 @@ class PayPalFlow:
+                 event="cl",
+             )
+ 
++            if self.country == "US":
++                presenter = getattr(self, "us_email_first_presenter", None)
++                if isinstance(presenter, UsEmailFirstPresenter):
++                    authorized_model = presenter.mark_authorized()
++                    self.state.us_onboarding_stage = authorized_model.stage
++                    self._us_onboarding_updated(authorized_model)
++
+             return {
+                 "status": "success",
+                 "ba_token": ba_token_resp,
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__manual_browser.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__manual_browser.py"
+index 644da99..fe7be0b 100644
+--- "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__manual_browser.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__manual_browser.py"
+@@ -48,6 +48,7 @@ class ManualBrowserController:
+         locale: str = "pt-BR",
+         timezone_id: str = "America/Sao_Paulo",
+         completion_mode: str = "captcha",
++        autofill_values: dict[str, str] | None = None,
+     ) -> None:
+         self.proxy_config = proxy_config
+         self.user_agent = user_agent
+@@ -58,6 +59,11 @@ class ManualBrowserController:
+         self.locale = str(locale or "pt-BR")
+         self.timezone_id = str(timezone_id or "America/Sao_Paulo")
+         self.completion_mode = str(completion_mode or "captcha").lower()
++        self.autofill_values = {
++            str(key): str(value)
++            for key, value in (autofill_values or {}).items()
++            if str(value or "")
++        }
+         self.initial_datadome = next(
+             (
+                 str(cookie.get("value") or "")
+@@ -73,6 +79,7 @@ class ManualBrowserController:
+         self._commands: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=100)
+         self._stop_event = threading.Event()
+         self._done_event = threading.Event()
++        self._otp_prompt_event = threading.Event()
+         self._thread: threading.Thread | None = None
+         self.result_cookies: list[dict[str, Any]] = []
+ 
+@@ -115,7 +122,15 @@ class ManualBrowserController:
+ 
+     def action(self, payload: dict[str, Any]) -> None:
+         action_type = str(payload.get("type") or "").strip().lower()
+-        if action_type not in {"click", "text", "key", "reload", "scroll", "finish"}:
++        if action_type not in {
++            "click",
++            "text",
++            "key",
++            "reload",
++            "scroll",
++            "finish",
++            "otp",
++        }:
+             raise ValueError("Unsupported browser action")
+         command = dict(payload)
+         command["type"] = action_type
+@@ -124,6 +139,23 @@ class ManualBrowserController:
+         except queue.Full as exc:
+             raise ValueError("Browser action queue is full") from exc
+ 
++    def wait_for_otp_prompt(
++        self,
++        timeout: float,
++        cancel_event: threading.Event | None = None,
++    ) -> bool:
++        """Wait until the official page exposes a one-time-code input."""
++
++        deadline = time.time() + max(0.0, float(timeout))
++        while not self._otp_prompt_event.wait(0.25):
++            if self._done_event.is_set() or self._stop_event.is_set():
++                return False
++            if cancel_event is not None and cancel_event.is_set():
++                return False
++            if time.time() >= deadline:
++                return False
++        return True
++
+     def _set_state(self, **values: Any) -> None:
+         with self._lock:
+             for key, value in values.items():
+@@ -227,26 +259,176 @@ class ManualBrowserController:
+                 return str(cookie.get("value") or "")
+         return ""
+ 
++    @staticmethod
++    def _is_paypal_hostname(hostname: str) -> bool:
++        return hostname == "paypal.com" or hostname.endswith(".paypal.com")
++
++    @staticmethod
++    def _is_member_review_route(parsed_url) -> bool:
++        path = (parsed_url.path or "/").lower().rstrip("/") or "/"
++        fragment = (parsed_url.fragment or "").lower()
++        if path == "/webapps/hermes":
++            return "billingweb/review" in fragment
++        return path == "/checkoutnow/review"
++
++    @staticmethod
++    def _autofill_selectors() -> dict[str, tuple[str, ...]]:
++        """Stable semantic selectors used across PayPal signup/review variants."""
++
++        return {
++            "email": (
++                'input[autocomplete="email"]',
++                'input[type="email"]',
++                'input[name*="email" i]',
++            ),
++            "phone": (
++                'input[autocomplete="tel"]',
++                'input[type="tel"]',
++                'input[name*="phone" i]',
++            ),
++            "password": (
++                'input[autocomplete="new-password"]',
++                'input[type="password"]',
++            ),
++            "first_name": (
++                'input[autocomplete="given-name"]',
++                'input[name*="firstName" i]',
++                'input[id*="firstName" i]',
++            ),
++            "last_name": (
++                'input[autocomplete="family-name"]',
++                'input[name*="lastName" i]',
++                'input[id*="lastName" i]',
++            ),
++            "card_number": (
++                'input[autocomplete="cc-number"]',
++                'input[name*="cardNumber" i]',
++                'input[id*="cardNumber" i]',
++            ),
++            "card_expiry": (
++                'input[autocomplete="cc-exp"]',
++                'input[name*="expir" i]',
++                'input[id*="expir" i]',
++            ),
++            "card_cvv": (
++                'input[autocomplete="cc-csc"]',
++                'input[name*="securityCode" i]',
++                'input[name*="cvv" i]',
++            ),
++            "address_line1": (
++                'input[autocomplete="address-line1"]',
++                'input[name*="line1" i]',
++                'input[id*="line1" i]',
++            ),
++            "city": (
++                'input[autocomplete="address-level2"]',
++                'input[name*="city" i]',
++            ),
++            "state": (
++                'input[autocomplete="address-level1"]',
++                'input[name*="state" i]',
++            ),
++            "postal_code": (
++                'input[autocomplete="postal-code"]',
++                'input[name*="postal" i]',
++                'input[name*="zip" i]',
++            ),
++        }
++
++    def _autofill_visible_fields(self, page) -> None:
++        """Fill only empty visible inputs; the operator remains in control."""
++
++        if not self.autofill_values:
++            return
++        targets = [page]
++        targets.extend(frame for frame in page.frames if frame is not page.main_frame)
++        for key, value in self.autofill_values.items():
++            selectors = self._autofill_selectors().get(key, ())
++            if not selectors:
++                continue
++            completed = False
++            for target in targets:
++                for selector in selectors:
++                    try:
++                        locator = target.locator(selector).first
++                        if (
++                            locator.count()
++                            and locator.is_visible()
++                            and locator.is_editable()
++                            and not locator.input_value()
++                        ):
++                            locator.fill(value, timeout=1200)
++                            completed = True
++                            break
++                    except Exception:
++                        continue
++                if completed:
++                    break
++
++    @staticmethod
++    def _otp_selectors() -> tuple[str, ...]:
++        return (
++            'input[autocomplete="one-time-code"]',
++            'input[name*="otp" i]',
++            'input[id*="otp" i]',
++            'input[name*="code" i][inputmode="numeric"]',
++        )
++
++    def _detect_otp_prompt(self, page) -> None:
++        targets = [page]
++        targets.extend(frame for frame in page.frames if frame is not page.main_frame)
++        for target in targets:
++            for selector in self._otp_selectors():
++                try:
++                    locator = target.locator(selector)
++                    if locator.count() and locator.first.is_visible():
++                        self._otp_prompt_event.set()
++                        return
++                except Exception:
++                    continue
++
++    def _fill_one_time_code(self, page, code: str) -> bool:
++        normalized = str(code or "").strip()
++        if not normalized.isdigit() or not 4 <= len(normalized) <= 12:
++            return False
++        targets = [page]
++        targets.extend(frame for frame in page.frames if frame is not page.main_frame)
++        for target in targets:
++            for selector in self._otp_selectors():
++                try:
++                    locator = target.locator(selector)
++                    visible = [
++                        locator.nth(index)
++                        for index in range(min(locator.count(), len(normalized)))
++                        if locator.nth(index).is_visible()
++                    ]
++                    if not visible:
++                        continue
++                    if len(visible) >= len(normalized):
++                        for field, digit in zip(visible, normalized):
++                            field.fill(digit, timeout=1200)
++                    else:
++                        visible[0].fill(normalized, timeout=1200)
++                    try:
++                        visible[-1].press("Enter", timeout=800)
++                    except Exception:
++                        pass
++                    return True
++                except Exception:
++                    continue
++        return False
++
+     def _completion_ready(self, cookies: list[dict[str, Any]], current_url: str, http_status: int) -> bool:
+         parsed = urlparse(current_url)
+         hostname = (parsed.hostname or "").lower()
+         if self.completion_mode == "agreement":
+             return hostname in {"pm-redirects.stripe.com", "pay.openai.com", "chatgpt.com"}
+-        if self.completion_mode == "member":
++        if self.completion_mode in {"member", "funding"}:
+             euat = self._cookie_value(cookies, "AV894Kt2TSumQQrJwe-8mzmyREO")
+-            route = f"{parsed.path}#{parsed.fragment}".lower()
+             return bool(
+                 euat
+-                and hostname.endswith("paypal.com")
+-                and any(
+-                    marker in route
+-                    for marker in (
+-                        "/webapps/hermes",
+-                        "/checkoutnow",
+-                        "/checkoutweb/",
+-                        "billingweb/review",
+-                    )
+-                )
++                and self._is_paypal_hostname(hostname)
++                and self._is_member_review_route(parsed)
+                 and 200 <= int(http_status or 0) < 400
+             )
+         current_datadome = self._cookie_value(cookies, "datadome")
+@@ -395,6 +577,7 @@ class ManualBrowserController:
+                 self._set_state(ready=True, message="临时浏览器已打开，请在画面中完成验证")
+ 
+                 last_frame_at = 0.0
++                last_autofill_at = 0.0
+                 while not self._stop_event.is_set():
+                     self._set_state(current_url=page.url)
+                     try:
+@@ -420,6 +603,14 @@ class ManualBrowserController:
+                             page.reload(wait_until="domcontentloaded", timeout=45000)
+                         elif command_type == "scroll":
+                             page.mouse.wheel(0, max(-1200, min(int(command.get("delta_y", 500)), 1200)))
++                        elif command_type == "otp":
++                            if not self._fill_one_time_code(
++                                page,
++                                str(command.get("value") or ""),
++                            ):
++                                self._set_state(
++                                    message="已取得验证码，等待 PayPal 验证输入框"
++                                )
+                         elif command_type == "finish":
+                             current_cookies = context.cookies()
+                             if self._completion_ready(current_cookies, page.url, int(navigation.get("status") or 0)):
+@@ -436,6 +627,10 @@ class ManualBrowserController:
+                             )
+ 
+                     now = time.time()
++                    if now - last_autofill_at >= 0.8:
++                        self._autofill_visible_fields(page)
++                        self._detect_otp_prompt(page)
++                        last_autofill_at = now
+                     if now - last_frame_at >= 0.65:
+                         try:
+                             frame = page.screenshot(type="jpeg", quality=68, full_page=False, timeout=8000)
+@@ -446,7 +641,14 @@ class ManualBrowserController:
+                         last_frame_at = now
+ 
+                     current_cookies = context.cookies()
+-                    if self._completion_ready(current_cookies, page.url, int(navigation.get("status") or 0)):
++                    if (
++                        self.completion_mode != "funding"
++                        and self._completion_ready(
++                            current_cookies,
++                            page.url,
++                            int(navigation.get("status") or 0),
++                        )
++                    ):
+                         self.result_cookies = current_cookies
+                         self._set_state(done=True, message="验证已完成，正在同步 Cookie")
+                         self._done_event.set()
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__models.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__models.py"
+index 0bf56b3..6080ddb 100644
+--- "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__paypal__models.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__models.py"
+@@ -69,8 +69,19 @@ class SessionState:
+     content_identifier: str = ""
+     signup_url: str = ""
+     signup_context_ready: bool = False
++    us_onboarding_stage: str = ""
++    email_submitted: bool = False
++    member_created: bool = False
++    phone_login_verified: bool = False
++    member_authenticated: bool = False
++    funding_selected: bool = False
++    funding_instrument_id: str = ""
++    funding_last_digits: str = ""
+     onboarding_url: str = ""
+     show_create_account_action_id: str = ""
++    submit_email_action_id: str = ""
++    # Compatibility alias for callers/tests created before the US email-first
++    # action was named according to what it actually submits.
+     create_user_action_id: str = ""
+ 
+     def update_from_cookies(self, cookies: dict):
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__us_email_first.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__us_email_first.py"
+new file mode 100644
+index 0000000..aea8105
+--- /dev/null
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__paypal__us_email_first.py"
+@@ -0,0 +1,277 @@
++"""Pure in-memory MVP/Strategy state machine for the US email-first flow."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Protocol
++
++
++EVENT_CREATE_EMAIL_ACCOUNT = "create_email_account"
++EVENT_REQUEST_PHONE_OTP = "request_phone_otp"
++EVENT_CONFIRM_PHONE_OTP = "confirm_phone_otp"
++EVENT_HYDRATE_AUTHENTICATED_BUYER = "hydrate_authenticated_buyer"
++EVENT_BIND_CARD = "bind_card"
++EVENT_AUTHORIZE = "authorize"
++
++PREPARATION_EVENT_ORDER = (
++    EVENT_CREATE_EMAIL_ACCOUNT,
++    EVENT_REQUEST_PHONE_OTP,
++    EVENT_CONFIRM_PHONE_OTP,
++    EVENT_HYDRATE_AUTHENTICATED_BUYER,
++    EVENT_BIND_CARD,
++)
++FLOW_EVENT_ORDER = (*PREPARATION_EVENT_ORDER, EVENT_AUTHORIZE)
++
++STAGE_IDLE = "idle"
++STAGE_AUTHORIZATION_READY = "authorization_ready"
++STAGE_AUTHORIZED = "authorized"
++
++US_EMAIL_NOT_SUBMITTED = "US_EMAIL_NOT_SUBMITTED"
++US_PHONE_UNAVAILABLE = "US_PHONE_UNAVAILABLE"
++US_PHONE_NOT_VERIFIED = "US_PHONE_NOT_VERIFIED"
++US_BUYER_USER_ID_MISSING = "US_BUYER_USER_ID_MISSING"
++US_EUAT_TOKEN_MISSING = "US_EUAT_TOKEN_MISSING"
++US_FUNDING_INSTRUMENT_MISSING = "US_FUNDING_INSTRUMENT_MISSING"
++US_AUTHENTICATION_RESULT_INVALID = "US_AUTHENTICATION_RESULT_INVALID"
++US_FLOW_EVENT_ORDER_INVALID = "US_FLOW_EVENT_ORDER_INVALID"
++US_AUTHORIZATION_NOT_READY = "US_AUTHORIZATION_NOT_READY"
++
++
++@dataclass
++class UsEmailFirstModel:
++    """Model: durable facts and completed events for one US onboarding run."""
++
++    email_submitted: bool = False
++    phone: str = ""
++    phone_verified: bool = False
++    buyer_user_id: str = ""
++    euat_token: str = ""
++    funding_instrument_id: str = ""
++    stage: str = STAGE_IDLE
++    events: list[str] = field(default_factory=list)
++
++
++@dataclass(frozen=True)
++class MemberAuthenticationResult:
++    """Authenticated-member facts returned by the View adapter."""
++
++    phone_verified: bool
++    user_id: str
++    euat_token: str
++
++
++class UsEmailFirstView(Protocol):
++    """View: side-effect adapter implemented by the active transport/UI."""
++
++    def acquire_phone_after_email(self) -> str: ...
++
++    def authenticate_member_with_phone(
++        self, signup_url: str
++    ) -> MemberAuthenticationResult: ...
++
++    def bind_card_in_authenticated_session(self, review_url: str) -> str: ...
++
++
++class UsEmailFirstFlowError(RuntimeError):
++    """Stable, machine-readable failure raised at a gated flow stage."""
++
++    def __init__(self, code: str, stage: str) -> None:
++        self.code = code
++        self.stage = stage
++        super().__init__(f"{code}: stage={stage}")
++
++
++class UsEmailFirstStrategy(Protocol):
++    """Strategy selected by the Presenter for a particular US flow version."""
++
++    def prepare(
++        self,
++        model: UsEmailFirstModel,
++        view: UsEmailFirstView,
++        *,
++        signup_url: str,
++        review_url: str,
++    ) -> UsEmailFirstModel: ...
++
++    def mark_authorized(self, model: UsEmailFirstModel) -> UsEmailFirstModel: ...
++
++
++class EmailFirstAuthorizationStrategy:
++    """Prepare an authenticated US buyer without repeating completed steps."""
++
++    @staticmethod
++    def _fail(model: UsEmailFirstModel, code: str, stage: str) -> None:
++        model.stage = stage
++        raise UsEmailFirstFlowError(code, stage)
++
++    def _validate_event_prefix(self, model: UsEmailFirstModel) -> None:
++        events = list(model.events)
++        if len(events) > len(FLOW_EVENT_ORDER) or events != list(
++            FLOW_EVENT_ORDER[: len(events)]
++        ):
++            self._fail(
++                model,
++                US_FLOW_EVENT_ORDER_INVALID,
++                str(events[-1] if events else STAGE_IDLE),
++            )
++
++    def _record(self, model: UsEmailFirstModel, event: str) -> None:
++        self._validate_event_prefix(model)
++        event_index = FLOW_EVENT_ORDER.index(event)
++        if len(model.events) > event_index:
++            return
++        if len(model.events) != event_index:
++            self._fail(model, US_FLOW_EVENT_ORDER_INVALID, event)
++        model.events.append(event)
++
++    @staticmethod
++    def _authentication_ready(model: UsEmailFirstModel) -> bool:
++        return bool(
++            model.phone_verified
++            and model.buyer_user_id.strip()
++            and model.euat_token.strip()
++        )
++
++    def prepare(
++        self,
++        model: UsEmailFirstModel,
++        view: UsEmailFirstView,
++        *,
++        signup_url: str,
++        review_url: str,
++    ) -> UsEmailFirstModel:
++        self._validate_event_prefix(model)
++        if model.events == list(FLOW_EVENT_ORDER):
++            return model
++
++        model.stage = EVENT_CREATE_EMAIL_ACCOUNT
++        if not model.email_submitted:
++            self._fail(model, US_EMAIL_NOT_SUBMITTED, EVENT_CREATE_EMAIL_ACCOUNT)
++        self._record(model, EVENT_CREATE_EMAIL_ACCOUNT)
++
++        if not model.phone.strip():
++            model.stage = EVENT_REQUEST_PHONE_OTP
++            model.phone = str(view.acquire_phone_after_email() or "").strip()
++            if not model.phone:
++                self._fail(model, US_PHONE_UNAVAILABLE, EVENT_REQUEST_PHONE_OTP)
++        self._record(model, EVENT_REQUEST_PHONE_OTP)
++
++        if not self._authentication_ready(model):
++            model.stage = EVENT_CONFIRM_PHONE_OTP
++            authentication = view.authenticate_member_with_phone(signup_url)
++            if not isinstance(authentication, MemberAuthenticationResult):
++                self._fail(
++                    model,
++                    US_AUTHENTICATION_RESULT_INVALID,
++                    EVENT_CONFIRM_PHONE_OTP,
++                )
++            model.phone_verified = bool(authentication.phone_verified)
++            model.buyer_user_id = str(authentication.user_id or "").strip()
++            model.euat_token = str(authentication.euat_token or "").strip()
++
++        if not model.phone_verified:
++            self._fail(model, US_PHONE_NOT_VERIFIED, EVENT_CONFIRM_PHONE_OTP)
++        self._record(model, EVENT_CONFIRM_PHONE_OTP)
++
++        model.stage = EVENT_HYDRATE_AUTHENTICATED_BUYER
++        if not model.buyer_user_id:
++            self._fail(
++                model,
++                US_BUYER_USER_ID_MISSING,
++                EVENT_HYDRATE_AUTHENTICATED_BUYER,
++            )
++        if not model.euat_token:
++            self._fail(
++                model,
++                US_EUAT_TOKEN_MISSING,
++                EVENT_HYDRATE_AUTHENTICATED_BUYER,
++            )
++        self._record(model, EVENT_HYDRATE_AUTHENTICATED_BUYER)
++
++        if not model.funding_instrument_id.strip():
++            model.stage = EVENT_BIND_CARD
++            model.funding_instrument_id = str(
++                view.bind_card_in_authenticated_session(review_url) or ""
++            ).strip()
++            if not model.funding_instrument_id:
++                self._fail(
++                    model,
++                    US_FUNDING_INSTRUMENT_MISSING,
++                    EVENT_BIND_CARD,
++                )
++        self._record(model, EVENT_BIND_CARD)
++        model.stage = STAGE_AUTHORIZATION_READY
++        return model
++
++    def mark_authorized(self, model: UsEmailFirstModel) -> UsEmailFirstModel:
++        self._validate_event_prefix(model)
++        prepared = bool(
++            model.email_submitted
++            and model.phone.strip()
++            and self._authentication_ready(model)
++            and model.funding_instrument_id.strip()
++            and model.events[: len(PREPARATION_EVENT_ORDER)]
++            == list(PREPARATION_EVENT_ORDER)
++        )
++        if not prepared:
++            self._fail(model, US_AUTHORIZATION_NOT_READY, EVENT_AUTHORIZE)
++        self._record(model, EVENT_AUTHORIZE)
++        model.stage = STAGE_AUTHORIZED
++        return model
++
++
++class UsEmailFirstPresenter:
++    """Presenter: expose the state machine while keeping effects in the View."""
++
++    def __init__(
++        self,
++        model: UsEmailFirstModel,
++        view: UsEmailFirstView,
++        strategy: UsEmailFirstStrategy | None = None,
++    ) -> None:
++        self.model = model
++        self.view = view
++        self.strategy = strategy or EmailFirstAuthorizationStrategy()
++
++    def prepare_authorization(
++        self, *, signup_url: str, review_url: str
++    ) -> UsEmailFirstModel:
++        return self.strategy.prepare(
++            self.model,
++            self.view,
++            signup_url=signup_url,
++            review_url=review_url,
++        )
++
++    def mark_authorized(self) -> UsEmailFirstModel:
++        return self.strategy.mark_authorized(self.model)
++
++
++__all__ = [
++    "EVENT_AUTHORIZE",
++    "EVENT_BIND_CARD",
++    "EVENT_CONFIRM_PHONE_OTP",
++    "EVENT_CREATE_EMAIL_ACCOUNT",
++    "EVENT_HYDRATE_AUTHENTICATED_BUYER",
++    "EVENT_REQUEST_PHONE_OTP",
++    "EmailFirstAuthorizationStrategy",
++    "FLOW_EVENT_ORDER",
++    "MemberAuthenticationResult",
++    "PREPARATION_EVENT_ORDER",
++    "STAGE_AUTHORIZATION_READY",
++    "STAGE_AUTHORIZED",
++    "US_AUTHENTICATION_RESULT_INVALID",
++    "US_AUTHORIZATION_NOT_READY",
++    "US_BUYER_USER_ID_MISSING",
++    "US_EMAIL_NOT_SUBMITTED",
++    "US_EUAT_TOKEN_MISSING",
++    "US_FLOW_EVENT_ORDER_INVALID",
++    "US_FUNDING_INSTRUMENT_MISSING",
++    "US_PHONE_NOT_VERIFIED",
++    "US_PHONE_UNAVAILABLE",
++    "UsEmailFirstFlowError",
++    "UsEmailFirstModel",
++    "UsEmailFirstPresenter",
++    "UsEmailFirstStrategy",
++    "UsEmailFirstView",
++]
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_email_first_flow.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_email_first_flow.py"
+new file mode 100644
+index 0000000..eb9b929
+--- /dev/null
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_email_first_flow.py"
+@@ -0,0 +1,220 @@
++import pytest
++
++from paypal.us_email_first import (
++    EVENT_BIND_CARD,
++    EVENT_CONFIRM_PHONE_OTP,
++    EVENT_CREATE_EMAIL_ACCOUNT,
++    EVENT_HYDRATE_AUTHENTICATED_BUYER,
++    EVENT_REQUEST_PHONE_OTP,
++    FLOW_EVENT_ORDER,
++    MemberAuthenticationResult,
++    PREPARATION_EVENT_ORDER,
++    STAGE_AUTHORIZATION_READY,
++    STAGE_AUTHORIZED,
++    US_AUTHORIZATION_NOT_READY,
++    US_BUYER_USER_ID_MISSING,
++    US_EMAIL_NOT_SUBMITTED,
++    US_EUAT_TOKEN_MISSING,
++    US_FUNDING_INSTRUMENT_MISSING,
++    US_PHONE_NOT_VERIFIED,
++    UsEmailFirstFlowError,
++    UsEmailFirstModel,
++    UsEmailFirstPresenter,
++)
++
++
++SIGNUP_URL = "https://www.paypal.com/checkoutweb/signup?token=EC-fixture"
++REVIEW_URL = "https://www.paypal.com/webapps/hermes#/billingweb/review"
++
++
++class RecordingView:
++    def __init__(
++        self,
++        *,
++        authentication: MemberAuthenticationResult | None = None,
++        funding_results: list[str] | None = None,
++    ) -> None:
++        self.authentication = authentication or MemberAuthenticationResult(
++            phone_verified=True,
++            user_id="fixture-user",
++            euat_token="fixture-euat",
++        )
++        self.funding_results = list(funding_results or ["CARD-fixture"])
++        self.calls: list[tuple[str, str]] = []
++
++    def acquire_phone_after_email(self) -> str:
++        self.calls.append(("acquire_phone_after_email", ""))
++        return "+12025550123"
++
++    def authenticate_member_with_phone(
++        self, signup_url: str
++    ) -> MemberAuthenticationResult:
++        self.calls.append(("authenticate_member_with_phone", signup_url))
++        return self.authentication
++
++    def bind_card_in_authenticated_session(self, review_url: str) -> str:
++        self.calls.append(("bind_card_in_authenticated_session", review_url))
++        return self.funding_results.pop(0) if self.funding_results else ""
++
++
++def presenter_for(
++    *,
++    email_submitted: bool = True,
++    authentication: MemberAuthenticationResult | None = None,
++    funding_results: list[str] | None = None,
++) -> tuple[UsEmailFirstPresenter, RecordingView]:
++    view = RecordingView(
++        authentication=authentication,
++        funding_results=funding_results,
++    )
++    presenter = UsEmailFirstPresenter(
++        UsEmailFirstModel(email_submitted=email_submitted),
++        view,
++    )
++    return presenter, view
++
++
++def test_us_flow_records_email_phone_login_card_authorize_in_order():
++    presenter, view = presenter_for()
++
++    prepared = presenter.prepare_authorization(
++        signup_url=SIGNUP_URL,
++        review_url=REVIEW_URL,
++    )
++
++    assert prepared.events == list(PREPARATION_EVENT_ORDER)
++    assert prepared.stage == STAGE_AUTHORIZATION_READY
++    assert prepared.phone == "+12025550123"
++    assert prepared.phone_verified is True
++    assert prepared.buyer_user_id == "fixture-user"
++    assert prepared.euat_token == "fixture-euat"
++    assert prepared.funding_instrument_id == "CARD-fixture"
++    assert view.calls == [
++        ("acquire_phone_after_email", ""),
++        ("authenticate_member_with_phone", SIGNUP_URL),
++        ("bind_card_in_authenticated_session", REVIEW_URL),
++    ]
++
++    authorized = presenter.mark_authorized()
++
++    assert authorized.events == list(FLOW_EVENT_ORDER)
++    assert authorized.stage == STAGE_AUTHORIZED
++
++
++def test_missing_email_stops_before_phone_or_card_side_effects():
++    presenter, view = presenter_for(email_submitted=False)
++
++    with pytest.raises(UsEmailFirstFlowError) as captured:
++        presenter.prepare_authorization(
++            signup_url=SIGNUP_URL,
++            review_url=REVIEW_URL,
++        )
++
++    assert captured.value.code == US_EMAIL_NOT_SUBMITTED
++    assert captured.value.stage == EVENT_CREATE_EMAIL_ACCOUNT
++    assert presenter.model.events == []
++    assert view.calls == []
++
++
++@pytest.mark.parametrize(
++    ("authentication", "error_code", "expected_events"),
++    [
++        (
++            MemberAuthenticationResult(False, "fixture-user", "fixture-euat"),
++            US_PHONE_NOT_VERIFIED,
++            [EVENT_CREATE_EMAIL_ACCOUNT, EVENT_REQUEST_PHONE_OTP],
++        ),
++        (
++            MemberAuthenticationResult(True, "", "fixture-euat"),
++            US_BUYER_USER_ID_MISSING,
++            [
++                EVENT_CREATE_EMAIL_ACCOUNT,
++                EVENT_REQUEST_PHONE_OTP,
++                EVENT_CONFIRM_PHONE_OTP,
++            ],
++        ),
++        (
++            MemberAuthenticationResult(True, "fixture-user", ""),
++            US_EUAT_TOKEN_MISSING,
++            [
++                EVENT_CREATE_EMAIL_ACCOUNT,
++                EVENT_REQUEST_PHONE_OTP,
++                EVENT_CONFIRM_PHONE_OTP,
++            ],
++        ),
++    ],
++)
++def test_authentication_gates_block_card_binding(
++    authentication, error_code, expected_events
++):
++    presenter, view = presenter_for(authentication=authentication)
++
++    with pytest.raises(UsEmailFirstFlowError) as captured:
++        presenter.prepare_authorization(
++            signup_url=SIGNUP_URL,
++            review_url=REVIEW_URL,
++        )
++
++    assert captured.value.code == error_code
++    assert presenter.model.events == expected_events
++    assert not any(call[0] == "bind_card_in_authenticated_session" for call in view.calls)
++
++
++def test_missing_funding_blocks_authorization():
++    presenter, view = presenter_for(funding_results=[""])
++
++    with pytest.raises(UsEmailFirstFlowError) as captured:
++        presenter.prepare_authorization(
++            signup_url=SIGNUP_URL,
++            review_url=REVIEW_URL,
++        )
++
++    assert captured.value.code == US_FUNDING_INSTRUMENT_MISSING
++    assert captured.value.stage == EVENT_BIND_CARD
++    assert presenter.model.events == [
++        EVENT_CREATE_EMAIL_ACCOUNT,
++        EVENT_REQUEST_PHONE_OTP,
++        EVENT_CONFIRM_PHONE_OTP,
++        EVENT_HYDRATE_AUTHENTICATED_BUYER,
++    ]
++    with pytest.raises(UsEmailFirstFlowError) as authorize_error:
++        presenter.mark_authorized()
++    assert authorize_error.value.code == US_AUTHORIZATION_NOT_READY
++    assert [call[0] for call in view.calls].count(
++        "bind_card_in_authenticated_session"
++    ) == 1
++
++
++def test_card_retry_does_not_repeat_email_account_or_phone_otp():
++    presenter, view = presenter_for(funding_results=["", "CARD-retry"])
++
++    with pytest.raises(UsEmailFirstFlowError) as first_attempt:
++        presenter.prepare_authorization(
++            signup_url=SIGNUP_URL,
++            review_url=REVIEW_URL,
++        )
++    assert first_attempt.value.code == US_FUNDING_INSTRUMENT_MISSING
++
++    prepared = presenter.prepare_authorization(
++        signup_url=SIGNUP_URL,
++        review_url=REVIEW_URL,
++    )
++
++    call_names = [call[0] for call in view.calls]
++    assert call_names.count("acquire_phone_after_email") == 1
++    assert call_names.count("authenticate_member_with_phone") == 1
++    assert call_names.count("bind_card_in_authenticated_session") == 2
++    assert prepared.funding_instrument_id == "CARD-retry"
++    assert prepared.events == list(PREPARATION_EVENT_ORDER)
++    assert len(prepared.events) == len(set(prepared.events))
++
++
++def test_mark_authorized_is_idempotent_after_success():
++    presenter, _view = presenter_for()
++    presenter.prepare_authorization(signup_url=SIGNUP_URL, review_url=REVIEW_URL)
++
++    presenter.mark_authorized()
++    presenter.mark_authorized()
++
++    assert presenter.model.events == list(FLOW_EVENT_ORDER)
++    assert presenter.model.stage == STAGE_AUTHORIZED
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_email_first_integration.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_email_first_integration.py"
+new file mode 100644
+index 0000000..5ef957d
+--- /dev/null
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_email_first_integration.py"
+@@ -0,0 +1,447 @@
++from types import MethodType, SimpleNamespace
++
++import pytest
++
++import web as paypal_web
++from paypal.elevation_flow import IdentityElevationPayPalFlow
++from paypal.flow import PayPalFlow
++from paypal.models import BillingAddress, CardInfo, SessionState, UserInfo
++from paypal.us_email_first import (
++    MemberAuthenticationResult,
++    PREPARATION_EVENT_ORDER,
++    UsEmailFirstModel,
++    UsEmailFirstPresenter,
++)
++
++
++SIGNUP_URL = "https://www.paypal.com/checkoutweb/signup?token=EC-fixture"
++REVIEW_URL = "https://www.paypal.com/webapps/hermes#/billingweb/review"
++
++
++class ResponseStub:
++    def __init__(self, *, status=200, text="", headers=None, url="https://www.paypal.com/pay"):
++        self.status_code = status
++        self.text = text
++        self.headers = dict(headers or {})
++        self.url = url
++
++
++class StateSessionStub:
++    def __init__(self, state: SessionState, graphql_result=None):
++        self.state = state
++        self.graphql_result = graphql_result
++        self.graphql_calls = []
++        self.get_calls = []
++
++    def set_euat_token(self, value):
++        self.state.euat_token = str(value or "")
++
++    def graphql(self, operation, query, variables, **kwargs):
++        self.graphql_calls.append((operation, variables, kwargs))
++        return self.graphql_result
++
++    def get(self, *args, **kwargs):
++        self.get_calls.append((args, kwargs))
++        raise AssertionError("this integration fixture must not perform HTTP GET")
++
++
++def test_us_email_server_action_posts_only_email_and_replaces_bootstrap_ec():
++    pay_response = ResponseStub(status=200)
++    email_response = ResponseStub(
++        status=200,
++        text='{"ecToken":"EC-email-first"}',
++    )
++
++    class ActionSession:
++        def __init__(self):
++            self.posts = []
++            self.responses = [pay_response, email_response]
++
++        def post(self, url, **kwargs):
++            self.posts.append((url, kwargs))
++            return self.responses.pop(0)
++
++    flow = PayPalFlow.__new__(PayPalFlow)
++    flow.ba_token = "BA-fixture"
++    flow.user = fixture_user(
++        phone="+12025550123",
++        email="email-first@example.com",
++    )
++    flow.state = SessionState(
++        ba_token=flow.ba_token,
++        ec_token="EC-bootstrap",
++        ctx_id="ctx-fixture",
++        show_create_account_action_id="a" * 32,
++        submit_email_action_id="b" * 32,
++    )
++    flow.session = ActionSession()
++
++    response = flow._submit_us_email_server_actions("https://www.paypal.com/pay")
++
++    assert response is email_response
++    assert flow.state.email_submitted is True
++    assert flow.state.ec_token == "EC-email-first"
++    assert len(flow.session.posts) == 2
++    email_files = flow.session.posts[1][1]["files"]
++    email_fields = {name: value[1] for name, value in email_files}
++    assert email_fields["_1_login_email"] == "email-first@example.com"
++    serialized_fields = repr(email_fields).lower()
++    assert "phone" not in serialized_fields
++    assert "card" not in serialized_fields
++
++
++def test_us_email_action_evidence_rejects_failed_http_even_with_ec():
++    evidence = PayPalFlow._email_action_evidence(
++        ResponseStub(status=500, text='{"ecToken":"EC-rejected"}')
++    )
++
++    assert evidence["ec_token"] == "EC-rejected"
++    assert evidence["verified"] is False
++
++
++def fixture_user(phone="", email="generated@example.com", country="US"):
++    country_code = "+1" if country == "US" else "+44"
++    digits = "".join(character for character in phone if character.isdigit())
++    calling_digits = country_code.lstrip("+")
++    local = digits[len(calling_digits) :] if digits.startswith(calling_digits) else digits
++    return UserInfo(
++        first_name="Fixture",
++        last_name="Buyer",
++        email=email,
++        phone=phone,
++        phone_local=local,
++        phone_country_code=country_code,
++        password="Fixture-Password-1!",
++        dob="01/01/1990",
++        cpf="",
++    )
++
++
++def fixture_address(country="US"):
++    return BillingAddress(
++        street="Main Street",
++        house_number="1",
++        district="",
++        city="New York" if country == "US" else "London",
++        state="NY" if country == "US" else "",
++        postal_code="10001" if country == "US" else "SW1A 1AA",
++        country=country,
++    )
++
++
++def test_paypal_flow_us_phase3_uses_presenter_and_never_legacy_steps(monkeypatch):
++    calls = []
++
++    class WiredUsFlow(PayPalFlow):
++        def __init__(self):
++            self.country = "US"
++            self.ba_token = "BA-fixture"
++            self.user = fixture_user()
++            self.address = fixture_address()
++            self.state = SessionState(
++                ba_token=self.ba_token,
++                ec_token="EC-fixture",
++                email_submitted=True,
++                signup_url=SIGNUP_URL,
++            )
++            self.session = StateSessionStub(self.state)
++            self.us_email_first_model = UsEmailFirstModel()
++            self.us_email_first_presenter = UsEmailFirstPresenter(
++                self.us_email_first_model, self
++            )
++
++        def acquire_phone_after_email(self):
++            calls.append("acquire_phone_after_email")
++            return "+12025550123"
++
++        def authenticate_member_with_phone(self, signup_url):
++            calls.append(("authenticate_member_with_phone", signup_url))
++            return MemberAuthenticationResult(True, "buyer-US", "euat-US")
++
++        def bind_card_in_authenticated_session(self, review_url):
++            calls.append(("bind_card_in_authenticated_session", review_url))
++            return "CARD-US"
++
++        def _build_member_review_url(self):
++            return REVIEW_URL
++
++        def _confirm_phone_with_retry(self, *_args):
++            pytest.fail("US email-first Phase3 must not call legacy phone confirmation")
++
++        def _signup_with_card_retry(self, *_args):
++            pytest.fail("US email-first Phase3 must not call legacy signup")
++
++        def _us_onboarding_updated(self, model):
++            calls.append(("published", tuple(model.events)))
++
++    monkeypatch.setattr("paypal.flow.send_analytics_ts", lambda *_args, **_kwargs: None)
++    flow = WiredUsFlow()
++
++    flow._phase3_signup_and_2fa()
++
++    assert isinstance(flow.us_email_first_presenter, UsEmailFirstPresenter)
++    assert flow.us_email_first_model.events == list(PREPARATION_EVENT_ORDER)
++    assert calls[:3] == [
++        "acquire_phone_after_email",
++        ("authenticate_member_with_phone", SIGNUP_URL),
++        ("bind_card_in_authenticated_session", REVIEW_URL),
++    ]
++    assert flow.state.phone_login_verified is True
++    assert flow.state.member_authenticated is True
++    assert flow.state.funding_selected is True
++    assert flow.state.funding_instrument_id == "CARD-US"
++
++
++def test_paypal_flow_non_us_phase3_keeps_legacy_two_step_order(monkeypatch):
++    calls = []
++
++    class LegacyFlow(PayPalFlow):
++        def _confirm_phone_with_retry(self, token, signup_url):
++            calls.append(("confirm_phone", token, signup_url))
++
++        def _signup_with_card_retry(self, token, signup_url):
++            calls.append(("signup", token, signup_url))
++            self.state.euat_token = "legacy-euat"
++
++    flow = LegacyFlow.__new__(LegacyFlow)
++    flow.country = "GB"
++    flow.ba_token = "BA-legacy"
++    flow.state = SessionState(
++        ba_token=flow.ba_token,
++        ec_token="EC-legacy",
++        signup_url="https://www.paypal.com/checkoutweb/signup?token=EC-legacy",
++    )
++    flow.session = StateSessionStub(flow.state)
++    monkeypatch.setattr("paypal.flow.send_tealeaf_data", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr("paypal.flow.send_analytics_ts", lambda *_args, **_kwargs: None)
++
++    flow._phase3_signup_and_2fa()
++
++    assert calls == [
++        ("confirm_phone", "EC-legacy", flow.state.signup_url),
++        ("signup", "EC-legacy", flow.state.signup_url),
++    ]
++    assert flow.state.euat_token == "legacy-euat"
++
++
++@pytest.mark.parametrize(
++    ("selected", "expected_selected", "expected_id"),
++    [
++        ({"lastDigits": "1111", "type": "CARD"}, False, ""),
++        ({"id": "CARD-selected", "lastDigits": "2222", "type": "CARD"}, True, "CARD-selected"),
++    ],
++)
++def test_buyer_funding_context_requires_selected_instrument_id(
++    selected, expected_selected, expected_id
++):
++    state = SessionState(euat_token="fixture-euat")
++    graphql_result = {
++        "data": {
++            "checkoutSession": {
++                "buyer": {
++                    "userId": "buyer-US",
++                    "auth": {"accessToken": "refreshed-euat"},
++                },
++                "fundingOptions": {
++                    "fundingInstrument": selected,
++                    "allPlans": [
++                        {
++                            "fundingSources": [
++                                {"fundingInstrument": {"id": "CARD-available"}}
++                            ]
++                        }
++                    ],
++                },
++            }
++        }
++    }
++    flow = PayPalFlow.__new__(PayPalFlow)
++    flow.state = state
++    flow.session = StateSessionStub(state, graphql_result)
++    flow.address = fixture_address()
++    flow.locale = "en_US"
++
++    context = flow._sync_buyer_funding_context("EC-fixture", REVIEW_URL)
++
++    assert context["funding_selected"] is expected_selected
++    assert context["funding_instrument_id"] == expected_id
++    assert context["available_instrument_ids"] == ["CARD-available"]
++    assert state.funding_selected is expected_selected
++    assert state.funding_instrument_id == expected_id
++
++
++def test_web_phone_provider_is_blocked_until_email_submission(monkeypatch):
++    provider_calls = []
++    flow = paypal_web.WebPayPalFlow.__new__(paypal_web.WebPayPalFlow)
++    flow.country = "US"
++    flow.state = SessionState(email_submitted=False)
++    flow.user = fixture_user()
++    flow.card = CardInfo("4111111111111111", "12/2030", "123")
++    flow.address = fixture_address()
++    flow.runtime_form_schema = {}
++    flow.job = SimpleNamespace(
++        sms_provider="smsbower",
++        runtime_schema=None,
++        set_status=lambda status, stage: None,
++        set_generated=lambda payload: None,
++    )
++
++    monkeypatch.setattr(
++        paypal_web,
++        "sms_provider_client",
++        lambda provider: provider_calls.append(("resolve", provider)) or object(),
++    )
++    monkeypatch.setattr(paypal_web, "sms_provider_label", lambda _provider: "SMSBower")
++    monkeypatch.setattr(
++        paypal_web,
++        "acquire_job_sms_activation",
++        lambda job, client, *, country: provider_calls.append(("acquire", country))
++        or SimpleNamespace(phone="+12025550123"),
++    )
++
++    with pytest.raises(RuntimeError, match="US_EMAIL_NOT_SUBMITTED"):
++        flow.acquire_phone_after_email()
++    assert provider_calls == []
++
++    flow.state.email_submitted = True
++    phone = flow.acquire_phone_after_email()
++
++    assert phone == "+12025550123"
++    assert provider_calls == [("resolve", "smsbower"), ("acquire", "US")]
++
++
++@pytest.mark.parametrize(
++    ("country", "acquire_after_phase2", "expected_email"),
++    [
++        ("US", True, "source-account@example.com"),
++        ("GB", False, "generated-gb@example.com"),
++    ],
++)
++def test_run_job_automatic_sms_order_and_us_source_email(
++    monkeypatch, country, acquire_after_phase2, expected_email
++):
++    events = []
++    proxy = SimpleNamespace(url="", enabled=False, label="fixture")
++    provider_phone = "+12025550123" if country == "US" else "+447700900123"
++
++    def generate_user_stub(phone, country):
++        events.append(("generate_user", country, phone))
++        return fixture_user(
++            phone=phone,
++            email=f"generated-{country.lower()}@example.com",
++            country=country,
++        )
++
++    def acquire_stub(job, _client, *, country):
++        events.append(("acquire", country))
++        job.phone = provider_phone
++        return SimpleNamespace(phone=provider_phone)
++
++    class FlowStub:
++        acquire_phone_after_email = paypal_web.WebPayPalFlow.acquire_phone_after_email
++
++        def __init__(self, **kwargs):
++            self.job = kwargs["job"]
++            self.user = kwargs["user"]
++            self.card = kwargs["card"]
++            self.address = kwargs["address"]
++            self.country = self.job.country
++            self.state = SessionState()
++            self.runtime_form_schema = {}
++            events.append(("flow_init", self.user.email, self.user.phone))
++
++        def run(self):
++            events.append(("phase2_complete", self.country))
++            if self.country == "US":
++                self.state.email_submitted = True
++                self.acquire_phone_after_email()
++            return {"status": "success", "return_url": "https://merchant.test/return"}
++
++    monkeypatch.setattr(paypal_web, "select_working_proxy", lambda *_args, **_kwargs: proxy)
++    monkeypatch.setattr(paypal_web, "generate_user", generate_user_stub)
++    monkeypatch.setattr(
++        paypal_web,
++        "generate_card",
++        lambda **_kwargs: CardInfo("4111111111111111", "12/2030", "123"),
++    )
++    monkeypatch.setattr(paypal_web, "generate_address", fixture_address)
++    monkeypatch.setattr(paypal_web, "sms_provider_client", lambda _provider: object())
++    monkeypatch.setattr(paypal_web, "sms_provider_label", lambda _provider: "SMSBower")
++    monkeypatch.setattr(paypal_web, "acquire_job_sms_activation", acquire_stub)
++    monkeypatch.setattr(paypal_web, "WebPayPalFlow", FlowStub)
++    monkeypatch.setattr(
++        paypal_web,
++        "PAYMENT_COMPLETION_PRESENTER",
++        SimpleNamespace(
++            present=lambda result, target: SimpleNamespace(
++                requires_braintree_bridge=False, route="fixture"
++            )
++        ),
++    )
++    monkeypatch.setattr(paypal_web, "record_payment_audit", lambda *_args: None)
++    monkeypatch.setattr(paypal_web, "record_protocol_metric", lambda *_args: None)
++
++    job = paypal_web.WebJob(
++        id=f"fixture-{country.lower()}",
++        owner_device_id="fixture-device",
++        ba_token="BA-ABCDEFGH123456",
++        phone="",
++        country=country,
++        sms_provider="smsbower",
++        sms_country=country,
++        buyer_mode="original",
++        source_account_email="source-account@example.com",
++        _proxy_config=proxy,
++    )
++    job.acquire_execution_slot = lambda: None
++    job.release_execution_slot = lambda: None
++    job.finalize_sms_activation = lambda **_kwargs: None
++
++    paypal_web.run_job(job)
++
++    event_names = [event[0] for event in events]
++    acquire_index = event_names.index("acquire")
++    phase2_index = event_names.index("phase2_complete")
++    assert (acquire_index > phase2_index) is acquire_after_phase2
++    flow_init = next(event for event in events if event[0] == "flow_init")
++    assert flow_init[1] == expected_email
++    assert job.status == "completed"
++
++
++def test_identity_elevation_us_authenticated_selected_skips_signup_get():
++    state = SessionState(
++        ba_token="BA-fixture",
++        ec_token="EC-fixture",
++        euat_token="fixture-euat",
++        signup_context_ready=True,
++        member_authenticated=True,
++        funding_selected=True,
++    )
++    session = StateSessionStub(state)
++    flow = IdentityElevationPayPalFlow.__new__(IdentityElevationPayPalFlow)
++    flow.state = state
++    flow.session = session
++    flow.address = fixture_address()
++    flow.ba_token = "BA-fixture"
++    flow.locale = "en_US"
++    query_calls = []
++    expected = {
++        "buyer_ready": True,
++        "funding_selected": True,
++        "funding_available": True,
++        "funding_available_count": 1,
++        "funding_errors": [],
++        "funding_checkpoints": [],
++        "fatal_contingency": "",
++    }
++    flow._build_member_review_url = MethodType(lambda self: REVIEW_URL, flow)
++    flow._query_elevated_context = MethodType(
++        lambda self, token, referer: query_calls.append((token, referer)) or expected,
++        flow,
++    )
++
++    result = flow._protocol_identity_elevation()
++
++    assert result is expected
++    assert query_calls == [("EC-fixture", REVIEW_URL)]
++    assert session.get_calls == []
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__tests__test_us_onboarding_compat.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_onboarding_compat.py"
+index 191efc0..c510d2f 100644
+--- "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__tests__test_us_onboarding_compat.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__tests__test_us_onboarding_compat.py"
+@@ -142,15 +142,38 @@ def test_member_completion_requires_euat_and_paypal_review_route():
+         "https://www.paypal.com/webapps/hermes#/billingweb/review",
+         200,
+     )
++    assert controller._completion_ready(
++        cookies,
++        "https://www.paypal.com/checkoutnow/review",
++        302,
++    )
+     assert not controller._completion_ready(
+         [],
+         "https://www.paypal.com/webapps/hermes#/billingweb/review",
+         200,
+     )
++    rejected_urls = (
++        "https://evilpaypal.com/webapps/hermes#/billingweb/review",
++        "https://www.paypal.com/webapps/hermes",
++        "https://www.paypal.com/webapps/hermes#/billingweb/confirm",
++        "https://www.paypal.com/checkoutnow",
++        "https://www.paypal.com/checkoutnow/reviewing",
++        "https://www.paypal.com/checkoutweb/signup",
++        "https://www.paypal.com/checkoutweb/review",
++        "https://www.paypal.com/checkoutweb/anything",
++        "https://www.paypal.com/signin",
++    )
++    for rejected_url in rejected_urls:
++        assert not controller._completion_ready(cookies, rejected_url, 200)
+     assert not controller._completion_ready(
+         cookies,
+-        "https://www.paypal.com/signin",
+-        200,
++        "https://www.paypal.com/checkoutnow/review",
++        199,
++    )
++    assert not controller._completion_ready(
++        cookies,
++        "https://www.paypal.com/checkoutnow/review",
++        400,
+     )
+ 
+ 
+diff --git "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__web.py" "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__web.py"
+index c79d7ef..d68a5ac 100644
+--- "a/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\baseline/paypal-agreement-protocol__web.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\paypal-us-email-first-20260818\\modified/paypal-agreement-protocol__web.py"
+@@ -41,6 +41,7 @@ from paypal.elevation_flow import IdentityElevationPayPalFlow
+ from paypal.checkout_validation import validate_oaics_checkout
+ from paypal.manual_browser import ManualBrowserController
+ from paypal.models import BillingAddress, CardInfo, UserInfo, generate_address, generate_card, generate_user
++from paypal.us_email_first import MemberAuthenticationResult
+ from paypal.online_address import resolve_online_address
+ from paypal.payment_completion import (
+     PaymentCompletionPresenter,
+@@ -926,6 +927,16 @@ class WebJob:
+             "updated_at": None,
+         }
+     )
++    us_onboarding: dict[str, Any] = field(
++        default_factory=lambda: {
++            "stage": "idle",
++            "events": [],
++            "email_submitted": False,
++            "phone_verified": False,
++            "member_authenticated": False,
++            "funding_selected": False,
++        }
++    )
+     awaiting_prompt: str = ""
+     challenge_url: str = ""
+     logs: list[dict[str, Any]] = field(default_factory=list)
+@@ -1464,6 +1475,26 @@ class WebJob:
+                 if include_logs
+                 else []
+             )
++            flow_model = getattr(self._flow, "us_email_first_model", None)
++            us_onboarding = dict(self.us_onboarding or {})
++            if flow_model is not None:
++                us_onboarding = {
++                    "stage": str(getattr(flow_model, "stage", "") or ""),
++                    "events": list(getattr(flow_model, "events", []) or []),
++                    "email_submitted": bool(
++                        getattr(flow_model, "email_submitted", False)
++                    ),
++                    "phone_verified": bool(
++                        getattr(flow_model, "phone_verified", False)
++                    ),
++                    "member_authenticated": bool(
++                        getattr(flow_model, "buyer_user_id", "")
++                        and getattr(flow_model, "euat_token", "")
++                    ),
++                    "funding_selected": bool(
++                        getattr(flow_model, "funding_instrument_id", "")
++                    ),
++                }
+             return {
+                 "id": self.id,
+                 "created_at": self.created_at,
+@@ -1502,6 +1533,7 @@ class WebJob:
+                 "sms_verified": self._sms_verified,
+                 "phone_validation": sanitize_payload(self.phone_validation),
+                 "phone_verification": sanitize_payload(self.phone_verification),
++                "us_onboarding": us_onboarding,
+                 "buyer_mode": self.buyer_mode,
+                 "debug": self.debug and ALLOW_DEBUG_LOGS,
+                 "max_card_attempts": self.max_card_attempts,
+@@ -1603,6 +1635,25 @@ class WebPayPalFlow(PayPalFlow):
+         self.job.check_cancelled()
+         self.job.set_status("running", stage)
+ 
++    def _us_onboarding_updated(self, model) -> None:
++        self.job.us_onboarding = {
++            "stage": str(getattr(model, "stage", "") or ""),
++            "events": list(getattr(model, "events", []) or []),
++            "email_submitted": bool(
++                getattr(model, "email_submitted", False)
++            ),
++            "phone_verified": bool(
++                getattr(model, "phone_verified", False)
++            ),
++            "member_authenticated": bool(
++                getattr(model, "buyer_user_id", "")
++                and getattr(model, "euat_token", "")
++            ),
++            "funding_selected": bool(
++                getattr(model, "funding_instrument_id", "")
++            ),
++        }
++
+     def _phase0_initial_load(self):
+         self._set_stage("Phase 0：打开协议页")
+         return super()._phase0_initial_load()
+@@ -1621,9 +1672,16 @@ class WebPayPalFlow(PayPalFlow):
+             runtime_schema["kyc"] = infer_dynamic_kyc(
+                 getattr(self, "_signup_html", "")
+             )
+-            phone_error = validate_runtime_phone(
+-                runtime_schema, self.user.phone_local, self.user.phone
+-            )
++            # The current US checkout creates the email/account context before
++            # requesting a phone. Automatic SMS numbers are therefore
++            # acquired only after this phase; validate the number when the US
++            # onboarding presenter requests it instead of rejecting the empty
++            # placeholder here.
++            phone_error = ""
++            if self.user.phone or self.country != "US":
++                phone_error = validate_runtime_phone(
++                    runtime_schema, self.user.phone_local, self.user.phone
++                )
+             runtime_schema["phone_validation_error"] = phone_error
+             if phone_error:
+                 raise RuntimeError(f"RUNTIME_PHONE_VALIDATION_FAILED: {phone_error}")
+@@ -1751,8 +1809,66 @@ class WebPayPalFlow(PayPalFlow):
+             logger.warning("Runtime country schema resolution soft-failed: {}", schema_error)
+         return result
+ 
++    def acquire_phone_after_email(self) -> str:
++        """View: acquire/validate the US phone only after email submission."""
++
++        if self.country != "US":
++            return str(self.user.phone or "")
++        if not getattr(self.state, "email_submitted", False):
++            raise RuntimeError(
++                "US_EMAIL_NOT_SUBMITTED: phone acquisition requires the email step"
++            )
++
++        if not self.user.phone and self.job.sms_provider in AUTOMATIC_SMS_PROVIDERS:
++            client = sms_provider_client(self.job.sms_provider)
++            provider_label = sms_provider_label(self.job.sms_provider)
++            self.job.set_status(
++                "running",
++                f"邮箱步骤已完成；{provider_label} 正在获取 US PayPal 手机号",
++            )
++            activation = acquire_job_sms_activation(
++                self.job,
++                client,
++                country=self.country,
++            )
++            phone_profile = generate_user(activation.phone, country=self.country)
++            self.user.phone = phone_profile.phone
++            self.user.phone_local = phone_profile.phone_local
++            self.user.phone_country_code = phone_profile.phone_country_code
++            logger.info(
++                "{} US PayPal number acquired after email submission: {}",
++                provider_label,
++                mask_phone(self.user.phone),
++            )
++
++        if not self.user.phone:
++            raise RuntimeError(
++                "US_PHONE_REQUIRED_AFTER_EMAIL: provide a phone before member login"
++            )
++
++        runtime_schema = getattr(self, "runtime_form_schema", None) or {}
++        phone_error = validate_runtime_phone(
++            runtime_schema,
++            self.user.phone_local,
++            self.user.phone,
++        )
++        if phone_error:
++            raise RuntimeError(f"RUNTIME_PHONE_VALIDATION_FAILED: {phone_error}")
++        runtime_schema["phone_validation_error"] = ""
++        if runtime_schema:
++            self.runtime_form_schema = runtime_schema
++            self.job.runtime_schema = runtime_schema
++        self.job.set_generated(
++            public_generated_payload(self.user, self.card, self.address)
++        )
++        return self.user.phone
++
+     def _phase3_signup_and_2fa(self):
+-        self._set_stage("Phase 3：短信验证与注册")
++        self._set_stage(
++            "Phase 3：手机验证登录与登录态绑卡"
++            if self.country == "US"
++            else "Phase 3：短信验证与注册"
++        )
+         return super()._phase3_signup_and_2fa()
+ 
+     def _phase4_authorize(self):
+@@ -1825,7 +1941,9 @@ class WebPayPalFlow(PayPalFlow):
+             locale=browser_locale,
+             timezone_id=browser_timezone,
+             completion_mode="member",
++            autofill_values=self._member_browser_autofill_values(),
+         )
++        self._start_member_browser_sms_bridge(controller)
+         solved_cookies = self.job.wait_for_browser(
+             controller,
+             stage="等待完成新版 US PayPal 会员验证",
+@@ -1849,6 +1967,163 @@ class WebPayPalFlow(PayPalFlow):
+         )
+         return True
+ 
++    def _start_member_browser_sms_bridge(
++        self, controller: ManualBrowserController
++    ) -> None:
++        """Poll an automatic provider only after PayPal shows its OTP input."""
++
++        provider = str(getattr(self.job, "sms_provider", "manual") or "manual")
++        if provider not in AUTOMATIC_SMS_PROVIDERS:
++            return
++        activation = self.job.sms_activation()
++        if activation is None:
++            return
++
++        def bridge() -> None:
++            provider_label = sms_provider_label(provider)
++            try:
++                prompt_seen = controller.wait_for_otp_prompt(
++                    OTP_INPUT_TIMEOUT_SECONDS,
++                    self.job._cancel_event,
++                )
++                if not prompt_seen:
++                    return
++                client = sms_provider_client(provider)
++                try:
++                    client.mark_sent(activation)
++                except SMSBowerPhoneError as lifecycle_error:
++                    logger.warning(
++                        "{} browser OTP readiness update: {}",
++                        provider_label,
++                        lifecycle_error,
++                    )
++                self.job.set_phone_verification(
++                    "code_sent",
++                    "PayPal 官方会员页已发送验证码，接码平台正在自动读取",
++                    paypal_send_accepted=True,
++                )
++                excluded_codes = self.job.sms_consumed_codes(activation)
++                code = client.wait_for_code(
++                    activation,
++                    cancel_event=self.job._cancel_event,
++                    timeout_seconds=AUTO_SMS_OTP_TIMEOUT_SECONDS,
++                    exclude_codes=excluded_codes,
++                )
++                self.job.record_sms_code(activation, code)
++                self.job.set_phone_verification(
++                    "sms_received",
++                    "接码平台已取得验证码并填入 PayPal 官方会员页",
++                    paypal_send_accepted=True,
++                    sms_received=True,
++                )
++                controller.action({"type": "otp", "value": code})
++            except Exception as bridge_error:
++                logger.warning(
++                    "{} official-page OTP bridge stopped: {}",
++                    provider_label,
++                    redact_text(bridge_error),
++                )
++
++        threading.Thread(
++            target=bridge,
++            name=f"paypal-member-otp-{self.job.id}",
++            daemon=True,
++        ).start()
++
++    def _member_browser_autofill_values(self) -> dict[str, str]:
++        """Keep generated member/card values private while filling PayPal UI."""
++
++        user = getattr(self, "user", None)
++        card = getattr(self, "card", None)
++        address = getattr(self, "address", None)
++        line1 = ""
++        if address is not None:
++            line1 = " ".join(
++                value
++                for value in (
++                    str(getattr(address, "house_number", "") or "").strip(),
++                    str(getattr(address, "street", "") or "").strip(),
++                )
++                if value
++            )
++        return {
++            "email": str(getattr(user, "email", "") or ""),
++            "phone": str(getattr(user, "phone", "") or ""),
++            "password": str(getattr(user, "password", "") or ""),
++            "first_name": str(getattr(user, "first_name", "") or ""),
++            "last_name": str(getattr(user, "last_name", "") or ""),
++            "card_number": str(getattr(card, "number", "") or ""),
++            "card_expiry": str(getattr(card, "expiry", "") or ""),
++            "card_cvv": str(getattr(card, "cvv", "") or ""),
++            "address_line1": line1,
++            "city": str(getattr(address, "city", "") or ""),
++            "state": str(getattr(address, "state", "") or ""),
++            "postal_code": str(getattr(address, "postal_code", "") or ""),
++        }
++
++    def authenticate_member_with_phone(
++        self, signup_url: str
++    ) -> MemberAuthenticationResult:
++        """View: complete phone login and return the authenticated buyer facts."""
++
++        if not self.user.phone:
++            self.acquire_phone_after_email()
++        recovered = self.complete_member_onboarding(signup_url)
++        authenticated = bool(
++            recovered and self.state.user_id and self.state.euat_token
++        )
++        if authenticated:
++            self.state.phone_login_verified = True
++            self.state.member_authenticated = True
++            self.job.set_phone_verification(
++                "confirmed",
++                "PayPal 官方会员页已完成手机验证并建立登录态",
++                paypal_send_accepted=True,
++                sms_received=True,
++                paypal_confirmed=True,
++            )
++            activation = self.job.sms_activation()
++            if activation is not None:
++                self.job.mark_sms_verified(activation)
++        return MemberAuthenticationResult(
++            phone_verified=authenticated,
++            user_id=str(self.state.user_id or ""),
++            euat_token=str(self.state.euat_token or ""),
++        )
++
++    def bind_card_in_authenticated_session(self, review_url: str) -> str:
++        """View: bind/select a card, then prove it through Funding Context."""
++
++        token = self.state.ec_token or self.ba_token
++        context = self._sync_buyer_funding_context(token, review_url)
++        instrument_id = str(context.get("funding_instrument_id") or "")
++        if instrument_id:
++            return instrument_id
++
++        browser_locale, browser_timezone = self._browser_locale_timezone(self.country)
++        controller = ManualBrowserController(
++            proxy_config=self.proxy_config,
++            user_agent=USER_AGENT,
++            cookies=self._browser_cookie_snapshot(),
++            start_url=review_url,
++            locale=browser_locale,
++            timezone_id=browser_timezone,
++            completion_mode="funding",
++            autofill_values=self._member_browser_autofill_values(),
++        )
++        solved_cookies = self.job.wait_for_browser(
++            controller,
++            stage="等待在登录态绑定 US PayPal 银行卡",
++            prompt=(
++                "请在 PayPal 官方审核页完成银行卡绑定/选择；"
++                "完成后点击‘完成验证并继续’，系统会校验 Funding Context"
++            ),
++        )
++        self._sync_browser_cookies(solved_cookies)
++        referer = controller.state().current_url or review_url
++        context = self._sync_buyer_funding_context(token, referer)
++        return str(context.get("funding_instrument_id") or "")
++
+     def _before_final_authorize(self, review_url: str) -> None:
+         if not self.job.manual_funding:
+             return
+@@ -2632,7 +2907,11 @@ def run_job(job: WebJob) -> None:
+             )
+             job._proxy_config = proxy_config
+             job.check_cancelled()
+-            if job.sms_provider in AUTOMATIC_SMS_PROVIDERS:
++            defer_us_phone = bool(
++                job.country == "US"
++                and job.sms_provider in AUTOMATIC_SMS_PROVIDERS
++            )
++            if job.sms_provider in AUTOMATIC_SMS_PROVIDERS and not defer_us_phone:
+                 provider_client = sms_provider_client(job.sms_provider)
+                 provider_label = sms_provider_label(job.sms_provider)
+                 job.set_status("running", f"{provider_label} 正在获取 PayPal 手机号")
+@@ -2646,7 +2925,14 @@ def run_job(job: WebJob) -> None:
+                     mask_phone(activation.phone),
+                 )
+                 job.check_cancelled()
++            elif defer_us_phone:
++                logger.info(
++                    "US PayPal automatic phone acquisition deferred until the email step succeeds"
++                )
+             user = generate_user(job.phone, country=job.country)
++            if job.country == "US" and job.source_account_email:
++                user.email = job.source_account_email
++                logger.info("US PayPal account creation will use the source account email")
+             job.check_cancelled()
+             card = generate_card(
+                 proxy_url=proxy_config.url,

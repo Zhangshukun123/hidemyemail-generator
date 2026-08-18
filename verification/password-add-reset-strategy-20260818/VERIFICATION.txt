@@ -1,0 +1,82 @@
+VERIFICATION_STATUS=PASS
+DATE=2026-08-18
+WORKSPACE=D:\AI\hidemyemail-generator
+BASELINE_COMMIT=2e926b8f15cde78b823c3f25aa3e6c9a6cc73983
+
+CHANGED_BRANCH_OR_FIELD=_complete_password_add_reauth.password_write_strategy=added|reset; verify_password_with_clean_auth.password_add_reauth=false after reset completion; complete_protocol_credentials.verified_access_token has priority over original-session refresh
+RESTORED_BEHAVIOR=one zkgmail account completes password proof, TOTP enrollment, Session persistence, and protocolReady=true; registration proxy restored to its original enabled state
+
+SOURCE_CORE=D:\AI\hidemyemail-generator\src\hidemyemail_generator\vendor\gptfree_register\core\chatgpt_register.py
+SOURCE_CREDENTIAL_STRATEGY=D:\AI\hidemyemail-generator\src\hidemyemail_generator\protocol_credentials.py
+SOURCE_WORKER=D:\AI\hidemyemail-generator\src\hidemyemail_generator\protocol_registration_worker.py
+TEST_SOURCE=D:\AI\hidemyemail-generator\tests\test_protocol_registration.py
+
+SOURCE_CORE_BASELINE_GIT_BLOB_SHA1=8fa67134968b0cf3a0fbc48c605e087c2dbdcfaa
+SOURCE_CREDENTIAL_BASELINE_GIT_BLOB_SHA1=cc61e669ba5516d61999c6dc17384e722f741ebf
+SOURCE_WORKER_BASELINE_GIT_BLOB_SHA1=26745da5ad9515250ef9bf91f89e3a4a6167986b
+TEST_BASELINE_GIT_BLOB_SHA1=5981d1acd5cef95c285e64cef59182215898d11b
+ORIGINAL_FILE_SHA256=B1712CBB6A2971E55B8F5C35B1499CAF020BF775479BAB62DED26C50E32EF414
+MODIFIED_FILE_SHA256=250BDB56AB58AA411D1DEDFB1A755516131F4476B623A916F6A5732F62473009
+SOURCE_CREDENTIAL_MODIFIED_SHA256=B42CD34AE600480E9C0D2D759E20F5A54A684B28937247BBBE1B62836573658A
+SOURCE_WORKER_MODIFIED_SHA256=87885C73A7688B9C56A193AF734ACA662F0689B9210D0CDAECC0509D6BBF292B
+TEST_MODIFIED_SHA256=D7152825099DC4D491A84C03188511B26D90F01F10E02C065F3EFE9A23F8DD86
+
+ARTIFACT_MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\password-add-reset-strategy-20260818\MODIFIED_FILE
+ARTIFACT_DIFF_FILE=D:\AI\hidemyemail-generator\verification\password-add-reset-strategy-20260818\DIFF_FILE
+ARTIFACT_VERIFICATION=D:\AI\hidemyemail-generator\verification\password-add-reset-strategy-20260818\VERIFICATION.txt
+ARTIFACT_ROLLBACK=D:\AI\hidemyemail-generator\verification\password-add-reset-strategy-20260818\ROLLBACK.sh
+
+BASELINE_COMMAND=.venv\Scripts\python.exe -m unittest tests.test_protocol_registration.ProtocolCredentialTests.test_passwordless_result_adds_password_and_activates_totp tests.test_protocol_registration.ProtocolRegistrationWorkerTests.test_password_checkpoint_waits_for_login_proof_before_2fa tests.test_protocol_registration.ProtocolAuthStateTests.test_add_password_reauth_completes_email_otp_totp_and_password_add tests.test_protocol_registration.ProtocolAuthStateTests.test_add_password_reauth_seeds_logged_in_session_cookies
+BASELINE_INPUT=pre-change authentication code at BASELINE_COMMIT; four existing password/reauth credential tests
+BASELINE_LITERAL_OUTPUT=Ran 4 tests in 0.233s
+BASELINE_LITERAL_RESULT=OK
+BASELINE_EXIT_STATUS=0
+
+MODIFIED_COMMAND=.venv\Scripts\python.exe -m unittest tests.test_protocol_registration -v
+MODIFIED_INPUT=current worktree; add-password Strategy, 409 reset fallback, clean-login reauth reset, verified-token MFA selection, and existing protocol regressions
+MODIFIED_LITERAL_OUTPUT=Ran 67 tests in 2.305s
+MODIFIED_LITERAL_RESULT=OK
+MODIFIED_EXIT_STATUS=0
+
+STATIC_COMMAND=.venv\Scripts\python.exe -m ruff check src/hidemyemail_generator/protocol_credentials.py src/hidemyemail_generator/protocol_registration_worker.py src/hidemyemail_generator/vendor/gptfree_register/core/chatgpt_register.py tests/test_protocol_registration.py
+STATIC_INPUT=current worktree production and test files
+STATIC_LITERAL_OUTPUT=All checks passed!
+STATIC_EXIT_STATUS=0
+
+COMPILE_COMMAND=.venv\Scripts\python.exe -m py_compile src/hidemyemail_generator/protocol_credentials.py src/hidemyemail_generator/protocol_registration_worker.py src/hidemyemail_generator/vendor/gptfree_register/core/chatgpt_register.py tests/test_protocol_registration.py
+COMPILE_INPUT=current worktree production and test files
+COMPILE_LITERAL_OUTPUT=
+COMPILE_EXIT_STATUS=0
+
+REAL_GENERATION_COMMAND=POST http://127.0.0.1:8765/api/protocol-registration/start
+REAL_GENERATION_INPUT={"provider":"zkgmail","concurrency":1,"setup_credentials":true}
+REAL_GENERATION_LITERAL_OUTPUT={"event":"STARTED","provider":"zkgmail","concurrency":1,"setupCredentials":true,"email":"markrodriguez78@zkgmail.com","processId":"24565100156da6dc"}
+REAL_GENERATION_RESULT=exactly one zkgmail address acquired; the first run independently confirmed the password and preserved a ready Session, then exposed an old-token-overwrites-new-token HTTP 401 at MFA enrollment
+REAL_GENERATION_EXIT_STATUS=2
+
+REAL_MODIFIED_COMMAND=POST http://127.0.0.1:8765/api/protocol-registration/start
+REAL_MODIFIED_INPUT={"emails":["markrodriguez78@zkgmail.com"],"concurrency":1,"setup_credentials":true,"force":true}; existing account only; registration proxy temporarily disabled and restored in finally
+REAL_MODIFIED_LITERAL_OUTPUT={"event":"DIRECT_RETRY_FINAL_TASK","processId":"530f90e074168955","status":"completed","phase":"completed","completed":1,"total":1,"succeeded":1,"failed":0,"accountStatus":"success","accountStage":"completed"}
+REAL_MODIFIED_LITERAL_RESULT={"event":"DIRECT_RETRY_FINAL_ACCOUNT","email":"markrodriguez78@zkgmail.com","hasPassword":true,"passwordConfirmed":true,"hasTwoFactor":true,"hasSession":true,"protocolReady":true,"sessionStatus":"ready","tokenExpired":false,"registrationMode":"protocol"}
+REAL_MODIFIED_EXIT_STATUS=0
+PROXY_RESTORE_LITERAL_RESULT={"event":"PROXY_RESTORED","expectedEnabled":true,"actualEnabled":true,"restored":true}
+
+INSTALL_COMMAND=C:\Users\29070\.local\bin\uv.exe pip install --python .venv\Scripts\python.exe --reinstall --no-deps -e .
+INSTALL_INPUT=current worktree editable package
+INSTALL_LITERAL_OUTPUT=Installed 1 package in 161ms
+INSTALL_LITERAL_RESULT=hidemyemail-generator==2.1.0 (from file:///D:/AI/hidemyemail-generator)
+INSTALL_EXIT_STATUS=0
+
+RESTART_COMMAND=Stop-Process -Id 34076; Start-Process -FilePath D:\AI\hidemyemail-generator\.venv\Scripts\pythonw.exe -ArgumentList -m,hidemyemail_generator.webapp,--host,127.0.0.1,--port,8765,--region,china -WindowStyle Hidden
+RESTART_INPUT=verified listener PID 34076 on 127.0.0.1:8765; installed editable package
+RESTART_LITERAL_OUTPUT={"healthStatus":200,"healthBody":"ok","hasPassword":true,"passwordConfirmed":true,"hasTwoFactor":true,"hasSession":true,"protocolReady":true,"sessionStatus":"ready","tokenExpired":false,"registrationMode":"protocol","registrationProxyEnabled":true}
+RESTART_EXIT_STATUS=0
+
+ROLLBACK_COMMAND=$root='D:\AI\hidemyemail-generator'; $bundle=Join-Path $root 'verification\password-add-reset-strategy-20260818\rollback-test-bundle'; @('src\hidemyemail_generator\vendor\gptfree_register\core\chatgpt_register.py','src\hidemyemail_generator\protocol_credentials.py','src\hidemyemail_generator\protocol_registration_worker.py') | ForEach-Object { $destination=Join-Path $bundle $_; New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null; Copy-Item -LiteralPath (Join-Path $root $_) -Destination $destination -Force }; & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x '/d/AI/hidemyemail-generator/verification/password-add-reset-strategy-20260818/ROLLBACK.sh' && test -x '/d/AI/hidemyemail-generator/verification/password-add-reset-strategy-20260818/ROLLBACK.sh' && '/d/AI/hidemyemail-generator/verification/password-add-reset-strategy-20260818/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/password-add-reset-strategy-20260818/rollback-test-bundle'"
+ROLLBACK_INPUT=rollback-test-bundle containing modified chatgpt_register.py, protocol_credentials.py, and protocol_registration_worker.py; active sources are not rollback targets
+ROLLBACK_LITERAL_OUTPUT=ROLLBACK_RESULT=restored-original-bundle
+ROLLBACK_LITERAL_RESULT=chatgpt_register.py blob_sha1=8fa67134968b0cf3a0fbc48c605e087c2dbdcfaa; protocol_credentials.py blob_sha1=cc61e669ba5516d61999c6dc17384e722f741ebf; protocol_registration_worker.py blob_sha1=26745da5ad9515250ef9bf91f89e3a4a6167986b; allHashMatch=true; activeSourcesLeftChanged=true
+ROLLBACK_EXIT_STATUS=0
+ROLLBACK_EXECUTABLE=true
+ROLLBACK_RESTORED_STATUS=rollback bundle restored all three production files to baseline Git blobs and baseline behavior; active sources and MODIFIED_FILE remain changed
+MODIFIED_FILE_LEFT_CHANGED=true

@@ -9,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from hidemyemail_generator.liandong_shop import (
+    DEFAULT_LIANDONG_SHOP_CODE_URL,
     LIANDONG_SHOP_TOKEN_ENV,
     UNBOUND_GOODS,
     LiandongShopClient,
@@ -32,7 +33,43 @@ class LiandongShopTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(goods.goods_id, 685418)
-        self.assertEqual(content, "seller@zkgmail.com----password----ABCDEF")
+        self.assertEqual(
+            content,
+            "seller@zkgmail.com-----------password----------ABCDEF",
+        )
+
+    def test_passwordless_card_uses_code_portal_without_two_factor(self):
+        with mock.patch.dict(os.environ, {"LIANDONG_SHOP_CODE_URL": ""}):
+            goods, content = card_upload_for_account(
+                "Passwordless@icloud.com",
+                {
+                    "account_type": "plus",
+                    "password": "",
+                    "password_confirmed": False,
+                    "two_factor": {"enabled": False},
+                },
+            )
+
+        self.assertEqual(goods.goods_id, 698207)
+        self.assertEqual(
+            content,
+            f"passwordless@icloud.com--------{DEFAULT_LIANDONG_SHOP_CODE_URL}",
+        )
+
+    def test_passwordless_card_supports_configured_code_portal(self):
+        with mock.patch.dict(
+            os.environ,
+            {"LIANDONG_SHOP_CODE_URL": "https://codes.example.test/inbox"},
+        ):
+            _goods, content = card_upload_for_account(
+                "passwordless@icloud.com",
+                {"account_type": "plus"},
+            )
+
+        self.assertEqual(
+            content,
+            "passwordless@icloud.com--------https://codes.example.test/inbox",
+        )
 
     def test_requires_enabled_two_factor(self):
         with self.assertRaisesRegex(LiandongShopError, "2FA"):
@@ -43,6 +80,18 @@ class LiandongShopTests(unittest.IsolatedAsyncioTestCase):
                     "password": "password",
                     "password_confirmed": True,
                     "two_factor": {"enabled": False, "secret": "ABC"},
+                },
+            )
+
+    def test_rejects_unconfirmed_password_instead_of_using_passwordless_format(self):
+        with self.assertRaisesRegex(LiandongShopError, "已确认的密码"):
+            card_upload_for_account(
+                "seller@zkgmail.com",
+                {
+                    "account_type": "plus",
+                    "password": "password",
+                    "password_confirmed": False,
+                    "two_factor": {"enabled": True, "secret": "ABC"},
                 },
             )
 

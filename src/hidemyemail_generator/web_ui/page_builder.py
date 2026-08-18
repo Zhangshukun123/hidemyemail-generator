@@ -51,6 +51,7 @@ def build_app_page() -> str:
                 "static/sms_settings.js",
                 "static/liandong_shop.js",
                 "static/app.js",
+                "static/catchall_mailbox.js",
                 "static/plus_exports.js",
                 "static/account_actions.js",
             ),

@@ -1,0 +1,46 @@
+--- ORIGINAL_FILE	2026-08-18
++++ MODIFIED_FILE	2026-08-18
+@@ password reauth query @@
+- post_login_add_password=true
++ connection=password
++ login_hint=<account email>
++ reauth=password
++ post_login_add_password=true
++ max_age=0
+
+@@ password write presenter / Strategy chain @@
+- Retry /api/accounts/password/add for every failure and return one generic error.
++ Primary Strategy: authenticated /api/accounts/password/add.
++ HTTP 409 Strategy transition: email OTP + /api/accounts/password/reset.
++ HTTP 401: stop without reset.
++ HTTP 403/transient transport: one bounded fresh-Sentinel retry.
++ HTTP 429 and deterministic 4xx: stop without reset.
++ Return an explicit added/reset outcome so the worker creates a clean login.
+
+@@ tests @@
++ Assert auth.openai.com endpoint, password_reset Sentinel, request body and referer.
++ Assert the full reauth query contract.
++ Assert 409 -> reset, 401/403 -> no reset, and reset error preservation.
++ Assert a 409 reset completion clears reauth token/cookie/device state before clean login.
++ Assert the clean password-login Access Token cannot be overwritten by the old registration Session.
++ Assert a verifier without a fresh token stops before creating a new TOTP enrollment.
+
+@@ clean-login token -> TOTP strategy @@
+- Refresh the original registration Session after independent password verification.
+- Let that older refresh overwrite the new password-login Access Token.
++ Prefer the Access Token returned by the independent password-login session.
++ Refresh the original Session only when no password verifier ran.
++ Preserve an existing TOTP factor without refreshing the older Session.
++ Stop before enrollment when a verifier ran but returned no usable Access Token.
+
+@@ 409 reset -> clean-login state @@
+- Keep password_add_reauth and inject the old token/cookies/device into the next retry.
++ Clear password_add_reauth after reset completion.
++ Start the proof attempt without the old reauth token/cookies/device.
+
+@@ observed zkgmail result @@
++ One zkgmail address acquired; no second address requested.
++ Password independently confirmed in a new login session.
++ TOTP 2FA enabled with the verified-login token.
++ Session ready, protocolReady=true, tokenExpired=false.
++ Temporary direct-network validation restored the original registration-proxy enabled state.

@@ -1,0 +1,16 @@
+diff --git a/verification/paypal-us-update-20260818/ORIGINAL_FILE.json b/verification/paypal-us-update-20260818/MODIFIED_FILE.json
+--- a/verification/paypal-us-update-20260818/ORIGINAL_FILE.json
++++ b/verification/paypal-us-update-20260818/MODIFIED_FILE.json
+@@ -1,7 +1,9 @@
+ {
+   "branch": "US",
+   "field": "upstream_update_detected",
+-  "value": null,
+-  "result": "pending",
+-  "local_imported_revision": "4719066ec6fd56b57a5bd9599758366836c9dc0a"
++  "value": false,
++  "result": "not_updated_no_code_change",
++  "local_imported_revision": "4719066ec6fd56b57a5bd9599758366836c9dc0a",
++  "upstream_head_revision": "4719066ec6fd56b57a5bd9599758366836c9dc0a",
++  "checked_at": "2026-08-18T16:28:28.1078845+08:00"
+ }

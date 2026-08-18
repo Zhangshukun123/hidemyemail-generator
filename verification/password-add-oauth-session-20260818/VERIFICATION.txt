@@ -1,0 +1,58 @@
+BRANCH=codex/registration-reliability-98
+CHANGED_BRANCH=password_write_strategy == PASSWORD_WRITE_ADDED
+CHANGED_FIELDS=reauth_access_token, add_result.continue_url, access_token, session_token, session_json, session_cookies
+RESTORED_BEHAVIOR=password/add follows its same-session OAuth callback, returns a fresh Access Token, then enrolls and activates TOTP without a final password login or final email OTP.
+
+ARTIFACTS
+MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\password-add-oauth-session-20260818\MODIFIED_FILE
+DIFF_FILE=D:\AI\hidemyemail-generator\verification\password-add-oauth-session-20260818\DIFF_FILE
+VERIFICATION=D:\AI\hidemyemail-generator\verification\password-add-oauth-session-20260818\VERIFICATION.txt
+ROLLBACK=D:\AI\hidemyemail-generator\verification\password-add-oauth-session-20260818\ROLLBACK.sh
+
+HASHES
+BASELINE_CHATGPT_REGISTER_SHA256=DF8EDBD269F82649BED6A1214F429A2CB779AF575B343E72210D55C66452B7AD
+MODIFIED_CHATGPT_REGISTER_SHA256=02F455EB9F991510A0A96D42BB5727261E1356501412F0F6D6F36627BF442B23
+BASELINE_PROTOCOL_WORKER_SHA256=AE4865C2A235578593A362D43D7B1871B69AE946CD6F344728645AA2FFF7AF9D
+MODIFIED_PROTOCOL_WORKER_SHA256=5FFD28F6111C2EACEDE3FBA9475329F6559642EA783F13F75118256835EBBFD4
+
+BASELINE
+COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_protocol_registration.py -q --tb=short
+INPUT=pre-change copies chatgpt_register.py.baseline and protocol_registration_worker.py.baseline
+LITERAL_OUTPUT=68 passed, 5 subtests passed in 3.70s
+EXIT_STATUS=0
+
+MODIFIED
+COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_protocol_registration.py -q --tb=short
+INPUT=modified chatgpt_register.py, protocol_registration_worker.py, protocol_credentials.py, and tests/test_protocol_registration.py
+LITERAL_OUTPUT=68 passed, 5 subtests passed in 3.69s
+EXIT_STATUS=0
+
+MODIFIED_LINT
+COMMAND=.\.venv\Scripts\python.exe -m ruff check src/hidemyemail_generator/vendor/gptfree_register/core/chatgpt_register.py src/hidemyemail_generator/protocol_registration_worker.py src/hidemyemail_generator/protocol_credentials.py tests/test_protocol_registration.py
+INPUT=the four changed/tested Python files
+LITERAL_OUTPUT=All checks passed!
+EXIT_STATUS=0
+
+LIVE_REGISTRATION
+COMMAND=POST http://127.0.0.1:8765/api/protocol-registration/start
+INPUT={"provider":"zkgmail","concurrency":1,"setup_credentials":true}
+LITERAL_OUTPUT=email=stevengarcia61@zkgmail.com; task=92397afd71a2e32f; status=completed; succeeded=1; failed=0; message=协议注册完成（Session/Cookie + 密码 + 2FA）
+EXIT_STATUS=0
+LIVE_PASSWORD_ADD_EVENTS=1
+LIVE_PASSWORD_LOGIN_VERIFICATION_ATTEMPTS=0
+LIVE_PASSWORD_LOGIN_VERIFIED=false
+LIVE_SAVED=true
+LIVE_HAS_PASSWORD=true
+LIVE_PASSWORD_CONFIRMED=true
+LIVE_HAS_2FA=true
+LIVE_TWO_FACTOR_STATUS=enabled
+LIVE_PLAN=Free
+
+ROLLBACK
+COMMAND="C:\Program Files\Git\bin\bash.exe" -lc "'/d/AI/hidemyemail-generator/verification/password-add-oauth-session-20260818/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/password-add-oauth-session-20260818/rollback-test'"
+INPUT=isolated rollback-test copy containing both modified source files
+LITERAL_OUTPUT=ROLLBACK_OK=/d/AI/hidemyemail-generator/verification/password-add-oauth-session-20260818/rollback-test
+EXIT_STATUS=0
+RESTORED_CHATGPT_REGISTER_SHA256=DF8EDBD269F82649BED6A1214F429A2CB779AF575B343E72210D55C66452B7AD
+RESTORED_PROTOCOL_WORKER_SHA256=AE4865C2A235578593A362D43D7B1871B69AE946CD6F344728645AA2FFF7AF9D
+RESTORED_STATUS=chatgpt_restored=true; worker_restored=true; production source remains modified

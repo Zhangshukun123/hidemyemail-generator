@@ -1,0 +1,16 @@
+Usage: python -m hidemyemail_generator.main [OPTIONS] COMMAND [ARGS]...
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  batch            Track long generation runs across restarts / 跟踪批量生成任务
+  capture-cookie   Open iCloud Plus and capture the Hide My Email request...
+  deactivate       Stop an address from forwarding mail / 停用隐藏邮箱转发
+  generate         Generate emails / 生成隐藏邮箱
+  inbox            Local inbox, verification code, and address state...
+  list             List emails / 查看隐藏邮箱
+  quota            Estimate how many addresses Apple will still accept /...
+  reactivate       Resume forwarding for a deactivated address / 恢复已停用的隐藏邮箱
+  update-metadata  Change the label or note of an address / 修改隐藏邮箱的标签或备注
+  whoami           Show the account represented by the saved cookie /...

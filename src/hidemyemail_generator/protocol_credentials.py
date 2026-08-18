@@ -282,9 +282,12 @@ def complete_protocol_credentials(
     )
     try:
         if not password_set:
-            logger("账号尚无可验证密码；将通过当前添加密码复核流程设置并验证")
+            logger("账号尚无密码；将使用当前注册 Session 直接添加密码")
         else:
-            logger("正在用全新认证会话复核已保存密码")
+            logger("注册阶段已设置密码；直接继续配置 2FA")
+        verification_performed = password_verifier is not None
+        verified_access_token = ""
+        reuse_registration_session = False
         if password_verifier is not None:
             verification = password_verifier()
             if not isinstance(verification, dict) or not verification.get("verified"):
@@ -294,27 +297,24 @@ def complete_protocol_credentials(
                     else ""
                 )
                 raise ProtocolCredentialSetupError(
-                    "密码设置响应尚未通过独立登录验证"
+                    "当前认证会话添加密码失败"
                     + (f" · {detail[:300]}" if detail else "")
                 )
-            verified_token = str(
+            reuse_registration_session = bool(
+                verification.get("reuse_registration_session")
+            )
+            verified_access_token = str(
                 verification.get("access_token") or ""
             ).strip()
-            if verified_token:
-                token = verified_token
-            logger("全新认证会话已接受保存密码")
+            if verified_access_token:
+                token = verified_access_token
+            logger("当前认证会话已确认密码添加成功")
         elif not password_set:
             raise ProtocolCredentialSetupError(
-                "密码设置响应缺少独立登录验证，停止配置 2FA"
+                "账号尚无密码且未执行添加密码流程，停止配置 2FA"
             )
         if on_password_confirmed is not None:
             on_password_confirmed()
-
-        if session_token:
-            refreshed = _refresh_access_token(session, language=language)
-            if refreshed:
-                token = refreshed
-                logger("MFA 前已使用原注册会话刷新 Access Token")
 
         if saved_secret:
             logger("已保留现有 TOTP 2FA")
@@ -331,6 +331,25 @@ def complete_protocol_credentials(
                     "recovery_codes": [],
                 },
             }
+
+        # Password setup reuses the just-authenticated registration Session.
+        # Refresh its token in-place and continue to MFA without another login
+        # or another email OTP challenge.
+        if (not verification_performed or reuse_registration_session) and session_token:
+            refreshed = _refresh_access_token(session, language=language)
+            if refreshed:
+                token = refreshed
+                logger("添加密码后已刷新当前注册 Session 的 Access Token")
+            elif reuse_registration_session:
+                logger("添加密码后继续使用当前注册 Session 的 Access Token")
+        elif (
+            verification_performed
+            and not reuse_registration_session
+            and not verified_access_token
+        ):
+            raise ProtocolCredentialSetupError(
+                "添加密码流程未返回可用于创建 2FA 的 Access Token"
+            )
 
         enrolled = _require_success(
             _post_json(

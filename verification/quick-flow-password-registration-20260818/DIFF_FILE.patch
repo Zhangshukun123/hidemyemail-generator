@@ -1,0 +1,248 @@
+diff --git a/src/hidemyemail_generator/web_ui/static/app.js b/src/hidemyemail_generator/web_ui/static/app.js
+--- a/src/hidemyemail_generator/web_ui/static/app.js
++++ b/src/hidemyemail_generator/web_ui/static/app.js
+@@ -785,6 +785,7 @@
+       this.legacyKeys = {
+         registrationProvider: "hme_quick_registration_provider",
+         registrationMode: "hme_quick_registration_mode",
++        protocolSetupCredentials: "hme_quick_protocol_setup_credentials",
+         concurrency: "hme_quick_registration_concurrency",
+         roxyTargetCount: "hme_quick_registration_target",
+         registrationProxyMode: "hme_quick_registration_proxy_mode",
+@@ -798,7 +799,6 @@
+         targetAmount: "hme_quick_paypal_us_target_amount", postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
+       };
+     }
+-
+     getItem(key) {
+       try {
+         return this.storage.getItem(key);
+@@ -827,6 +827,7 @@
+       const snapshot = {
+         registrationProvider: enumValue(candidate.registrationProvider, ["inventory", "zkgmail"], "inventory"),
+         registrationMode: enumValue(candidate.registrationMode, ["headless", "headed", "roxy", "protocol"], "headless"),
++        protocolSetupCredentials: booleanValue(candidate.protocolSetupCredentials, false),
+         concurrency: integerValue(candidate.concurrency, 1, 10, 1),
+         targetCount: integerValue(candidate.targetCount, 1, 100, Number(roxyTargetCount)),
+         roxyTargetCount,
+@@ -845,7 +846,6 @@
+       };
+       return cardLinkCountryPolicy.normalizeSnapshot(snapshot);
+     }
+-
+     load() {
+       const legacy = Object.fromEntries(Object.entries(this.legacyKeys).map(([field, key]) =>
+         [field, this.getItem(key)]
+@@ -875,7 +875,6 @@
+       }
+       return snapshot;
+     }
+-
+     restore() {
+       return this.write(this.load());
+     }
+@@ -886,7 +885,6 @@
+         savedAt: new Date().toISOString(),
+       }));
+     }
+-
+     saveCollapsed(collapsed) {
+       const snapshot = this.load();
+       snapshot.collapsed = Boolean(collapsed);
+@@ -898,7 +896,7 @@
+     constructor() {
+       this.details = $("quickFlowConfigDetails");
+       this.savedState = $("quickFlowSavedConfigState");
+-      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding");
++      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding"); this.protocolSetupCredentials = $("quickProtocolSetupCredentials");
+       this.fields = {
+         registrationProvider: $("quickRegistrationProvider"),
+         registrationMode: $("quickRegistrationMode"),
+@@ -915,15 +913,14 @@
+         targetAmount: $("quickCardLinkTargetAmount"),
+       };
+     }
+-
+     read() {
+       return {
+         ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) => [field, element.value])),
++        protocolSetupCredentials: Boolean(this.protocolSetupCredentials.checked),
+         postPaymentPhoneBinding: Boolean(this.postPaymentPhoneBinding.checked),
+         collapsed: !this.details.open,
+       };
+     }
+-
+     apply(snapshot) {
+       Object.entries(this.fields).forEach(([field, element]) => {
+         const value = String(snapshot[field] ?? "");
+@@ -931,6 +928,7 @@
+           element.value = value;
+         }
+       });
++      this.protocolSetupCredentials.checked = snapshot.protocolSetupCredentials === true;
+       this.postPaymentPhoneBinding.checked = snapshot.postPaymentPhoneBinding === true;
+       this.details.open = !snapshot.collapsed;
+     }
+@@ -945,13 +943,14 @@
+       const summary = [
+         this.selectedLabel("registrationProvider", current.registrationProvider),
+         this.selectedLabel("registrationMode", current.registrationMode),
++        current.registrationMode === "protocol" ? (current.protocolSetupCredentials ? "密码 + 2FA" : "仅 Session") : "",
+         "并发 " + current.concurrency + " / 目标 " + current.targetCount,
+         this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
+         "每号 " + current.extractionCount + " 次",
+         current.postPaymentPhoneBinding ? "确认 Plus 后接码" : "确认 Plus 即结束",
+         this.selectedLabel("registrationProxyMode", current.registrationProxyMode),
+         this.selectedLabel("extractionProxyMode", current.extractionProxyMode),
+-      ].join(" · ");
++      ].filter(Boolean).join(" · ");
+       this.savedSummary.textContent = summary;
+       this.savedSummary.title = summary;
+       this.savedState.textContent = snapshot.savedAt
+@@ -960,7 +959,7 @@
+     }
+ 
+     bind(onChange, onToggle) {
+-      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.postPaymentPhoneBinding) onChange(); });
++      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.protocolSetupCredentials || event.target === this.postPaymentPhoneBinding) onChange(); });
+       this.details.addEventListener("toggle", () => onToggle(!this.details.open));
+     }
+   }
+@@ -1978,7 +1977,9 @@
+ 
+       const registrationMode = $("quickRegistrationMode").value || "headless";
+       const protocolMode = registrationMode === "protocol";
++      const protocolSetupCredentials = protocolMode && Boolean($("quickProtocolSetupCredentials").checked);
+       const roxyMode = registrationMode === "roxy";
++      $("quickProtocolSetupCredentialsLabel").hidden = !protocolMode;
+       $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
+       const quickTargetCount = $("quickRegistrationTargetCount");
+       quickTargetCount.disabled = !roxyMode;
+@@ -2003,7 +2004,9 @@
+         : protocolMode
+         ? "Mail Auth 协议将获取 1 个" + (registrationProvider === "zkgmail"
+           ? " zkgmail.com 邮箱并从 QQ 邮箱自动取码"
+-          : " iCloud 库存邮箱") + "，仅保存 Session/Cookie，无需启动浏览器。"
++          : " iCloud 库存邮箱") + (protocolSetupCredentials
++            ? "，并设置密码与 TOTP 2FA，无需启动浏览器。"
++            : "，仅保存 Session/Cookie，无需启动浏览器。")
+         : roxyMode
+           ? "Roxy 使用账号管理中已保存的专用环境，最多 5 个并发窗口并按目标数分轮；" +
+             (registrationProvider === "zkgmail" ? "验证码从 QQ 转发邮箱读取。" : "验证码从 iCloud 收件箱读取。")
+@@ -3845,7 +3848,7 @@
+           status: "running", phase: "prepare", progress: 5, taskId: "",
+           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
+           registrationProvider, targetAmount,
+-          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true,
++          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true, protocolSetupCredentials: protocol && configSnapshot.protocolSetupCredentials === true,
+           registrationMode: mode,
+           registrationProxyMode: configSnapshot.registrationProxyMode,
+           registrationProxyCountry: configSnapshot.registrationProxyCountry,
+@@ -3869,7 +3872,7 @@
+           await this.quickFlowHistoryPresenter.persist(flow);
+           const data = protocol
+             ? await this.api.post("/api/protocol-registration/start", {
+-                provider: registrationProvider, concurrency: 1, setup_credentials: false,
++                provider: registrationProvider, concurrency: 1, setup_credentials: configSnapshot.protocolSetupCredentials === true,
+               })
+             : await this.api.post("/api/registration/start", {
+                 label: registrationProviderLabel + "一键注册、提链并协议支付",
+@@ -4583,6 +4586,7 @@
+         localStorage.setItem("hme_quick_registration_mode", event.target.value);
+         this.renderer.renderQuickFlow(this.store.state);
+       });
++      $("quickProtocolSetupCredentials").addEventListener("change", () => this.renderer.renderQuickFlow(this.store.state));
+       $("quickRegistrationProvider").addEventListener("change", (event) => {
+         localStorage.setItem("hme_quick_registration_provider", event.target.value);
+         this.renderer.renderQuickFlow(this.store.state);
+diff --git a/src/hidemyemail_generator/web_ui/static/app.css b/src/hidemyemail_generator/web_ui/static/app.css
+--- a/src/hidemyemail_generator/web_ui/static/app.css
++++ b/src/hidemyemail_generator/web_ui/static/app.css
+@@ -1300,6 +1300,7 @@
+ .quick-flow-post-payment-option span { display: grid; gap: 2px; }
+ .quick-flow-post-payment-option strong { font-size: 9px; }
+ .quick-flow-post-payment-option small { color: var(--muted); font-size: 7px; line-height: 1.4; }
++.quick-flow-protocol-credential-option[hidden] { display: none; }
+ .quick-flow-actions {
+   min-height: 50px;
+   padding: 7px 14px 10px;
+diff --git a/src/hidemyemail_generator/web_ui/templates/app.html b/src/hidemyemail_generator/web_ui/templates/app.html
+--- a/src/hidemyemail_generator/web_ui/templates/app.html
++++ b/src/hidemyemail_generator/web_ui/templates/app.html
+@@ -260,7 +260,7 @@
+                 <div class="quick-flow-section-title"><i>01</i><div><strong>注册账号</strong><small id="quickRegistrationSourceDescription">领取远端 iCloud 未注册库存并创建账号</small></div><span>ACCOUNT</span></div>
+                 <div class="quick-flow-field-grid quick-flow-payment-grid quick-flow-registration-grid">
+                   <label class="field-label">邮箱来源<select id="quickRegistrationProvider"><option value="inventory">iCloud 库存邮箱</option><option value="zkgmail">zkgmail.com · QQ 接码</option></select></label>
+-                  <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议（仅 Session）</option></select></label>
++                  <label class="field-label">注册方式<select id="quickRegistrationMode"><option value="headless">无头浏览器</option><option value="headed">有头浏览器</option><option value="roxy">Roxy 随机指纹</option><option value="protocol">Mail Auth 协议</option></select></label>
+                   <label class="field-label">并发窗口<input id="quickRegistrationConcurrency" type="number" min="1" max="10" step="1" value="1"></label>
+                   <label class="field-label">目标账号数<input id="quickRegistrationTargetCount" type="number" min="1" max="100" step="1" value="1"></label>
+                 </div>
+@@ -268,6 +268,7 @@
+                   <label class="field-label">注册代理<select id="quickRegistrationProxyMode"><option value="direct">本机 IP 直连</option></select></label>
+                   <label class="field-label">注册代理出口<select id="quickRegistrationProxyCountry"></select></label>
+                 </div>
++                <label id="quickProtocolSetupCredentialsLabel" class="quick-flow-post-payment-option quick-flow-protocol-credential-option" for="quickProtocolSetupCredentials" hidden><input id="quickProtocolSetupCredentials" type="checkbox"><span><strong>同时设置密码与 TOTP 2FA</strong><small>仅 Mail Auth 协议生效；开启后完成 Session/Cookie、密码和 2FA，关闭则只保存 Session/Cookie</small></span></label>
+                 <div class="quick-flow-context-group"><div id="quickRegistrationHint" class="mode-label">无头浏览器将在后台完成注册；验证码自动从 iCloud 收件箱读取。</div><div id="quickRegistrationProxySummary" class="mode-label">第一 IP：注册与首次提链共用</div></div>
+               </section>
+               <section class="quick-flow-form-section">
+diff --git a/tests/test_web_ui.py b/tests/test_web_ui.py
+--- a/tests/test_web_ui.py
++++ b/tests/test_web_ui.py
+@@ -165,7 +165,7 @@
+         self.assertIn("无头浏览器", page)
+         self.assertIn("有头浏览器", page)
+         self.assertIn("Mail Auth · 默认仅 Session", page)
+-        self.assertIn("Mail Auth 协议（仅 Session）", page)
++        self.assertIn('<option value="protocol">Mail Auth 协议</option>', page)
+         self.assertIn("密码与 TOTP 2FA 可选", page)
+         otp_step = page.index('data-protocol-stage="email_verification"')
+         session_step = page.index('data-protocol-stage="session"')
+@@ -317,6 +317,8 @@
+         self.assertIn("paymentProxyBackupCount", page)
+         self.assertIn("个实测出口（", page)
+         self.assertIn('id="quickRegistrationMode"', page)
++        self.assertIn('id="quickProtocolSetupCredentials" type="checkbox"', page)
++        self.assertIn("同时设置密码与 TOTP 2FA", page)
+         self.assertIn('id="quickRegistrationProvider"', page)
+         self.assertIn('<option value="inventory">iCloud 库存邮箱</option>', page)
+         self.assertIn('<option value="zkgmail">zkgmail.com · QQ 接码</option>', page)
+@@ -431,6 +433,11 @@
+             "const configSnapshot = this.quickFlowConfigPresenter.persist()", page
+         )
+         self.assertIn("configSnapshot,", page)
++        self.assertIn("hme_quick_protocol_setup_credentials", page)
++        self.assertIn(
++            "setup_credentials: configSnapshot.protocolSetupCredentials === true",
++            page,
++        )
+         self.assertIn(
+             "postPaymentPhoneBinding: booleanValue(candidate.postPaymentPhoneBinding, false)",
+             page,
+diff --git a/tests/test_quick_flow_config_ui.py b/tests/test_quick_flow_config_ui.py
+--- a/tests/test_quick_flow_config_ui.py
++++ b/tests/test_quick_flow_config_ui.py
+@@ -151,6 +151,15 @@
+         assert start_button.is_visible()
+         assert start_button.is_enabled()
+ 
++        page.locator("#quickRegistrationMode").select_option("protocol")
++        credential_option = page.locator("#quickProtocolSetupCredentialsLabel")
++        assert credential_option.is_visible()
++        page.locator("#quickProtocolSetupCredentials").check()
++        assert page.evaluate(
++            "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).protocolSetupCredentials"
++        ) is True
++        assert "密码 + 2FA" in page.locator("#quickFlowSavedConfigSummary").inner_text()
++
+         page.locator("#quickRegistrationMode").select_option("roxy")
+         page.locator("#quickRegistrationConcurrency").fill("3")
+         page.locator("#quickRegistrationConcurrency").dispatch_event("change")
+@@ -224,6 +233,7 @@
+         assert page.locator("#quickCardLinkMethod").input_value() == "paypal_gb"
+         assert page.locator("#quickExtractionFirstProxyCountry").input_value() == "GB"
+         assert page.locator("#quickExtractionCount").input_value() == "6"
++        assert page.locator("#quickProtocolSetupCredentials").is_checked()
+         assert save_button.is_visible()
+         assert save_button.is_enabled()
+         assert start_button.is_visible()

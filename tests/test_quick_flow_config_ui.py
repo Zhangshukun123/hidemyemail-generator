@@ -92,7 +92,13 @@ def _quick_flow_payloads() -> dict[str, dict]:
             "label": "SMSBower",
             "timeoutSeconds": 60,
         },
-        "/api/zkgmail/status": {"ok": True, "configured": True, "domain": "zkgmail.com"},
+        "/api/zkgmail/status": {
+            "ok": True,
+            "configured": True,
+            "domain": "cclgmail.com",
+            "domains": ["cclgmail.com", "zkgmail.com"],
+            "forwardAccount": "35***4@qq.com",
+        },
         "/api/paypal/status": {"ok": True, "available": True, "running": False},
     }
 
@@ -127,6 +133,17 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
                     body=html,
                 )
                 return
+            if path == "/api/zkgmail/config" and route.request.method == "POST":
+                requested = route.request.post_data_json.get("domain")
+                payloads["/api/zkgmail/status"]["domain"] = requested
+                route.fulfill(
+                    status=200,
+                    content_type="application/json; charset=utf-8",
+                    body=json.dumps(
+                        payloads["/api/zkgmail/status"], ensure_ascii=False
+                    ),
+                )
+                return
             route.fulfill(
                 status=200,
                 content_type="application/json; charset=utf-8",
@@ -150,6 +167,15 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         assert save_button.inner_text() == "保存配置"
         assert start_button.is_visible()
         assert start_button.is_enabled()
+
+        page.locator("#quickRegistrationMode").select_option("protocol")
+        credential_option = page.locator("#quickProtocolSetupCredentialsLabel")
+        assert credential_option.is_visible()
+        page.locator("#quickProtocolSetupCredentials").check()
+        assert page.evaluate(
+            "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).protocolSetupCredentials"
+        ) is True
+        assert "密码 + 2FA" in page.locator("#quickFlowSavedConfigSummary").inner_text()
 
         page.locator("#quickRegistrationMode").select_option("roxy")
         page.locator("#quickRegistrationConcurrency").fill("3")
@@ -224,6 +250,28 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         assert page.locator("#quickCardLinkMethod").input_value() == "paypal_gb"
         assert page.locator("#quickExtractionFirstProxyCountry").input_value() == "GB"
         assert page.locator("#quickExtractionCount").input_value() == "6"
+        assert page.locator("#quickProtocolSetupCredentials").is_checked()
+        assert page.locator("#catchAllDomainSelect").input_value() == "cclgmail.com"
+        catch_all_options = page.locator(
+            "#quickRegistrationProvider option[data-catchall-domain]"
+        )
+        assert catch_all_options.count() == 2
+        assert catch_all_options.nth(0).text_content() == "zkgmail.com · QQ 接码"
+        assert catch_all_options.nth(1).text_content() == "cclgmail.com · QQ 接码"
+        page.evaluate(
+            """
+            const select = document.getElementById('quickRegistrationProvider');
+            const option = [...select.options].find(
+              (item) => item.dataset.catchallDomain === 'zkgmail.com'
+            );
+            option.selected = true;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            """
+        )
+        page.wait_for_function(
+            "document.getElementById('catchAllDomainSelect').value === 'zkgmail.com'"
+        )
+        assert "zkgmail.com" in page.locator("#zkgmailStatus").inner_text()
         assert save_button.is_visible()
         assert save_button.is_enabled()
         assert start_button.is_visible()

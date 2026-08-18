@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import threading
 import unittest
@@ -10,6 +11,7 @@ from unittest import mock
 from aiohttp.test_utils import TestClient, TestServer
 
 from hidemyemail_generator.inbox import connect_db, insert_message
+from hidemyemail_generator.openai_registration_otp import _is_qq_forwarded_email
 from hidemyemail_generator.webapp import create_app
 from hidemyemail_generator.zkgmail import (
     ZkgmailConfigStore,
@@ -28,9 +30,31 @@ class ZkgmailConfigTests(unittest.TestCase):
             state = store.configure(authorization_code="local-qq-auth-code")
 
             self.assertTrue(state["configured"])
-            self.assertEqual(state["domain"], "zkgmail.com")
+            self.assertEqual(state["domain"], "cclgmail.com")
+            self.assertEqual(state["domains"], ["cclgmail.com", "zkgmail.com"])
             self.assertEqual(store.load()["authorizationCode"], "local-qq-auth-code")
             self.assertNotIn("authorizationCode", state)
+
+    def test_domain_can_be_added_and_selected_without_changing_qq_mailbox(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ZkgmailConfigStore(Path(temp_dir) / "mail.db")
+
+            state = store.configure(domain="mail.example.net")
+
+            self.assertFalse(state["configured"])
+            self.assertEqual(state["domain"], "mail.example.net")
+            self.assertIn("cclgmail.com", state["domains"])
+            self.assertEqual(state["forwardAccount"], "35***4@qq.com")
+
+    def test_browser_otp_reader_recognizes_a_saved_custom_forward_domain(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(domain="codes.example.net")
+
+            with mock.patch.dict(os.environ, {"HME_BROWSER_DB_FILE": str(db_file)}):
+                self.assertTrue(_is_qq_forwarded_email("new.user@codes.example.net"))
+                self.assertFalse(_is_qq_forwarded_email("new.user@other.example.net"))
 
 
 class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
@@ -387,7 +411,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertRegex(
                 email,
-                r"^[a-z]+\d{2,4}@zkgmail\.com$",
+                r"^[a-z]+\d{2,4}@cclgmail\.com$",
             )
             self.assertEqual(first, "246810")
             self.assertEqual(repeated, "")
@@ -492,7 +516,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
                     ) VALUES (?, '', 'unused', 'zkgmail', '', 1, ?, ?)
                     """,
                     (
-                        "emilyjohnson27@zkgmail.com",
+                        "emilyjohnson27@cclgmail.com",
                         datetime.now(timezone.utc).isoformat(),
                         datetime.now(timezone.utc).isoformat(),
                     ),
@@ -507,7 +531,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             ):
                 email = await client.acquire_email()
 
-            self.assertEqual(email, "danielwilson824@zkgmail.com")
+            self.assertEqual(email, "danielwilson824@cclgmail.com")
 
     async def test_configure_verifies_imap_before_saving(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -528,6 +552,29 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ZkgmailWebRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_domain_route_adds_and_selects_custom_qq_forward_domain(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(base_dir=Path(temp_dir))
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/zkgmail/config",
+                    json={"domain": "signup.mail.example"},
+                    headers={"X-Local-Token": app["local_token"]},
+                )
+                payload = await response.json()
+                status = await client.get("/api/zkgmail/status")
+                status_payload = await status.json()
+            finally:
+                await client.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(payload["configured"])
+        self.assertEqual(payload["domain"], "signup.mail.example")
+        self.assertIn("cclgmail.com", payload["domains"])
+        self.assertEqual(status_payload["domain"], "signup.mail.example")
+
     async def test_config_and_status_routes_do_not_return_authorization_code(self):
         class ClientStub:
             def __init__(self):
@@ -540,8 +587,8 @@ class ZkgmailWebRouteTests(unittest.IsolatedAsyncioTestCase):
                     "forwardAccount": "35***4@qq.com",
                 }
 
-            async def configure(self, authorization_code=None):
-                self.codes.append(authorization_code)
+            async def configure(self, authorization_code=None, domain=None):
+                self.codes.append((authorization_code, domain))
                 return self.public_state()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -564,7 +611,7 @@ class ZkgmailWebRouteTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
 
         self.assertEqual(configured.status, 200)
-        self.assertEqual(stub.codes, ["route-secret-code"])
+        self.assertEqual(stub.codes, [("route-secret-code", None)])
         self.assertTrue(status_payload["configured"])
         self.assertNotIn("authorizationCode", configured_payload)
         self.assertNotIn("authorizationCode", status_payload)

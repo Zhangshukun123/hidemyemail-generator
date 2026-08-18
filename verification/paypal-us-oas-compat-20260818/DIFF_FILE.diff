@@ -1,0 +1,693 @@
+diff --git a/paypal-agreement-protocol/paypal/flow.py b/paypal-agreement-protocol/paypal/flow.py
+index 5c79381..625d902 100644
+--- a/paypal-agreement-protocol/paypal/flow.py
++++ b/paypal-agreement-protocol/paypal/flow.py
+@@ -25,6 +25,7 @@ from paypal.models import (
+     generate_address,
+ )
+ from paypal.payment_completion import is_trusted_openai_checkout_url
++from paypal.onboarding_compat import OnboardingCompatibilityPresenter
+ from paypal.session import PayPalSession, sanitize_for_log
+ from paypal.proxy import build_proxy_config, ProxyConfig
+ from paypal.fingerprint import (
+@@ -120,6 +121,9 @@ COUNTRY_PROFILES = {
+ }
+ 
+ 
++ONBOARDING_COMPATIBILITY_PRESENTER = OnboardingCompatibilityPresenter()
++
++
+ class PayPalFlow:
+     def __init__(
+         self,
+@@ -1470,11 +1474,24 @@ class PayPalFlow:
+                     (diagnostic.get("last_graphql") or {}).get("paypal_debug_id") or "<missing>",
+                 )
+ 
+-            if create_member_oas and self.country == "US":
++            compatibility = ONBOARDING_COMPATIBILITY_PRESENTER.recover(
++                country=self.country,
++                errors=errors,
++                signup_url=signup_url,
++                view=self,
++            )
++            if compatibility.matched:
++                logger.warning(
++                    "PayPal onboarding compatibility branch selected: {}",
++                    compatibility.code,
++                )
++                if compatibility.recovered:
++                    logger.success(
++                        "PayPal official member onboarding completed; continuing protocol authorization"
++                    )
++                    return
+                 raise RuntimeError(
+-                    "US PayPal createMemberAccount was rejected by onboarding risk "
+-                    "control (OAS_ERROR). The verified OTP session is now terminal; "
+-                    "start a new clean job rather than rotating profile data in place."
++                    f"{compatibility.code}: {compatibility.message}"
+                 )
+ 
+             if create_member_oas and attempt < self.max_card_attempts:
+@@ -1510,6 +1527,14 @@ class PayPalFlow:
+         """Hook for web adapters to refresh masked generated-profile details."""
+         return None
+ 
++    def complete_member_onboarding(self, signup_url: str) -> bool:
++        """View hook for an official PayPal member-onboarding handoff.
++
++        CLI callers have no embedded browser, so they receive the presenter's
++        structured action-required result.  Web adapters override this hook.
++        """
++        return False
++
+     def _follow_modxo_action_redirect(self, resp, referer: str):
+         """Follow Next server-action redirects emitted by ModXO.
+ 
+diff --git a/paypal-agreement-protocol/paypal/manual_browser.py b/paypal-agreement-protocol/paypal/manual_browser.py
+index 5aac41d..644da99 100644
+--- a/paypal-agreement-protocol/paypal/manual_browser.py
++++ b/paypal-agreement-protocol/paypal/manual_browser.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import itertools
+ import os
+ import queue
++import shutil
+ import socket
+ import subprocess
+ import sys
+@@ -227,9 +228,27 @@ class ManualBrowserController:
+         return ""
+ 
+     def _completion_ready(self, cookies: list[dict[str, Any]], current_url: str, http_status: int) -> bool:
+-        hostname = (urlparse(current_url).hostname or "").lower()
++        parsed = urlparse(current_url)
++        hostname = (parsed.hostname or "").lower()
+         if self.completion_mode == "agreement":
+             return hostname in {"pm-redirects.stripe.com", "pay.openai.com", "chatgpt.com"}
++        if self.completion_mode == "member":
++            euat = self._cookie_value(cookies, "AV894Kt2TSumQQrJwe-8mzmyREO")
++            route = f"{parsed.path}#{parsed.fragment}".lower()
++            return bool(
++                euat
++                and hostname.endswith("paypal.com")
++                and any(
++                    marker in route
++                    for marker in (
++                        "/webapps/hermes",
++                        "/checkoutnow",
++                        "/checkoutweb/",
++                        "billingweb/review",
++                    )
++                )
++                and 200 <= int(http_status or 0) < 400
++            )
+         current_datadome = self._cookie_value(cookies, "datadome")
+         return bool(
+             current_datadome
+@@ -238,6 +257,42 @@ class ManualBrowserController:
+             and 200 <= int(http_status or 0) < 400
+         )
+ 
++    @staticmethod
++    def _chromium_executable() -> str:
++        configured = str(os.getenv("PAYPAL_CHROMIUM_EXECUTABLE") or "").strip()
++        candidates = [configured] if configured else []
++        if os.name == "nt":
++            for root in (
++                os.getenv("PROGRAMFILES"),
++                os.getenv("PROGRAMFILES(X86)"),
++                os.getenv("LOCALAPPDATA"),
++            ):
++                if root:
++                    candidates.extend(
++                        [
++                            os.path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
++                            os.path.join(root, "Chromium", "Application", "chrome.exe"),
++                            os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
++                        ]
++                    )
++        else:
++            candidates.extend(
++                filter(
++                    None,
++                    (
++                        shutil.which("chromium"),
++                        shutil.which("chromium-browser"),
++                        shutil.which("google-chrome"),
++                        shutil.which("google-chrome-stable"),
++                    ),
++                )
++            )
++        for candidate in candidates:
++            expanded = os.path.expanduser(str(candidate or ""))
++            if expanded and os.path.isfile(expanded):
++                return expanded
++        return ""
++
+     def _run(self) -> None:
+         xvfb: subprocess.Popen | None = None
+         browser = None
+@@ -255,17 +310,34 @@ class ManualBrowserController:
+                 self._done_event.set()
+                 return
+ 
+-            with _DISPLAY_LOCK:
+-                display_number = next(_DISPLAY_COUNTER)
+-            display = f":{display_number}"
+-            xvfb = subprocess.Popen(
+-                ["Xvfb", display, "-screen", "0", f"{self.viewport_width}x{self.viewport_height}x24", "-nolisten", "tcp", "-ac"],
+-                stdout=subprocess.DEVNULL,
+-                stderr=subprocess.DEVNULL,
+-            )
+-            time.sleep(0.35)
+-            if xvfb.poll() is not None:
+-                raise RuntimeError("Xvfb failed to start")
++            display = ""
++            headless = False
++            xvfb_binary = shutil.which("Xvfb") if os.name != "nt" else None
++            if xvfb_binary:
++                with _DISPLAY_LOCK:
++                    display_number = next(_DISPLAY_COUNTER)
++                display = f":{display_number}"
++                xvfb = subprocess.Popen(
++                    [
++                        xvfb_binary,
++                        display,
++                        "-screen",
++                        "0",
++                        f"{self.viewport_width}x{self.viewport_height}x24",
++                        "-nolisten",
++                        "tcp",
++                        "-ac",
++                    ],
++                    stdout=subprocess.DEVNULL,
++                    stderr=subprocess.DEVNULL,
++                )
++                time.sleep(0.35)
++                if xvfb.poll() is not None:
++                    raise RuntimeError("Xvfb failed to start")
++            elif os.name != "nt":
++                # Playwright's bundled browser is a functional fallback for
++                # minimal Linux hosts where Xvfb/Chromium are not installed.
++                headless = True
+ 
+             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+             from playwright.sync_api import sync_playwright
+@@ -273,16 +345,21 @@ class ManualBrowserController:
+             self._set_state(message="正在通过任务代理打开验证页面…")
+             with sync_playwright() as playwright:
+                 launch_kwargs: dict[str, Any] = {
+-                    "headless": False,
+-                    "executable_path": "/usr/bin/chromium",
+-                    "env": {**os.environ, "DISPLAY": display},
++                    "headless": headless,
+                     "args": [
+-                        "--no-sandbox",
+-                        "--disable-dev-shm-usage",
+                         "--disable-background-networking",
+                         "--window-size=1280,800",
+                     ],
+                 }
++                executable_path = self._chromium_executable()
++                if executable_path:
++                    launch_kwargs["executable_path"] = executable_path
++                if display:
++                    launch_kwargs["env"] = {**os.environ, "DISPLAY": display}
++                if os.name != "nt":
++                    launch_kwargs["args"].extend(
++                        ["--no-sandbox", "--disable-dev-shm-usage"]
++                    )
+                 proxy, proxy_bridge, proxy_auth_file = self._start_socks5_http_bridge(self.proxy_config)
+                 if proxy:
+                     launch_kwargs["proxy"] = proxy
+diff --git a/paypal-agreement-protocol/web.py b/paypal-agreement-protocol/web.py
+index c74a72e..c79d7ef 100644
+--- a/paypal-agreement-protocol/web.py
++++ b/paypal-agreement-protocol/web.py
+@@ -1337,8 +1337,10 @@ class WebJob:
+             self.check_cancelled()
+             self._browser = browser
+             self.status = "awaiting_captcha"
+-            self.stage = "等待服务器临时浏览器验证"
+-            self.awaiting_prompt = "请在下方临时 Chromium 画面中手动完成验证"
++            self.stage = str(stage or "等待服务器临时浏览器验证")
++            self.awaiting_prompt = str(
++                prompt or "请在下方临时 Chromium 画面中手动完成验证"
++            )
+             self.challenge_url = ""
+             self.updated_at = now_ts()
+             self._condition.notify_all()
+@@ -1791,10 +1793,9 @@ class WebPayPalFlow(PayPalFlow):
+             self.session.set_euat_token(euat_value)
+         self.session._sync_state_cookies()
+ 
+-    def _before_final_authorize(self, review_url: str) -> None:
+-        if not self.job.manual_funding:
+-            return
+-        locale_timezone = {
++    @staticmethod
++    def _browser_locale_timezone(country: str) -> tuple[str, str]:
++        return {
+             "GB": ("en-GB", "Europe/London"),
+             "US": ("en-US", "America/New_York"),
+             "BR": ("pt-BR", "America/Sao_Paulo"),
+@@ -1807,8 +1808,51 @@ class WebPayPalFlow(PayPalFlow):
+             "AE": ("en-AE", "Asia/Dubai"),
+             "AU": ("en-AU", "Australia/Sydney"),
+             "CA": ("en-CA", "America/Toronto"),
+-        }
+-        browser_locale, browser_timezone = locale_timezone.get(self.country, ("en-US", "UTC"))
++        }.get(str(country or "").upper(), ("en-US", "UTC"))
++
++    def complete_member_onboarding(self, signup_url: str) -> bool:
++        """View: finish current US member review in PayPal's official page."""
++
++        browser_locale, browser_timezone = self._browser_locale_timezone(self.country)
++        logger.warning(
++            "US createMemberAccount requires the current PayPal official member-onboarding page"
++        )
++        controller = ManualBrowserController(
++            proxy_config=self.proxy_config,
++            user_agent=USER_AGENT,
++            cookies=self._browser_cookie_snapshot(),
++            start_url=signup_url,
++            locale=browser_locale,
++            timezone_id=browser_timezone,
++            completion_mode="member",
++        )
++        solved_cookies = self.job.wait_for_browser(
++            controller,
++            stage="等待完成新版 US PayPal 会员验证",
++            prompt=(
++                "请在下方 PayPal 官方页面登录或完成会员验证；进入付款审核页后会自动继续"
++            ),
++        )
++        self._sync_browser_cookies(solved_cookies)
++        referer = controller.state().current_url or signup_url
++        buyer_ready = self._sync_buyer_context(
++            self.state.ec_token or self.ba_token,
++            referer,
++        )
++        if not buyer_ready:
++            logger.error(
++                "PayPal official member handoff finished without a checkout buyer context"
++            )
++            return False
++        logger.success(
++            "PayPal official member handoff synchronized the buyer context"
++        )
++        return True
++
++    def _before_final_authorize(self, review_url: str) -> None:
++        if not self.job.manual_funding:
++            return
++        browser_locale, browser_timezone = self._browser_locale_timezone(self.country)
+         logger.info("Opening PayPal official review page for manual funding-source setup")
+         controller = ManualBrowserController(
+             proxy_config=self.proxy_config,
+diff --git a/paypal-agreement-protocol/paypal/onboarding_compat.py b/paypal-agreement-protocol/paypal/onboarding_compat.py
+new file mode 100644
+index 0000000..302b8d9
+--- /dev/null
++++ b/paypal-agreement-protocol/paypal/onboarding_compat.py
+@@ -0,0 +1,134 @@
++"""MVP/Strategy compatibility layer for PayPal onboarding changes.
++
++The protocol flow owns transport and state.  This module only classifies a
++PayPal response (Model), selects a recovery strategy (Presenter), and invokes
++the adapter supplied by the active UI (View).
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Protocol
++
++
++US_MEMBER_RISK_REVIEW = "US_MEMBER_RISK_REVIEW"
++
++
++@dataclass(frozen=True)
++class OnboardingFailureModel:
++    """Normalized facts from one failed SignUpNewMember response."""
++
++    country: str
++    messages: frozenset[str]
++    checkpoints: frozenset[str]
++
++    @classmethod
++    def from_errors(
++        cls, country: str, errors: list[dict]
++    ) -> "OnboardingFailureModel":
++        messages: set[str] = set()
++        checkpoints: set[str] = set()
++        for error in errors or []:
++            if not isinstance(error, dict):
++                continue
++            message = str(error.get("message") or error.get("_name") or "")
++            if message:
++                messages.add(message.upper())
++            checkpoints.update(
++                str(item)
++                for item in (error.get("checkpoints") or [])
++                if str(item)
++            )
++        return cls(
++            country=str(country or "").upper(),
++            messages=frozenset(messages),
++            checkpoints=frozenset(checkpoints),
++        )
++
++
++@dataclass(frozen=True)
++class OnboardingRecoveryDecision:
++    """Presenter result consumed by the protocol orchestrator."""
++
++    matched: bool
++    recovered: bool = False
++    code: str = ""
++    message: str = ""
++
++
++class OnboardingCompatibilityView(Protocol):
++    """UI adapter capable of completing PayPal's official member handoff."""
++
++    def complete_member_onboarding(self, signup_url: str) -> bool: ...
++
++
++class OnboardingRecoveryStrategy(Protocol):
++    def matches(self, model: OnboardingFailureModel) -> bool: ...
++
++    def recover(
++        self,
++        model: OnboardingFailureModel,
++        signup_url: str,
++        view: OnboardingCompatibilityView,
++    ) -> OnboardingRecoveryDecision: ...
++
++
++class UsMemberRiskReviewStrategy:
++    """Route current US createMemberAccount review to the official UI."""
++
++    def matches(self, model: OnboardingFailureModel) -> bool:
++        return bool(
++            model.country == "US"
++            and "OAS_ERROR" in model.messages
++            and "createMemberAccount" in model.checkpoints
++        )
++
++    def recover(
++        self,
++        model: OnboardingFailureModel,
++        signup_url: str,
++        view: OnboardingCompatibilityView,
++    ) -> OnboardingRecoveryDecision:
++        recovered = bool(view.complete_member_onboarding(signup_url))
++        return OnboardingRecoveryDecision(
++            matched=True,
++            recovered=recovered,
++            code=US_MEMBER_RISK_REVIEW,
++            message=(
++                "US PayPal member onboarding requires completion in the official "
++                "PayPal page before protocol authorization can continue."
++            ),
++        )
++
++
++class OnboardingCompatibilityPresenter:
++    """Choose the first matching recovery strategy."""
++
++    def __init__(
++        self,
++        strategies: tuple[OnboardingRecoveryStrategy, ...] | None = None,
++    ) -> None:
++        self.strategies = strategies or (UsMemberRiskReviewStrategy(),)
++
++    def recover(
++        self,
++        *,
++        country: str,
++        errors: list[dict],
++        signup_url: str,
++        view: OnboardingCompatibilityView,
++    ) -> OnboardingRecoveryDecision:
++        model = OnboardingFailureModel.from_errors(country, errors)
++        for strategy in self.strategies:
++            if strategy.matches(model):
++                return strategy.recover(model, signup_url, view)
++        return OnboardingRecoveryDecision(matched=False)
++
++
++__all__ = [
++    "OnboardingCompatibilityPresenter",
++    "OnboardingCompatibilityView",
++    "OnboardingFailureModel",
++    "OnboardingRecoveryDecision",
++    "US_MEMBER_RISK_REVIEW",
++    "UsMemberRiskReviewStrategy",
++]
+diff --git a/paypal-agreement-protocol/tests/test_us_onboarding_compat.py b/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+new file mode 100644
+index 0000000..191efc0
+--- /dev/null
++++ b/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+@@ -0,0 +1,239 @@
++from types import SimpleNamespace
++
++import web as paypal_web
++from paypal.flow import PayPalFlow
++from paypal.manual_browser import ManualBrowserController
++from paypal.models import SessionState
++from paypal.onboarding_compat import (
++    OnboardingCompatibilityPresenter,
++    OnboardingFailureModel,
++    US_MEMBER_RISK_REVIEW,
++)
++
++
++US_OAS_ERRORS = [
++    {
++        "message": "OAS_ERROR",
++        "checkpoints": ["createMemberAccount"],
++        "path": ["onboardAccount"],
++    }
++]
++
++
++class RecoveryView:
++    def __init__(self, recovered=True):
++        self.recovered = recovered
++        self.signup_urls = []
++
++    def complete_member_onboarding(self, signup_url):
++        self.signup_urls.append(signup_url)
++        return self.recovered
++
++
++def test_us_oas_model_matches_member_risk_review():
++    model = OnboardingFailureModel.from_errors("us", US_OAS_ERRORS)
++
++    assert model.country == "US"
++    assert model.messages == frozenset({"OAS_ERROR"})
++    assert model.checkpoints == frozenset({"createMemberAccount"})
++
++
++def test_presenter_routes_us_oas_to_official_member_handoff():
++    view = RecoveryView()
++
++    decision = OnboardingCompatibilityPresenter().recover(
++        country="US",
++        errors=US_OAS_ERRORS,
++        signup_url="https://www.paypal.com/checkoutweb/signup?token=EC-test",
++        view=view,
++    )
++
++    assert decision.matched is True
++    assert decision.recovered is True
++    assert decision.code == US_MEMBER_RISK_REVIEW
++    assert view.signup_urls == [
++        "https://www.paypal.com/checkoutweb/signup?token=EC-test"
++    ]
++
++
++def test_presenter_does_not_route_non_us_oas():
++    view = RecoveryView()
++
++    decision = OnboardingCompatibilityPresenter().recover(
++        country="GB",
++        errors=US_OAS_ERRORS,
++        signup_url="https://www.paypal.com/checkoutweb/signup?token=EC-test",
++        view=view,
++    )
++
++    assert decision.matched is False
++    assert decision.recovered is False
++    assert view.signup_urls == []
++
++
++class FlowSessionStub:
++    def __init__(self):
++        self.euat_tokens = []
++
++    def set_euat_token(self, value):
++        self.euat_tokens.append(value)
++
++    def diagnostic_snapshot(self):
++        return {
++            "engine": "fixture",
++            "cookie_names": ["nsid"],
++            "last_graphql": {"paypal_debug_id": "fixture-debug-id"},
++        }
++
++
++class RecoveringPayPalFlow(PayPalFlow):
++    def __init__(self):
++        self.country = "US"
++        self.max_card_attempts = 1
++        self.runtime_form_schema = None
++        self.session = FlowSessionStub()
++        self.state = SessionState(
++            ba_token="BA-fixture",
++            ec_token="EC-fixture",
++            ctx_id="ctx-fixture",
++            ssrt="ssrt-fixture",
++            content_identifier="US:en:fixture:compliance.signupTerms",
++        )
++        self.handoff_urls = []
++
++    def _send_signup_attempt(self, token, signup_url):
++        return {"data": {"onboardAccount": None}, "errors": US_OAS_ERRORS}
++
++    def complete_member_onboarding(self, signup_url):
++        self.handoff_urls.append(signup_url)
++        self.state.euat_token = "fixture-euat"
++        self.state.user_id = "fixture-user"
++        return True
++
++
++def test_signup_flow_continues_after_us_official_member_handoff():
++    flow = RecoveringPayPalFlow()
++    signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-fixture"
++
++    flow._signup_with_card_retry("EC-fixture", signup_url)
++
++    assert flow.handoff_urls == [signup_url]
++    assert flow.state.euat_token == "fixture-euat"
++    assert flow.state.user_id == "fixture-user"
++
++
++def test_member_completion_requires_euat_and_paypal_review_route():
++    controller = ManualBrowserController(
++        proxy_config=None,
++        user_agent="fixture",
++        cookies=[],
++        start_url="https://www.paypal.com/checkoutweb/signup",
++        completion_mode="member",
++    )
++    cookies = [
++        {
++            "name": "AV894Kt2TSumQQrJwe-8mzmyREO",
++            "value": "fixture-euat",
++        }
++    ]
++
++    assert controller._completion_ready(
++        cookies,
++        "https://www.paypal.com/webapps/hermes#/billingweb/review",
++        200,
++    )
++    assert not controller._completion_ready(
++        [],
++        "https://www.paypal.com/webapps/hermes#/billingweb/review",
++        200,
++    )
++    assert not controller._completion_ready(
++        cookies,
++        "https://www.paypal.com/signin",
++        200,
++    )
++
++
++def test_web_flow_member_handoff_syncs_browser_buyer_context(monkeypatch):
++    observed = {}
++
++    class ControllerStub:
++        def __init__(self, **kwargs):
++            observed["controller"] = kwargs
++
++        def state(self):
++            return SimpleNamespace(
++                current_url="https://www.paypal.com/webapps/hermes#/billingweb/review"
++            )
++
++    class JobStub:
++        def wait_for_browser(self, controller, *, stage, prompt):
++            observed["stage"] = stage
++            observed["prompt"] = prompt
++            return [
++                {
++                    "name": "AV894Kt2TSumQQrJwe-8mzmyREO",
++                    "value": "fixture-euat",
++                    "domain": ".paypal.com",
++                }
++            ]
++
++    monkeypatch.setattr(paypal_web, "ManualBrowserController", ControllerStub)
++    flow = paypal_web.WebPayPalFlow.__new__(paypal_web.WebPayPalFlow)
++    flow.country = "US"
++    flow.proxy_config = SimpleNamespace()
++    flow.state = SessionState(ba_token="BA-fixture", ec_token="EC-fixture")
++    flow.ba_token = "BA-fixture"
++    flow.job = JobStub()
++    flow._browser_cookie_snapshot = lambda: []
++    flow._sync_browser_cookies = lambda cookies: observed.update(cookies=cookies)
++    flow._sync_buyer_context = (
++        lambda token, referer: observed.update(token=token, referer=referer) or True
++    )
++
++    recovered = flow.complete_member_onboarding(
++        "https://www.paypal.com/checkoutweb/signup?token=EC-fixture"
++    )
++
++    assert recovered is True
++    assert observed["controller"]["completion_mode"] == "member"
++    assert observed["token"] == "EC-fixture"
++    assert "新版 US PayPal" in observed["stage"]
++    assert "官方页面" in observed["prompt"]
++
++
++def test_wait_for_browser_uses_presented_stage_and_prompt():
++    job = paypal_web.WebJob(
++        id="fixturejob",
++        owner_device_id="fixture-device",
++        ba_token="BA-fixture",
++        phone="+12025550123",
++    )
++    observed = {}
++
++    class BrowserStub:
++        def start(self):
++            observed["started"] = True
++
++        def wait(self, timeout, cancel_event):
++            observed["stage"] = job.stage
++            observed["prompt"] = job.awaiting_prompt
++            return [{"name": "fixture", "value": "cookie"}]
++
++        def stop(self):
++            observed["stopped"] = True
++
++    job.release_execution_slot = lambda: None
++    job.acquire_execution_slot = lambda: None
++
++    cookies = job.wait_for_browser(
++        BrowserStub(),
++        stage="等待新版会员验证",
++        prompt="请完成 PayPal 官方页面验证",
++    )
++
++    assert cookies == [{"name": "fixture", "value": "cookie"}]
++    assert observed["stage"] == "等待新版会员验证"
++    assert observed["prompt"] == "请完成 PayPal 官方页面验证"
++    assert observed["started"] is True
++    assert observed["stopped"] is True

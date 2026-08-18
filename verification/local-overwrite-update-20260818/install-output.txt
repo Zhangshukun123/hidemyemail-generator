@@ -1,0 +1,9 @@
+   Building hidemyemail-generator @ file:///D:/AI/hidemyemail-generator
+      Built hidemyemail-generator @ file:///D:/AI/hidemyemail-generator
+Prepared 1 package in 7.57s
+Uninstalled 1 package in 2ms
+warning: Failed to hardlink files; falling back to full copy. This may lead to degraded performance.
+         If the cache and target directories are on different filesystems, hardlinking may not be supported.
+         If this is intentional, set `export UV_LINK_MODE=copy` or use `--link-mode=copy` to suppress this warning.
+Installed 1 package in 198ms
+ ~ hidemyemail-generator==2.1.0 (from file:///D:/AI/hidemyemail-generator)
