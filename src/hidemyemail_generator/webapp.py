@@ -6771,8 +6771,6 @@ def create_app(
         if provider in {"manual", "smsbower"}:
             concurrency = 1
             target_count = 1
-        elif browser_engine != "roxy":
-            target_count = concurrency
         email = str(payload.get("email") or "").strip().lower()
         if provider == "manual" and (
             not email
@@ -6790,12 +6788,12 @@ def create_app(
                 label=label,
                 headless=bool(payload.get("headless", False)),
                 concurrency=concurrency,
+                target_count=target_count,
                 email=email,
                 provider=provider,
             )
             if browser_engine != "camoufox":
                 registration_options["browser_engine"] = browser_engine
-                registration_options["target_count"] = target_count
             task = app["registration_manager"].start(**registration_options)
         except (RuntimeError, ValueError) as error:
             return web.json_response(
@@ -6928,6 +6926,14 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "协议注册并发必须是 1–5"}, status=400
             )
+        try:
+            target_count = int(payload.get("target_count") or 1)
+        except (TypeError, ValueError):
+            target_count = 0
+        if not 1 <= target_count <= 100:
+            return web.json_response(
+                {"ok": False, "error": "目标账号数必须是 1–100"}, status=400
+            )
         # Every user-facing protocol registration must finish with a confirmed
         # password and an enabled TOTP factor.  Older clients may still send
         # setup_credentials=false; keep accepting the field for compatibility,
@@ -6938,63 +6944,77 @@ def create_app(
             return web.json_response(
                 {"ok": False, "error": "协议注册暂不支持该邮箱来源"}, status=400
             )
-        inventory_email = ""
-        zkgmail_email = ""
+        inventory_emails: list[str] = []
+        zkgmail_emails: list[str] = []
+
+        async def release_acquired_emails(message: str) -> None:
+            for email in inventory_emails:
+                await complete_registration_inventory_email(email, False, message)
+            for email in zkgmail_emails:
+                await app["zkgmail_client"].cancel_email(email, message)
+
         if provider == "inventory":
-            try:
-                inventory_email = await acquire_registration_inventory_email(
-                    "iCloud 邮箱协议注册"
-                )
-            except RuntimeError as error:
-                return web.json_response(
-                    {"ok": False, "error": str(error)}, status=409
-                )
-            if not inventory_email:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "code": "inventory_empty",
-                        "error": "iCloud 未注册库存为空",
-                    },
-                    status=409,
-                )
-        elif provider == "zkgmail":
-            try:
-                zkgmail_email = str(
-                    await app["zkgmail_client"].acquire_email(
-                        "QQ 转发邮箱协议注册"
+            for index in range(target_count):
+                try:
+                    email = await acquire_registration_inventory_email(
+                        f"iCloud 邮箱协议注册 {index + 1}/{target_count}"
                     )
-                ).strip().lower()
-            except (ValueError, RuntimeError) as error:
-                return web.json_response(
-                    {"ok": False, "error": str(error)}, status=409
-                )
-            if not valid_account_email(zkgmail_email):
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "code": "zkgmail_generation_failed",
-                        "error": "未生成有效的 QQ 转发注册邮箱",
-                    },
-                    status=409,
-                )
+                except RuntimeError as error:
+                    await release_acquired_emails(str(error))
+                    return web.json_response(
+                        {"ok": False, "error": str(error)}, status=409
+                    )
+                if not email:
+                    await release_acquired_emails("协议注册目标数量领取未完成")
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "code": "inventory_empty",
+                            "error": (
+                                f"iCloud 未注册库存不足：目标 {target_count} 个，"
+                                f"实际领取 {len(inventory_emails)} 个"
+                            ),
+                        },
+                        status=409,
+                    )
+                inventory_emails.append(email)
+        elif provider == "zkgmail":
+            for index in range(target_count):
+                try:
+                    email = str(
+                        await app["zkgmail_client"].acquire_email(
+                            f"QQ 转发邮箱协议注册 {index + 1}/{target_count}"
+                        )
+                    ).strip().lower()
+                except (ValueError, RuntimeError) as error:
+                    await release_acquired_emails(str(error))
+                    return web.json_response(
+                        {"ok": False, "error": str(error)}, status=409
+                    )
+                if not valid_account_email(email):
+                    await release_acquired_emails("QQ 转发注册邮箱生成未完成")
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "code": "zkgmail_generation_failed",
+                            "error": (
+                                f"QQ 转发注册邮箱生成不足：目标 {target_count} 个，"
+                                f"实际生成 {len(zkgmail_emails)} 个"
+                            ),
+                        },
+                        status=409,
+                    )
+                zkgmail_emails.append(email)
 
-        acquired_email = inventory_email or zkgmail_email
-
-        async def release_acquired_email(message: str) -> None:
-            if inventory_email:
-                await complete_registration_inventory_email(
-                    inventory_email, False, message
-                )
-            elif zkgmail_email:
-                await app["zkgmail_client"].cancel_email(zkgmail_email, message)
+        acquired_emails = [*inventory_emails, *zkgmail_emails]
+        acquired_email = acquired_emails[0] if acquired_emails else ""
 
         async def complete_acquired_email(
             email: str, success: bool, message: str
         ) -> None:
-            if inventory_email:
+            if email in inventory_emails:
                 await complete_registration_inventory_email(email, success, message)
-            elif zkgmail_email:
+            elif email in zkgmail_emails:
                 await app["zkgmail_client"].complete_email(
                     email, success, message
                 )
@@ -7015,20 +7035,22 @@ def create_app(
             }
         # A newly acquired provider address is a valid registration input even
         # though it is not yet an active Apple identity or a stored GPT account.
-        if acquired_email and acquired_email not in accounts_by_email:
+        for acquired in acquired_emails:
+            if acquired in accounts_by_email:
+                continue
             account = await asyncio.to_thread(
-                load_account_record, app["db_file"], acquired_email
+                load_account_record, app["db_file"], acquired
             )
             session = account_session(account)
             access_token = account_session_access_token(account)
-            accounts_by_email[acquired_email] = {
-                "email": acquired_email,
+            accounts_by_email[acquired] = {
+                "email": acquired,
                 "registrationComplete": bool(session and access_token),
             }
         run_all = bool(payload.get("all"))
         force_recheck = bool(payload.get("force"))
-        if acquired_email:
-            requested = [acquired_email]
+        if acquired_emails:
+            requested = acquired_emails
         elif run_all:
             requested = list(accounts_by_email)
         else:
@@ -7047,7 +7069,7 @@ def create_app(
             or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
         ]
         if invalid:
-            await release_acquired_email("注册邮箱未能导入本地账号列表")
+            await release_acquired_emails("注册邮箱未能导入本地账号列表")
             return web.json_response(
                 {
                     "ok": False,
@@ -7067,7 +7089,7 @@ def create_app(
         ]
         skipped = len(requested) - len(pending)
         if not pending:
-            await release_acquired_email("邮箱已完成协议注册")
+            await release_acquired_emails("邮箱已完成协议注册")
             message = (
                 (
                     "全部账号的密码、Session 与 TOTP 2FA 均已完成"
@@ -7087,16 +7109,16 @@ def create_app(
                 "concurrency": concurrency,
                 "setup_credentials": setup_credentials,
             }
-            if acquired_email:
+            if acquired_emails:
                 start_options["on_account_finished"] = complete_acquired_email
             task = app["protocol_registration_manager"].start(**start_options)
         except ValueError as error:
-            await release_acquired_email(str(error))
+            await release_acquired_emails(str(error))
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=400
             )
         except RuntimeError as error:
-            await release_acquired_email(str(error))
+            await release_acquired_emails(str(error))
             return web.json_response(
                 {"ok": False, "error": str(error)}, status=409
             )
@@ -7108,6 +7130,8 @@ def create_app(
                 "skipped": skipped,
                 "provider": provider or "selected",
                 "email": acquired_email,
+                "emails": acquired_emails,
+                "targetCount": len(pending),
                 "task": task,
             }
         )

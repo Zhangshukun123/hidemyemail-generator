@@ -787,7 +787,7 @@
         registrationMode: "hme_quick_registration_mode",
         protocolSetupCredentials: "hme_quick_protocol_setup_credentials",
         concurrency: "hme_quick_registration_concurrency",
-        roxyTargetCount: "hme_quick_registration_target",
+        targetCount: "hme_quick_registration_target",
         registrationProxyMode: "hme_quick_registration_proxy_mode",
         registrationProxyCountry: "hme_quick_registration_proxy_country",
         cardLinkMethod: "hme_quick_card_link_method",
@@ -818,8 +818,8 @@
       const textValue = (value, fallback = "") => String(value ?? fallback).trim();
       const booleanValue = (value, fallback = false) => value === null || value === undefined || value === "" ? Boolean(fallback)
         : typeof value === "boolean" ? value : ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
-      const roxyTargetCount = integerValue(
-        candidate.roxyTargetCount ?? candidate.targetCount,
+      const targetCount = integerValue(
+        candidate.targetCount ?? candidate.roxyTargetCount,
         1,
         100,
         1,
@@ -829,8 +829,9 @@
         registrationMode: enumValue(candidate.registrationMode, ["headless", "headed", "roxy", "protocol"], "headless"),
         protocolSetupCredentials: true,
         concurrency: integerValue(candidate.concurrency, 1, 10, 1),
-        targetCount: integerValue(candidate.targetCount, 1, 100, Number(roxyTargetCount)),
-        roxyTargetCount,
+        targetCount,
+        // Retain the legacy field while target count is promoted to a mode-independent setting.
+        roxyTargetCount: targetCount,
         registrationProxyMode: textValue(candidate.registrationProxyMode, "direct") || "direct",
         registrationProxyCountry: textValue(candidate.registrationProxyCountry, "NL") || "NL",
         cardLinkMethod: enumValue(candidate.cardLinkMethod, ["de_oaics_paypal", "paypal_us", "paypal_gb"], "de_oaics_paypal"),
@@ -990,11 +991,9 @@
 
     persist(stateLabel = "配置已自动保存") {
       const current = this.view.read();
-      const previous = this.model.load();
       const snapshot = this.model.save({
         ...current,
-        roxyTargetCount: current.registrationMode === "roxy"
-          ? current.targetCount : previous.roxyTargetCount,
+        roxyTargetCount: current.targetCount,
       });
       this.view.render(snapshot, stateLabel);
       return snapshot;
@@ -1976,16 +1975,16 @@
       $("quickProtocolSetupCredentialsLabel").hidden = !protocolMode;
       $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
       const quickTargetCount = $("quickRegistrationTargetCount");
-      quickTargetCount.disabled = !roxyMode;
-      if (!roxyMode) {
-        quickTargetCount.value = protocolMode
-          ? "1" : $("quickRegistrationConcurrency").value;
-      } else {
-        const savedTargetCount = Number(localStorage.getItem("hme_quick_registration_target") || 1);
+      quickTargetCount.disabled = false;
+      if (quickTargetCount.dataset.ready !== "1") {
+        const savedTargetCount = Number(
+          localStorage.getItem("hme_quick_registration_target") || quickTargetCount.value || 1
+        );
         quickTargetCount.value = String(
           Number.isInteger(savedTargetCount) && savedTargetCount >= 1 && savedTargetCount <= 100
             ? savedTargetCount : 1
         );
+        quickTargetCount.dataset.ready = "1";
       }
       const targetCount = Number(quickTargetCount.value || 1);
       const extractionCount = $("quickExtractionCount");
@@ -1996,7 +1995,7 @@
       $("quickRegistrationHint").textContent = !registrationProviderReady
         ? (state.zkgmail?.domain || "cclgmail.com") + " 需要 QQ 邮箱授权码，请先在账号管理中完成配置。"
         : protocolMode
-        ? "Mail Auth 协议将获取 1 个" + (registrationProvider === "zkgmail"
+        ? "Mail Auth 协议将按目标数获取 " + targetCount + " 个" + (registrationProvider === "zkgmail"
           ? " " + (state.zkgmail?.domain || "cclgmail.com") + " 邮箱并从 QQ 邮箱自动取码"
           : " iCloud 库存邮箱") +
           "，并强制设置密码与 TOTP 2FA，无需启动浏览器。"
@@ -2010,7 +2009,6 @@
               (registrationProvider === "zkgmail" ? " QQ 转发邮箱" : " iCloud 收件箱") + "读取。";
 
       methodSelect.disabled = false;
-      if (!roxyMode) quickTargetCount.disabled = true;
       registrationProxyCountrySelect.disabled = registrationProxyModeSelect.value === "direct" ||
         registrationProxyModeSelect.value === "clash";
       extractionFirstCountrySelect.disabled = config.fixedProxyCountry ||
@@ -3780,20 +3778,14 @@
         }
         const protocol = mode === "protocol";
         const roxy = mode === "roxy";
-        let concurrency = Number($("quickRegistrationConcurrency").value);
-        let targetCount = Number($("quickRegistrationTargetCount").value);
+        const concurrency = Number($("quickRegistrationConcurrency").value);
+        const targetCount = Number($("quickRegistrationTargetCount").value);
         const extractionCount = Number($("quickExtractionCount").value);
         const concurrencyLimit = protocol || roxy ? 5 : 10;
         if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > concurrencyLimit) {
           throw new Error("并发窗口必须是 1–" + concurrencyLimit + " 的整数");
         }
-        if (protocol) {
-          concurrency = 1;
-          targetCount = 1;
-          this.assertProtocolRuntime();
-        } else if (!roxy) {
-          targetCount = concurrency;
-        }
+        if (protocol) this.assertProtocolRuntime();
         if (!Number.isInteger(targetCount) || targetCount < 1 || targetCount > 100) {
           throw new Error("目标账号数必须是 1–100 的整数");
         }
@@ -3865,7 +3857,8 @@
           await this.quickFlowHistoryPresenter.persist(flow);
           const data = protocol
             ? await this.api.post("/api/protocol-registration/start", {
-                provider: registrationProvider, concurrency: 1, setup_credentials: true,
+                provider: registrationProvider, concurrency,
+                target_count: targetCount, setup_credentials: true,
               })
             : await this.api.post("/api/registration/start", {
                 label: registrationProviderLabel + "一键注册、提链并协议支付",

@@ -1531,6 +1531,36 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(browser.start_options["concurrency"], 5)
         self.assertEqual(len(browser.started_accounts), 12)
 
+    async def test_camoufox_target_count_is_independent_from_concurrency(self):
+        browser = FakeBrowserManager()
+        inventory = [f"target-{index}@icloud.com" for index in range(1, 8)]
+
+        async def acquire(_label):
+            return inventory.pop(0) if inventory else ""
+
+        manager = RegistrationTaskManager(
+            browser_manager=browser,
+            acquire_email=acquire,
+            confirm_email=lambda _email: asyncio.sleep(0),
+            release_email=lambda _email: asyncio.sleep(0),
+        )
+        state = manager.start(
+            label="Camoufox 目标注册",
+            headless=True,
+            concurrency=3,
+            target_count=7,
+        )
+
+        self.assertEqual(state["targetCount"], 7)
+        self.assertEqual(state["concurrency"], 3)
+        await asyncio.wait_for(manager._task, timeout=5)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["claimed"], 7)
+        self.assertEqual(browser.start_options["concurrency"], 3)
+        self.assertEqual(len(browser.started_accounts), 7)
+
     async def test_single_roxy_browser_finalizes_first_account_before_second(self):
         events = []
 

@@ -352,6 +352,8 @@ class StructuredWebUiTests(unittest.TestCase):
         )
         self.assertIn('this.api.post("/api/registration/start"', page)
         self.assertIn('this.api.post("/api/protocol-registration/start"', page)
+        self.assertIn("quickTargetCount.disabled = false", page)
+        self.assertIn("target_count: targetCount, setup_credentials: true", page)
         self.assertIn('this.api.post("/api/account/card-link"', page)
         self.assertIn('this.commands.register("retry-quick-card-link"', page)
         self.assertIn('data-action="retry-quick-card-link"', page)
@@ -1059,6 +1061,38 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("stale", payload["runtime"])
         self.assertIn("available", payload["runtime"])
 
+    async def test_browser_registration_keeps_target_count_separate_from_concurrency(self):
+        class RegistrationManagerStub:
+            def __init__(self):
+                self.options = None
+
+            def start(self, **options):
+                self.options = options
+                return {"status": "running", "running": True}
+
+            async def close(self):
+                return None
+
+        manager = RegistrationManagerStub()
+        self.app["registration_manager"] = manager
+
+        response = await self.client.post(
+            "/api/registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={
+                "provider": "inventory",
+                "browser_engine": "camoufox",
+                "concurrency": 2,
+                "target_count": 6,
+            },
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["started"])
+        self.assertEqual(manager.options["concurrency"], 2)
+        self.assertEqual(manager.options["target_count"], 6)
+
     async def test_protocol_registration_start_rejects_empty_account_pool(self):
         response = await self.client.post(
             "/api/protocol-registration/start",
@@ -1131,6 +1165,73 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
         await manager.options["on_account_finished"](email, True, "registered")
         self.assertEqual(inventory.completed[0][:3], (email, True, "registered"))
         self.assertIsNotNone(inventory.completed[0][3])
+
+    async def test_protocol_registration_claims_the_editable_target_count(self):
+        emails = [f"inventory-protocol-{index}@icloud.com" for index in range(1, 4)]
+
+        class InventoryClientStub:
+            def __init__(self):
+                self.available = list(emails)
+                self.completed = []
+
+            async def acquire_email(self, _label):
+                return self.available.pop(0) if self.available else ""
+
+            def leased_record(self, leased_email):
+                return {
+                    "email": leased_email,
+                    "address": {
+                        "email": leased_email,
+                        "state": "unused",
+                        "source": "generated",
+                    },
+                }
+
+            async def complete_email(
+                self, completed_email, success, message, *, record=None
+            ):
+                self.completed.append((completed_email, success, message, record))
+
+        class ProtocolManagerStub:
+            def __init__(self):
+                self.options = None
+
+            def start(self, **options):
+                self.options = options
+                return {"status": "running", "running": True}
+
+            async def close(self):
+                return None
+
+        inventory = InventoryClientStub()
+        manager = ProtocolManagerStub()
+        self.app["inventory_client"] = inventory
+        self.app["inventory_initial_sync_complete"] = True
+        self.app["protocol_registration_manager"] = manager
+
+        response = await self.client.post(
+            "/api/protocol-registration/start",
+            headers={"X-Local-Token": self.app["local_token"]},
+            json={
+                "provider": "inventory",
+                "concurrency": 2,
+                "target_count": 3,
+            },
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["emails"], emails)
+        self.assertEqual(payload["targetCount"], 3)
+        self.assertEqual(manager.options["emails"], emails)
+        self.assertEqual(manager.options["concurrency"], 2)
+        for email in emails:
+            await manager.options["on_account_finished"](
+                email, True, "registered"
+            )
+        self.assertEqual(
+            [completed[0] for completed in inventory.completed], emails
+        )
 
     async def test_protocol_registration_can_generate_one_zkgmail_email(self):
         email = "protocol-zkgmail@zkgmail.com"

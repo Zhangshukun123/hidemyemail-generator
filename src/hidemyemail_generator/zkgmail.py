@@ -135,6 +135,12 @@ class ZkgmailSyncStrategy(Protocol):
     ) -> int: ...
 
 
+class LocalPartNamingStrategy(Protocol):
+    """Strategy interface for domain-specific mailbox local parts."""
+
+    def generate(self, domain: str) -> str: ...
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -148,6 +154,21 @@ def _generate_human_local_part() -> str:
     minimum = 10 ** (digit_count - 1)
     suffix = minimum + secrets.randbelow(9 * minimum)
     return f"{first_name}{last_name}{suffix}"
+
+
+def _generate_short_mark_local_part() -> str:
+    """Return ``mark`` followed by exactly four random digits."""
+
+    return f"mark{secrets.randbelow(10_000):04d}"
+
+
+class DomainLocalPartNamingStrategy:
+    """Select the local-part rule according to the active catch-all domain."""
+
+    def generate(self, domain: str) -> str:
+        if str(domain or "").strip().lower() == ZKGMAIL_DOMAIN:
+            return _generate_short_mark_local_part()
+        return _generate_human_local_part()
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -495,6 +516,7 @@ class ZkgmailMailClient:
         *,
         sync_interval_seconds: float = ZKGMAIL_SYNC_INTERVAL_SECONDS,
         sync_strategy: ZkgmailSyncStrategy | None = None,
+        local_part_strategy: LocalPartNamingStrategy | None = None,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -504,6 +526,7 @@ class ZkgmailMailClient:
         self._clock = clock or _utc_now
         self._monotonic = monotonic or time.monotonic
         self._sync_strategy = sync_strategy
+        self._local_part_strategy = local_part_strategy or DomainLocalPartNamingStrategy()
         self._acquired_at: dict[str, datetime] = {}
         self._consumed_message_ids: dict[str, set[int]] = {}
         self._next_sync_at = 0.0
@@ -581,7 +604,7 @@ class ZkgmailMailClient:
             conn = connect_db(str(self.db_file))
             try:
                 for _attempt in range(100):
-                    local_part = _generate_human_local_part()
+                    local_part = self._local_part_strategy.generate(domain)
                     email = f"{local_part}@{domain}"
                     exists = conn.execute(
                         "SELECT 1 FROM addresses WHERE lower(email) = ?",
@@ -600,7 +623,7 @@ class ZkgmailMailClient:
                     )
                     break
                 else:
-                    raise RuntimeError(f"无法生成未使用的 {domain} 人名邮箱")
+                    raise RuntimeError(f"无法生成未使用的 {domain} 邮箱")
             finally:
                 conn.close()
         self._acquired_at[email] = self._now()

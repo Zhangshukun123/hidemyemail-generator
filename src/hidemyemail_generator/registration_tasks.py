@@ -183,8 +183,6 @@ class RegistrationTaskManager:
             1
             if manual_email or provider == "smsbower"
             else max(1, min(100, requested_target_count))
-            if selected_browser_engine == "roxy"
-            else concurrency
         )
         reset_browser_state = getattr(self.browser_manager, "reset", None)
         if callable(reset_browser_state):
@@ -1539,8 +1537,8 @@ class ConcurrentRegistrationTaskManager:
         )
         if selected_browser_engine != "camoufox":
             process_start_options["browser_engine"] = selected_browser_engine
-            if target_count is not None:
-                process_start_options["target_count"] = target_count
+        if target_count is not None:
+            process_start_options["target_count"] = target_count
         task = manager.start(**process_start_options)
         process_id = str(task.get("id") or uuid.uuid4().hex)
         self._processes[process_id] = manager

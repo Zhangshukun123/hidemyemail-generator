@@ -178,8 +178,16 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
             "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).protocolSetupCredentials"
         ) is True
         assert "密码 + 2FA" in page.locator("#quickFlowSavedConfigSummary").inner_text()
+        protocol_target = page.locator("#quickRegistrationTargetCount")
+        assert protocol_target.is_enabled()
+        protocol_target.fill("4")
+        protocol_target.dispatch_event("change")
+        assert page.evaluate(
+            "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).targetCount"
+        ) == "4"
 
         page.locator("#quickRegistrationMode").select_option("roxy")
+        assert page.locator("#quickRegistrationTargetCount").input_value() == "4"
         page.locator("#quickRegistrationConcurrency").fill("3")
         page.locator("#quickRegistrationConcurrency").dispatch_event("change")
         page.locator("#quickRegistrationTargetCount").fill("7")
@@ -190,7 +198,11 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         page.locator("#quickExtractionCount").dispatch_event("change")
 
         page.locator("#quickRegistrationMode").select_option("headed")
-        assert page.locator("#quickRegistrationTargetCount").input_value() == "3"
+        assert page.locator("#quickRegistrationTargetCount").is_enabled()
+        assert page.locator("#quickRegistrationTargetCount").input_value() == "7"
+        page.locator("#quickRegistrationMode").select_option("protocol")
+        assert page.locator("#quickRegistrationTargetCount").is_enabled()
+        assert page.locator("#quickRegistrationTargetCount").input_value() == "7"
         page.locator("#quickRegistrationMode").select_option("roxy")
         assert page.locator("#quickRegistrationTargetCount").input_value() == "7"
 

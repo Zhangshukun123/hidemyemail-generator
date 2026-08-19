@@ -17,6 +17,7 @@ from hidemyemail_generator.zkgmail import (
     ZkgmailConfigStore,
     ZkgmailMailClient,
     _generate_human_local_part,
+    _generate_short_mark_local_part,
     _known_zkgmail_aliases,
     _sync_relevant_messages,
 )
@@ -82,6 +83,34 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(local_part, "emilyjohnson27")
         self.assertTrue(local_part.isalnum())
+
+    def test_zkgmail_local_part_uses_short_mark_random_rule(self):
+        with mock.patch(
+            "hidemyemail_generator.zkgmail.secrets.randbelow",
+            return_value=27,
+        ):
+            local_part = _generate_short_mark_local_part()
+
+        self.assertEqual(local_part, "mark0027")
+        self.assertRegex(local_part, r"^mark\d{4}$")
+
+    async def test_zkgmail_domain_selects_short_mark_random_rule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(
+                authorization_code="local-qq-auth-code",
+                domain="zkgmail.com",
+            )
+            client = ZkgmailMailClient(store)
+
+            with mock.patch(
+                "hidemyemail_generator.zkgmail._generate_short_mark_local_part",
+                return_value="mark4821",
+            ):
+                email = await client.acquire_email("OpenAI 注册")
+
+        self.assertEqual(email, "mark4821@zkgmail.com")
 
     async def test_completion_updates_generated_address_inventory_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
