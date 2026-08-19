@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
 
 from hidemyemail_generator import card_link_runtime
@@ -29,19 +31,44 @@ class _CheckoutSession:
 
 
 class PayPalCheckoutSentinelTests(unittest.TestCase):
-    def test_checkout_create_promotion_policy_never_schedules_update(self):
+    def test_vendored_sentinel_package_imports_without_core_path_injection(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                (
+                    "from hidemyemail_generator.vendor.gptfree_register.core."
+                    "gpt_trial_protocol.models import BrowserProfile; "
+                    "print(BrowserProfile.__name__)"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "BrowserProfile")
+
+    def test_checkout_create_promotion_at_target_skips_update(self):
         self.assertFalse(
             card_link_runtime.opll_should_update_checkout_promotion(
                 apply_trial_promotion=True,
                 checkout_includes_trial_promo=True,
                 target_amount="0",
-                actual_amount="2000",
+                actual_amount="0",
             )
         )
+
+    def test_checkout_create_promotion_amount_mismatch_requests_single_fallback_update(self):
+        # The caller consumes this decision once for the existing Checkout; it
+        # must not acquire a second proxy or rebuild the Checkout first.
         self.assertTrue(
             card_link_runtime.opll_should_update_checkout_promotion(
                 apply_trial_promotion=True,
-                checkout_includes_trial_promo=False,
+                checkout_includes_trial_promo=True,
                 target_amount="0",
                 actual_amount="2000",
             )

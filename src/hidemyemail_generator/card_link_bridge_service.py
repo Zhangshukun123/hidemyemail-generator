@@ -41,9 +41,10 @@ class CardLinkBridgeCommand:
     promotion_proxy_url: str = field(default="", repr=False)
     target_amount: str = ""
     sentinel_so_enabled: bool = False
+    session_context: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "method": str(self.method or "").strip(),
             "access_token": str(self.access_token or "").strip(),
             "country": str(self.country or "").strip().upper(),
@@ -55,6 +56,10 @@ class CardLinkBridgeCommand:
             "target_amount": str(self.target_amount or "").strip(),
             "sentinel_so_enabled": bool(self.sentinel_so_enabled),
         }
+        session_context = dict(self.session_context or {})
+        if session_context:
+            payload["session_context"] = session_context
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +108,7 @@ def _redact(value: object, secrets: tuple[str, ...]) -> str:
     return text
 
 
-def _payload_secrets(payload: dict[str, str]) -> tuple[str, ...]:
+def _payload_secrets(payload: dict[str, Any]) -> tuple[str, ...]:
     candidates = [
         payload.get("access_token", ""),
         payload.get("account_email", ""),
@@ -121,6 +126,17 @@ def _payload_secrets(payload: dict[str, str]) -> tuple[str, ...]:
             raw = str(component or "").strip()
             if raw:
                 candidates.extend((raw, unquote(raw)))
+    session_context = payload.get("session_context")
+    if isinstance(session_context, dict):
+        pending: list[object] = [session_context]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, dict):
+                pending.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                pending.extend(item)
+            elif isinstance(item, str) and item.strip():
+                candidates.append(item.strip())
     return tuple(
         sorted(
             {candidate for candidate in candidates if candidate},

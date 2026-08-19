@@ -1912,6 +1912,43 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sentinel.flows, ["password_reset"])
 
+    async def test_email_otp_resend_uses_dedicated_post_endpoint(self):
+        module = self._core_module()
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {"page": {"type": "email_otp_verification"}}
+
+        class FakeSession:
+            def __init__(self):
+                self.posts = []
+
+            async def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                return FakeResponse()
+
+        session = FakeSession()
+        client = module.OpenAIAuthClient(sentinel=SimpleNamespace())
+        client._session = session
+
+        result = await client.resend_email_otp()
+
+        self.assertEqual(result["_http_status"], 200)
+        url, kwargs = session.posts[0]
+        self.assertEqual(
+            url,
+            "https://auth.openai.com/api/accounts/email-otp/resend",
+        )
+        self.assertEqual(kwargs["json"], {})
+        self.assertEqual(
+            kwargs["headers"]["referer"],
+            "https://auth.openai.com/email-verification",
+        )
+
     async def test_password_add_protocol_uses_auth_endpoint_and_sentinel_flow(self):
         module = self._core_module()
 
@@ -2845,7 +2882,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                     "_http_status": 200,
                 }
 
-            async def send_email_otp(self):
+            async def resend_email_otp(self):
                 self.resend_count += 1
                 return {"_http_status": 200}
 
@@ -3602,7 +3639,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                     "external_url": "https://auth.openai.com/authorize/continue"
                 }
 
-            async def send_email_otp(self):
+            async def resend_email_otp(self):
                 self.resend_count += 1
                 return {"_http_status": 200}
 
@@ -3647,6 +3684,168 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
             "https://auth.openai.com/authorize/continue",
         )
 
+    async def test_otp_timeout_resends_and_uses_shorter_followup_wait(self):
+        created = []
+        fetch_timeouts = []
+
+        class FakeResponse:
+            def __init__(self, *, url, payload=None, status=200):
+                self.url = url
+                self._payload = payload or {}
+                self.status_code = status
+                self.text = ""
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = SimpleNamespace(jar=[])
+
+            async def get(self, url, **_kwargs):
+                if url.endswith("/api/auth/session"):
+                    return FakeResponse(
+                        url=url,
+                        payload={
+                            "accessToken": "header.payload.signature",
+                            "sessionToken": "timeout-retry-session",
+                        },
+                    )
+                return FakeResponse(url="https://chatgpt.com/")
+
+        class FakeAuth:
+            BASE_URL = "https://auth.openai.com"
+            CHATGPT_URL = "https://chatgpt.com"
+
+            def __init__(self, **_kwargs):
+                self.device_id = "timeout-retry-device"
+                self.sentinel = SimpleNamespace(set_cookies=lambda _cookies: None)
+                self.session = FakeSession()
+                self.resend_count = 0
+                created.append(self)
+
+            async def share_session_with_sentinel(self):
+                return None
+
+            async def init_page_email(self, _email, **_kwargs):
+                return {
+                    "device_id": self.device_id,
+                    "cookies": {},
+                    "page_path": "/email-verification",
+                }
+
+            async def validate_email_otp(self, code):
+                self.validated_code = code
+                return {
+                    "external_url": "https://auth.openai.com/authorize/continue"
+                }
+
+            async def resend_email_otp(self):
+                self.resend_count += 1
+                return {"_http_status": 200}
+
+            async def _get_session(self):
+                return self.session
+
+            async def create_account(self, *_args, **_kwargs):
+                raise AssertionError("create_account must not run after direct OAuth")
+
+            async def close(self):
+                return None
+
+        def fetch_code(*_args, **kwargs):
+            fetch_timeouts.append(kwargs["timeout"])
+            return "" if len(fetch_timeouts) == 1 else "123456"
+
+        module = self._core_module()
+        bot = module.ChatGPTRegister(
+            {
+                "email": "protocol@icloud.com",
+                "refresh_token": "http://127.0.0.1/code",
+            },
+            with_password=False,
+            otp_timeout=120,
+        )
+        with (
+            patch.object(module, "OpenAIAuthClient", FakeAuth),
+            patch.object(module, "_fetch_otp_sync", side_effect=fetch_code),
+        ):
+            result = await bot._register_async(
+                password="GeneratedPassword!1",
+                name="Test User",
+                birthdate="1995-01-01",
+                client_id="",
+                refresh_token="http://127.0.0.1/code",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(fetch_timeouts, [120, 45])
+        self.assertEqual(created[0].resend_count, 1)
+        self.assertEqual(created[0].validated_code, "123456")
+
+    async def test_otp_timeout_fails_only_after_all_three_waits(self):
+        created = []
+        fetch_timeouts = []
+
+        class FakeAuth:
+            BASE_URL = "https://auth.openai.com"
+            CHATGPT_URL = "https://chatgpt.com"
+
+            def __init__(self, **_kwargs):
+                self.device_id = "timeout-device"
+                self.sentinel = SimpleNamespace(set_cookies=lambda _cookies: None)
+                self.resend_count = 0
+                created.append(self)
+
+            async def share_session_with_sentinel(self):
+                return None
+
+            async def init_page_email(self, _email, **_kwargs):
+                return {
+                    "device_id": self.device_id,
+                    "cookies": {},
+                    "page_path": "/email-verification",
+                }
+
+            async def resend_email_otp(self):
+                self.resend_count += 1
+                return {"_http_status": 200}
+
+            async def close(self):
+                return None
+
+        def fetch_code(*_args, **kwargs):
+            fetch_timeouts.append(kwargs["timeout"])
+            return ""
+
+        module = self._core_module()
+        bot = module.ChatGPTRegister(
+            {
+                "email": "protocol@icloud.com",
+                "refresh_token": "http://127.0.0.1/code",
+            },
+            with_password=False,
+            otp_timeout=120,
+        )
+        with (
+            patch.object(module, "OpenAIAuthClient", FakeAuth),
+            patch.object(module, "_fetch_otp_sync", side_effect=fetch_code),
+        ):
+            result = await bot._register_async(
+                password="GeneratedPassword!1",
+                name="Test User",
+                birthdate="1995-01-01",
+                client_id="",
+                refresh_token="http://127.0.0.1/code",
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            result["error"], "otp_timeout: 已等待 3 次仍未收到验证码"
+        )
+        self.assertEqual(fetch_timeouts, [120, 45, 45])
+        self.assertEqual(created[0].resend_count, 2)
+
     async def test_deactivated_account_stops_before_resend_or_create(self):
         created = []
 
@@ -3675,7 +3874,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                     }
                 }
 
-            async def send_email_otp(self):
+            async def resend_email_otp(self):
                 self.resend_count += 1
                 raise AssertionError("deactivated account must not resend OTP")
 

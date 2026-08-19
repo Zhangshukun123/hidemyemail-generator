@@ -14,10 +14,10 @@ from hidemyemail_generator.inbox import connect_db, insert_message
 from hidemyemail_generator.openai_registration_otp import _is_qq_forwarded_email
 from hidemyemail_generator.webapp import create_app
 from hidemyemail_generator.zkgmail import (
+    DomainLocalPartNamingStrategy,
     ZkgmailConfigStore,
     ZkgmailMailClient,
     _generate_human_local_part,
-    _generate_named_local_part,
     _known_zkgmail_aliases,
     _sync_relevant_messages,
 )
@@ -34,10 +34,22 @@ class ZkgmailConfigTests(unittest.TestCase):
             self.assertEqual(state["domain"], "cclgmail.com")
             self.assertEqual(
                 state["domains"],
-                ["cclgmail.com", "zkgmail.com", "shukunlabs.xyz"],
+                ["cclgmail.com", "zkgmail.com", "shukunlabs.xyz", "llhdsczy.com"],
             )
             self.assertEqual(store.load()["authorizationCode"], "local-qq-auth-code")
             self.assertNotIn("authorizationCode", state)
+            self.assertNotIn("codeServiceToken", state)
+
+    def test_llhdsczy_local_archive_token_is_persisted_but_never_returned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ZkgmailConfigStore(Path(temp_dir) / "mail.db")
+
+            state = store.configure_code_service("ab" * 32)
+
+            self.assertTrue(state["localArchiveConfigured"])
+            self.assertTrue(store.supports_email("signup123@llhdsczy.com"))
+            self.assertEqual(store.load()["codeServiceToken"], "ab" * 32)
+            self.assertNotIn("codeServiceToken", state)
 
     def test_domain_can_be_added_and_selected_without_changing_qq_mailbox(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -68,6 +80,34 @@ class ZkgmailConfigTests(unittest.TestCase):
 
 
 class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llhdsczy_uses_server_archive_and_consumes_cursor(self):
+        calls = []
+
+        def fetcher(url, token, email, cursor):
+            calls.append((url, token, email, cursor))
+            return (("246810", "cursor-1") if not cursor else ("", cursor))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ZkgmailConfigStore(Path(temp_dir) / "mail.db")
+            store.configure(
+                authorization_code="local-qq-auth-code",
+                domain="llhdsczy.com",
+            )
+            store.configure_code_service("ab" * 32)
+            client = ZkgmailMailClient(store, remote_code_fetcher=fetcher)
+            with mock.patch(
+                "hidemyemail_generator.zkgmail._generate_human_local_part",
+                return_value="emilyjohnson27",
+            ):
+                email = await client.acquire_email()
+
+            self.assertEqual(await client.poll_code(email), "246810")
+            self.assertEqual(await client.poll_code(email), "")
+
+        self.assertEqual(calls[0][2:], (email, ""))
+        self.assertEqual(calls[1][2:], (email, "cursor-1"))
+        self.assertTrue(calls[0][0].startswith("https://"))
+        self.assertEqual(calls[0][1], "ab" * 32)
     def test_human_local_part_uses_alphanumeric_name_and_short_number(self):
         with (
             mock.patch(
@@ -82,41 +122,35 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             local_part = _generate_human_local_part()
 
         self.assertEqual(local_part, "emilyjohnson27")
-        self.assertTrue(local_part.isalnum())
+        self.assertRegex(local_part, r"^[a-z]+\d{2,4}$")
 
-    def test_zkgmail_local_part_uses_william_name_and_variable_number(self):
-        with (
-            mock.patch(
-                "hidemyemail_generator.zkgmail.secrets.choice",
-                side_effect=["william", "moore"],
-            ),
-            mock.patch(
-                "hidemyemail_generator.zkgmail.secrets.randbelow",
-                side_effect=[2, 5249],
-            ),
-        ):
-            local_part = _generate_named_local_part()
+    def test_every_domain_uses_the_same_random_human_name_rule(self):
+        strategy = DomainLocalPartNamingStrategy()
+        generated_names = [
+            "emilyjohnson27",
+            "danielwilson824",
+            "sophiataylor4827",
+            "jamesanderson93",
+        ]
 
-        self.assertEqual(local_part, "williammoore6249")
-        self.assertRegex(local_part, r"^william[a-z]+\d{2,6}$")
+        with mock.patch(
+            "hidemyemail_generator.zkgmail._generate_human_local_part",
+            side_effect=generated_names,
+        ) as generate:
+            local_parts = [
+                strategy.generate(domain)
+                for domain in (
+                    "cclgmail.com",
+                    "zkgmail.com",
+                    "shukunlabs.xyz",
+                    "codes.example.net",
+                )
+            ]
 
-    def test_zkgmail_local_part_supports_mark_name_prefix(self):
-        with (
-            mock.patch(
-                "hidemyemail_generator.zkgmail.secrets.choice",
-                side_effect=["mark", "moore"],
-            ),
-            mock.patch(
-                "hidemyemail_generator.zkgmail.secrets.randbelow",
-                side_effect=[2, 5249],
-            ),
-        ):
-            local_part = _generate_named_local_part()
+        self.assertEqual(local_parts, generated_names)
+        self.assertEqual(generate.call_count, 4)
 
-        self.assertEqual(local_part, "markmoore6249")
-        self.assertRegex(local_part, r"^(william|mark)[a-z]+\d{2,6}$")
-
-    async def test_zkgmail_domain_selects_william_random_rule(self):
+    async def test_zkgmail_domain_uses_random_human_name_rule(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "mail.db"
             store = ZkgmailConfigStore(db_file)
@@ -127,12 +161,12 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             client = ZkgmailMailClient(store)
 
             with mock.patch(
-                "hidemyemail_generator.zkgmail._generate_named_local_part",
-                return_value="markmoore6249",
+                "hidemyemail_generator.zkgmail._generate_human_local_part",
+                return_value="sophiaanderson4827",
             ):
                 email = await client.acquire_email("OpenAI 注册")
 
-        self.assertEqual(email, "markmoore6249@zkgmail.com")
+        self.assertEqual(email, "sophiaanderson4827@zkgmail.com")
 
     async def test_completion_updates_generated_address_inventory_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -333,6 +367,83 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
                     elif sync_task is not None:
                         await asyncio.gather(sync_task, return_exceptions=True)
                 self.assertIsNone(client.sync_task)
+
+    async def test_idle_notification_bypasses_cooldown_and_syncs_new_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = Path(temp_dir) / "mail.db"
+            store = ZkgmailConfigStore(db_file)
+            store.configure(authorization_code="local-qq-auth-code")
+            idle_started = threading.Event()
+            emit_idle = threading.Event()
+            sync_calls = 0
+
+            def sync_strategy(_config, target_db, _aliases, *, limit):
+                nonlocal sync_calls
+                del limit
+                sync_calls += 1
+                if sync_calls != 2:
+                    return 0
+                now = datetime.now(timezone.utc).isoformat()
+                conn = connect_db(str(target_db))
+                try:
+                    insert_message(
+                        conn,
+                        {
+                            "account_key": "qq-idle",
+                            "folder": "INBOX",
+                            "uid": "idle-1",
+                            "sender": "noreply@openai.com",
+                            "recipients": email,
+                            "hme_address": email,
+                            "subject": "OpenAI verification code",
+                            "code": "864209",
+                            "body_preview": "Your verification code is 864209",
+                            "received_at": now,
+                            "created_at": now,
+                        },
+                    )
+                finally:
+                    conn.close()
+                return 1
+
+            def idle_strategy(_config, stop_event, on_activity):
+                idle_started.set()
+                if emit_idle.wait(2) and not stop_event.is_set():
+                    on_activity()
+                stop_event.wait(2)
+
+            client = ZkgmailMailClient(
+                store,
+                sync_interval_seconds=60,
+                sync_strategy=sync_strategy,
+                idle_enabled=True,
+                idle_strategy=idle_strategy,
+            )
+            email = await client.acquire_email("OpenAI 注册")
+            try:
+                self.assertEqual(await client.poll_code(email), "")
+                first_sync = client.sync_task
+                self.assertIsNotNone(first_sync)
+                await first_sync
+                self.assertTrue(
+                    await asyncio.to_thread(idle_started.wait, 1),
+                    "QQ IDLE 监听没有启动",
+                )
+                self.assertEqual(sync_calls, 1)
+
+                emit_idle.set()
+                for _ in range(100):
+                    if sync_calls >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+                second_sync = client.sync_task
+                if second_sync is not None:
+                    await second_sync
+
+                self.assertEqual(sync_calls, 2)
+                self.assertEqual(await client.poll_code(email), "864209")
+            finally:
+                await client.close()
 
     async def test_poll_surfaces_sync_failure_once_before_retrying(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -591,7 +702,7 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "本机取码记录"):
                 await restarted.poll_next_code(email)
 
-    async def test_generated_address_retries_an_existing_human_name(self):
+    async def test_generated_address_retries_an_existing_random_human_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "mail.db"
             store = ZkgmailConfigStore(db_file)

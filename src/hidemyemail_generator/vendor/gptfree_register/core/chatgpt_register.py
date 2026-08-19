@@ -651,6 +651,23 @@ class OpenAIAuthClient:
         payload["_http_status"] = int(getattr(resp, "status_code", 0) or 0)
         return payload
 
+    async def resend_email_otp(self) -> dict:
+        """Resend the current email OTP through the dedicated retry endpoint."""
+        s = await self._get_session()
+        url = f"{self.BASE_URL}/api/accounts/email-otp/resend"
+        referer = f"{self.BASE_URL}/email-verification"
+        headers = self._common_headers(referer=referer)
+        headers["accept"] = "application/json"
+        resp = await s.post(url, json={}, headers=headers)
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"text": str(getattr(resp, "text", "") or "")}
+        if not isinstance(payload, dict):
+            payload = {"payload": payload}
+        payload["_http_status"] = int(getattr(resp, "status_code", 0) or 0)
+        return payload
+
     async def navigate_password_registration(self) -> dict:
         """Enter the username/password signup branch before receiving the OTP."""
         s = await self._get_session()
@@ -2027,7 +2044,7 @@ class ChatGPTRegister:
                                     else ""
                                 )
                             )
-                        resend_result = await auth.send_email_otp()
+                        resend_result = await auth.resend_email_otp()
                         resend_code, resend_message = auth_error_details(resend_result)
                         resend_status = int(
                             resend_result.get("_http_status", 0) or 0
@@ -2278,24 +2295,46 @@ class ChatGPTRegister:
             validate_result: dict = {}
             code = ""
             for otp_attempt in range(1, 4):
+                otp_wait = (
+                    self.otp_timeout
+                    if otp_attempt == 1
+                    else min(self.otp_timeout, 45)
+                )
                 self._l(
                     f"  {_ts()} [..] 等待邮箱验证码 "
-                    f"(第 {otp_attempt}/3 次, timeout={self.otp_timeout}s)..."
+                    f"(第 {otp_attempt}/3 次, timeout={otp_wait}s)..."
                 )
                 code = await asyncio.to_thread(
                     _fetch_otp_sync,
                     self.email,
                     refresh_token,
                     client_id,
-                    timeout=self.otp_timeout,
+                    timeout=otp_wait,
                     log_fn=self._log_fn,
                 )
                 # since 仅作日志；email_provider 自己做时间窗口
                 _ = since
                 if not code:
-                    return self._failed(
-                        f"otp_timeout: {self.otp_timeout}s 内未收到验证码"
+                    if otp_attempt >= 3:
+                        return self._failed(
+                            "otp_timeout: 已等待 3 次仍未收到验证码"
+                        )
+                    self._l(
+                        f"  {_ts()} [!] 本轮未收到验证码；请求服务端重新发送 "
+                        f"({otp_attempt}/2)..."
                     )
+                    resend_result = await auth.resend_email_otp()
+                    resend_code, resend_msg = auth_error_details(resend_result)
+                    resend_status = int(
+                        resend_result.get("_http_status", 0) or 0
+                    )
+                    if resend_code or resend_status >= 400:
+                        return self._failed(
+                            f"otp_resend_failed: {resend_code or resend_status}"
+                            + (f" ({resend_msg})" if resend_msg else "")
+                        )
+                    since = time.time()
+                    continue
 
                 self._l(f"  {_ts()} [..] 提交邮箱验证码...")
                 validate_result = await auth.validate_email_otp(code)
@@ -2316,7 +2355,7 @@ class ChatGPTRegister:
                     f"  {_ts()} [!] 验证码无效或过期，重新发送 "
                     f"({otp_attempt}/2)..."
                 )
-                resend_result = await auth.send_email_otp()
+                resend_result = await auth.resend_email_otp()
                 resend_code, resend_msg = auth_error_details(resend_result)
                 resend_status = int(resend_result.get("_http_status", 0) or 0)
                 if resend_code or resend_status >= 400:

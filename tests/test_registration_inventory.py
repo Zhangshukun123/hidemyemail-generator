@@ -483,6 +483,23 @@ class RegistrationInventoryTests(unittest.TestCase):
 
 
 class RegistrationInventoryWiringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_remote_inventory_does_not_enable_local_record_sync(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(
+                base_dir=Path(temp_dir),
+                inventory_service_url="https://inventory.example.com",
+                inventory_service_token="test-token",
+            )
+
+            self.assertTrue(app["inventory_client"].configured)
+            self.assertNotIn("sync_inventory_to_remote", app)
+            self.assertEqual(app["inventory_sync_state"]["status"], "disabled")
+            self.assertEqual(app["inventory_sync_state"]["mode"], "local-only")
+            self.assertNotIn(
+                "remote_inventory_sync_context",
+                {context.__name__ for context in app.cleanup_ctx},
+            )
+
     async def test_inventory_client_sessions_follow_host_proxy_environment(self):
         client = RemoteRegistrationInventoryClient(
             service_url="https://inventory.example.com",

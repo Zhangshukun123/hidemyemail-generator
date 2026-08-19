@@ -76,7 +76,10 @@ from hidemyemail_generator.openai_account_security import (
 from hidemyemail_generator.openai_browser_cli import prepare_registration_proxy
 from hidemyemail_generator.openai_browser_selectors import PASSWORD_CONTINUE_SELECTORS
 from hidemyemail_generator.openai_mfa import MfaSetupError
-from hidemyemail_generator.openai_registration_otp import EmailVerificationPageAdvanced
+from hidemyemail_generator.openai_registration_otp import (
+    QQ_FORWARD_OTP_POLL_INTERVAL_SECONDS,
+    EmailVerificationPageAdvanced,
+)
 from hidemyemail_generator.openai_registration_flow import (
     _detect_verification_language,
     _fill_about_you_age_prompt,
@@ -1624,6 +1627,43 @@ class BrowserTaskHelperTests(unittest.TestCase):
             payload["since"],
             "1970-01-01T00:01:33+00:00",
         )
+
+    def test_qq_forward_reader_checks_local_code_api_without_long_poll_gap(self):
+        class Response:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self.payload = payload
+                self.ok = 200 <= status_code < 300
+
+            def json(self):
+                return dict(self.payload)
+
+        class Session:
+            def __init__(self):
+                self.calls = 0
+
+            def post(self, _url, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return Response(404, {"ok": False, "error": "尚未到达"})
+                return Response(200, {"ok": True, "code": "135790"})
+
+            def close(self):
+                return None
+
+        with patch.dict(sys.modules, {"requests": SimpleNamespace(Session=Session)}):
+            reader = ManualOtpReader(
+                SimpleNamespace(email="fast@zkgmail.com"), lambda _message: None, ""
+            )
+        reader.token = "test-token"
+
+        with patch(
+            "hidemyemail_generator.openai_registration_otp.time.sleep"
+        ) as sleep:
+            code = reader.wait_for_code(123.0)
+
+        self.assertEqual(code, "135790")
+        sleep.assert_called_once_with(QQ_FORWARD_OTP_POLL_INTERVAL_SECONDS)
 
     def test_smsbower_backend_code_fills_japanese_code_field(self):
         class Reader:

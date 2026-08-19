@@ -5,7 +5,10 @@ import imaplib
 import json
 import re
 import secrets
+import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
@@ -32,10 +35,12 @@ ZKGMAIL_SETTING_KEY = "zkgmail_qq_inbox_config_v1"
 ZKGMAIL_DOMAIN = "zkgmail.com"
 CCLGMAIL_DOMAIN = "cclgmail.com"
 SHUKUNLABS_DOMAIN = "shukunlabs.xyz"
+LLHDSCZY_DOMAIN = "llhdsczy.com"
 DEFAULT_QQ_FORWARD_DOMAINS = (
     CCLGMAIL_DOMAIN,
     ZKGMAIL_DOMAIN,
     SHUKUNLABS_DOMAIN,
+    LLHDSCZY_DOMAIN,
 )
 ZKGMAIL_FORWARD_ACCOUNT = "352121354@qq.com"
 ZKGMAIL_IMAP_HOST = "imap.qq.com"
@@ -43,6 +48,13 @@ ZKGMAIL_IMAP_PORT = 993
 ZKGMAIL_FOLDER = "INBOX"
 ZKGMAIL_SYNC_INTERVAL_SECONDS = 1.0
 ZKGMAIL_MESSAGE_LIMIT = 30
+ZKGMAIL_IDLE_POLL_SECONDS = 1.0
+ZKGMAIL_IDLE_RESTART_SECONDS = 60.0
+ZKGMAIL_IDLE_RECONNECT_SECONDS = 2.0
+LLHDSCZY_CODE_SERVICE_URL = (
+    "https://zkgmail.8-208-13-52.sslip.io/api/internal/code/latest"
+)
+LLHDSCZY_CODE_SERVICE_TIMEOUT_SECONDS = 10.0
 ZKGMAIL_FIRST_NAMES = (
     "james",
     "john",
@@ -75,7 +87,6 @@ ZKGMAIL_FIRST_NAMES = (
     "olivia",
     "sophia",
 )
-ZKGMAIL_NAME_PREFIXES = ("william", "mark")
 ZKGMAIL_LAST_NAMES = (
     "smith",
     "johnson",
@@ -136,10 +147,31 @@ class ZkgmailSyncStrategy(Protocol):
     ) -> int: ...
 
 
+class ZkgmailIdleStrategy(Protocol):
+    """Strategy interface for listening to QQ IMAP IDLE notifications."""
+
+    def __call__(
+        self,
+        config: InboxConfig,
+        stop_event: threading.Event,
+        on_activity: Callable[[], None],
+    ) -> None: ...
+
+
 class LocalPartNamingStrategy(Protocol):
     """Strategy interface for domain-specific mailbox local parts."""
 
     def generate(self, domain: str) -> str: ...
+
+
+class RemoteCodeFetcher(Protocol):
+    def __call__(
+        self,
+        url: str,
+        token: str,
+        email: str,
+        after_cursor: str,
+    ) -> tuple[str, str]: ...
 
 
 def _utc_now() -> datetime:
@@ -157,23 +189,56 @@ def _generate_human_local_part() -> str:
     return f"{first_name}{last_name}{suffix}"
 
 
-def _generate_named_local_part() -> str:
-    """Return ``william`` or ``mark`` plus a surname and numeric suffix."""
-
-    prefix = secrets.choice(ZKGMAIL_NAME_PREFIXES)
-    surname = secrets.choice(ZKGMAIL_LAST_NAMES)
-    digit_count = 2 + secrets.randbelow(5)
-    minimum = 10 ** (digit_count - 1)
-    suffix = minimum + secrets.randbelow(9 * minimum)
-    return f"{prefix}{surname}{suffix}"
+def _fetch_remote_code(
+    url: str,
+    token: str,
+    email: str,
+    after_cursor: str,
+) -> tuple[str, str]:
+    payload: dict[str, str] = {"email": email}
+    if after_cursor:
+        payload["afterCursor"] = after_cursor
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=LLHDSCZY_CODE_SERVICE_TIMEOUT_SECONDS,
+        ) as response:
+            body = response.read(16 * 1024)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return "", after_cursor
+        if error.code in (401, 403):
+            raise RuntimeError("llhdsczy 本地归档取码凭据无效") from error
+        raise RuntimeError("llhdsczy 本地归档取码服务暂时不可用") from error
+    except (OSError, TimeoutError, urllib.error.URLError) as error:
+        raise RuntimeError("无法连接 llhdsczy 本地归档取码服务") from error
+    try:
+        result = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("llhdsczy 本地归档取码响应无效") from error
+    if not isinstance(result, dict) or result.get("state") != "found":
+        return "", after_cursor
+    code = re.sub(r"[^A-Za-z0-9]", "", str(result.get("code") or ""))
+    cursor = str(result.get("cursor") or "").strip()
+    if not 4 <= len(code) <= 10 or not 1 <= len(cursor) <= 128:
+        raise RuntimeError("llhdsczy 本地归档取码响应无效")
+    return code, cursor
 
 
 class DomainLocalPartNamingStrategy:
-    """Select the local-part rule according to the active catch-all domain."""
+    """Generate a random human-name local part for every catch-all domain."""
 
     def generate(self, domain: str) -> str:
-        if str(domain or "").strip().lower() == ZKGMAIL_DOMAIN:
-            return _generate_named_local_part()
+        del domain
         return _generate_human_local_part()
 
 
@@ -230,6 +295,48 @@ def _test_imap_connection(config: InboxConfig) -> None:
             mailbox.logout()
         except Exception:
             pass
+
+
+def _watch_mailbox_idle(
+    config: InboxConfig,
+    stop_event: threading.Event,
+    on_activity: Callable[[], None],
+) -> None:
+    """Keep one read-only QQ IMAP connection waiting for mailbox changes."""
+
+    from imap_tools import MailBox
+
+    while not stop_event.is_set():
+        try:
+            with MailBox(
+                config.host,
+                port=config.port,
+                timeout=DEFAULT_IMAP_TIMEOUT,
+            ).login(
+                config.username,
+                config.password,
+                initial_folder=None,
+            ) as mailbox:
+                mailbox.folder.set(config.folder, readonly=True)
+                while not stop_event.is_set():
+                    cycle_deadline = time.monotonic() + ZKGMAIL_IDLE_RESTART_SECONDS
+                    mailbox.idle.start()
+                    try:
+                        while (
+                            not stop_event.is_set()
+                            and time.monotonic() < cycle_deadline
+                        ):
+                            responses = mailbox.idle.poll(
+                                timeout=ZKGMAIL_IDLE_POLL_SECONDS
+                            )
+                            if responses:
+                                on_activity()
+                                break
+                    finally:
+                        mailbox.idle.stop()
+        except Exception:
+            if stop_event.wait(ZKGMAIL_IDLE_RECONNECT_SECONDS):
+                return
 
 
 def _known_zkgmail_aliases(db_file: Path) -> set[str]:
@@ -364,6 +471,7 @@ class ZkgmailConfigStore:
             "port": ZKGMAIL_IMAP_PORT,
             "username": self.initial_username,
             "authorizationCode": "",
+            "codeServiceToken": "",
             "folder": ZKGMAIL_FOLDER,
             "useSsl": True,
             "domains": list(DEFAULT_QQ_FORWARD_DOMAINS),
@@ -393,6 +501,7 @@ class ZkgmailConfigStore:
         state["port"] = ZKGMAIL_IMAP_PORT
         state["username"] = ZKGMAIL_FORWARD_ACCOUNT
         state["authorizationCode"] = str(state.get("authorizationCode") or "").strip()
+        state["codeServiceToken"] = str(state.get("codeServiceToken") or "").strip()
         state["folder"] = ZKGMAIL_FOLDER
         state["useSsl"] = True
         raw_domains = state.get("domains")
@@ -493,6 +602,9 @@ class ZkgmailConfigStore:
         state = self.load()
         return {
             "configured": bool(state["authorizationCode"]),
+            "localArchiveConfigured": bool(
+                re.fullmatch(r"[0-9a-fA-F]{64}", state["codeServiceToken"])
+            ),
             "domain": state["activeDomain"],
             "domains": list(state["domains"]),
             "forwardAccount": mask_account(state["username"]),
@@ -502,6 +614,20 @@ class ZkgmailConfigStore:
             "useSsl": state["useSsl"],
             "updatedAt": state["updatedAt"],
         }
+
+    def configure_code_service(self, token: str) -> dict[str, Any]:
+        value = str(token or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError("llhdsczy 本地归档取码令牌无效")
+        state = self.load()
+        state["codeServiceToken"] = value.lower()
+        state["updatedAt"] = _utc_now().isoformat()
+        self._save(state)
+        return self.public_state()
+
+    def code_service_token(self) -> str:
+        value = str(self.load().get("codeServiceToken") or "").strip()
+        return value if re.fullmatch(r"[0-9a-fA-F]{64}", value) else ""
 
     def supports_email(self, email: str) -> bool:
         target = str(email or "").strip().lower()
@@ -522,7 +648,10 @@ class ZkgmailMailClient:
         *,
         sync_interval_seconds: float = ZKGMAIL_SYNC_INTERVAL_SECONDS,
         sync_strategy: ZkgmailSyncStrategy | None = None,
+        idle_enabled: bool = False,
+        idle_strategy: ZkgmailIdleStrategy | None = None,
         local_part_strategy: LocalPartNamingStrategy | None = None,
+        remote_code_fetcher: RemoteCodeFetcher | None = None,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -532,12 +661,19 @@ class ZkgmailMailClient:
         self._clock = clock or _utc_now
         self._monotonic = monotonic or time.monotonic
         self._sync_strategy = sync_strategy
+        self._idle_enabled = bool(idle_enabled)
+        self._idle_strategy = idle_strategy or _watch_mailbox_idle
         self._local_part_strategy = local_part_strategy or DomainLocalPartNamingStrategy()
+        self._remote_code_fetcher = remote_code_fetcher or _fetch_remote_code
         self._acquired_at: dict[str, datetime] = {}
         self._consumed_message_ids: dict[str, set[int]] = {}
+        self._remote_cursors: dict[str, str] = {}
         self._next_sync_at = 0.0
         self._sync_task: asyncio.Task[None] | None = None
         self._sync_error: RuntimeError | None = None
+        self._idle_task: asyncio.Task[None] | None = None
+        self._idle_stop_event: threading.Event | None = None
+        self._idle_sync_pending = False
         self._lock = asyncio.Lock()
 
     def _now(self) -> datetime:
@@ -564,6 +700,7 @@ class ZkgmailMailClient:
         authorization_code: str | None = None,
         domain: str | None = None,
     ) -> dict[str, Any]:
+        await self._stop_idle_listener()
         async with self._lock:
             await self._wait_for_sync_completion()
             if authorization_code is None and domain is not None:
@@ -624,7 +761,11 @@ class ZkgmailMailClient:
                         label=str(label or f"{domain} 注册")[:200],
                         state="unused",
                         source="zkgmail",
-                        note=f"Catch-all 转发至 {ZKGMAIL_FORWARD_ACCOUNT}",
+                        note=(
+                            "Catch-all 保存至服务器本地归档"
+                            if domain == LLHDSCZY_DOMAIN
+                            else f"Catch-all 转发至 {ZKGMAIL_FORWARD_ACCOUNT}"
+                        ),
                         is_active=True,
                     )
                     break
@@ -674,6 +815,53 @@ class ZkgmailMailClient:
             self._sync_error = None
         self._sync_task = None
         self._next_sync_at = self._monotonic() + self.sync_interval_seconds
+        if self._idle_sync_pending:
+            self._idle_sync_pending = False
+            self._next_sync_at = 0.0
+            self._start_sync_if_due()
+
+    def _handle_idle_activity(self) -> None:
+        if self._sync_task is not None:
+            self._idle_sync_pending = True
+            return
+        self._next_sync_at = 0.0
+        self._start_sync_if_due()
+
+    def _finish_idle_listener(self, task: asyncio.Task[None]) -> None:
+        if self._idle_task is not task:
+            return
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._idle_task = None
+        self._idle_stop_event = None
+
+    def _start_idle_listener_if_needed(self) -> None:
+        if not self._idle_enabled or self._idle_task is not None:
+            return
+        config = self.config_store.inbox_config()
+        loop = asyncio.get_running_loop()
+        stop_event = threading.Event()
+
+        def notify() -> None:
+            try:
+                loop.call_soon_threadsafe(self._handle_idle_activity)
+            except RuntimeError:
+                return
+
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._idle_strategy,
+                config,
+                stop_event,
+                notify,
+            ),
+            name="zkgmail-imap-idle",
+        )
+        self._idle_stop_event = stop_event
+        self._idle_task = task
+        task.add_done_callback(self._finish_idle_listener)
 
     def _start_sync_if_due(self) -> bool:
         # Single-Flight pattern: concurrent HTTP polls share one IMAP scan.
@@ -739,7 +927,22 @@ class ZkgmailMailClient:
 
     async def poll_code(self, email: str, *, since: str = "") -> str:
         target = self._normalize_email(email)
+        if target.endswith(f"@{LLHDSCZY_DOMAIN}"):
+            token = self.config_store.code_service_token()
+            if token:
+                cursor = self._remote_cursors.get(target, "")
+                code, next_cursor = await asyncio.to_thread(
+                    self._remote_code_fetcher,
+                    LLHDSCZY_CODE_SERVICE_URL,
+                    token,
+                    target,
+                    cursor,
+                )
+                if code:
+                    self._remote_cursors[target] = next_cursor
+                return code
         async with self._lock:
+            self._start_idle_listener_if_needed()
             # Cache-Aside pattern: a local hit must never wait behind remote IMAP.
             code = self._next_stored_code(target, since)
             if code:
@@ -795,7 +998,19 @@ class ZkgmailMailClient:
     async def close(self) -> None:
         """Wait for the detached IMAP adapter before application shutdown."""
 
+        await self._stop_idle_listener()
         await self._wait_for_sync_completion()
+
+    async def _stop_idle_listener(self) -> None:
+        task = self._idle_task
+        stop_event = self._idle_stop_event
+        if stop_event is not None:
+            stop_event.set()
+        if task is None:
+            return
+        await asyncio.gather(task, return_exceptions=True)
+        if self._idle_task is task:
+            self._finish_idle_listener(task)
 
     async def _wait_for_sync_completion(self) -> None:
         task = self._sync_task
@@ -821,12 +1036,15 @@ class ZkgmailMailClient:
         target = self._normalize_email(email)
         removed = self._acquired_at.pop(target, None) is not None
         self._consumed_message_ids.pop(target, None)
+        self._remote_cursors.pop(target, None)
         return removed
 
 
 __all__ = [
     "CCLGMAIL_DOMAIN",
     "DEFAULT_QQ_FORWARD_DOMAINS",
+    "LLHDSCZY_CODE_SERVICE_URL",
+    "LLHDSCZY_DOMAIN",
     "SHUKUNLABS_DOMAIN",
     "ZKGMAIL_DOMAIN",
     "ZKGMAIL_FORWARD_ACCOUNT",

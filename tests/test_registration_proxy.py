@@ -434,7 +434,7 @@ class RegistrationProxyRouteTests(unittest.IsolatedAsyncioTestCase):
         registration_status = await self.client.get("/api/registration-proxy/status")
 
         self.assertEqual(response.status, 200)
-        self.assertEqual((await response.json())["cardLinkCountries"]["de"], "GB")
+        self.assertEqual((await response.json())["cardLinkCountries"]["de"], "DE")
         self.assertEqual(
             (await status.json())["cardLinkCountries"]["phPromotion"], "TR"
         )

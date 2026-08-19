@@ -69,6 +69,7 @@ _SEMANTIC_EMAIL_OTP_INPUT_SELECTORS = (
 # request to the active task start, so this tolerance cannot select an older
 # registration run's code.
 ICLOUD_CODE_TIMESTAMP_SKEW_SECONDS = 30.0
+QQ_FORWARD_OTP_POLL_INTERVAL_SECONDS = 0.25
 
 
 def _is_qq_forwarded_email(email: str) -> bool:
@@ -208,6 +209,11 @@ class ManualOtpReader:
         zkgmail_inbox = getattr(
             self, "zkgmail_inbox", _is_qq_forwarded_email(self.email)
         )
+        poll_interval_seconds = (
+            QQ_FORWARD_OTP_POLL_INTERVAL_SECONDS
+            if zkgmail_inbox
+            else OTP_POLL_INTERVAL_SECONDS
+        )
         while time.time() < deadline:
             try:
                 page_advanced = getattr(self, "page_advanced", None)
@@ -261,7 +267,7 @@ class ManualOtpReader:
                 elif response.status_code == 409 and registration_error:
                     raise RuntimeError(registration_error)
                 if response.status_code == 404:
-                    time.sleep(OTP_POLL_INTERVAL_SECONDS)
+                    time.sleep(poll_interval_seconds)
                     continue
                 if response.ok and payload.get("ok"):
                     code = re.sub(r"[^A-Za-z0-9]", "", str(payload.get("code") or ""))
@@ -273,7 +279,7 @@ class ManualOtpReader:
                 raise
             except Exception as error:
                 last_error = str(error)
-            time.sleep(OTP_POLL_INTERVAL_SECONDS)
+            time.sleep(poll_interval_seconds)
         detail = f"：{last_error}" if last_error else ""
         raise TimeoutError(f"在 600 秒内未收到邮箱验证码{detail}")
 

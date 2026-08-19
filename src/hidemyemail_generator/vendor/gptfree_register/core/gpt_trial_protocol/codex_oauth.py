@@ -10,8 +10,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from chatgpt_register import OpenAIAuthClient
-from codex_oauth import CODEX_CLIENT_ID, CODEX_REDIRECT_URI, generate_oauth_url
+if "." in (__package__ or ""):
+    from ..chatgpt_register import OpenAIAuthClient
+    from ..codex_oauth import CODEX_CLIENT_ID, CODEX_REDIRECT_URI, generate_oauth_url
+else:
+    # Compatibility for the standalone worker, which adds ``core`` to
+    # ``sys.path`` and imports this package as top-level ``gpt_trial_protocol``.
+    from chatgpt_register import OpenAIAuthClient
+    from codex_oauth import CODEX_CLIENT_ID, CODEX_REDIRECT_URI, generate_oauth_url
 
 from .errors import NoPhoneAvailableError
 from .sms import SmsActivation, SmsProvider

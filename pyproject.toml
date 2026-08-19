@@ -13,6 +13,7 @@ dependencies = [
     "loguru>=0.7,<1",
     "pproxy>=2.7,<3",
     "curl-cffi>=0.13.0",
+    "imap-tools>=1.11,<2",
 ]
 
 authors = [

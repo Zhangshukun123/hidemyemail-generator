@@ -133,6 +133,65 @@ def command(
 
 
 class SharedCardLinkBridgePresenterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nonempty_session_context_is_forwarded_and_redacted(self):
+        session_token = "session-context-token-secret"
+        device_id = "session-context-device-secret"
+        cookie_value = "session-context-cookie-secret"
+        session_context = {
+            "session_token": session_token,
+            "device_id": device_id,
+            "storage_state": {
+                "cookies": [
+                    {
+                        "name": "oai-sc",
+                        "value": cookie_value,
+                        "domain": "chatgpt.com",
+                        "path": "/",
+                    }
+                ]
+            },
+        }
+        bridge_command = CardLinkBridgeCommand(
+            access_token="at-session-context",
+            method="paypal_us",
+            country="US",
+            currency="USD",
+            locale="en-US",
+            account_email="session-context@example.test",
+            create_proxy_url="http://session:proxy-secret@proxy.test:8000",
+            promotion_proxy_url="http://session:proxy-secret@proxy.test:8000",
+            target_amount="0",
+            session_context=session_context,
+        )
+        view = MemoryCardLinkBridgeProcessView()
+        presenter = SharedCardLinkBridgePresenter(view)
+
+        await presenter.generate(bridge_command)
+
+        payload = view.exchange_calls[0]["payload"]
+        self.assertEqual(payload["session_context"], session_context)
+        message = (
+            f"session={session_token} device={device_id} cookie={cookie_value}"
+        )
+        rendered_logs = (
+            bridge_service._redact(
+                message,
+                bridge_service._payload_secrets(payload),
+            ),
+            openai_card_link_bridge._worker_redact(
+                message,
+                openai_card_link_bridge._worker_request_secrets(payload),
+            ),
+        )
+        for secret in (session_token, device_id, cookie_value):
+            self.assertNotIn(secret, repr(bridge_command))
+            for rendered in rendered_logs:
+                self.assertNotIn(secret, rendered)
+        for rendered in rendered_logs:
+            self.assertIn("[REDACTED]", rendered)
+
+        await presenter.close()
+
     async def test_progress_callback_receives_worker_logs_before_result_hand_off(self):
         view = MemoryCardLinkBridgeProcessView()
         presenter = SharedCardLinkBridgePresenter(view)

@@ -128,7 +128,6 @@ from .registration_inventory_client import (
 from .registration_inventory_sync import (
     SYNC_SCHEMA_VERSION,
     export_inventory_record,
-    export_inventory_records,
     import_inventory_records,
 )
 from .registration_monitor import RegistrationMonitorPresenter
@@ -3342,6 +3341,70 @@ def _save_account_card_link(
     return card_link
 
 
+_CARD_LINK_SESSION_COOKIE_BASES = frozenset(
+    {
+        "__Secure-next-auth.session-token",
+        "__Secure-authjs.session-token",
+        "next-auth.session-token",
+        "authjs.session-token",
+    }
+)
+_CARD_LINK_SESSION_COOKIE_NAMES = frozenset({"oai-did", "oai-sc"})
+
+
+def _card_link_session_context(record: dict[str, Any]) -> dict[str, Any]:
+    """Return only portable auth/device state for an isolated card-link session."""
+
+    session = account_session(record)
+    session_token = str(
+        session.get("sessionToken")
+        or session.get("session_token")
+        or ""
+    ).strip()
+    device_id = str(
+        record.get("device_id")
+        or record.get("oai_device_id")
+        or session.get("device_id")
+        or session.get("oai_device_id")
+        or ""
+    ).strip()
+    cookies: list[dict[str, Any]] = []
+    for raw_cookie in account_saved_cookies(record):
+        if not isinstance(raw_cookie, dict):
+            continue
+        name = str(raw_cookie.get("name") or "").strip()
+        value = str(raw_cookie.get("value") or "").strip()
+        domain = str(raw_cookie.get("domain") or "chatgpt.com").strip().lower()
+        domain_key = domain.lstrip(".")
+        is_auth_cookie = name in _CARD_LINK_SESSION_COOKIE_BASES or any(
+            name.startswith(f"{base}.") for base in _CARD_LINK_SESSION_COOKIE_BASES
+        )
+        if (
+            not value
+            or (not is_auth_cookie and name not in _CARD_LINK_SESSION_COOKIE_NAMES)
+            or domain_key not in {"chatgpt.com", "openai.com"}
+            or (domain_key == "openai.com" and name != "oai-did")
+        ):
+            continue
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain or "chatgpt.com",
+            "path": str(raw_cookie.get("path") or "/"),
+        }
+        cookies.append(cookie)
+        if name == "oai-did" and not device_id:
+            device_id = value
+    context: dict[str, Any] = {}
+    if session_token:
+        context["session_token"] = session_token
+    if device_id:
+        context["device_id"] = device_id
+    if cookies:
+        context["storage_state"] = {"cookies": cookies}
+    return context
+
+
 async def _run_card_link_bridge(
     *,
     target_project_dir: Path,
@@ -3357,6 +3420,7 @@ async def _run_card_link_bridge(
     promotion_proxy_url: str = "",
     target_amount: str = "",
     sentinel_so_enabled: bool = False,
+    session_context: dict[str, Any] | None = None,
     shared_presenter: SharedCardLinkBridgePresenter | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict:
@@ -3377,6 +3441,11 @@ async def _run_card_link_bridge(
                     promotion_proxy_url=promotion_proxy,
                     target_amount=target_amount,
                     sentinel_so_enabled=sentinel_so_enabled,
+                    session_context=(
+                        dict(session_context)
+                        if isinstance(session_context, dict)
+                        else {}
+                    ),
                 ),
                 on_log=progress_callback,
             )
@@ -4204,13 +4273,13 @@ def create_app(
     )
     app["local_registration_leases"] = {}
     app["inventory_fallback_active"] = False
-    app["inventory_sync_lock"] = asyncio.Lock()
     app["inventory_sync_interval_seconds"] = max(
         1.0, float(inventory_sync_interval_seconds)
     )
     app["inventory_initial_sync_complete"] = False
     app["inventory_sync_state"] = {
-        "status": "waiting" if app["inventory_client"].configured else "disabled",
+        "status": "disabled",
+        "mode": "local-only",
         "lastAttemptAt": "",
         "lastSuccessAt": "",
         "lastError": "",
@@ -4220,59 +4289,9 @@ def create_app(
         "batches": 0,
     }
 
-    async def sync_inventory_to_remote(
-        emails: list[str] | None = None,
-    ) -> dict[str, Any]:
-        client: RemoteRegistrationInventoryClient = app["inventory_client"]
-        if not client.configured:
-            return {"configured": False, "records": 0, "addresses": 0, "accounts": 0}
-        async with app["inventory_sync_lock"]:
-            state: dict[str, Any] = app["inventory_sync_state"]
-            state.update(
-                status="syncing",
-                lastAttemptAt=datetime.now(timezone.utc).isoformat(),
-                lastError="",
-            )
-            try:
-                records = await asyncio.to_thread(
-                    export_inventory_records,
-                    app["db_file"],
-                    emails=emails,
-                )
-                result = await client.sync_records(records)
-            except Exception as error:
-                state.update(status="error", lastError=str(error)[:1000])
-                raise
-            state.update(
-                status="ready",
-                lastSuccessAt=datetime.now(timezone.utc).isoformat(),
-                lastError="",
-                **result,
-            )
-            if emails is None:
-                app["inventory_initial_sync_complete"] = True
-            return {"configured": True, **result}
-
-    async def sync_saved_account_to_remote(email: str) -> None:
-        try:
-            await sync_inventory_to_remote([str(email or "").strip().lower()])
-        except RuntimeError:
-            if not app["inventory_fallback_active"]:
-                raise
-
-    async def remove_and_sync_deleted_email(email: str) -> None:
+    async def remove_deleted_email_records(email: str) -> None:
         target = str(email or "").strip().lower()
         await asyncio.to_thread(_remove_deleted_email_records, app["db_file"], target)
-        if not app["inventory_client"].configured:
-            return
-        try:
-            await sync_inventory_to_remote([target])
-        except Exception:
-            # The local tombstone still blocks stale remote leases.  The
-            # background inventory synchronizer retries the targeted record.
-            pass
-
-    app["sync_inventory_to_remote"] = sync_inventory_to_remote
     app["registration_proxy_store"] = RegistrationProxyStore(app["db_file"])
     app["card_link_proxy_store"] = RegistrationProxyStore(
         app["db_file"], setting_key=CARD_LINK_PROXY_SETTING_KEY
@@ -4307,7 +4326,6 @@ def create_app(
 
     app["protocol_registration_manager"] = ConcurrentProtocolRegistrationManager(
         process_factory=create_protocol_registration_process,
-        on_account_saved=sync_saved_account_to_remote,
         verify_account_plan=verify_saved_account_plan,
         max_processes=5,
     )
@@ -4337,11 +4355,13 @@ def create_app(
             db_file=app["db_file"],
             roxy_registration_store=app["roxy_registration_store"],
         ),
-        on_account_saved=sync_saved_account_to_remote,
     )
     app["plus_account_exporter"] = AccountExportPresenter(app["db_file"])
     app["zkgmail_config_store"] = ZkgmailConfigStore(app["db_file"])
-    app["zkgmail_client"] = ZkgmailMailClient(app["zkgmail_config_store"])
+    app["zkgmail_client"] = ZkgmailMailClient(
+        app["zkgmail_config_store"],
+        idle_enabled=True,
+    )
 
     def valid_account_email(email: str) -> bool:
         domains = app["zkgmail_config_store"].public_state().get("domains", [])
@@ -4373,7 +4393,6 @@ def create_app(
         force_headless=force_browser_headless,
         registration_proxy_store=app["registration_proxy_store"],
         roxy_registration_store=app["roxy_registration_store"],
-        on_account_saved=sync_saved_account_to_remote,
     )
     app["card_link_bridge_file"] = Path(__file__).with_name(
         "openai_card_link_bridge.py"
@@ -4467,11 +4486,10 @@ def create_app(
         # this workstation.  Consume only completed accounts; a password-only
         # record from a failed attempt stays retryable and reuses that password.
         #
-        # The full local-to-remote sync is owned by
-        # ``remote_inventory_sync_context``.  Waiting for that multi-batch sync
-        # here used to block the start endpoint (and therefore the quick-flow
-        # UI) for about a minute.  Lease immediately instead; the duplicate
-        # check below still reconciles any completed local account safely.
+        # Local account records intentionally remain on this workstation and
+        # are not uploaded to the remote inventory.  Lease immediately; the
+        # duplicate check below still reconciles a completed local account
+        # without transmitting its saved credentials.
         remote_error: RuntimeError | None = None
         try:
             for _attempt in range(100):
@@ -4596,7 +4614,6 @@ def create_app(
             force_headless=primary_browser.force_headless,
             registration_proxy_store=primary_browser.registration_proxy_store,
             roxy_registration_store=primary_browser.roxy_registration_store,
-            on_account_saved=sync_saved_account_to_remote,
         )
         return RegistrationTaskManager(
             browser_manager=process_browser,
@@ -4941,28 +4958,6 @@ def create_app(
                 await task
 
     app.cleanup_ctx.append(deactivation_scan_context)
-
-    if app["inventory_client"].configured:
-        async def remote_inventory_sync_context(_: web.Application):
-            async def sync_loop() -> None:
-                while True:
-                    try:
-                        await sync_inventory_to_remote()
-                    except Exception:
-                        # The status endpoint exposes the last error.  Keep the
-                        # local service usable and retry without losing data.
-                        pass
-                    await asyncio.sleep(app["inventory_sync_interval_seconds"])
-
-            task = asyncio.create_task(sync_loop())
-            try:
-                yield
-            finally:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-
-        app.cleanup_ctx.append(remote_inventory_sync_context)
 
     if app["inventory_server_enabled"]:
         async def scheduled_generation_context(_: web.Application):
@@ -5548,7 +5543,7 @@ def create_app(
                     await app["smsbower_client"].forget_email(email)
                 else:
                     await app["zkgmail_client"].forget_email(email)
-                await remove_and_sync_deleted_email(email)
+                await remove_deleted_email_records(email)
                 return web.json_response(
                     {
                         "ok": True,
@@ -5563,7 +5558,7 @@ def create_app(
                 )
 
             if local_only:
-                await remove_and_sync_deleted_email(email)
+                await remove_deleted_email_records(email)
                 return web.json_response(
                     {
                         "ok": True,
@@ -5604,7 +5599,7 @@ def create_app(
                 None,
             )
             if identity is None:
-                await remove_and_sync_deleted_email(email)
+                await remove_deleted_email_records(email)
                 return web.json_response(
                     {
                         "ok": True,
@@ -5637,7 +5632,7 @@ def create_app(
                     )
                 deleted = await hme.delete_email(anonymous_id)
 
-            await remove_and_sync_deleted_email(email)
+            await remove_deleted_email_records(email)
             if not deleted or not deleted.get("success"):
                 return web.json_response(
                     {
@@ -6474,6 +6469,7 @@ def create_app(
                             promotion_proxy_url=attempt_promotion_proxy,
                             target_amount=target_amount,
                             sentinel_so_enabled=sentinel_so_enabled,
+                            session_context=_card_link_session_context(record),
                             shared_presenter=app["card_link_bridge_service"],
                             progress_callback=publish_card_link_progress,
                         )

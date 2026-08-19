@@ -117,6 +117,7 @@ def generate_paypal_us_event(
     *,
     account_email: str = "",
     sentinel_so_enabled: bool = False,
+    session_context: dict | None = None,
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
@@ -142,6 +143,7 @@ def generate_paypal_us_event(
             account_email=str(account_email or "").strip(),
             diagnostic_log=diagnostic_log,
             sentinel_so_enabled=sentinel_so_enabled,
+            session_context=session_context,
         )
     else:
         checkout = runtime.generate_opll_paypal_long_link(
@@ -156,6 +158,7 @@ def generate_paypal_us_event(
             diagnostic_log=diagnostic_log,
             checkout_create_promotion_only=True,
             sentinel_so_enabled=sentinel_so_enabled,
+            session_context=session_context,
         )
     link = str(
         checkout.get("paypal_ba_approve_url")
@@ -195,6 +198,7 @@ def generate_paypal_gb_event(
     *,
     account_email: str = "",
     sentinel_so_enabled: bool = False,
+    session_context: dict | None = None,
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
@@ -223,6 +227,7 @@ def generate_paypal_gb_event(
         diagnostic_log=diagnostic_log,
         checkout_create_promotion_only=True,
         sentinel_so_enabled=sentinel_so_enabled,
+        session_context=session_context,
     )
     link = str(
         checkout.get("paypal_ba_approve_url")
@@ -269,6 +274,7 @@ def generate_paypal_de_event(
     *,
     account_email: str = "",
     sentinel_so_enabled: bool = False,
+    session_context: dict | None = None,
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
@@ -297,6 +303,7 @@ def generate_paypal_de_event(
         checkout_includes_trial_promo=True,
         checkout_create_promotion_only=True,
         sentinel_so_enabled=sentinel_so_enabled,
+        session_context=session_context,
         diagnostic_log=diagnostic_log,
     )
     link = str(
@@ -364,6 +371,17 @@ def _worker_request_secrets(payload: dict) -> tuple[str, ...]:
             raw = str(component or "").strip()
             if raw:
                 candidates.extend((raw, unquote(raw)))
+    session_context = payload.get("session_context")
+    if isinstance(session_context, dict):
+        pending: list[object] = [session_context]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, dict):
+                pending.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                pending.extend(item)
+            elif isinstance(item, str) and item.strip():
+                candidates.append(item.strip())
     return tuple(
         sorted(
             {candidate for candidate in candidates if candidate},
@@ -390,6 +408,11 @@ def _worker_generate(
     account_email = str(payload.get("account_email") or "").strip()
     target_amount = str(payload.get("target_amount") or "").strip()
     sentinel_so_enabled = payload.get("sentinel_so_enabled") is True
+    session_context = (
+        dict(payload.get("session_context"))
+        if isinstance(payload.get("session_context"), dict)
+        else {}
+    )
     secrets = _worker_request_secrets(payload)
     card_link_runtime.clear_proxy_exit_cache()
 
@@ -410,14 +433,19 @@ def _worker_generate(
         "paypal_us": generate_paypal_us_event,
         "paypal_gb": generate_paypal_gb_event,
     }[method]
+    options = {
+        "account_email": account_email,
+        "sentinel_so_enabled": sentinel_so_enabled,
+        "diagnostic_log": diagnostic_log,
+    }
+    if session_context:
+        options["session_context"] = session_context
     return generator(
         token,
         create_proxy_url,
         promotion_proxy_url,
         target_amount,
-        account_email=account_email,
-        sentinel_so_enabled=sentinel_so_enabled,
-        diagnostic_log=diagnostic_log,
+        **options,
     )
 
 

@@ -37,6 +37,7 @@ from hidemyemail_generator.webapp import (
     _configured_inventory_service_token,
     _configured_workbench_import_token,
     _active_protocol_code_emails,
+    _card_link_session_context,
     _configure_utf8_stdio,
     _generation_failure_message,
     _latest_code_for_email,
@@ -49,6 +50,121 @@ from hidemyemail_generator.liandong_shop import LiandongShopError
 
 
 class WebAppStdioTests(unittest.TestCase):
+    def test_card_link_session_context_keeps_only_portable_identity_cookies(self):
+        record = {
+            "session": {
+                "sessionToken": "saved-session-token",
+                "device_id": "saved-device-id",
+            },
+            "cookies": [
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": "chatgpt-next-auth",
+                    "domain": ".chatgpt.com",
+                    "path": "/",
+                },
+                {
+                    "name": "__Secure-authjs.session-token.0",
+                    "value": "chatgpt-authjs-chunk",
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                },
+                {
+                    "name": "oai-did",
+                    "value": "chatgpt-device-cookie",
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                },
+                {
+                    "name": "oai-sc",
+                    "value": "chatgpt-sentinel-cookie",
+                    "domain": ".chatgpt.com",
+                    "path": "/",
+                },
+                {
+                    "name": "oai-did",
+                    "value": "legacy-openai-device-cookie",
+                    "domain": ".openai.com",
+                    "path": "/",
+                },
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": "openai-auth-must-not-forward",
+                    "domain": ".openai.com",
+                    "path": "/",
+                },
+                {
+                    "name": "oai-sc",
+                    "value": "openai-sentinel-must-not-forward",
+                    "domain": ".openai.com",
+                    "path": "/",
+                },
+                {
+                    "name": "cf_clearance",
+                    "value": "cloudflare-clearance-must-not-forward",
+                    "domain": ".chatgpt.com",
+                    "path": "/",
+                },
+                {
+                    "name": "__cf_bm",
+                    "value": "cloudflare-bot-cookie-must-not-forward",
+                    "domain": ".chatgpt.com",
+                    "path": "/",
+                },
+                {
+                    "name": "unrelated-cookie",
+                    "value": "unrelated-must-not-forward",
+                    "domain": ".chatgpt.com",
+                    "path": "/",
+                },
+            ],
+        }
+
+        context = _card_link_session_context(record)
+
+        self.assertEqual(context["session_token"], "saved-session-token")
+        self.assertEqual(context["device_id"], "saved-device-id")
+        cookies = context["storage_state"]["cookies"]
+        self.assertEqual(
+            {(cookie["name"], cookie["domain"]) for cookie in cookies},
+            {
+                ("__Secure-next-auth.session-token", ".chatgpt.com"),
+                ("__Secure-authjs.session-token.0", "chatgpt.com"),
+                ("oai-did", "chatgpt.com"),
+                ("oai-sc", ".chatgpt.com"),
+                ("oai-did", ".openai.com"),
+            },
+        )
+        serialized = json.dumps(context, sort_keys=True)
+        for excluded in (
+            "openai-auth-must-not-forward",
+            "openai-sentinel-must-not-forward",
+            "cloudflare-clearance-must-not-forward",
+            "cloudflare-bot-cookie-must-not-forward",
+            "unrelated-must-not-forward",
+        ):
+            self.assertNotIn(excluded, serialized)
+
+    def test_card_link_session_context_uses_allowed_oai_did_as_device_fallback(self):
+        context = _card_link_session_context(
+            {
+                "session_json": json.dumps(
+                    {"session_token": "legacy-session-token"}
+                ),
+                "cookies": [
+                    {
+                        "name": "oai-did",
+                        "value": "cookie-device-id",
+                        "domain": ".openai.com",
+                        "path": "/",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(context["session_token"], "legacy-session-token")
+        self.assertEqual(context["device_id"], "cookie-device-id")
+
     def test_protocol_code_waiters_include_every_concurrent_task(self):
         waiting = _active_protocol_code_emails(
             {
@@ -1389,12 +1505,13 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(urlsplit(proxy_url).hostname, "extract.example")
         self.assertIn("extract-user-region-BR-sid-", unquote(urlsplit(proxy_url).username or ""))
 
-    async def test_registration_save_callbacks_only_sync_inventory(self):
+    async def test_registration_save_callbacks_do_not_sync_remote_inventory(self):
         process = self.app["registration_manager"].process_factory()
         callbacks = (
             self.app["browser_manager"].on_account_saved,
             self.app["protocol_registration_manager"].on_account_saved,
             process.browser_manager.on_account_saved,
+            self.app["plus_codex_presenter"].on_account_saved,
         )
         bridge = mock.AsyncMock()
 
@@ -1403,9 +1520,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
             new=bridge,
         ):
             for callback in callbacks:
-                self.assertIsNotNone(callback)
-                self.assertEqual(callback.__name__, "sync_saved_account_to_remote")
-                await callback("card-link@icloud.com")
+                self.assertIsNone(callback)
 
         bridge.assert_not_awaited()
         saved = load_account_record(self.app["db_file"], "card-link@icloud.com")

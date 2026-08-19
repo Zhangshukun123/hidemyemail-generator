@@ -1,13 +1,14 @@
 import ast
-import inspect
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from hidemyemail_generator import card_link_runtime
 from hidemyemail_generator.openai_card_link_bridge import (
@@ -20,7 +21,231 @@ from hidemyemail_generator.openai_card_link_bridge import (
 from scripts.vendor_card_link_runtime import source_segment_with_decorators
 
 
+class _JsonResponse:
+    def __init__(self, payload=None, *, status_code=200, headers=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = headers or {}
+        self.text = json.dumps(self._payload)
+
+    def json(self):
+        return self._payload
+
+
+class _ApprovalSession:
+    def __init__(self, label, result, events):
+        self.label = label
+        self.result = result
+        self.events = events
+        self.requests = []
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        self.requests.append(
+            {"operation": "checkout", "method": "GET", "url": url, **kwargs}
+        )
+        self.events.append((self.label, "checkout", url))
+        return _JsonResponse(headers={"x-request-id": f"req-{self.label}-checkout"})
+
+    def post(self, url, **kwargs):
+        if url.endswith("/backend-api/sentinel/ping"):
+            operation = "sentinel"
+            payload = {"result": "ok"}
+        elif url.endswith("/backend-api/payments/checkout/approve"):
+            operation = "approve"
+            payload = {"result": self.result}
+        else:  # pragma: no cover - makes unexpected protocol calls explicit
+            raise AssertionError(f"unexpected approval request: {url}")
+        self.requests.append(
+            {"operation": operation, "method": "POST", "url": url, **kwargs}
+        )
+        self.events.append((self.label, operation, url))
+        return _JsonResponse(
+            payload,
+            headers={"x-request-id": f"req-{self.label}-{operation}"},
+        )
+
+    def close(self):
+        self.closed = True
+        self.events.append((self.label, "close", ""))
+
+
 class CardLinkBridgeTests(unittest.TestCase):
+    def _run_us_oaics_promotion_case(self, create_amount):
+        first_proxy = "http://us-sticky.example:8000"
+        ignored_proxy = "socks5://ignored-followup.example:9000"
+        oaics_id = "oaics_us_promotion_behavior"
+        stripe_id = "cs_live_uspromotionbehavior"
+        paypal_url = (
+            "https://www.paypal.com/agreements/approve?"
+            "ba_token=us_promotion_behavior"
+        )
+        raw_create_payload = {
+            "checkout_session_id": oaics_id,
+            "currency": "USD",
+            "total_summary": {"due": create_amount},
+            "payment_method_types": ["card", "paypal"],
+        }
+        materialized_payload = {
+            "checkout_session_id": oaics_id,
+            "client_secret": f"{stripe_id}_secret_fixturetoken",
+            "currency": "USD",
+            "total_summary": {"due": 0},
+            "payment_method_types": ["card", "paypal"],
+        }
+        checkout = {
+            "cs_id": oaics_id,
+            "billing_country": "US",
+            "currency": "USD",
+            "processor_entity": "openai_llc",
+            "stripe_publishable_key": "pk_test_us",
+            "oai_device_id": "did-us-promotion",
+            "_checkout_payload": raw_create_payload,
+        }
+        payment_page = {
+            "stripe_hosted_url": f"https://checkout.stripe.com/c/pay/{stripe_id}",
+            "payment_method_types": ["card", "paypal"],
+            "currency": "usd",
+            "total_summary": {"due": 0},
+            "config_id": "cfg-us-promotion",
+            "init_checksum": "checksum-us-promotion",
+        }
+        chatgpt_session = object()
+        stripe_session = object()
+        diagnostics = []
+
+        with ExitStack() as stack:
+            validate = stack.enter_context(
+                patch.object(card_link_runtime, "opll_validate_access_token", return_value={})
+            )
+            create_checkout = stack.enter_context(
+                patch.object(card_link_runtime, "opll_create_checkout", return_value=checkout)
+            )
+            build_chatgpt = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_build_chatgpt_session",
+                    return_value=chatgpt_session,
+                )
+            )
+            update_checkout = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_chatgpt_update_checkout_promotion",
+                    return_value=materialized_payload,
+                )
+            )
+            fetch_checkout = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_chatgpt_fetch_checkout",
+                    return_value=materialized_payload,
+                )
+            )
+            build_stripe = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_build_stripe_session",
+                    return_value=stripe_session,
+                )
+            )
+            stripe_init = stack.enter_context(
+                patch.object(card_link_runtime, "opll_stripe_init", return_value=payment_page)
+            )
+            apply_promotion = stack.enter_context(
+                patch.object(card_link_runtime, "opll_apply_checkout_trial_promotion")
+            )
+            wait_for_page = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_wait_for_us_tr_promoted_payment_page",
+                    return_value=payment_page,
+                )
+            )
+            billing = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_billing_for_country",
+                    return_value={
+                        "name": "Taylor Morgan",
+                        "email": "member@icloud.com",
+                        "phone": "+12125550123",
+                        "country": "US",
+                        "line1": "88 Broadway",
+                        "city": "New York",
+                        "state": "NY",
+                        "postal_code": "10007",
+                    },
+                )
+            )
+            create_method = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_stripe_create_paypal_method",
+                    return_value="pm_us_promotion",
+                )
+            )
+            confirm = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_stripe_confirm",
+                    return_value={"submission_attempt": {"state": "requires_approval"}},
+                )
+            )
+            redirect = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_redirect_url_after_confirm",
+                    return_value="https://pm-redirects.stripe.com/authorize/us-behavior",
+                )
+            )
+            resolve = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_resolve_paypal_redirect_result",
+                    return_value={
+                        "selected_url": paypal_url,
+                        "paypal_ba_approve_url": paypal_url,
+                        "payment_link_type": "paypal_approve",
+                    },
+                )
+            )
+
+            result = card_link_runtime.generate_opll_paypal_us_tr_long_link(
+                "at-test",
+                first_proxy,
+                ignored_proxy,
+                "0",
+                account_email="member@icloud.com",
+                diagnostic_log=diagnostics.append,
+                session_context={"session_json": '{"accessToken":"at-test"}'},
+            )
+
+        return SimpleNamespace(
+            result=result,
+            first_proxy=first_proxy,
+            ignored_proxy=ignored_proxy,
+            oaics_id=oaics_id,
+            stripe_id=stripe_id,
+            chatgpt_session=chatgpt_session,
+            stripe_session=stripe_session,
+            diagnostics=diagnostics,
+            validate=validate,
+            create_checkout=create_checkout,
+            build_chatgpt=build_chatgpt,
+            update_checkout=update_checkout,
+            fetch_checkout=fetch_checkout,
+            build_stripe=build_stripe,
+            stripe_init=stripe_init,
+            apply_promotion=apply_promotion,
+            wait_for_page=wait_for_page,
+            billing=billing,
+            create_method=create_method,
+            confirm=confirm,
+            redirect=redirect,
+            resolve=resolve,
+        )
+
     def test_us_billing_country_mismatch_is_retryable_with_fresh_proxy(self):
         error = RuntimeError(
             'checkout create failed: HTTP 400 {"detail":'
@@ -461,11 +686,182 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["method"], "de_oaics_paypal")
         self.assertEqual(event["promotion_strategy"], "checkout_create")
 
-    def test_us_zero_flow_source_has_no_checkout_promotion_update_call(self):
-        source = inspect.getsource(card_link_runtime.generate_opll_paypal_us_tr_long_link)
+    def test_us_create_zero_amount_skips_checkout_promotion_update(self):
+        case = self._run_us_oaics_promotion_case(create_amount=0)
 
-        self.assertNotIn("opll_chatgpt_update_checkout_promotion(", source)
-        self.assertIn("include_trial_promo=True", source)
+        case.update_checkout.assert_not_called()
+        case.fetch_checkout.assert_called_once()
+        self.assertIs(case.fetch_checkout.call_args.kwargs["chatgpt"], case.chatgpt_session)
+        self.assertEqual(case.build_chatgpt.call_args.args[1], case.first_proxy)
+        self.assertEqual(case.create_checkout.call_args.args[3], case.first_proxy)
+        self.assertTrue(case.create_checkout.call_args.kwargs["include_trial_promo"])
+        self.assertEqual(case.stripe_init.call_args.args[0], case.stripe_id)
+        self.assertEqual(case.stripe_init.call_args.args[3], case.first_proxy)
+        self.assertEqual(
+            case.stripe_init.call_args.kwargs["browser_timezone"],
+            "America/New_York",
+        )
+        case.apply_promotion.assert_not_called()
+        self.assertEqual(case.result["cs_id"], case.oaics_id)
+        self.assertEqual(case.result["promotion_strategy"], "checkout_create")
+        self.assertEqual(case.result["promotion_proxy"], "")
+
+    def test_us_create_nonzero_amount_updates_original_oaics_once_on_same_proxy(self):
+        case = self._run_us_oaics_promotion_case(create_amount=1933)
+
+        case.update_checkout.assert_called_once()
+        update_args = case.update_checkout.call_args.args
+        update_kwargs = case.update_checkout.call_args.kwargs
+        self.assertEqual(update_args[0], "at-test")
+        self.assertEqual(update_args[1]["cs_id"], case.oaics_id)
+        self.assertEqual(update_args[2], case.first_proxy)
+        self.assertIs(update_kwargs["session"], case.chatgpt_session)
+        self.assertTrue(update_kwargs["include_checkout_context"])
+        self.assertEqual(case.build_chatgpt.call_args.args[1], case.first_proxy)
+        case.fetch_checkout.assert_not_called()
+        case.apply_promotion.assert_not_called()
+        self.assertEqual(case.stripe_init.call_args.args[0], case.stripe_id)
+        self.assertEqual(case.stripe_init.call_args.args[3], case.first_proxy)
+        self.assertEqual(case.result["cs_id"], case.oaics_id)
+        self.assertEqual(
+            case.result["promotion_strategy"],
+            "checkout_create_then_single_update",
+        )
+        self.assertEqual(case.result["promotion_proxy"], case.first_proxy)
+        self.assertTrue(any("唯一一次 Update" in item for item in case.diagnostics))
+
+    def test_approve_blocked_retries_with_fresh_session_on_same_proxy_in_order(self):
+        events = []
+        first = _ApprovalSession("first", "blocked", events)
+        second = _ApprovalSession("second", "approved", events)
+        proxy = "http://us-sticky.example:8000"
+        fallback_proxy = "http://us-fallback.example:8000"
+        checkout_id = "oaics_us_approve_behavior"
+        checkout = {
+            "billing_country": "US",
+            "processor_entity": "openai_llc",
+            "oai_device_id": "did-us-approve",
+        }
+        diagnostics = []
+
+        with patch.object(
+            card_link_runtime,
+            "opll_build_chatgpt_session",
+            side_effect=[first, second],
+        ) as build_session:
+            result = card_link_runtime.opll_chatgpt_approve_with_retry(
+                "at-test",
+                checkout_id,
+                checkout,
+                [proxy, fallback_proxy],
+                request_locale="en-US",
+                attempts=3,
+                interval_seconds=0,
+                rotate_ip_each_attempt=False,
+                diagnostic_log=diagnostics.append,
+            )
+
+        self.assertIs(result, second)
+        self.assertEqual(build_session.call_count, 2)
+        self.assertEqual(
+            [call.args[1] for call in build_session.call_args_list],
+            [proxy, proxy],
+        )
+        self.assertEqual(
+            [call.kwargs["device_id"] for call in build_session.call_args_list],
+            ["did-us-approve", "did-us-approve"],
+        )
+        self.assertEqual(
+            [(label, operation) for label, operation, _url in events if operation != "close"],
+            [
+                ("first", "checkout"),
+                ("first", "sentinel"),
+                ("first", "approve"),
+                ("second", "checkout"),
+                ("second", "sentinel"),
+                ("second", "approve"),
+            ],
+        )
+        self.assertTrue(first.closed)
+        self.assertFalse(second.closed)
+        expected_checkout_url = (
+            "https://chatgpt.com/checkout/openai_llc/"
+            f"{checkout_id}"
+        )
+        for session in (first, second):
+            self.assertEqual(
+                [request["operation"] for request in session.requests],
+                ["checkout", "sentinel", "approve"],
+            )
+            self.assertEqual(session.requests[0]["url"], expected_checkout_url)
+            self.assertEqual(session.requests[1]["json"], {})
+            self.assertEqual(
+                session.requests[2]["json"],
+                {
+                    "checkout_session_id": checkout_id,
+                    "processor_entity": "openai_llc",
+                },
+            )
+        self.assertTrue(any("同一粘性代理" in item for item in diagnostics))
+
+    def test_approve_second_blocked_stops_without_third_session(self):
+        events = []
+        first = _ApprovalSession("first", "blocked", events)
+        second = _ApprovalSession("second", "blocked", events)
+        proxy = "http://us-sticky.example:8000"
+        fallback_proxy = "http://us-fallback.example:8000"
+        checkout_id = "oaics_us_approve_behavior"
+        checkout = {
+            "billing_country": "US",
+            "processor_entity": "openai_llc",
+            "oai_device_id": "did-us-approve",
+        }
+
+        with patch.object(
+            card_link_runtime,
+            "opll_build_chatgpt_session",
+            side_effect=[first, second],
+        ) as build_session:
+            with self.assertRaises(card_link_runtime.OpllChatgptApproveBlocked):
+                card_link_runtime.opll_chatgpt_approve_with_retry(
+                    "at-test",
+                    checkout_id,
+                    checkout,
+                    [proxy, fallback_proxy],
+                    request_locale="en-US",
+                    attempts=3,
+                    interval_seconds=0,
+                    rotate_ip_each_attempt=False,
+                )
+
+        self.assertEqual(build_session.call_count, 2)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertEqual(
+            [call.args[1] for call in build_session.call_args_list],
+            [proxy, proxy],
+        )
+        for session in (first, second):
+            self.assertEqual(
+                session.requests[0]["url"],
+                "https://chatgpt.com/checkout/openai_llc/"
+                f"{checkout_id}",
+            )
+            self.assertEqual(
+                session.requests[2]["json"]["checkout_session_id"],
+                checkout_id,
+            )
+        self.assertEqual(
+            [(label, operation) for label, operation, _url in events if operation != "close"],
+            [
+                ("first", "checkout"),
+                ("first", "sentinel"),
+                ("first", "approve"),
+                ("second", "checkout"),
+                ("second", "sentinel"),
+                ("second", "approve"),
+            ],
+        )
 
     def test_us_paypal_zero_target_uses_embedded_zero_amount_flow(self):
         logs = []
