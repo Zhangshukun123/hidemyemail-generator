@@ -75,6 +75,7 @@ ZKGMAIL_FIRST_NAMES = (
     "olivia",
     "sophia",
 )
+ZKGMAIL_NAME_PREFIXES = ("william", "mark")
 ZKGMAIL_LAST_NAMES = (
     "smith",
     "johnson",
@@ -156,14 +157,15 @@ def _generate_human_local_part() -> str:
     return f"{first_name}{last_name}{suffix}"
 
 
-def _generate_william_local_part() -> str:
-    """Return ``william`` plus a surname and a variable-length numeric suffix."""
+def _generate_named_local_part() -> str:
+    """Return ``william`` or ``mark`` plus a surname and numeric suffix."""
 
+    prefix = secrets.choice(ZKGMAIL_NAME_PREFIXES)
     surname = secrets.choice(ZKGMAIL_LAST_NAMES)
     digit_count = 2 + secrets.randbelow(5)
     minimum = 10 ** (digit_count - 1)
     suffix = minimum + secrets.randbelow(9 * minimum)
-    return f"william{surname}{suffix}"
+    return f"{prefix}{surname}{suffix}"
 
 
 class DomainLocalPartNamingStrategy:
@@ -171,7 +173,7 @@ class DomainLocalPartNamingStrategy:
 
     def generate(self, domain: str) -> str:
         if str(domain or "").strip().lower() == ZKGMAIL_DOMAIN:
-            return _generate_william_local_part()
+            return _generate_named_local_part()
         return _generate_human_local_part()
 
 
