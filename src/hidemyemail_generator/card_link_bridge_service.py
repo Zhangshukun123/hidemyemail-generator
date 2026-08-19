@@ -17,7 +17,9 @@ WORKER_MESSAGE_PREFIX = "HME_CARD_LINK_WORKER:"
 WORKER_PROTOCOL_VERSION = 1
 MAX_PROTOCOL_LINE_BYTES = 1024 * 1024
 MAX_PROGRESS_LOGS = 200
-SHARED_CARD_LINK_METHODS = frozenset({"paypal_us", "paypal_gb"})
+SHARED_CARD_LINK_METHODS = frozenset(
+    {"de_oaics_paypal", "paypal_us", "paypal_gb"}
+)
 _SENSITIVE_ENV_KEYS = (
     "HME_OPENAI_ACCESS_TOKEN",
     "HME_CARD_LINK_CREATE_PROXY_URL",
@@ -38,8 +40,9 @@ class CardLinkBridgeCommand:
     create_proxy_url: str = field(default="", repr=False)
     promotion_proxy_url: str = field(default="", repr=False)
     target_amount: str = ""
+    sentinel_so_enabled: bool = False
 
-    def to_payload(self) -> dict[str, str]:
+    def to_payload(self) -> dict[str, Any]:
         return {
             "method": str(self.method or "").strip(),
             "access_token": str(self.access_token or "").strip(),
@@ -50,6 +53,7 @@ class CardLinkBridgeCommand:
             "create_proxy_url": str(self.create_proxy_url or "").strip(),
             "promotion_proxy_url": str(self.promotion_proxy_url or "").strip(),
             "target_amount": str(self.target_amount or "").strip(),
+            "sentinel_so_enabled": bool(self.sentinel_so_enabled),
         }
 
 

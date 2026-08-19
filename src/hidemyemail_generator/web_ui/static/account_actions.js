@@ -68,7 +68,12 @@
       const targetAmount = policy.amount || String(
         saved.targetAmount || localStorage.getItem("hme_quick_card_link_target_amount") || "",
       ).trim();
-      return { method, mode, attempts, firstCountry, secondCountry, targetAmount, policy };
+      const sentinelSoEnabled = saved.sentinelSoEnabled !== false &&
+        localStorage.getItem("hme_quick_paypal_sentinel_so_enabled") !== "false";
+      return {
+        method, mode, attempts, firstCountry, secondCountry, targetAmount,
+        sentinelSoEnabled, policy,
+      };
     }
 
     cardLinkPayload(account, forceRetry = false) {
@@ -86,6 +91,7 @@
         use_secondary_proxy: false,
         promotion_proxy_choice: "first",
         target_amount: config.targetAmount,
+        sentinel_so_enabled: config.sentinelSoEnabled,
         force_retry: Boolean(forceRetry),
         attempt_limit: config.attempts,
       };

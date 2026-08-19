@@ -1855,6 +1855,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             bridge.await_args.kwargs["account_email"], "card-link@icloud.com"
         )
+        self.assertTrue(bridge.await_args.kwargs["sentinel_so_enabled"])
 
     async def test_generates_us_paypal_link_with_desktop_flow_options(self):
         browser_manager = self.app["browser_manager"]
@@ -1892,6 +1893,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "independent_proxy_pair": True,
                     "use_secondary_proxy": True,
                     "promotion_proxy_choice": "second",
+                    "sentinel_so_enabled": False,
                 },
                 headers={"X-Local-Token": self.app["local_token"]},
             )
@@ -1901,6 +1903,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["country"], "US")
         self.assertEqual(call["currency"], "USD")
         self.assertEqual(call["target_amount"], "1933")
+        self.assertFalse(call["sentinel_so_enabled"])
         self.assertIn("create.example:8000", call["create_proxy_url"])
         self.assertEqual(call["promotion_proxy_url"], call["create_proxy_url"])
         self.assertEqual(call["python_executable"], Path(sys.executable))

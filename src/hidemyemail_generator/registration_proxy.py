@@ -121,10 +121,12 @@ class CardLinkProxyCountryPolicy:
     """Keep fixed-region checkout methods and proxy roles in one country."""
 
     METHOD_COUNTRIES = {
+        "de_oaics_paypal": "DE",
         "paypal_us": "US",
         "paypal_gb": "GB",
     }
     PREFERENCE_COUNTRIES = {
+        "de": "DE",
         "paypalUsCreate": "US",
         "paypalUsFollowup": "US",
         "paypalGbCreate": "GB",

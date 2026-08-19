@@ -1,4 +1,5 @@
 import ast
+import inspect
 import json
 import os
 import subprocess
@@ -13,6 +14,7 @@ from hidemyemail_generator.openai_card_link_bridge import (
     EVENT_PREFIX,
     card_link_error_is_retryable,
     generate_paypal_gb_event,
+    generate_paypal_de_event,
     generate_paypal_us_event,
 )
 from scripts.vendor_card_link_runtime import source_segment_with_decorators
@@ -327,6 +329,8 @@ class CardLinkBridgeTests(unittest.TestCase):
             self.assertEqual(approve, create)
             self.assertEqual(target, "1933")
             self.assertEqual(options["account_email"], "member@icloud.com")
+            self.assertTrue(options["checkout_create_promotion_only"])
+            self.assertTrue(options["sentinel_so_enabled"])
             return {
                 "cs_id": "cs_test_us",
                 "billing_country": "US",
@@ -347,6 +351,7 @@ class CardLinkBridgeTests(unittest.TestCase):
             "socks5://ignored-followup.example:9000",
             "1933",
             account_email="member@icloud.com",
+            sentinel_so_enabled=True,
             runtime=runtime,
         )
 
@@ -378,6 +383,8 @@ class CardLinkBridgeTests(unittest.TestCase):
             self.assertEqual((create, followup, approve), (first_proxy,) * 3)
             self.assertEqual(target, "0")
             self.assertEqual(options["account_email"], "member@icloud.com")
+            self.assertTrue(options["checkout_create_promotion_only"])
+            self.assertTrue(options["sentinel_so_enabled"])
             return {
                 "cs_id": "cs_test_gb",
                 "billing_country": "GB",
@@ -402,6 +409,7 @@ class CardLinkBridgeTests(unittest.TestCase):
             "socks5://ignored-second.example:9000",
             "999",
             account_email="member@icloud.com",
+            sentinel_so_enabled=True,
             runtime=runtime,
         )
 
@@ -411,6 +419,53 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["amount"], "0")
         self.assertEqual(event["link_proxy_country"], "GB")
         self.assertEqual(event["link_proxy_ip"], "203.0.113.44")
+
+    def test_de_paypal_uses_checkout_create_promotion_without_update_proxy(self):
+        first_proxy = "http://de-first.example:8000"
+
+        def generate(token, country, currency, create, followup, approve, target, **options):
+            self.assertEqual((country, currency), ("DE", "EUR"))
+            self.assertEqual((create, followup, approve), (first_proxy,) * 3)
+            self.assertEqual(target, "0")
+            self.assertTrue(options["checkout_includes_trial_promo"])
+            self.assertTrue(options["checkout_create_promotion_only"])
+            self.assertTrue(options["sentinel_so_enabled"])
+            return {
+                "cs_id": "oaics_test_de",
+                "billing_country": "DE",
+                "currency": "EUR",
+                "paypal_ba_approve_url": "https://www.paypal.com/agreements/approve?ba_token=de_create",
+                "stripe_amount": "0",
+                "promotion_applied": True,
+                "promotion_strategy": "checkout_create",
+            }
+
+        runtime = SimpleNamespace(
+            PAYPAL_BR_DE_STRICT_ZERO_FLOW="br_de_strict_zero",
+            detect_proxy_health=lambda *_args, **_kwargs: SimpleNamespace(
+                success=True, country="DE", ip="203.0.113.49", error="", failed_stage="",
+            ),
+            generate_opll_paypal_long_link=generate,
+            opll_is_paypal_success_url=lambda value: value.endswith("de_create"),
+        )
+        event = generate_paypal_de_event(
+            "at-test",
+            first_proxy,
+            "http://ignored-promo.example:9000",
+            "0",
+            account_email="member@icloud.com",
+            sentinel_so_enabled=True,
+            runtime=runtime,
+        )
+
+        self.assertEqual(event["method"], "de_oaics_paypal")
+        self.assertEqual(event["promotion_strategy"], "checkout_create")
+
+    def test_us_zero_flow_source_has_no_checkout_promotion_update_call(self):
+        source = inspect.getsource(card_link_runtime.generate_opll_paypal_us_tr_long_link)
+
+        self.assertNotIn("opll_chatgpt_update_checkout_promotion(", source)
+        self.assertIn("include_trial_promo=True", source)
 
     def test_us_paypal_zero_target_uses_embedded_zero_amount_flow(self):
         logs = []

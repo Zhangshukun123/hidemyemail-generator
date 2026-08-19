@@ -169,6 +169,51 @@ PAYPAL_NATIVE_POST_APPROVE_POLL_SECONDS = (8, 8, 8, 8, 20)
 
 PAYPAL_NATIVE_APPROVE_RETRY_INTERVAL_SECONDS = 1.0
 
+
+def opll_paypal_checkout_sentinel_headers(
+    proxy_url: str,
+    device_id: str,
+    request_locale: str,
+) -> dict[str, str]:
+    """Generate the flow-bound SEN + SO headers for one checkout creation."""
+
+    from .vendor.gptfree_register.core.gpt_trial_protocol.models import (
+        BrowserProfile,
+        ProtocolConfig,
+    )
+    from .vendor.gptfree_register.core.gpt_trial_protocol.sentinel_http import (
+        SentinelHttpTokenProvider,
+    )
+
+    locale_context = opll_locale_context_for_country(
+        str(request_locale or "en-US").split("-", 1)[-1]
+    )
+    profile = BrowserProfile(
+        user_agent=OPLL_USER_AGENT,
+        sec_ch_ua=(
+            f'"Chromium";v="{OPLL_BROWSER_MAJOR}", '
+            f'"Not=A?Brand";v="24", "Google Chrome";v="{OPLL_BROWSER_MAJOR}"'
+        ),
+        language=str(request_locale or "en-US"),
+        timezone=str(locale_context.get("browser_timezone") or "America/New_York"),
+        device_id=str(device_id or "").strip() or str(uuid.uuid4()),
+    )
+    provider = SentinelHttpTokenProvider(
+        config=ProtocolConfig(
+            timeout=float(PAY_LONG_LINK_TIMEOUT),
+            profile=profile,
+        ),
+        proxy=str(proxy_url or "").strip() or None,
+        device_id=profile.device_id,
+    )
+    bundle = provider.get_openai_sentinel(purpose="checkout")
+    headers = bundle.sentinel.as_headers()
+    if not headers.get("openai-sentinel-token"):
+        raise OpllChatgptSentinelError("Checkout SEN 主令牌生成失败")
+    if not headers.get("openai-sentinel-so-token"):
+        raise OpllChatgptSentinelError("Checkout SO 附加令牌生成失败")
+    return headers
+
 @dataclasses.dataclass(frozen=True)
 class ProxyHealthResult:
     success: bool
@@ -1485,6 +1530,9 @@ def opll_create_checkout(
     chatgpt_session: requests.Session | None = None,
     return_raw_payload: bool = False,
     request_timeout: float = PAY_LONG_LINK_TIMEOUT,
+    sentinel_so_enabled: bool = False,
+    sentinel_header_provider=None,
+    diagnostic_log=None,
 ) -> dict:
     country = normalize_opll_country(country)
     currency = currency_for_country(country)
@@ -1521,14 +1569,24 @@ def opll_create_checkout(
             "promo_campaign_id": "plus-1-month-free",
             "is_coupon_from_query_param": False,
         }
+    checkout_headers = {
+        "Referer": "https://chatgpt.com/",
+        "x-openai-target-path": "/backend-api/payments/checkout",
+        "x-openai-target-route": "/backend-api/payments/checkout",
+    }
+    if sentinel_so_enabled:
+        provider = sentinel_header_provider or opll_paypal_checkout_sentinel_headers
+        checkout_headers.update(
+            provider(proxy_url, oai_device_id, request_locale)
+        )
+        opll_emit_diagnostic(
+            diagnostic_log,
+            "[PayPal] Checkout 已生成并提交 SEN + SO 双令牌",
+        )
     response = session.post(
         "https://chatgpt.com/backend-api/payments/checkout",
         json=payload,
-        headers={
-            "Referer": "https://chatgpt.com/",
-            "x-openai-target-path": "/backend-api/payments/checkout",
-            "x-openai-target-route": "/backend-api/payments/checkout",
-        },
+        headers=checkout_headers,
         timeout=max(1.0, float(request_timeout or PAY_LONG_LINK_TIMEOUT)),
     )
     if response.status_code >= 400:
@@ -2041,6 +2099,21 @@ def opll_classify_promotion_update_error(
             return "edge_or_ip_blocked", True
         return "forbidden_unknown", True
     return "business_rejection", False
+
+def opll_should_update_checkout_promotion(
+    *,
+    apply_trial_promotion: bool,
+    checkout_includes_trial_promo: bool,
+    target_amount: str,
+    actual_amount: str,
+) -> bool:
+    """Policy: Create-time promotions are verified, never updated afterward."""
+
+    if checkout_includes_trial_promo or not apply_trial_promotion:
+        return False
+    expected = str(target_amount or "").strip()
+    return not expected or str(actual_amount or "").strip() != expected
+
 
 def opll_chatgpt_update_checkout_promotion(
     access_token: str,
@@ -4806,7 +4879,7 @@ def opll_extract_paypal_from_oaics_checkout(
     if not stripe_checkout_id:
         opll_emit_diagnostic(
             diagnostic_log,
-            "[PayPal OAICS] Create/Update/Fetch 尚无 Stripe cs_；"
+        "[PayPal OAICS] Create/Fetch 尚无 Stripe cs_；"
             "第一代理使用 oaics_ 提交 Checkout Taxes 物化支付会话",
         )
         taxes_payload = opll_chatgpt_checkout_taxes(
@@ -4837,13 +4910,11 @@ def opll_extract_paypal_from_oaics_checkout(
             *(payload for _stage, payload in materialized_payloads)
         )
 
-    amount_matches_target = bool(target_amount) and amount == target_amount
-    needs_promotion_update = bool(
-        promotion_requested
-        and (
-            (apply_trial_promotion and not target_amount)
-            or (target_amount and not amount_matches_target)
-        )
+    needs_promotion_update = opll_should_update_checkout_promotion(
+        apply_trial_promotion=apply_trial_promotion,
+        checkout_includes_trial_promo=checkout_includes_trial_promo,
+        target_amount=target_amount,
+        actual_amount=amount,
     )
     if needs_promotion_update:
         opll_emit_diagnostic(
@@ -5315,6 +5386,8 @@ def generate_opll_paypal_long_link(
     return_checkout_short: bool = False,
     payment_method_country: str = "",
     checkout_includes_trial_promo: bool = False,
+    checkout_create_promotion_only: bool = False,
+    sentinel_so_enabled: bool = False,
 ) -> dict:
     create_proxy_url = str(create_proxy_url or "").strip()
     configured_followup_proxy_url = str(followup_proxy_url or "").strip()
@@ -5328,11 +5401,13 @@ def generate_opll_paypal_long_link(
     currency_country = requested_country
     normalized_target_amount = str(target_amount or "").strip()
     normalized_paypal_flow = str(paypal_flow or "").strip().lower()
+    checkout_create_promotion_only = bool(checkout_create_promotion_only)
     return_checkout_short = bool(return_checkout_short)
     browser_runtime = browser_runtime if isinstance(browser_runtime, dict) else {}
     is_br_de_strict_zero = normalized_paypal_flow == PAYPAL_BR_DE_STRICT_ZERO_FLOW
     strict_zero_checkout_includes_trial_promo = bool(
-        is_br_de_strict_zero and checkout_includes_trial_promo
+        is_br_de_strict_zero
+        and (checkout_includes_trial_promo or checkout_create_promotion_only)
     )
     strict_zero_payment_method_country = ""
     # JP 严格零：与 DE 相同后置活动门禁；沿用界面默认三段代理，不强制合并/不校验出口。
@@ -5359,8 +5434,8 @@ def generate_opll_paypal_long_link(
         if configured_followup_proxy_url == create_proxy_url:
             opll_emit_diagnostic(
                 diagnostic_log,
-                "[PayPal GB] Checkout、优惠 Update、Stripe、Confirm、Approve 和轮询"
-                "全程复用英国第一代理",
+                "[PayPal GB] Checkout 创建时直接携带优惠；Stripe、Confirm、Approve 和轮询"
+                "全程复用英国第一代理，不提交优惠 Update",
             )
         else:
             opll_emit_diagnostic(
@@ -5405,7 +5480,7 @@ def generate_opll_paypal_long_link(
             else f"账单与 Payment Method 跟随货币国家 {currency_country}"
         )
         proxy_strategy = (
-            "Checkout 创建时直接携带优惠；若金额不为 0，则使用第一代理补提交一次优惠 Update"
+                "Checkout 创建时直接携带优惠；后续仅校验金额，不提交优惠 Update"
             if strict_zero_checkout_includes_trial_promo
             else "第二代理仅负责优惠 Update"
         )
@@ -5537,7 +5612,7 @@ def generate_opll_paypal_long_link(
         try:
             checkout_promo_text = (
                 "第一代理创建并直接带优惠"
-                if strict_zero_checkout_includes_trial_promo
+                if (strict_zero_checkout_includes_trial_promo or checkout_create_promotion_only)
                 else
                 "第一代理创建，暂不带优惠"
                 if is_de_native_promotion
@@ -5555,7 +5630,9 @@ def generate_opll_paypal_long_link(
                     "EUR",
                     create_proxy_url,
                     request_locale=post_request_locale,
-                    include_trial_promo=False,
+                    include_trial_promo=checkout_create_promotion_only,
+                    sentinel_so_enabled=sentinel_so_enabled,
+                    diagnostic_log=diagnostic_log,
                 )
             elif is_de_native_promotion:
                 checkout = opll_create_checkout(
@@ -5564,8 +5641,10 @@ def generate_opll_paypal_long_link(
                     "EUR",
                     native_primary_proxy_url,
                     request_locale=post_request_locale,
-                    include_trial_promo=False,
+                    include_trial_promo=checkout_create_promotion_only,
                     checkout_ui_mode="hosted",
+                    sentinel_so_enabled=sentinel_so_enabled,
+                    diagnostic_log=diagnostic_log,
                     **(
                         {"session": browser_runtime.get("primary_chatgpt_session")}
                         if browser_runtime.get("primary_chatgpt_session") is not None
@@ -5579,7 +5658,12 @@ def generate_opll_paypal_long_link(
                     currency_for_country(checkout_country),
                     create_proxy_url,
                     request_locale=post_request_locale,
-                    include_trial_promo=strict_zero_checkout_includes_trial_promo,
+                    include_trial_promo=(
+                        strict_zero_checkout_includes_trial_promo
+                        or checkout_create_promotion_only
+                    ),
+                    sentinel_so_enabled=sentinel_so_enabled,
+                    diagnostic_log=diagnostic_log,
                 )
             else:
                 checkout = opll_create_checkout(
@@ -5588,6 +5672,9 @@ def generate_opll_paypal_long_link(
                     currency_for_country(checkout_country),
                     create_proxy_url,
                     request_locale=post_request_locale,
+                    include_trial_promo=True,
+                    sentinel_so_enabled=sentinel_so_enabled,
+                    diagnostic_log=diagnostic_log,
                 )
             if is_br_de_strict_zero:
                 checkout_billing_country = str(checkout.get("billing_country") or "").upper()
@@ -5675,10 +5762,14 @@ def generate_opll_paypal_long_link(
                     payment_method_country=pm_country,
                     apply_trial_promotion=(
                         oaics_promotion_required
-                        and not strict_zero_checkout_includes_trial_promo
+                        and not (
+                            strict_zero_checkout_includes_trial_promo
+                            or checkout_create_promotion_only
+                        )
                     ),
                     checkout_includes_trial_promo=(
                         strict_zero_checkout_includes_trial_promo
+                        or checkout_create_promotion_only
                     ),
                     return_checkout_short=return_checkout_short,
                     paypal_flow=normalized_paypal_flow,
@@ -5811,7 +5902,41 @@ def generate_opll_paypal_long_link(
                 ctx["currency"] = str(checkout.get("currency") or "").lower()
             effective_payload = init_payload
             promotion: dict = {}
-            if is_de_native_promotion:
+            if checkout_create_promotion_only:
+                opll_emit_diagnostic(
+                    diagnostic_log,
+                    "[PayPal] 步骤 4/7：Checkout 创建时已携带优惠；"
+                    "跳过优惠 Update，正在轮询金额与 PayPal 支付方式",
+                )
+                payment_page = opll_wait_for_us_tr_promoted_payment_page(
+                    stripe,
+                    checkout["cs_id"],
+                    stripe_pk,
+                    ctx,
+                    init_payload,
+                    promotion_already_proven=True,
+                    required_amount=target_amount,
+                    required_payment_method_type="paypal",
+                    attempts=6,
+                )
+                effective_payload = {**init_payload, **payment_page}
+                promotion = {
+                    "promotion_id": PIX_TRIAL_PROMOTION_ID,
+                    "promotion_applied": True,
+                    "promotion_strategy": "checkout_create",
+                    "promotion_proof": "checkout_create_amount_verified",
+                }
+                promotion_applied = True
+                stripe_amount, stripe_amount_source = opll_stripe_amount_info(
+                    effective_payload
+                )
+                ctx = opll_stripe_context(effective_payload, payment_locale, ctx=ctx)
+                if not ctx.get("currency"):
+                    ctx["currency"] = str(checkout.get("currency") or "").lower()
+                stripe_hosted_url = str(
+                    effective_payload.get("stripe_hosted_url") or stripe_hosted_url
+                ).strip()
+            elif is_de_native_promotion:
                 opll_emit_diagnostic(
                     diagnostic_log,
                     "[PayPal] 步骤 4/7：第二代理仅提交优惠 Update；"
@@ -5869,7 +5994,7 @@ def generate_opll_paypal_long_link(
                     opll_emit_diagnostic(
                         diagnostic_log,
                         "[PayPal] 步骤 4/7：Checkout 创建时已携带优惠；"
-                        "先校验真实金额，非 0 时使用第一代理补做一次 checkout/update",
+                        "仅校验真实金额，不提交优惠 Update",
                     )
                     initial_amount, initial_amount_source = opll_stripe_amount_info(
                         init_payload
@@ -5883,40 +6008,11 @@ def generate_opll_paypal_long_link(
                             target_amount,
                         )
                     except AmountMismatchError:
-                        opll_emit_diagnostic(
-                            diagnostic_log,
-                            "[PayPal] Checkout 携带优惠后金额仍未匹配："
-                            f"目标={target_amount}，实际={initial_amount or '<未知>'}，"
-                            f"来源={initial_amount_source or '<未知>'}；"
-                            "保留当前 Checkout，使用第一代理补做一次优惠 Update",
+                        raise AmountMismatchError(
+                            str(target_amount or "").strip(),
+                            initial_amount,
+                            initial_amount_source,
                         )
-                        (
-                            promotion,
-                            payment_page,
-                            promotion_used_proxy,
-                        ) = opll_apply_de_strict_zero_promotion_with_ip_rotation(
-                            stripe,
-                            checkout,
-                            stripe_pk,
-                            init_payload,
-                            ctx,
-                            access_token=access_token,
-                            request_proxy_url=create_proxy_url,
-                            rotation_proxy_url=create_upstream_proxy_url,
-                            target_amount=target_amount,
-                            request_locale=post_request_locale,
-                            diagnostic_log=diagnostic_log,
-                            max_ip_refreshes=0,
-                        )
-                        promotion = dict(promotion)
-                        promotion["promotion_strategy"] = (
-                            "checkout_create_then_single_update"
-                        )
-                        promotion["promotion_proof"] = str(
-                            promotion.get("promotion_proof")
-                            or "checkout_update_after_create_amount_mismatch"
-                        )
-                        promotion_applied = promotion.get("promotion_applied") is True
                     else:
                         promotion = {
                             "promotion_id": PIX_TRIAL_PROMOTION_ID,
@@ -6180,7 +6276,9 @@ def generate_opll_paypal_long_link(
                     "promotion_requested": True,
                     "promotion_applied": promotion.get("promotion_applied") is True,
                     "promotion_required": True,
-                    "promotion_strategy": "post_init_update",
+                    "promotion_strategy": str(
+                        promotion.get("promotion_strategy") or "checkout_create"
+                    ),
                     "promotion_proxy": promotion_proxy_used,
                     "create_proxy_used": payment_proxy_used,
                     "payment_proxy_used": payment_proxy_used,
@@ -6191,7 +6289,7 @@ def generate_opll_paypal_long_link(
                 }
                 opll_emit_diagnostic(
                     diagnostic_log,
-                    f"[PayPal短链] 第一代理确认支持 PayPal，第二代理优惠已更新；短链生成完成: {short_url}",
+                    f"[PayPal短链] Checkout 创建时已携带优惠；短链生成完成: {short_url}",
                 )
                 return opll_apply_amount_check(short_result, target_amount)
             checkout["payment_method_country"] = pm_country
@@ -6342,11 +6440,10 @@ def generate_opll_paypal_long_link(
                     payment_proxy_used = create_upstream_proxy_url or create_proxy_url
                     result.update({
                         "promotion_required": True,
-                        "promotion_strategy": "post_init_update",
-                        "promotion_proxy": (
-                            promotion_upstream_proxy_url
-                            or configured_followup_proxy_url
+                        "promotion_strategy": str(
+                            promotion.get("promotion_strategy") or "checkout_create"
                         ),
+                        "promotion_proxy": "",
                         "create_proxy_used": payment_proxy_used,
                         "payment_proxy_used": payment_proxy_used,
                         "approve_proxy_used": payment_proxy_used,
@@ -6365,8 +6462,10 @@ def generate_opll_paypal_long_link(
                     "promotion_requested": True,
                     "promotion_applied": promotion.get("promotion_applied") is True,
                     "promotion_required": True,
-                    "promotion_strategy": "post_init_update",
-                    "promotion_proxy": promotion_proxy_used,
+                    "promotion_strategy": str(
+                        promotion.get("promotion_strategy") or "checkout_create"
+                    ),
+                    "promotion_proxy": "" if checkout_create_promotion_only else promotion_proxy_used,
                     "create_proxy_used": payment_proxy_used,
                     "payment_proxy_used": payment_proxy_used,
                     "approve_proxy_used": payment_proxy_used,
@@ -6399,6 +6498,7 @@ def generate_opll_paypal_us_tr_long_link(
     *,
     account_email: str = "",
     diagnostic_log=None,
+    sentinel_so_enabled: bool = False,
 ) -> dict:
     us_proxy_url = str(us_proxy_url or "").strip()
     # The PayPal US flow keeps one stable exit identity for every stage.
@@ -6412,7 +6512,7 @@ def generate_opll_paypal_us_tr_long_link(
     opll_validate_access_token(access_token, us_proxy_url, request_locale="en-US")
     opll_emit_diagnostic(
         diagnostic_log,
-        "[PayPal US] 步骤 2/7：第一代理创建 US/USD Checkout（暂不带优惠）",
+        "[PayPal US] 步骤 2/7：第一代理创建 US/USD Checkout（直接携带优惠）",
     )
     checkout = opll_create_checkout(
         access_token,
@@ -6420,9 +6520,11 @@ def generate_opll_paypal_us_tr_long_link(
         "USD",
         us_proxy_url,
         request_locale="en-US",
-        include_trial_promo=False,
+        include_trial_promo=True,
         checkout_ui_mode="hosted",
         return_raw_payload=True,
+        sentinel_so_enabled=sentinel_so_enabled,
+        diagnostic_log=diagnostic_log,
     )
     raw_create_payload = checkout.pop("_checkout_payload", {})
     if not isinstance(raw_create_payload, dict):
@@ -6442,25 +6544,10 @@ def generate_opll_paypal_us_tr_long_link(
         opll_emit_diagnostic(
             diagnostic_log,
             "[PayPal US] Checkout 返回 oaics_；保留其作为 ChatGPT Checkout ID，"
-            "第一代理提交一次优惠 Update，再解析底层 Stripe cs_",
+            "优惠已在 Create 阶段携带，直接解析底层 Stripe cs_",
         )
-        oaics_update_payload = opll_chatgpt_update_checkout_promotion(
-            access_token,
-            checkout,
-            tr_proxy_url,
-            request_locale="en-US",
-            device_id=str(checkout.get("oai_device_id") or ""),
-            include_checkout_context=True,
-        )
-        updated_checkout_id = opll_extract_checkout_session_id(
-            oaics_update_payload
-        )
-        if updated_checkout_id.startswith("oaics_"):
-            checkout["cs_id"] = updated_checkout_id
-            checkout_id = updated_checkout_id
         stripe_checkout_id = opll_extract_stripe_payment_page_id(
             raw_create_payload,
-            oaics_update_payload,
         )
         if not stripe_checkout_id:
             us_chatgpt = opll_build_chatgpt_session(
@@ -6489,7 +6576,7 @@ def generate_opll_paypal_us_tr_long_link(
                 )
                 opll_emit_diagnostic(
                     diagnostic_log,
-                    "[PayPal US] oaics_ Create/Update/Fetch 尚未返回 Stripe cs_；"
+                    "[PayPal US] oaics_ Create/Fetch 尚未返回 Stripe cs_；"
                     "第一代理调用 Checkout Taxes 物化底层支付会话",
                 )
                 oaics_taxes_payload = opll_chatgpt_checkout_taxes(
@@ -6519,7 +6606,7 @@ def generate_opll_paypal_us_tr_long_link(
         if not stripe_checkout_id:
             oaics_amount = ""
             oaics_amount_source = "missing_payload"
-            oaics_amount_stage = "checkout_update"
+            oaics_amount_stage = "checkout_create"
             oaics_currency = ""
             declared_methods: list[str] = []
             for stage, payload in (
@@ -6681,11 +6768,11 @@ def generate_opll_paypal_us_tr_long_link(
                         "checkout_payment_method_types": declared_methods,
                         "promotion_id": PIX_TRIAL_PROMOTION_ID,
                         "promotion_applied": True,
-                        "promotion_strategy": "us_tr_oaics_update_setup_intent",
+                        "promotion_strategy": "checkout_create",
                         "promotion_proof": (
-                            "chatgpt_checkout_update_and_setup_intent_amount_verified"
+                            "checkout_create_and_setup_intent_amount_verified"
                         ),
-                        "promotion_proxy": tr_proxy_url,
+                        "promotion_proxy": "",
                         "paypal_flow": PAYPAL_US_TR_FLOW,
                     },
                     target_amount,
@@ -6708,8 +6795,8 @@ def generate_opll_paypal_us_tr_long_link(
                 )
             if not stripe_checkout_id:
                 raise RuntimeError(
-                    "OAICS_PAYMENT_ROUTE_MISSING: PayPal US 的 oaics_ Checkout 已完成一次优惠 Update，"
-                    "但 Create、Update、Fetch、Taxes、PayPal Confirm 均未返回 "
+                    "OAICS_PAYMENT_ROUTE_MISSING: PayPal US 的 oaics_ Checkout 已在 Create 阶段携带优惠，"
+                    "但 Create、Fetch、Taxes、PayPal Confirm 均未返回 "
                     "Stripe cs_/client_secret；已停止，未向 Stripe 发送 oaics_ ID"
                 )
 
@@ -6754,56 +6841,28 @@ def generate_opll_paypal_us_tr_long_link(
 
     opll_emit_diagnostic(
         diagnostic_log,
-        "[PayPal US] 步骤 4/7：第一代理正在提交优惠 Update；完成后再校验金额"
-        if not is_oaics_checkout
-        else "[PayPal US] 步骤 4/7：oaics_ 优惠 Update 已提交；第一代理正在轮询金额与 PayPal",
+        "[PayPal US] 步骤 4/7：Checkout 创建时已携带优惠；"
+        "跳过优惠 Update，正在轮询金额与 PayPal",
     )
-    tr_stripe = opll_build_stripe_session(tr_proxy_url, request_locale="en-US")
-    if is_oaics_checkout:
-        promotion = {
-            "promotion_id": PIX_TRIAL_PROMOTION_ID,
-            "promotion_applied": True,
-            "promotion_strategy": "us_tr_oaics_update",
-            "promotion_proof": "chatgpt_checkout_update_then_stripe_validation",
-        }
-        payment_page = opll_wait_for_us_tr_promoted_payment_page(
-            tr_stripe,
-            stripe_checkout_id,
-            stripe_pk,
-            ctx,
-            init_payload,
-            promotion_already_proven=True,
-            required_amount=str(target_amount or "").strip(),
-            required_payment_method_type="paypal",
-        )
-        promotion_applied = True
-    else:
-        promotion = opll_apply_checkout_trial_promotion(
-            tr_stripe,
-            stripe_checkout_id,
-            stripe_pk,
-            init_payload,
-            ctx,
-            access_token=access_token,
-            checkout=checkout,
-            chatgpt_proxy_url=tr_proxy_url,
-            request_locale="en-US",
-            allow_pending=True,
-        )
-        payment_page = promotion.get("payment_page")
-        if not isinstance(payment_page, dict):
-            raise RuntimeError("应用优惠后的 Payment Page 状态无效")
-        payment_page = opll_wait_for_us_tr_promoted_payment_page(
-            tr_stripe,
-            stripe_checkout_id,
-            stripe_pk,
-            ctx,
-            payment_page,
-            before_payload=init_payload,
-        )
-        promotion_applied = opll_pix_promotion_applied(init_payload, payment_page)
+    promotion = {
+        "promotion_id": PIX_TRIAL_PROMOTION_ID,
+        "promotion_applied": True,
+        "promotion_strategy": "checkout_create",
+        "promotion_proof": "checkout_create_then_stripe_validation",
+    }
+    payment_page = opll_wait_for_us_tr_promoted_payment_page(
+        us_stripe,
+        stripe_checkout_id,
+        stripe_pk,
+        ctx,
+        init_payload,
+        promotion_already_proven=True,
+        required_amount=str(target_amount or "").strip(),
+        required_payment_method_type="paypal",
+    )
+    promotion_applied = True
     if not promotion_applied:
-        raise RuntimeError("活动更新响应未证明优惠已生效")
+        raise RuntimeError("Checkout 创建响应未证明优惠已生效")
 
     effective_payload = {**init_payload, **payment_page}
     opll_require_payment_method_type(effective_payload, "paypal", require_declared=True)
@@ -6820,7 +6879,7 @@ def generate_opll_paypal_us_tr_long_link(
     opll_apply_amount_check(amount_result, target_amount)
     opll_emit_diagnostic(
         diagnostic_log,
-        f"[PayPal US] 优惠更新与金额校验通过：目标={target_amount}，当前={stripe_amount}",
+        f"[PayPal US] Checkout 优惠与金额校验通过：目标={target_amount}，当前={stripe_amount}",
     )
 
     ctx = opll_stripe_context(effective_payload, ctx=ctx)
@@ -6905,10 +6964,10 @@ def generate_opll_paypal_us_tr_long_link(
         "promotion_id": str(promotion.get("promotion_id") or PIX_TRIAL_PROMOTION_ID),
         "promotion_applied": promotion_applied,
         "promotion_strategy": str(
-            promotion.get("promotion_strategy") or "post_init_update"
+            promotion.get("promotion_strategy") or "checkout_create"
         ),
         "promotion_proof": str(promotion.get("promotion_proof") or "checkout_update"),
-        "promotion_proxy": tr_proxy_url,
+        "promotion_proxy": "",
         "paypal_flow": PAYPAL_US_TR_FLOW,
     }
     return opll_apply_amount_check(result, target_amount)

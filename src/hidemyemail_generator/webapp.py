@@ -3356,13 +3356,14 @@ async def _run_card_link_bridge(
     create_proxy_url: str = "",
     promotion_proxy_url: str = "",
     target_amount: str = "",
+    sentinel_so_enabled: bool = False,
     shared_presenter: SharedCardLinkBridgePresenter | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict:
     token = str(access_token or "").strip()
     create_proxy = str(create_proxy_url or "").strip()
     promotion_proxy = str(promotion_proxy_url or "").strip()
-    if shared_presenter is not None and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
+    if shared_presenter is not None and method in PAYPAL_CARD_LINK_METHODS:
         try:
             shared_result = await shared_presenter.generate(
                 CardLinkBridgeCommand(
@@ -3375,6 +3376,7 @@ async def _run_card_link_bridge(
                     create_proxy_url=create_proxy,
                     promotion_proxy_url=promotion_proxy,
                     target_amount=target_amount,
+                    sentinel_so_enabled=sentinel_so_enabled,
                 ),
                 on_log=progress_callback,
             )
@@ -6050,6 +6052,10 @@ def create_app(
                 {"ok": False, "error": "提链进度 ID 无效"}, status=400
             )
         force_retry = body.get("force_retry") is True
+        sentinel_so_enabled = (
+            method in PAYPAL_CARD_LINK_METHODS
+            and body.get("sentinel_so_enabled", True) is not False
+        )
         try:
             attempt_limit = int(body.get("attempt_limit") or 1)
         except (TypeError, ValueError):
@@ -6402,14 +6408,14 @@ def create_app(
             )
         browser_manager: BrowserTaskManager = app["browser_manager"]
         if (
-            method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+            method not in PAYPAL_CARD_LINK_METHODS
             and not browser_manager.target_project_dir.is_dir()
         ):
             return web.json_response(
                 {"ok": False, "error": "OpenAI 支付运行目录不存在"}, status=503
             )
         if (
-            method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+            method not in PAYPAL_CARD_LINK_METHODS
             and not browser_manager.python_executable.is_file()
         ):
             return web.json_response(
@@ -6449,12 +6455,12 @@ def create_app(
                         result = await _run_card_link_bridge(
                             target_project_dir=(
                                 app["card_link_bridge_file"].parents[2]
-                                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                                if method in PAYPAL_CARD_LINK_METHODS
                                 else browser_manager.target_project_dir
                             ),
                             python_executable=(
                                 Path(sys.executable)
-                                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                                if method in PAYPAL_CARD_LINK_METHODS
                                 else browser_manager.python_executable
                             ),
                             bridge_file=app["card_link_bridge_file"],
@@ -6467,6 +6473,7 @@ def create_app(
                             create_proxy_url=attempt_create_proxy,
                             promotion_proxy_url=attempt_promotion_proxy,
                             target_amount=target_amount,
+                            sentinel_so_enabled=sentinel_so_enabled,
                             shared_presenter=app["card_link_bridge_service"],
                             progress_callback=publish_card_link_progress,
                         )

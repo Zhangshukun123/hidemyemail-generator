@@ -16,7 +16,7 @@
   const cardLinkExtractionModes = {
     paypal_us: {
       country: "US",
-      summary: "使用第一代理完成 US/USD Checkout、优惠、金额校验与 PayPal Confirm / Approve",
+      summary: "使用第一代理创建已携带优惠的 US/USD Checkout，并完成金额校验与 PayPal Confirm / Approve",
       label: "PayPal / 美国 · USD · 全程第一代理",
       checks: ["✓ Session 可用", "✓ 地区 US", "✓ 币种 USD", "✓ 返回 PayPal 授权链接"],
       button: "提取 PayPal 链接",
@@ -33,7 +33,7 @@
     },
     paypal_gb: {
       country: "GB",
-      summary: "使用英国第一代理完成 GB/GBP Checkout、优惠、金额校验与 PayPal Confirm / Approve",
+      summary: "使用英国第一代理创建已携带优惠的 GB/GBP Checkout，并完成金额校验与 PayPal Confirm / Approve",
       label: "PayPal / 英国 · GBP · 全程第一代理",
       checks: ["✓ Session 可用", "✓ 地区 GB", "✓ 币种 GBP", "✓ 优惠后金额 0", "✓ 返回 PayPal 授权链接"],
       button: "提取 PayPal 链接",
@@ -60,12 +60,13 @@
     },
     de_oaics_paypal: {
       country: "DE",
-      summary: "创建 DE/EUR oaics_ Checkout 并提取 PayPal BA 授权链接",
+      summary: "创建时直接携带优惠的 DE/EUR Checkout，并提取 PayPal BA 授权链接",
       label: "PayPal / 严格 0 · DE / EUR",
       checks: ["✓ Session 可用", "✓ 未生成同模式链接", "✓ DE / EUR", "✓ 优惠后金额 0"],
       button: "提取 PayPal 链接",
       success: "PayPal DE/EUR 链接已提取并复制",
       singleProxy: true,
+      fixedProxyCountry: true,
       createProxyPreference: "de",
       createProxyCountry: "DE",
       fixedTargetAmount: "0",
@@ -192,6 +193,7 @@
     const config = cardLinkRuntimeConfig(method);
     return {
       target_amount: config.fixedTargetAmount || $("cardLinkTargetAmount").value.trim(),
+      sentinel_so_enabled: Boolean($("cardLinkSentinelSo").checked),
     };
   }
 
@@ -796,7 +798,9 @@
         extractionFirstCountry: "hme_quick_extraction_first_country",
         extractionSecondCountry: "hme_quick_extraction_second_country",
         promotionProxyChoice: "hme_quick_promotion_proxy_choice",
-        targetAmount: "hme_quick_paypal_us_target_amount", postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
+        targetAmount: "hme_quick_paypal_us_target_amount",
+        sentinelSoEnabled: "hme_quick_paypal_sentinel_so_enabled",
+        postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
       };
     }
     getItem(key) {
@@ -841,6 +845,7 @@
         extractionSecondCountry: textValue(candidate.extractionSecondCountry, "DE") || "DE",
         promotionProxyChoice: enumValue(candidate.promotionProxyChoice, ["first", "second"], "first"),
         targetAmount: textValue(candidate.targetAmount),
+        sentinelSoEnabled: booleanValue(candidate.sentinelSoEnabled, true),
         postPaymentPhoneBinding: booleanValue(candidate.postPaymentPhoneBinding, false),
         savedAt: textValue(candidate.savedAt),
         collapsed: Boolean(candidate.collapsed),
@@ -897,7 +902,7 @@
     constructor() {
       this.details = $("quickFlowConfigDetails");
       this.savedState = $("quickFlowSavedConfigState");
-      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding"); this.protocolSetupCredentials = $("quickProtocolSetupCredentials");
+      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding"); this.protocolSetupCredentials = $("quickProtocolSetupCredentials"); this.sentinelSoEnabled = $("quickPaypalSentinelSo");
       this.fields = {
         registrationProvider: $("quickRegistrationProvider"),
         registrationMode: $("quickRegistrationMode"),
@@ -918,6 +923,7 @@
       return {
         ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) => [field, element.value])),
         protocolSetupCredentials: true,
+        sentinelSoEnabled: Boolean(this.sentinelSoEnabled.checked),
         postPaymentPhoneBinding: Boolean(this.postPaymentPhoneBinding.checked),
         collapsed: !this.details.open,
       };
@@ -931,6 +937,7 @@
       });
       this.protocolSetupCredentials.checked = true;
       this.protocolSetupCredentials.disabled = true;
+      this.sentinelSoEnabled.checked = snapshot.sentinelSoEnabled !== false;
       this.postPaymentPhoneBinding.checked = snapshot.postPaymentPhoneBinding === true;
       this.details.open = !snapshot.collapsed;
     }
@@ -949,6 +956,7 @@
         "并发 " + current.concurrency + " / 目标 " + current.targetCount,
         this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
         "每号 " + current.extractionCount + " 次",
+        current.sentinelSoEnabled ? "SEN + SO" : "仅基础 Checkout",
         current.postPaymentPhoneBinding ? "确认 Plus 后接码" : "确认 Plus 即结束",
         this.selectedLabel("registrationProxyMode", current.registrationProxyMode),
         this.selectedLabel("extractionProxyMode", current.extractionProxyMode),
@@ -961,7 +969,7 @@
     }
 
     bind(onChange, onToggle) {
-      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.protocolSetupCredentials || event.target === this.postPaymentPhoneBinding) onChange(); });
+      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.protocolSetupCredentials || event.target === this.sentinelSoEnabled || event.target === this.postPaymentPhoneBinding) onChange(); });
       this.details.addEventListener("toggle", () => onToggle(!this.details.open));
     }
   }
@@ -1935,7 +1943,7 @@
         targetAmountInput.value = localStorage.getItem("hme_quick_paypal_us_target_amount") || "";
         targetAmountInput.dataset.method = method;
       }
-      $("quickPromotionProxyChoiceLabel").hidden = method !== "de_oaics_paypal";
+      $("quickPromotionProxyChoiceLabel").hidden = true;
       const postPaymentPhoneBinding = Boolean($("quickPostPaymentPhoneBinding")?.checked);
       $("quickCardLinkChecks").innerHTML = [...config.checks, "✓ 自动协议支付", `✓ ${paymentSmsLabel} 自动取号`,
         postPaymentPhoneBinding ? "✓ Plus 确认后继续接码" : "✓ Plus 确认后直接结束",
@@ -1945,7 +1953,7 @@
         : extractionProxyReady
         ? (config.singleProxy
           ? "提链代理与注册代理独立。第一代理负责 " + config.country +
-            " Checkout、优惠 Update、金额校验、Confirm 与 Approve；不会获取或调用第二代理。"
+            " Checkout 创建（直接携带优惠）、金额校验、Confirm 与 Approve；不会提交优惠 Update。"
           : "提链代理与注册代理独立。首次提链使用第一代理出口；链接失败后重新提链使用第二代理出口。优惠更新当前使用" +
             (promotionChoice.value === "second" ? "第二 IP" : "第一 IP") + "。") +
           `提链成功后会按链接国家自动选择支付代理，并由 ${paymentSmsLabel} 自动取号、取码和启动协议支付。`
@@ -1963,9 +1971,7 @@
         "；第一出口：" + (extractionFirstCountrySelect.selectedOptions[0]?.textContent || "—") +
         (config.singleProxy ? "；全程复用第一代理" :
           "；第二出口：" + (extractionSecondCountrySelect.selectedOptions[0]?.textContent || "—")) +
-        (method === "de_oaics_paypal"
-          ? "；优惠更新：" + (promotionChoice.value === "second" ? "第二 IP" : "第一 IP")
-          : "；账单国家：跟随 IP 地址");
+        "；优惠：Checkout 创建时携带";
 
       const registrationMode = $("quickRegistrationMode").value || "headless";
       const protocolMode = registrationMode === "protocol";
@@ -2014,7 +2020,7 @@
       extractionFirstCountrySelect.disabled = config.fixedProxyCountry ||
         extractionProxyModeSelect.value === "clash";
       extractionSecondCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
-      promotionChoice.disabled = method !== "de_oaics_paypal";
+      promotionChoice.disabled = true;
       const taskState = protocolMode ? state.protocolRegistrationTask : state.registrationTask;
       const canStartNext = taskState?.canStartNext !== false;
       const roxyBusy = roxyMode && (state.registrationTask?.tasks || []).some((item) =>
@@ -2276,6 +2282,7 @@
       $("cardLinkTargetAmount").disabled = Boolean(config.fixedTargetAmount);
       $("cardLinkTargetAmount").value = config.fixedTargetAmount ||
         localStorage.getItem("hme_card_link_target_amount") || "";
+      $("cardLinkSentinelSoLabel").hidden = method === "ph_hosted";
       $("cardLinkChecks").innerHTML = config.checks.map((item) =>
         "<span>" + escapeHtml(item) + "</span>"
       ).join("");
@@ -3101,6 +3108,7 @@
         target_amount: config.targetAmount
           ? String(snapshot.targetAmount ?? $("quickCardLinkTargetAmount").value).trim()
           : config.fixedTargetAmount || "0",
+        sentinel_so_enabled: snapshot.sentinelSoEnabled !== false,
         force_retry: Boolean(forceRetry),
         attempt_limit: Math.max(1, Math.min(
           100, Number(snapshot.extractionCount || $("quickExtractionCount").value || 1),
@@ -3833,7 +3841,9 @@
           status: "running", phase: "prepare", progress: 5, taskId: "",
           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
           registrationProvider, targetAmount,
-          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true, protocolSetupCredentials: protocol,
+          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true,
+          sentinelSoEnabled: configSnapshot.sentinelSoEnabled !== false,
+          protocolSetupCredentials: protocol,
           registrationMode: mode,
           registrationProxyMode: configSnapshot.registrationProxyMode,
           registrationProxyCountry: configSnapshot.registrationProxyCountry,
@@ -4540,6 +4550,15 @@
         localStorage.setItem("hme_card_link_target_amount", value);
         this.renderer.renderCardSelection(this.store.state);
       });
+      $("cardLinkSentinelSo").addEventListener("change", (event) => {
+        localStorage.setItem(
+          "hme_card_link_paypal_sentinel_so_enabled",
+          event.target.checked ? "1" : "0",
+        );
+        this.toast(event.target.checked
+          ? "PayPal Checkout 已启用 SEN + SO"
+          : "PayPal Checkout 已关闭 SEN + SO");
+      });
       $("cardLinkProxyMode").addEventListener("change", async (event) => {
         const method = $("cardLinkMethod").value;
         try {
@@ -4935,6 +4954,8 @@
       const savedQuickMode = localStorage.getItem("hme_quick_registration_mode");
       $("cardLinkTargetAmount").value =
         localStorage.getItem("hme_card_link_target_amount") || "";
+      $("cardLinkSentinelSo").checked =
+        localStorage.getItem("hme_card_link_paypal_sentinel_so_enabled") !== "0";
       $("quickRegistrationMode").value = ["headless", "headed", "roxy", "protocol"].includes(savedQuickMode)
         ? savedQuickMode : "headless";
       const savedQuickConcurrency = Number(localStorage.getItem("hme_quick_registration_concurrency") || 1);

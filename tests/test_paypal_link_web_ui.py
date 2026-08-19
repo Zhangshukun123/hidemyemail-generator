@@ -17,6 +17,10 @@ class PayPalLinkWebUiTests(unittest.TestCase):
         self.assertIn('id="cardLinkBillingCountryState"', page)
         self.assertIn("跟随 IP 地址", page)
         self.assertIn("cardLinkPaymentPayload", page)
+        self.assertIn('id="quickPaypalSentinelSo" type="checkbox" checked', page)
+        self.assertIn('id="cardLinkSentinelSo" type="checkbox" checked', page)
+        self.assertIn("sentinel_so_enabled", page)
+        self.assertIn("Checkout 创建时携带", page)
 
     def test_proxy_store_accepts_new_paypal_mode_preferences(self):
         with tempfile.TemporaryDirectory() as temp_dir:

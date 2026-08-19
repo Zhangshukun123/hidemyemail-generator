@@ -216,6 +216,7 @@ class SharedCardLinkBridgePresenterTests(unittest.IsolatedAsyncioTestCase):
                     "http://first-user:first-pass@first-proxy.test:8000"
                 ),
                 "target_amount": "0",
+                "sentinel_so_enabled": False,
             },
         )
         self.assertEqual(
@@ -234,6 +235,7 @@ class SharedCardLinkBridgePresenterTests(unittest.IsolatedAsyncioTestCase):
                     "http://second-user:second-pass@second-proxy.test:9000"
                 ),
                 "target_amount": "0",
+                "sentinel_so_enabled": False,
             },
         )
 
@@ -569,8 +571,10 @@ class CardLinkBridgeWorkerTests(unittest.TestCase):
             target_amount,
             *,
             account_email,
+            sentinel_so_enabled,
             diagnostic_log,
         ):
+            self.assertFalse(sentinel_so_enabled)
             observed.append(
                 {
                     "method": "paypal_gb",
@@ -595,8 +599,10 @@ class CardLinkBridgeWorkerTests(unittest.TestCase):
             target_amount,
             *,
             account_email,
+            sentinel_so_enabled,
             diagnostic_log,
         ):
+            self.assertFalse(sentinel_so_enabled)
             observed.append(
                 {
                     "method": "paypal_us",

@@ -26,6 +26,7 @@ SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 
 DEFAULT_FLOW_BY_PURPOSE = {
     "register": "oauth_create_account",
+    "checkout": "authorize_continue",
 }
 
 

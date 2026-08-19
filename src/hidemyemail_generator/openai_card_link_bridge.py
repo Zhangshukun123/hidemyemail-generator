@@ -116,6 +116,7 @@ def generate_paypal_us_event(
     target_amount: str,
     *,
     account_email: str = "",
+    sentinel_so_enabled: bool = False,
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
@@ -140,6 +141,7 @@ def generate_paypal_us_event(
             normalized_target,
             account_email=str(account_email or "").strip(),
             diagnostic_log=diagnostic_log,
+            sentinel_so_enabled=sentinel_so_enabled,
         )
     else:
         checkout = runtime.generate_opll_paypal_long_link(
@@ -152,6 +154,8 @@ def generate_paypal_us_event(
             normalized_target,
             account_email=str(account_email or "").strip(),
             diagnostic_log=diagnostic_log,
+            checkout_create_promotion_only=True,
+            sentinel_so_enabled=sentinel_so_enabled,
         )
     link = str(
         checkout.get("paypal_ba_approve_url")
@@ -190,6 +194,7 @@ def generate_paypal_gb_event(
     target_amount: str,
     *,
     account_email: str = "",
+    sentinel_so_enabled: bool = False,
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
@@ -216,6 +221,8 @@ def generate_paypal_gb_event(
         "0",
         account_email=str(account_email or "").strip(),
         diagnostic_log=diagnostic_log,
+        checkout_create_promotion_only=True,
+        sentinel_so_enabled=sentinel_so_enabled,
     )
     link = str(
         checkout.get("paypal_ba_approve_url")
@@ -250,6 +257,72 @@ def generate_paypal_gb_event(
         "amount_verification": str(checkout.get("amount_verification") or ""),
         "promotion_applied": bool(checkout.get("promotion_applied")),
         "promotion_strategy": str(checkout.get("promotion_strategy") or ""),
+        **link_proxy_identity,
+    }
+
+
+def generate_paypal_de_event(
+    token: str,
+    create_proxy_url: str,
+    promotion_proxy_url: str,
+    target_amount: str,
+    *,
+    account_email: str = "",
+    sentinel_so_enabled: bool = False,
+    diagnostic_log=emit_progress,
+    runtime=card_link_runtime,
+) -> dict:
+    """Create a DE/EUR PayPal checkout with promotion attached at Create."""
+
+    create_proxy_url = str(create_proxy_url or "").strip()
+    link_proxy_identity = detect_link_proxy_identity(runtime, create_proxy_url)
+    detected_country = str(
+        link_proxy_identity.get("link_proxy_country") or ""
+    ).upper()
+    if detected_country and detected_country != "DE":
+        raise RuntimeError(
+            "提链代理真实出口国家与 DE 不一致："
+            f"当前={detected_country}"
+        )
+    checkout = runtime.generate_opll_paypal_long_link(
+        token,
+        "DE",
+        "EUR",
+        create_proxy_url,
+        create_proxy_url,
+        create_proxy_url,
+        "0",
+        paypal_flow=runtime.PAYPAL_BR_DE_STRICT_ZERO_FLOW,
+        account_email=str(account_email or "").strip(),
+        checkout_includes_trial_promo=True,
+        checkout_create_promotion_only=True,
+        sentinel_so_enabled=sentinel_so_enabled,
+        diagnostic_log=diagnostic_log,
+    )
+    link = str(
+        checkout.get("paypal_ba_approve_url")
+        or checkout.get("provider_redirect_url")
+        or checkout.get("long_url")
+        or ""
+    ).strip()
+    if not link or not runtime.opll_is_paypal_success_url(link):
+        raise RuntimeError("PayPal Checkout 已创建，但未生成有效的 PayPal 授权地址")
+    return {
+        "status": "success",
+        "url": link,
+        "method": "de_oaics_paypal",
+        "country": "DE",
+        "currency": "EUR",
+        "payment_link_type": str(checkout.get("payment_link_type") or ""),
+        "checkout_ui_mode": str(checkout.get("checkout_ui_mode") or "custom"),
+        "checkout_id_type": checkout_id_type(checkout.get("cs_id")),
+        "amount": str(checkout.get("stripe_amount") or ""),
+        "amount_currency": "EUR",
+        "amount_verification": str(checkout.get("amount_verification") or ""),
+        "promotion_applied": bool(checkout.get("promotion_applied")),
+        "promotion_strategy": str(
+            checkout.get("promotion_strategy") or "checkout_create"
+        ),
         **link_proxy_identity,
     }
 
@@ -307,7 +380,7 @@ def _worker_generate(
     output_stream=None,
 ) -> dict:
     method = str(payload.get("method") or "").strip()
-    if method not in {"paypal_us", "paypal_gb"}:
+    if method not in {"de_oaics_paypal", "paypal_us", "paypal_gb"}:
         raise ValueError(f"共享提链服务不支持方法：{method or 'empty'}")
     token = str(payload.get("access_token") or "").strip()
     if not token:
@@ -316,6 +389,7 @@ def _worker_generate(
     promotion_proxy_url = create_proxy_url
     account_email = str(payload.get("account_email") or "").strip()
     target_amount = str(payload.get("target_amount") or "").strip()
+    sentinel_so_enabled = payload.get("sentinel_so_enabled") is True
     secrets = _worker_request_secrets(payload)
     card_link_runtime.clear_proxy_exit_cache()
 
@@ -331,17 +405,18 @@ def _worker_generate(
                 output_stream=output_stream,
             )
 
-    generator = (
-        generate_paypal_us_event
-        if method == "paypal_us"
-        else generate_paypal_gb_event
-    )
+    generator = {
+        "de_oaics_paypal": generate_paypal_de_event,
+        "paypal_us": generate_paypal_us_event,
+        "paypal_gb": generate_paypal_gb_event,
+    }[method]
     return generator(
         token,
         create_proxy_url,
         promotion_proxy_url,
         target_amount,
         account_email=account_email,
+        sentinel_so_enabled=sentinel_so_enabled,
         diagnostic_log=diagnostic_log,
     )
 

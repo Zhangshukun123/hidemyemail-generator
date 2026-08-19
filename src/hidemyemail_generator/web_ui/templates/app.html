@@ -284,6 +284,7 @@
                   <label id="quickPromotionProxyChoiceLabel" class="field-label">更新优惠使用 IP<select id="quickPromotionProxyChoice"><option value="first">第一提链 IP</option><option value="second">第二提链 IP</option></select></label>
                   <label id="quickCardLinkTargetAmountLabel" class="field-label" hidden>目标金额<input id="quickCardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
                 </div>
+                <label id="quickPaypalSentinelSoLabel" class="quick-flow-post-payment-option" for="quickPaypalSentinelSo"><input id="quickPaypalSentinelSo" type="checkbox" checked><span><strong>SEN + SO</strong><small>Checkout 创建时同时生成并提交主 Sentinel 令牌与 SO 附加令牌</small></span></label>
                 <label class="quick-flow-post-payment-option" for="quickPostPaymentPhoneBinding"><input id="quickPostPaymentPhoneBinding" type="checkbox"><span><strong>确认 Plus 后继续接码</strong><small>用于绑定 OpenAI 手机号并获取 Codex OAuth；不勾选则确认 Plus 后直接结束任务</small></span></label>
                 <div class="quick-flow-context-group"><div id="quickCardLinkHint" class="mode-label">返回 cs_live 时自动继续同模式提链，直到单账号次数用完；首次使用第一代理出口，重试切换第二代理出口。</div><div id="quickExtractionProxySummary" class="mode-label">提链代理：请选择模式与两个出口</div></div>
                 <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span><span>✓ 自动协议支付</span></div>
@@ -382,6 +383,7 @@
               <label id="cardLinkTargetAmountLabel" class="field-label">目标金额<input id="cardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
               <div id="cardLinkBillingCountryState" class="card-link-billing-state"><span>账单国家</span><strong>跟随 IP 地址</strong></div>
             </div>
+            <label id="cardLinkSentinelSoLabel" class="quick-flow-post-payment-option" for="cardLinkSentinelSo"><input id="cardLinkSentinelSo" type="checkbox" checked><span><strong>SEN + SO</strong><small>PayPal Checkout 创建时同时提交主 Sentinel 令牌与 SO 附加令牌</small></span></label>
             <label class="field-label">提链代理模式<select id="cardLinkProxyMode" aria-label="提链代理模式"></select></label>
             <label id="cardLinkCreateProxyLabel" class="field-label">建单代理国家<select id="cardLinkCreateProxyCountry" aria-label="建单代理国家"></select></label>
             <label id="cardLinkPromotionProxyLabel" class="field-label">优惠代理国家<select id="cardLinkPromotionProxyCountry" aria-label="优惠代理国家"></select></label>
