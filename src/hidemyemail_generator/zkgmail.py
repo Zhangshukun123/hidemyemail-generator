@@ -156,10 +156,14 @@ def _generate_human_local_part() -> str:
     return f"{first_name}{last_name}{suffix}"
 
 
-def _generate_short_mark_local_part() -> str:
-    """Return ``mark`` followed by exactly four random digits."""
+def _generate_william_local_part() -> str:
+    """Return ``william`` plus a surname and a variable-length numeric suffix."""
 
-    return f"mark{secrets.randbelow(10_000):04d}"
+    surname = secrets.choice(ZKGMAIL_LAST_NAMES)
+    digit_count = 2 + secrets.randbelow(5)
+    minimum = 10 ** (digit_count - 1)
+    suffix = minimum + secrets.randbelow(9 * minimum)
+    return f"william{surname}{suffix}"
 
 
 class DomainLocalPartNamingStrategy:
@@ -167,7 +171,7 @@ class DomainLocalPartNamingStrategy:
 
     def generate(self, domain: str) -> str:
         if str(domain or "").strip().lower() == ZKGMAIL_DOMAIN:
-            return _generate_short_mark_local_part()
+            return _generate_william_local_part()
         return _generate_human_local_part()
 
 

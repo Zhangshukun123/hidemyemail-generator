@@ -17,7 +17,7 @@ from hidemyemail_generator.zkgmail import (
     ZkgmailConfigStore,
     ZkgmailMailClient,
     _generate_human_local_part,
-    _generate_short_mark_local_part,
+    _generate_william_local_part,
     _known_zkgmail_aliases,
     _sync_relevant_messages,
 )
@@ -84,17 +84,23 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_part, "emilyjohnson27")
         self.assertTrue(local_part.isalnum())
 
-    def test_zkgmail_local_part_uses_short_mark_random_rule(self):
-        with mock.patch(
-            "hidemyemail_generator.zkgmail.secrets.randbelow",
-            return_value=27,
+    def test_zkgmail_local_part_uses_william_name_and_variable_number(self):
+        with (
+            mock.patch(
+                "hidemyemail_generator.zkgmail.secrets.choice",
+                return_value="moore",
+            ),
+            mock.patch(
+                "hidemyemail_generator.zkgmail.secrets.randbelow",
+                side_effect=[2, 5249],
+            ),
         ):
-            local_part = _generate_short_mark_local_part()
+            local_part = _generate_william_local_part()
 
-        self.assertEqual(local_part, "mark0027")
-        self.assertRegex(local_part, r"^mark\d{4}$")
+        self.assertEqual(local_part, "williammoore6249")
+        self.assertRegex(local_part, r"^william[a-z]+\d{2,6}$")
 
-    async def test_zkgmail_domain_selects_short_mark_random_rule(self):
+    async def test_zkgmail_domain_selects_william_random_rule(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = Path(temp_dir) / "mail.db"
             store = ZkgmailConfigStore(db_file)
@@ -105,12 +111,12 @@ class ZkgmailClientTests(unittest.IsolatedAsyncioTestCase):
             client = ZkgmailMailClient(store)
 
             with mock.patch(
-                "hidemyemail_generator.zkgmail._generate_short_mark_local_part",
-                return_value="mark4821",
+                "hidemyemail_generator.zkgmail._generate_william_local_part",
+                return_value="williammoore6249",
             ):
                 email = await client.acquire_email("OpenAI 注册")
 
-        self.assertEqual(email, "mark4821@zkgmail.com")
+        self.assertEqual(email, "williammoore6249@zkgmail.com")
 
     async def test_completion_updates_generated_address_inventory_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
