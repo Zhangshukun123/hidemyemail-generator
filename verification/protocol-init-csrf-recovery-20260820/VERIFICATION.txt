@@ -1,0 +1,55 @@
+CHANGE
+branch: protocol_registration_worker.run -> TRANSIENT_INIT_RECOVERY.classify(raw) -> edge_403/transport retry
+field: proxy_url sticky-session id (Kookeey password route or provider -sid- segment)
+restored behavior/status: ROLLBACK_TEST_COPY matches the pre-change SHA-256 and restores the old behavior where only TLS transport markers trigger retry and proxy_url remains unchanged.
+
+PATHS
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\protocol-init-csrf-recovery-20260820\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\protocol-init-csrf-recovery-20260820\DIFF_FILE.diff
+VERIFICATION.txt: D:\AI\hidemyemail-generator\verification\protocol-init-csrf-recovery-20260820\VERIFICATION.txt
+ROLLBACK.sh: D:\AI\hidemyemail-generator\verification\protocol-init-csrf-recovery-20260820\ROLLBACK.sh
+
+HASHES
+ORIGINAL_FILE SHA256: B32D6F402A8BAA55F1ED898FF6DFDCFC1C4AC46B5AA609E5E0B553035169BAD8
+MODIFIED_FILE SHA256: A46C7ADC1E106E698411DAB50D92050D04D86BBBB693D0419EB4C899AAFA7C50
+
+BASELINE
+command: .\.venv\Scripts\python.exe -m pytest tests/test_protocol_registration.py -k "init_page_tls_failure or init_page_tls_full" -q
+input: none
+literal output/result:
+..                                                                       [100%]
+2 passed, 79 deselected in 0.30s
+exit status: 0
+
+MODIFIED
+command: .\.venv\Scripts\python.exe -m pytest tests/test_protocol_registration.py -k "init_page_tls_failure or init_page_tls_full or init_page_csrf_403" -q
+input: none
+literal output/result:
+...                                                                      [100%]
+3 passed, 79 deselected in 0.38s
+exit status: 0
+
+FULL REGRESSION
+command: .\.venv\Scripts\python.exe -m pytest tests/test_protocol_registration.py -q
+input: none
+literal output/result:
+........................................................... [ 71%]
+.......................                                                  [100%]
+82 passed, 13 subtests passed in 3.15s
+exit status: 0
+
+LINT
+command: .\.venv\Scripts\ruff.exe check src/hidemyemail_generator/protocol_registration_worker.py tests/test_protocol_registration.py
+input: none
+literal output/result:
+All checks passed!
+exit status: 0
+
+ROLLBACK
+command: $dir='D:/AI/hidemyemail-generator/verification/protocol-init-csrf-recovery-20260820'; Copy-Item -LiteralPath "$dir/MODIFIED_FILE" -Destination "$dir/ROLLBACK_TEST_COPY"; & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x '$dir/ROLLBACK.sh' && test -x '$dir/ROLLBACK.sh' && '$dir/ROLLBACK.sh' '$dir/ROLLBACK_TEST_COPY'"; $exit=$LASTEXITCODE; $hash=(Get-FileHash -Algorithm SHA256 "$dir/ROLLBACK_TEST_COPY").Hash; Write-Output "RESTORED_HASH=$hash"; Write-Output "EXIT_STATUS=$exit"; exit $exit
+input: MODIFIED_FILE copied to ROLLBACK_TEST_COPY
+literal output/result:
+ROLLBACK_OK sha256=B32D6F402A8BAA55F1ED898FF6DFDCFC1C4AC46B5AA609E5E0B553035169BAD8
+RESTORED_HASH=B32D6F402A8BAA55F1ED898FF6DFDCFC1C4AC46B5AA609E5E0B553035169BAD8
+EXIT_STATUS=0
+exit status: 0

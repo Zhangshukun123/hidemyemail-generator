@@ -1,0 +1,48 @@
+[project]
+name = "hidemyemail_generator"
+version = "2.1.0"
+description = "Generate and manage iCloud Hide My Email addresses"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.9.4",
+    "rich>=13.7.1",
+    "click>=8.1.7",
+    "certifi>=2024.2.2",
+    "httpx[http2,socks]>=0.27,<1",
+    "loguru>=0.7,<1",
+    "pproxy>=2.7,<3",
+    "curl-cffi>=0.13.0",
+    "imap-tools>=1.11,<2",
+]
+
+authors = [
+    { name = "rtuna" },
+]
+
+license = { text = "MIT" }
+
+[project.scripts]
+hidemyemail = "hidemyemail_generator.main:cli"
+hidemyemail-web = "hidemyemail_generator.webapp:main"
+
+[project.optional-dependencies]
+capture = [
+    "playwright>=1.56.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = ["paypal-agreement-protocol"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.15.12",
+]

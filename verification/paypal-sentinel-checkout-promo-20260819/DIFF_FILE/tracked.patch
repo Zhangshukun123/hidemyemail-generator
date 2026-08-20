@@ -1,0 +1,1342 @@
+diff --git a/src/hidemyemail_generator/card_link_bridge_service.py b/src/hidemyemail_generator/card_link_bridge_service.py
+index 334a972..dfcd9d9 100644
+--- a/src/hidemyemail_generator/card_link_bridge_service.py
++++ b/src/hidemyemail_generator/card_link_bridge_service.py
+@@ -17,7 +17,9 @@ WORKER_MESSAGE_PREFIX = "HME_CARD_LINK_WORKER:"
+ WORKER_PROTOCOL_VERSION = 1
+ MAX_PROTOCOL_LINE_BYTES = 1024 * 1024
+ MAX_PROGRESS_LOGS = 200
+-SHARED_CARD_LINK_METHODS = frozenset({"paypal_us", "paypal_gb"})
++SHARED_CARD_LINK_METHODS = frozenset(
++    {"de_oaics_paypal", "paypal_us", "paypal_gb"}
++)
+ _SENSITIVE_ENV_KEYS = (
+     "HME_OPENAI_ACCESS_TOKEN",
+     "HME_CARD_LINK_CREATE_PROXY_URL",
+@@ -38,8 +40,9 @@ class CardLinkBridgeCommand:
+     create_proxy_url: str = field(default="", repr=False)
+     promotion_proxy_url: str = field(default="", repr=False)
+     target_amount: str = ""
++    sentinel_so_enabled: bool = False
+ 
+-    def to_payload(self) -> dict[str, str]:
++    def to_payload(self) -> dict[str, Any]:
+         return {
+             "method": str(self.method or "").strip(),
+             "access_token": str(self.access_token or "").strip(),
+@@ -50,6 +53,7 @@ class CardLinkBridgeCommand:
+             "create_proxy_url": str(self.create_proxy_url or "").strip(),
+             "promotion_proxy_url": str(self.promotion_proxy_url or "").strip(),
+             "target_amount": str(self.target_amount or "").strip(),
++            "sentinel_so_enabled": bool(self.sentinel_so_enabled),
+         }
+ 
+ 
+diff --git a/src/hidemyemail_generator/card_link_runtime.py b/src/hidemyemail_generator/card_link_runtime.py
+index c9d336f..58afefd 100644
+--- a/src/hidemyemail_generator/card_link_runtime.py
++++ b/src/hidemyemail_generator/card_link_runtime.py
+@@ -169,6 +169,51 @@ PAYPAL_NATIVE_POST_APPROVE_POLL_SECONDS = (8, 8, 8, 8, 20)
+ 
+ PAYPAL_NATIVE_APPROVE_RETRY_INTERVAL_SECONDS = 1.0
+ 
++
++def opll_paypal_checkout_sentinel_headers(
++    proxy_url: str,
++    device_id: str,
++    request_locale: str,
++) -> dict[str, str]:
++    """Generate the flow-bound SEN + SO headers for one checkout creation."""
++
++    from .vendor.gptfree_register.core.gpt_trial_protocol.models import (
++        BrowserProfile,
++        ProtocolConfig,
++    )
++    from .vendor.gptfree_register.core.gpt_trial_protocol.sentinel_http import (
++        SentinelHttpTokenProvider,
++    )
++
++    locale_context = opll_locale_context_for_country(
++        str(request_locale or "en-US").split("-", 1)[-1]
++    )
++    profile = BrowserProfile(
++        user_agent=OPLL_USER_AGENT,
++        sec_ch_ua=(
++            f'"Chromium";v="{OPLL_BROWSER_MAJOR}", '
++            f'"Not=A?Brand";v="24", "Google Chrome";v="{OPLL_BROWSER_MAJOR}"'
++        ),
++        language=str(request_locale or "en-US"),
++        timezone=str(locale_context.get("browser_timezone") or "America/New_York"),
++        device_id=str(device_id or "").strip() or str(uuid.uuid4()),
++    )
++    provider = SentinelHttpTokenProvider(
++        config=ProtocolConfig(
++            timeout=float(PAY_LONG_LINK_TIMEOUT),
++            profile=profile,
++        ),
++        proxy=str(proxy_url or "").strip() or None,
++        device_id=profile.device_id,
++    )
++    bundle = provider.get_openai_sentinel(purpose="checkout")
++    headers = bundle.sentinel.as_headers()
++    if not headers.get("openai-sentinel-token"):
++        raise OpllChatgptSentinelError("Checkout SEN 主令牌生成失败")
++    if not headers.get("openai-sentinel-so-token"):
++        raise OpllChatgptSentinelError("Checkout SO 附加令牌生成失败")
++    return headers
++
+ @dataclasses.dataclass(frozen=True)
+ class ProxyHealthResult:
+     success: bool
+@@ -1485,6 +1530,9 @@ def opll_create_checkout(
+     chatgpt_session: requests.Session | None = None,
+     return_raw_payload: bool = False,
+     request_timeout: float = PAY_LONG_LINK_TIMEOUT,
++    sentinel_so_enabled: bool = False,
++    sentinel_header_provider=None,
++    diagnostic_log=None,
+ ) -> dict:
+     country = normalize_opll_country(country)
+     currency = currency_for_country(country)
+@@ -1521,14 +1569,24 @@ def opll_create_checkout(
+             "promo_campaign_id": "plus-1-month-free",
+             "is_coupon_from_query_param": False,
+         }
++    checkout_headers = {
++        "Referer": "https://chatgpt.com/",
++        "x-openai-target-path": "/backend-api/payments/checkout",
++        "x-openai-target-route": "/backend-api/payments/checkout",
++    }
++    if sentinel_so_enabled:
++        provider = sentinel_header_provider or opll_paypal_checkout_sentinel_headers
++        checkout_headers.update(
++            provider(proxy_url, oai_device_id, request_locale)
++        )
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal] Checkout 已生成并提交 SEN + SO 双令牌",
++        )
+     response = session.post(
+         "https://chatgpt.com/backend-api/payments/checkout",
+         json=payload,
+-        headers={
+-            "Referer": "https://chatgpt.com/",
+-            "x-openai-target-path": "/backend-api/payments/checkout",
+-            "x-openai-target-route": "/backend-api/payments/checkout",
+-        },
++        headers=checkout_headers,
+         timeout=max(1.0, float(request_timeout or PAY_LONG_LINK_TIMEOUT)),
+     )
+     if response.status_code >= 400:
+@@ -2042,6 +2100,21 @@ def opll_classify_promotion_update_error(
+         return "forbidden_unknown", True
+     return "business_rejection", False
+ 
++def opll_should_update_checkout_promotion(
++    *,
++    apply_trial_promotion: bool,
++    checkout_includes_trial_promo: bool,
++    target_amount: str,
++    actual_amount: str,
++) -> bool:
++    """Policy: Create-time promotions are verified, never updated afterward."""
++
++    if checkout_includes_trial_promo or not apply_trial_promotion:
++        return False
++    expected = str(target_amount or "").strip()
++    return not expected or str(actual_amount or "").strip() != expected
++
++
+ def opll_chatgpt_update_checkout_promotion(
+     access_token: str,
+     checkout: dict,
+@@ -4806,7 +4879,7 @@ def opll_extract_paypal_from_oaics_checkout(
+     if not stripe_checkout_id:
+         opll_emit_diagnostic(
+             diagnostic_log,
+-            "[PayPal OAICS] Create/Update/Fetch 尚无 Stripe cs_；"
++        "[PayPal OAICS] Create/Fetch 尚无 Stripe cs_；"
+             "第一代理使用 oaics_ 提交 Checkout Taxes 物化支付会话",
+         )
+         taxes_payload = opll_chatgpt_checkout_taxes(
+@@ -4837,13 +4910,11 @@ def opll_extract_paypal_from_oaics_checkout(
+             *(payload for _stage, payload in materialized_payloads)
+         )
+ 
+-    amount_matches_target = bool(target_amount) and amount == target_amount
+-    needs_promotion_update = bool(
+-        promotion_requested
+-        and (
+-            (apply_trial_promotion and not target_amount)
+-            or (target_amount and not amount_matches_target)
+-        )
++    needs_promotion_update = opll_should_update_checkout_promotion(
++        apply_trial_promotion=apply_trial_promotion,
++        checkout_includes_trial_promo=checkout_includes_trial_promo,
++        target_amount=target_amount,
++        actual_amount=amount,
+     )
+     if needs_promotion_update:
+         opll_emit_diagnostic(
+@@ -5315,6 +5386,8 @@ def generate_opll_paypal_long_link(
+     return_checkout_short: bool = False,
+     payment_method_country: str = "",
+     checkout_includes_trial_promo: bool = False,
++    checkout_create_promotion_only: bool = False,
++    sentinel_so_enabled: bool = False,
+ ) -> dict:
+     create_proxy_url = str(create_proxy_url or "").strip()
+     configured_followup_proxy_url = str(followup_proxy_url or "").strip()
+@@ -5328,11 +5401,13 @@ def generate_opll_paypal_long_link(
+     currency_country = requested_country
+     normalized_target_amount = str(target_amount or "").strip()
+     normalized_paypal_flow = str(paypal_flow or "").strip().lower()
++    checkout_create_promotion_only = bool(checkout_create_promotion_only)
+     return_checkout_short = bool(return_checkout_short)
+     browser_runtime = browser_runtime if isinstance(browser_runtime, dict) else {}
+     is_br_de_strict_zero = normalized_paypal_flow == PAYPAL_BR_DE_STRICT_ZERO_FLOW
+     strict_zero_checkout_includes_trial_promo = bool(
+-        is_br_de_strict_zero and checkout_includes_trial_promo
++        is_br_de_strict_zero
++        and (checkout_includes_trial_promo or checkout_create_promotion_only)
+     )
+     strict_zero_payment_method_country = ""
+     # JP 严格零：与 DE 相同后置活动门禁；沿用界面默认三段代理，不强制合并/不校验出口。
+@@ -5359,8 +5434,8 @@ def generate_opll_paypal_long_link(
+         if configured_followup_proxy_url == create_proxy_url:
+             opll_emit_diagnostic(
+                 diagnostic_log,
+-                "[PayPal GB] Checkout、优惠 Update、Stripe、Confirm、Approve 和轮询"
+-                "全程复用英国第一代理",
++                "[PayPal GB] Checkout 创建时直接携带优惠；Stripe、Confirm、Approve 和轮询"
++                "全程复用英国第一代理，不提交优惠 Update",
+             )
+         else:
+             opll_emit_diagnostic(
+@@ -5405,7 +5480,7 @@ def generate_opll_paypal_long_link(
+             else f"账单与 Payment Method 跟随货币国家 {currency_country}"
+         )
+         proxy_strategy = (
+-            "Checkout 创建时直接携带优惠；若金额不为 0，则使用第一代理补提交一次优惠 Update"
++                "Checkout 创建时直接携带优惠；后续仅校验金额，不提交优惠 Update"
+             if strict_zero_checkout_includes_trial_promo
+             else "第二代理仅负责优惠 Update"
+         )
+@@ -5537,7 +5612,7 @@ def generate_opll_paypal_long_link(
+         try:
+             checkout_promo_text = (
+                 "第一代理创建并直接带优惠"
+-                if strict_zero_checkout_includes_trial_promo
++                if (strict_zero_checkout_includes_trial_promo or checkout_create_promotion_only)
+                 else
+                 "第一代理创建，暂不带优惠"
+                 if is_de_native_promotion
+@@ -5555,7 +5630,9 @@ def generate_opll_paypal_long_link(
+                     "EUR",
+                     create_proxy_url,
+                     request_locale=post_request_locale,
+-                    include_trial_promo=False,
++                    include_trial_promo=checkout_create_promotion_only,
++                    sentinel_so_enabled=sentinel_so_enabled,
++                    diagnostic_log=diagnostic_log,
+                 )
+             elif is_de_native_promotion:
+                 checkout = opll_create_checkout(
+@@ -5564,8 +5641,10 @@ def generate_opll_paypal_long_link(
+                     "EUR",
+                     native_primary_proxy_url,
+                     request_locale=post_request_locale,
+-                    include_trial_promo=False,
++                    include_trial_promo=checkout_create_promotion_only,
+                     checkout_ui_mode="hosted",
++                    sentinel_so_enabled=sentinel_so_enabled,
++                    diagnostic_log=diagnostic_log,
+                     **(
+                         {"session": browser_runtime.get("primary_chatgpt_session")}
+                         if browser_runtime.get("primary_chatgpt_session") is not None
+@@ -5579,7 +5658,12 @@ def generate_opll_paypal_long_link(
+                     currency_for_country(checkout_country),
+                     create_proxy_url,
+                     request_locale=post_request_locale,
+-                    include_trial_promo=strict_zero_checkout_includes_trial_promo,
++                    include_trial_promo=(
++                        strict_zero_checkout_includes_trial_promo
++                        or checkout_create_promotion_only
++                    ),
++                    sentinel_so_enabled=sentinel_so_enabled,
++                    diagnostic_log=diagnostic_log,
+                 )
+             else:
+                 checkout = opll_create_checkout(
+@@ -5588,6 +5672,9 @@ def generate_opll_paypal_long_link(
+                     currency_for_country(checkout_country),
+                     create_proxy_url,
+                     request_locale=post_request_locale,
++                    include_trial_promo=True,
++                    sentinel_so_enabled=sentinel_so_enabled,
++                    diagnostic_log=diagnostic_log,
+                 )
+             if is_br_de_strict_zero:
+                 checkout_billing_country = str(checkout.get("billing_country") or "").upper()
+@@ -5675,10 +5762,14 @@ def generate_opll_paypal_long_link(
+                     payment_method_country=pm_country,
+                     apply_trial_promotion=(
+                         oaics_promotion_required
+-                        and not strict_zero_checkout_includes_trial_promo
++                        and not (
++                            strict_zero_checkout_includes_trial_promo
++                            or checkout_create_promotion_only
++                        )
+                     ),
+                     checkout_includes_trial_promo=(
+                         strict_zero_checkout_includes_trial_promo
++                        or checkout_create_promotion_only
+                     ),
+                     return_checkout_short=return_checkout_short,
+                     paypal_flow=normalized_paypal_flow,
+@@ -5811,7 +5902,41 @@ def generate_opll_paypal_long_link(
+                 ctx["currency"] = str(checkout.get("currency") or "").lower()
+             effective_payload = init_payload
+             promotion: dict = {}
+-            if is_de_native_promotion:
++            if checkout_create_promotion_only:
++                opll_emit_diagnostic(
++                    diagnostic_log,
++                    "[PayPal] 步骤 4/7：Checkout 创建时已携带优惠；"
++                    "跳过优惠 Update，正在轮询金额与 PayPal 支付方式",
++                )
++                payment_page = opll_wait_for_us_tr_promoted_payment_page(
++                    stripe,
++                    checkout["cs_id"],
++                    stripe_pk,
++                    ctx,
++                    init_payload,
++                    promotion_already_proven=True,
++                    required_amount=target_amount,
++                    required_payment_method_type="paypal",
++                    attempts=6,
++                )
++                effective_payload = {**init_payload, **payment_page}
++                promotion = {
++                    "promotion_id": PIX_TRIAL_PROMOTION_ID,
++                    "promotion_applied": True,
++                    "promotion_strategy": "checkout_create",
++                    "promotion_proof": "checkout_create_amount_verified",
++                }
++                promotion_applied = True
++                stripe_amount, stripe_amount_source = opll_stripe_amount_info(
++                    effective_payload
++                )
++                ctx = opll_stripe_context(effective_payload, payment_locale, ctx=ctx)
++                if not ctx.get("currency"):
++                    ctx["currency"] = str(checkout.get("currency") or "").lower()
++                stripe_hosted_url = str(
++                    effective_payload.get("stripe_hosted_url") or stripe_hosted_url
++                ).strip()
++            elif is_de_native_promotion:
+                 opll_emit_diagnostic(
+                     diagnostic_log,
+                     "[PayPal] 步骤 4/7：第二代理仅提交优惠 Update；"
+@@ -5869,7 +5994,7 @@ def generate_opll_paypal_long_link(
+                     opll_emit_diagnostic(
+                         diagnostic_log,
+                         "[PayPal] 步骤 4/7：Checkout 创建时已携带优惠；"
+-                        "先校验真实金额，非 0 时使用第一代理补做一次 checkout/update",
++                        "仅校验真实金额，不提交优惠 Update",
+                     )
+                     initial_amount, initial_amount_source = opll_stripe_amount_info(
+                         init_payload
+@@ -5883,40 +6008,11 @@ def generate_opll_paypal_long_link(
+                             target_amount,
+                         )
+                     except AmountMismatchError:
+-                        opll_emit_diagnostic(
+-                            diagnostic_log,
+-                            "[PayPal] Checkout 携带优惠后金额仍未匹配："
+-                            f"目标={target_amount}，实际={initial_amount or '<未知>'}，"
+-                            f"来源={initial_amount_source or '<未知>'}；"
+-                            "保留当前 Checkout，使用第一代理补做一次优惠 Update",
+-                        )
+-                        (
+-                            promotion,
+-                            payment_page,
+-                            promotion_used_proxy,
+-                        ) = opll_apply_de_strict_zero_promotion_with_ip_rotation(
+-                            stripe,
+-                            checkout,
+-                            stripe_pk,
+-                            init_payload,
+-                            ctx,
+-                            access_token=access_token,
+-                            request_proxy_url=create_proxy_url,
+-                            rotation_proxy_url=create_upstream_proxy_url,
+-                            target_amount=target_amount,
+-                            request_locale=post_request_locale,
+-                            diagnostic_log=diagnostic_log,
+-                            max_ip_refreshes=0,
+-                        )
+-                        promotion = dict(promotion)
+-                        promotion["promotion_strategy"] = (
+-                            "checkout_create_then_single_update"
++                        raise AmountMismatchError(
++                            str(target_amount or "").strip(),
++                            initial_amount,
++                            initial_amount_source,
+                         )
+-                        promotion["promotion_proof"] = str(
+-                            promotion.get("promotion_proof")
+-                            or "checkout_update_after_create_amount_mismatch"
+-                        )
+-                        promotion_applied = promotion.get("promotion_applied") is True
+                     else:
+                         promotion = {
+                             "promotion_id": PIX_TRIAL_PROMOTION_ID,
+@@ -6180,7 +6276,9 @@ def generate_opll_paypal_long_link(
+                     "promotion_requested": True,
+                     "promotion_applied": promotion.get("promotion_applied") is True,
+                     "promotion_required": True,
+-                    "promotion_strategy": "post_init_update",
++                    "promotion_strategy": str(
++                        promotion.get("promotion_strategy") or "checkout_create"
++                    ),
+                     "promotion_proxy": promotion_proxy_used,
+                     "create_proxy_used": payment_proxy_used,
+                     "payment_proxy_used": payment_proxy_used,
+@@ -6191,7 +6289,7 @@ def generate_opll_paypal_long_link(
+                 }
+                 opll_emit_diagnostic(
+                     diagnostic_log,
+-                    f"[PayPal短链] 第一代理确认支持 PayPal，第二代理优惠已更新；短链生成完成: {short_url}",
++                    f"[PayPal短链] Checkout 创建时已携带优惠；短链生成完成: {short_url}",
+                 )
+                 return opll_apply_amount_check(short_result, target_amount)
+             checkout["payment_method_country"] = pm_country
+@@ -6342,11 +6440,10 @@ def generate_opll_paypal_long_link(
+                     payment_proxy_used = create_upstream_proxy_url or create_proxy_url
+                     result.update({
+                         "promotion_required": True,
+-                        "promotion_strategy": "post_init_update",
+-                        "promotion_proxy": (
+-                            promotion_upstream_proxy_url
+-                            or configured_followup_proxy_url
++                        "promotion_strategy": str(
++                            promotion.get("promotion_strategy") or "checkout_create"
+                         ),
++                        "promotion_proxy": "",
+                         "create_proxy_used": payment_proxy_used,
+                         "payment_proxy_used": payment_proxy_used,
+                         "approve_proxy_used": payment_proxy_used,
+@@ -6365,8 +6462,10 @@ def generate_opll_paypal_long_link(
+                     "promotion_requested": True,
+                     "promotion_applied": promotion.get("promotion_applied") is True,
+                     "promotion_required": True,
+-                    "promotion_strategy": "post_init_update",
+-                    "promotion_proxy": promotion_proxy_used,
++                    "promotion_strategy": str(
++                        promotion.get("promotion_strategy") or "checkout_create"
++                    ),
++                    "promotion_proxy": "" if checkout_create_promotion_only else promotion_proxy_used,
+                     "create_proxy_used": payment_proxy_used,
+                     "payment_proxy_used": payment_proxy_used,
+                     "approve_proxy_used": payment_proxy_used,
+@@ -6399,6 +6498,7 @@ def generate_opll_paypal_us_tr_long_link(
+     *,
+     account_email: str = "",
+     diagnostic_log=None,
++    sentinel_so_enabled: bool = False,
+ ) -> dict:
+     us_proxy_url = str(us_proxy_url or "").strip()
+     # The PayPal US flow keeps one stable exit identity for every stage.
+@@ -6412,7 +6512,7 @@ def generate_opll_paypal_us_tr_long_link(
+     opll_validate_access_token(access_token, us_proxy_url, request_locale="en-US")
+     opll_emit_diagnostic(
+         diagnostic_log,
+-        "[PayPal US] 步骤 2/7：第一代理创建 US/USD Checkout（暂不带优惠）",
++        "[PayPal US] 步骤 2/7：第一代理创建 US/USD Checkout（直接携带优惠）",
+     )
+     checkout = opll_create_checkout(
+         access_token,
+@@ -6420,9 +6520,11 @@ def generate_opll_paypal_us_tr_long_link(
+         "USD",
+         us_proxy_url,
+         request_locale="en-US",
+-        include_trial_promo=False,
++        include_trial_promo=True,
+         checkout_ui_mode="hosted",
+         return_raw_payload=True,
++        sentinel_so_enabled=sentinel_so_enabled,
++        diagnostic_log=diagnostic_log,
+     )
+     raw_create_payload = checkout.pop("_checkout_payload", {})
+     if not isinstance(raw_create_payload, dict):
+@@ -6442,25 +6544,10 @@ def generate_opll_paypal_us_tr_long_link(
+         opll_emit_diagnostic(
+             diagnostic_log,
+             "[PayPal US] Checkout 返回 oaics_；保留其作为 ChatGPT Checkout ID，"
+-            "第一代理提交一次优惠 Update，再解析底层 Stripe cs_",
+-        )
+-        oaics_update_payload = opll_chatgpt_update_checkout_promotion(
+-            access_token,
+-            checkout,
+-            tr_proxy_url,
+-            request_locale="en-US",
+-            device_id=str(checkout.get("oai_device_id") or ""),
+-            include_checkout_context=True,
+-        )
+-        updated_checkout_id = opll_extract_checkout_session_id(
+-            oaics_update_payload
++            "优惠已在 Create 阶段携带，直接解析底层 Stripe cs_",
+         )
+-        if updated_checkout_id.startswith("oaics_"):
+-            checkout["cs_id"] = updated_checkout_id
+-            checkout_id = updated_checkout_id
+         stripe_checkout_id = opll_extract_stripe_payment_page_id(
+             raw_create_payload,
+-            oaics_update_payload,
+         )
+         if not stripe_checkout_id:
+             us_chatgpt = opll_build_chatgpt_session(
+@@ -6489,7 +6576,7 @@ def generate_opll_paypal_us_tr_long_link(
+                 )
+                 opll_emit_diagnostic(
+                     diagnostic_log,
+-                    "[PayPal US] oaics_ Create/Update/Fetch 尚未返回 Stripe cs_；"
++                    "[PayPal US] oaics_ Create/Fetch 尚未返回 Stripe cs_；"
+                     "第一代理调用 Checkout Taxes 物化底层支付会话",
+                 )
+                 oaics_taxes_payload = opll_chatgpt_checkout_taxes(
+@@ -6519,7 +6606,7 @@ def generate_opll_paypal_us_tr_long_link(
+         if not stripe_checkout_id:
+             oaics_amount = ""
+             oaics_amount_source = "missing_payload"
+-            oaics_amount_stage = "checkout_update"
++            oaics_amount_stage = "checkout_create"
+             oaics_currency = ""
+             declared_methods: list[str] = []
+             for stage, payload in (
+@@ -6681,11 +6768,11 @@ def generate_opll_paypal_us_tr_long_link(
+                         "checkout_payment_method_types": declared_methods,
+                         "promotion_id": PIX_TRIAL_PROMOTION_ID,
+                         "promotion_applied": True,
+-                        "promotion_strategy": "us_tr_oaics_update_setup_intent",
++                        "promotion_strategy": "checkout_create",
+                         "promotion_proof": (
+-                            "chatgpt_checkout_update_and_setup_intent_amount_verified"
++                            "checkout_create_and_setup_intent_amount_verified"
+                         ),
+-                        "promotion_proxy": tr_proxy_url,
++                        "promotion_proxy": "",
+                         "paypal_flow": PAYPAL_US_TR_FLOW,
+                     },
+                     target_amount,
+@@ -6708,8 +6795,8 @@ def generate_opll_paypal_us_tr_long_link(
+                 )
+             if not stripe_checkout_id:
+                 raise RuntimeError(
+-                    "OAICS_PAYMENT_ROUTE_MISSING: PayPal US 的 oaics_ Checkout 已完成一次优惠 Update，"
+-                    "但 Create、Update、Fetch、Taxes、PayPal Confirm 均未返回 "
++                    "OAICS_PAYMENT_ROUTE_MISSING: PayPal US 的 oaics_ Checkout 已在 Create 阶段携带优惠，"
++                    "但 Create、Fetch、Taxes、PayPal Confirm 均未返回 "
+                     "Stripe cs_/client_secret；已停止，未向 Stripe 发送 oaics_ ID"
+                 )
+ 
+@@ -6754,56 +6841,28 @@ def generate_opll_paypal_us_tr_long_link(
+ 
+     opll_emit_diagnostic(
+         diagnostic_log,
+-        "[PayPal US] 步骤 4/7：第一代理正在提交优惠 Update；完成后再校验金额"
+-        if not is_oaics_checkout
+-        else "[PayPal US] 步骤 4/7：oaics_ 优惠 Update 已提交；第一代理正在轮询金额与 PayPal",
++        "[PayPal US] 步骤 4/7：Checkout 创建时已携带优惠；"
++        "跳过优惠 Update，正在轮询金额与 PayPal",
+     )
+-    tr_stripe = opll_build_stripe_session(tr_proxy_url, request_locale="en-US")
+-    if is_oaics_checkout:
+-        promotion = {
+-            "promotion_id": PIX_TRIAL_PROMOTION_ID,
+-            "promotion_applied": True,
+-            "promotion_strategy": "us_tr_oaics_update",
+-            "promotion_proof": "chatgpt_checkout_update_then_stripe_validation",
+-        }
+-        payment_page = opll_wait_for_us_tr_promoted_payment_page(
+-            tr_stripe,
+-            stripe_checkout_id,
+-            stripe_pk,
+-            ctx,
+-            init_payload,
+-            promotion_already_proven=True,
+-            required_amount=str(target_amount or "").strip(),
+-            required_payment_method_type="paypal",
+-        )
+-        promotion_applied = True
+-    else:
+-        promotion = opll_apply_checkout_trial_promotion(
+-            tr_stripe,
+-            stripe_checkout_id,
+-            stripe_pk,
+-            init_payload,
+-            ctx,
+-            access_token=access_token,
+-            checkout=checkout,
+-            chatgpt_proxy_url=tr_proxy_url,
+-            request_locale="en-US",
+-            allow_pending=True,
+-        )
+-        payment_page = promotion.get("payment_page")
+-        if not isinstance(payment_page, dict):
+-            raise RuntimeError("应用优惠后的 Payment Page 状态无效")
+-        payment_page = opll_wait_for_us_tr_promoted_payment_page(
+-            tr_stripe,
+-            stripe_checkout_id,
+-            stripe_pk,
+-            ctx,
+-            payment_page,
+-            before_payload=init_payload,
+-        )
+-        promotion_applied = opll_pix_promotion_applied(init_payload, payment_page)
++    promotion = {
++        "promotion_id": PIX_TRIAL_PROMOTION_ID,
++        "promotion_applied": True,
++        "promotion_strategy": "checkout_create",
++        "promotion_proof": "checkout_create_then_stripe_validation",
++    }
++    payment_page = opll_wait_for_us_tr_promoted_payment_page(
++        us_stripe,
++        stripe_checkout_id,
++        stripe_pk,
++        ctx,
++        init_payload,
++        promotion_already_proven=True,
++        required_amount=str(target_amount or "").strip(),
++        required_payment_method_type="paypal",
++    )
++    promotion_applied = True
+     if not promotion_applied:
+-        raise RuntimeError("活动更新响应未证明优惠已生效")
++        raise RuntimeError("Checkout 创建响应未证明优惠已生效")
+ 
+     effective_payload = {**init_payload, **payment_page}
+     opll_require_payment_method_type(effective_payload, "paypal", require_declared=True)
+@@ -6820,7 +6879,7 @@ def generate_opll_paypal_us_tr_long_link(
+     opll_apply_amount_check(amount_result, target_amount)
+     opll_emit_diagnostic(
+         diagnostic_log,
+-        f"[PayPal US] 优惠更新与金额校验通过：目标={target_amount}，当前={stripe_amount}",
++        f"[PayPal US] Checkout 优惠与金额校验通过：目标={target_amount}，当前={stripe_amount}",
+     )
+ 
+     ctx = opll_stripe_context(effective_payload, ctx=ctx)
+@@ -6905,10 +6964,10 @@ def generate_opll_paypal_us_tr_long_link(
+         "promotion_id": str(promotion.get("promotion_id") or PIX_TRIAL_PROMOTION_ID),
+         "promotion_applied": promotion_applied,
+         "promotion_strategy": str(
+-            promotion.get("promotion_strategy") or "post_init_update"
++            promotion.get("promotion_strategy") or "checkout_create"
+         ),
+         "promotion_proof": str(promotion.get("promotion_proof") or "checkout_update"),
+-        "promotion_proxy": tr_proxy_url,
++        "promotion_proxy": "",
+         "paypal_flow": PAYPAL_US_TR_FLOW,
+     }
+     return opll_apply_amount_check(result, target_amount)
+diff --git a/src/hidemyemail_generator/openai_card_link_bridge.py b/src/hidemyemail_generator/openai_card_link_bridge.py
+index ffed161..c68eb98 100644
+--- a/src/hidemyemail_generator/openai_card_link_bridge.py
++++ b/src/hidemyemail_generator/openai_card_link_bridge.py
+@@ -116,6 +116,7 @@ def generate_paypal_us_event(
+     target_amount: str,
+     *,
+     account_email: str = "",
++    sentinel_so_enabled: bool = False,
+     diagnostic_log=emit_progress,
+     runtime=card_link_runtime,
+ ) -> dict:
+@@ -140,6 +141,7 @@ def generate_paypal_us_event(
+             normalized_target,
+             account_email=str(account_email or "").strip(),
+             diagnostic_log=diagnostic_log,
++            sentinel_so_enabled=sentinel_so_enabled,
+         )
+     else:
+         checkout = runtime.generate_opll_paypal_long_link(
+@@ -152,6 +154,8 @@ def generate_paypal_us_event(
+             normalized_target,
+             account_email=str(account_email or "").strip(),
+             diagnostic_log=diagnostic_log,
++            checkout_create_promotion_only=True,
++            sentinel_so_enabled=sentinel_so_enabled,
+         )
+     link = str(
+         checkout.get("paypal_ba_approve_url")
+@@ -190,6 +194,7 @@ def generate_paypal_gb_event(
+     target_amount: str,
+     *,
+     account_email: str = "",
++    sentinel_so_enabled: bool = False,
+     diagnostic_log=emit_progress,
+     runtime=card_link_runtime,
+ ) -> dict:
+@@ -216,6 +221,8 @@ def generate_paypal_gb_event(
+         "0",
+         account_email=str(account_email or "").strip(),
+         diagnostic_log=diagnostic_log,
++        checkout_create_promotion_only=True,
++        sentinel_so_enabled=sentinel_so_enabled,
+     )
+     link = str(
+         checkout.get("paypal_ba_approve_url")
+@@ -254,6 +261,72 @@ def generate_paypal_gb_event(
+     }
+ 
+ 
++def generate_paypal_de_event(
++    token: str,
++    create_proxy_url: str,
++    promotion_proxy_url: str,
++    target_amount: str,
++    *,
++    account_email: str = "",
++    sentinel_so_enabled: bool = False,
++    diagnostic_log=emit_progress,
++    runtime=card_link_runtime,
++) -> dict:
++    """Create a DE/EUR PayPal checkout with promotion attached at Create."""
++
++    create_proxy_url = str(create_proxy_url or "").strip()
++    link_proxy_identity = detect_link_proxy_identity(runtime, create_proxy_url)
++    detected_country = str(
++        link_proxy_identity.get("link_proxy_country") or ""
++    ).upper()
++    if detected_country and detected_country != "DE":
++        raise RuntimeError(
++            "提链代理真实出口国家与 DE 不一致："
++            f"当前={detected_country}"
++        )
++    checkout = runtime.generate_opll_paypal_long_link(
++        token,
++        "DE",
++        "EUR",
++        create_proxy_url,
++        create_proxy_url,
++        create_proxy_url,
++        "0",
++        paypal_flow=runtime.PAYPAL_BR_DE_STRICT_ZERO_FLOW,
++        account_email=str(account_email or "").strip(),
++        checkout_includes_trial_promo=True,
++        checkout_create_promotion_only=True,
++        sentinel_so_enabled=sentinel_so_enabled,
++        diagnostic_log=diagnostic_log,
++    )
++    link = str(
++        checkout.get("paypal_ba_approve_url")
++        or checkout.get("provider_redirect_url")
++        or checkout.get("long_url")
++        or ""
++    ).strip()
++    if not link or not runtime.opll_is_paypal_success_url(link):
++        raise RuntimeError("PayPal Checkout 已创建，但未生成有效的 PayPal 授权地址")
++    return {
++        "status": "success",
++        "url": link,
++        "method": "de_oaics_paypal",
++        "country": "DE",
++        "currency": "EUR",
++        "payment_link_type": str(checkout.get("payment_link_type") or ""),
++        "checkout_ui_mode": str(checkout.get("checkout_ui_mode") or "custom"),
++        "checkout_id_type": checkout_id_type(checkout.get("cs_id")),
++        "amount": str(checkout.get("stripe_amount") or ""),
++        "amount_currency": "EUR",
++        "amount_verification": str(checkout.get("amount_verification") or ""),
++        "promotion_applied": bool(checkout.get("promotion_applied")),
++        "promotion_strategy": str(
++            checkout.get("promotion_strategy") or "checkout_create"
++        ),
++        **link_proxy_identity,
++    }
++
++
+ def emit_worker(payload: dict, *, output_stream=None) -> None:
+     stream = output_stream or sys.stdout
+     message = {"v": WORKER_PROTOCOL_VERSION, **payload}
+@@ -307,7 +380,7 @@ def _worker_generate(
+     output_stream=None,
+ ) -> dict:
+     method = str(payload.get("method") or "").strip()
+-    if method not in {"paypal_us", "paypal_gb"}:
++    if method not in {"de_oaics_paypal", "paypal_us", "paypal_gb"}:
+         raise ValueError(f"共享提链服务不支持方法：{method or 'empty'}")
+     token = str(payload.get("access_token") or "").strip()
+     if not token:
+@@ -316,6 +389,7 @@ def _worker_generate(
+     promotion_proxy_url = create_proxy_url
+     account_email = str(payload.get("account_email") or "").strip()
+     target_amount = str(payload.get("target_amount") or "").strip()
++    sentinel_so_enabled = payload.get("sentinel_so_enabled") is True
+     secrets = _worker_request_secrets(payload)
+     card_link_runtime.clear_proxy_exit_cache()
+ 
+@@ -331,17 +405,18 @@ def _worker_generate(
+                 output_stream=output_stream,
+             )
+ 
+-    generator = (
+-        generate_paypal_us_event
+-        if method == "paypal_us"
+-        else generate_paypal_gb_event
+-    )
++    generator = {
++        "de_oaics_paypal": generate_paypal_de_event,
++        "paypal_us": generate_paypal_us_event,
++        "paypal_gb": generate_paypal_gb_event,
++    }[method]
+     return generator(
+         token,
+         create_proxy_url,
+         promotion_proxy_url,
+         target_amount,
+         account_email=account_email,
++        sentinel_so_enabled=sentinel_so_enabled,
+         diagnostic_log=diagnostic_log,
+     )
+ 
+diff --git a/src/hidemyemail_generator/registration_proxy.py b/src/hidemyemail_generator/registration_proxy.py
+index f1b9a9f..369d27c 100644
+--- a/src/hidemyemail_generator/registration_proxy.py
++++ b/src/hidemyemail_generator/registration_proxy.py
+@@ -121,10 +121,12 @@ class CardLinkProxyCountryPolicy:
+     """Keep fixed-region checkout methods and proxy roles in one country."""
+ 
+     METHOD_COUNTRIES = {
++        "de_oaics_paypal": "DE",
+         "paypal_us": "US",
+         "paypal_gb": "GB",
+     }
+     PREFERENCE_COUNTRIES = {
++        "de": "DE",
+         "paypalUsCreate": "US",
+         "paypalUsFollowup": "US",
+         "paypalGbCreate": "GB",
+diff --git a/src/hidemyemail_generator/vendor/gptfree_register/core/gpt_trial_protocol/sentinel_http.py b/src/hidemyemail_generator/vendor/gptfree_register/core/gpt_trial_protocol/sentinel_http.py
+index 5f19482..735811b 100644
+--- a/src/hidemyemail_generator/vendor/gptfree_register/core/gpt_trial_protocol/sentinel_http.py
++++ b/src/hidemyemail_generator/vendor/gptfree_register/core/gpt_trial_protocol/sentinel_http.py
+@@ -26,6 +26,7 @@ SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
+ 
+ DEFAULT_FLOW_BY_PURPOSE = {
+     "register": "oauth_create_account",
++    "checkout": "authorize_continue",
+ }
+ 
+ 
+diff --git a/src/hidemyemail_generator/web_ui/static/account_actions.js b/src/hidemyemail_generator/web_ui/static/account_actions.js
+index dc44a4f..1d17761 100644
+--- a/src/hidemyemail_generator/web_ui/static/account_actions.js
++++ b/src/hidemyemail_generator/web_ui/static/account_actions.js
+@@ -68,7 +68,12 @@
+       const targetAmount = policy.amount || String(
+         saved.targetAmount || localStorage.getItem("hme_quick_card_link_target_amount") || "",
+       ).trim();
+-      return { method, mode, attempts, firstCountry, secondCountry, targetAmount, policy };
++      const sentinelSoEnabled = saved.sentinelSoEnabled !== false &&
++        localStorage.getItem("hme_quick_paypal_sentinel_so_enabled") !== "false";
++      return {
++        method, mode, attempts, firstCountry, secondCountry, targetAmount,
++        sentinelSoEnabled, policy,
++      };
+     }
+ 
+     cardLinkPayload(account, forceRetry = false) {
+@@ -86,6 +91,7 @@
+         use_secondary_proxy: false,
+         promotion_proxy_choice: "first",
+         target_amount: config.targetAmount,
++        sentinel_so_enabled: config.sentinelSoEnabled,
+         force_retry: Boolean(forceRetry),
+         attempt_limit: config.attempts,
+       };
+diff --git a/src/hidemyemail_generator/web_ui/static/app.js b/src/hidemyemail_generator/web_ui/static/app.js
+index 8ec727c..46b4cdb 100644
+--- a/src/hidemyemail_generator/web_ui/static/app.js
++++ b/src/hidemyemail_generator/web_ui/static/app.js
+@@ -16,7 +16,7 @@
+   const cardLinkExtractionModes = {
+     paypal_us: {
+       country: "US",
+-      summary: "使用第一代理完成 US/USD Checkout、优惠、金额校验与 PayPal Confirm / Approve",
++      summary: "使用第一代理创建已携带优惠的 US/USD Checkout，并完成金额校验与 PayPal Confirm / Approve",
+       label: "PayPal / 美国 · USD · 全程第一代理",
+       checks: ["✓ Session 可用", "✓ 地区 US", "✓ 币种 USD", "✓ 返回 PayPal 授权链接"],
+       button: "提取 PayPal 链接",
+@@ -33,7 +33,7 @@
+     },
+     paypal_gb: {
+       country: "GB",
+-      summary: "使用英国第一代理完成 GB/GBP Checkout、优惠、金额校验与 PayPal Confirm / Approve",
++      summary: "使用英国第一代理创建已携带优惠的 GB/GBP Checkout，并完成金额校验与 PayPal Confirm / Approve",
+       label: "PayPal / 英国 · GBP · 全程第一代理",
+       checks: ["✓ Session 可用", "✓ 地区 GB", "✓ 币种 GBP", "✓ 优惠后金额 0", "✓ 返回 PayPal 授权链接"],
+       button: "提取 PayPal 链接",
+@@ -60,12 +60,13 @@
+     },
+     de_oaics_paypal: {
+       country: "DE",
+-      summary: "创建 DE/EUR oaics_ Checkout 并提取 PayPal BA 授权链接",
++      summary: "创建时直接携带优惠的 DE/EUR Checkout，并提取 PayPal BA 授权链接",
+       label: "PayPal / 严格 0 · DE / EUR",
+       checks: ["✓ Session 可用", "✓ 未生成同模式链接", "✓ DE / EUR", "✓ 优惠后金额 0"],
+       button: "提取 PayPal 链接",
+       success: "PayPal DE/EUR 链接已提取并复制",
+       singleProxy: true,
++      fixedProxyCountry: true,
+       createProxyPreference: "de",
+       createProxyCountry: "DE",
+       fixedTargetAmount: "0",
+@@ -192,6 +193,7 @@
+     const config = cardLinkRuntimeConfig(method);
+     return {
+       target_amount: config.fixedTargetAmount || $("cardLinkTargetAmount").value.trim(),
++      sentinel_so_enabled: Boolean($("cardLinkSentinelSo").checked),
+     };
+   }
+ 
+@@ -796,7 +798,9 @@
+         extractionFirstCountry: "hme_quick_extraction_first_country",
+         extractionSecondCountry: "hme_quick_extraction_second_country",
+         promotionProxyChoice: "hme_quick_promotion_proxy_choice",
+-        targetAmount: "hme_quick_paypal_us_target_amount", postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
++        targetAmount: "hme_quick_paypal_us_target_amount",
++        sentinelSoEnabled: "hme_quick_paypal_sentinel_so_enabled",
++        postPaymentPhoneBinding: "hme_quick_post_payment_phone_binding",
+       };
+     }
+     getItem(key) {
+@@ -841,6 +845,7 @@
+         extractionSecondCountry: textValue(candidate.extractionSecondCountry, "DE") || "DE",
+         promotionProxyChoice: enumValue(candidate.promotionProxyChoice, ["first", "second"], "first"),
+         targetAmount: textValue(candidate.targetAmount),
++        sentinelSoEnabled: booleanValue(candidate.sentinelSoEnabled, true),
+         postPaymentPhoneBinding: booleanValue(candidate.postPaymentPhoneBinding, false),
+         savedAt: textValue(candidate.savedAt),
+         collapsed: Boolean(candidate.collapsed),
+@@ -897,7 +902,7 @@
+     constructor() {
+       this.details = $("quickFlowConfigDetails");
+       this.savedState = $("quickFlowSavedConfigState");
+-      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding"); this.protocolSetupCredentials = $("quickProtocolSetupCredentials");
++      this.savedSummary = $("quickFlowSavedConfigSummary"); this.postPaymentPhoneBinding = $("quickPostPaymentPhoneBinding"); this.protocolSetupCredentials = $("quickProtocolSetupCredentials"); this.sentinelSoEnabled = $("quickPaypalSentinelSo");
+       this.fields = {
+         registrationProvider: $("quickRegistrationProvider"),
+         registrationMode: $("quickRegistrationMode"),
+@@ -918,6 +923,7 @@
+       return {
+         ...Object.fromEntries(Object.entries(this.fields).map(([field, element]) => [field, element.value])),
+         protocolSetupCredentials: true,
++        sentinelSoEnabled: Boolean(this.sentinelSoEnabled.checked),
+         postPaymentPhoneBinding: Boolean(this.postPaymentPhoneBinding.checked),
+         collapsed: !this.details.open,
+       };
+@@ -931,6 +937,7 @@
+       });
+       this.protocolSetupCredentials.checked = true;
+       this.protocolSetupCredentials.disabled = true;
++      this.sentinelSoEnabled.checked = snapshot.sentinelSoEnabled !== false;
+       this.postPaymentPhoneBinding.checked = snapshot.postPaymentPhoneBinding === true;
+       this.details.open = !snapshot.collapsed;
+     }
+@@ -949,6 +956,7 @@
+         "并发 " + current.concurrency + " / 目标 " + current.targetCount,
+         this.selectedLabel("cardLinkMethod", current.cardLinkMethod),
+         "每号 " + current.extractionCount + " 次",
++        current.sentinelSoEnabled ? "SEN + SO" : "仅基础 Checkout",
+         current.postPaymentPhoneBinding ? "确认 Plus 后接码" : "确认 Plus 即结束",
+         this.selectedLabel("registrationProxyMode", current.registrationProxyMode),
+         this.selectedLabel("extractionProxyMode", current.extractionProxyMode),
+@@ -961,7 +969,7 @@
+     }
+ 
+     bind(onChange, onToggle) {
+-      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.protocolSetupCredentials || event.target === this.postPaymentPhoneBinding) onChange(); });
++      this.details.addEventListener("change", (event) => { if (Object.values(this.fields).includes(event.target) || event.target === this.protocolSetupCredentials || event.target === this.sentinelSoEnabled || event.target === this.postPaymentPhoneBinding) onChange(); });
+       this.details.addEventListener("toggle", () => onToggle(!this.details.open));
+     }
+   }
+@@ -1935,7 +1943,7 @@
+         targetAmountInput.value = localStorage.getItem("hme_quick_paypal_us_target_amount") || "";
+         targetAmountInput.dataset.method = method;
+       }
+-      $("quickPromotionProxyChoiceLabel").hidden = method !== "de_oaics_paypal";
++      $("quickPromotionProxyChoiceLabel").hidden = true;
+       const postPaymentPhoneBinding = Boolean($("quickPostPaymentPhoneBinding")?.checked);
+       $("quickCardLinkChecks").innerHTML = [...config.checks, "✓ 自动协议支付", `✓ ${paymentSmsLabel} 自动取号`,
+         postPaymentPhoneBinding ? "✓ Plus 确认后继续接码" : "✓ Plus 确认后直接结束",
+@@ -1945,7 +1953,7 @@
+         : extractionProxyReady
+         ? (config.singleProxy
+           ? "提链代理与注册代理独立。第一代理负责 " + config.country +
+-            " Checkout、优惠 Update、金额校验、Confirm 与 Approve；不会获取或调用第二代理。"
++            " Checkout 创建（直接携带优惠）、金额校验、Confirm 与 Approve；不会提交优惠 Update。"
+           : "提链代理与注册代理独立。首次提链使用第一代理出口；链接失败后重新提链使用第二代理出口。优惠更新当前使用" +
+             (promotionChoice.value === "second" ? "第二 IP" : "第一 IP") + "。") +
+           `提链成功后会按链接国家自动选择支付代理，并由 ${paymentSmsLabel} 自动取号、取码和启动协议支付。`
+@@ -1963,9 +1971,7 @@
+         "；第一出口：" + (extractionFirstCountrySelect.selectedOptions[0]?.textContent || "—") +
+         (config.singleProxy ? "；全程复用第一代理" :
+           "；第二出口：" + (extractionSecondCountrySelect.selectedOptions[0]?.textContent || "—")) +
+-        (method === "de_oaics_paypal"
+-          ? "；优惠更新：" + (promotionChoice.value === "second" ? "第二 IP" : "第一 IP")
+-          : "；账单国家：跟随 IP 地址");
++        "；优惠：Checkout 创建时携带";
+ 
+       const registrationMode = $("quickRegistrationMode").value || "headless";
+       const protocolMode = registrationMode === "protocol";
+@@ -2014,7 +2020,7 @@
+       extractionFirstCountrySelect.disabled = config.fixedProxyCountry ||
+         extractionProxyModeSelect.value === "clash";
+       extractionSecondCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
+-      promotionChoice.disabled = method !== "de_oaics_paypal";
++      promotionChoice.disabled = true;
+       const taskState = protocolMode ? state.protocolRegistrationTask : state.registrationTask;
+       const canStartNext = taskState?.canStartNext !== false;
+       const roxyBusy = roxyMode && (state.registrationTask?.tasks || []).some((item) =>
+@@ -2276,6 +2282,7 @@
+       $("cardLinkTargetAmount").disabled = Boolean(config.fixedTargetAmount);
+       $("cardLinkTargetAmount").value = config.fixedTargetAmount ||
+         localStorage.getItem("hme_card_link_target_amount") || "";
++      $("cardLinkSentinelSoLabel").hidden = method === "ph_hosted";
+       $("cardLinkChecks").innerHTML = config.checks.map((item) =>
+         "<span>" + escapeHtml(item) + "</span>"
+       ).join("");
+@@ -3101,6 +3108,7 @@
+         target_amount: config.targetAmount
+           ? String(snapshot.targetAmount ?? $("quickCardLinkTargetAmount").value).trim()
+           : config.fixedTargetAmount || "0",
++        sentinel_so_enabled: snapshot.sentinelSoEnabled !== false,
+         force_retry: Boolean(forceRetry),
+         attempt_limit: Math.max(1, Math.min(
+           100, Number(snapshot.extractionCount || $("quickExtractionCount").value || 1),
+@@ -3833,7 +3841,9 @@
+           status: "running", phase: "prepare", progress: 5, taskId: "",
+           manager: protocol ? "protocol" : "browser", method, extractionCount, targetCount,
+           registrationProvider, targetAmount,
+-          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true, protocolSetupCredentials: protocol,
++          postPaymentPhoneBinding: configSnapshot.postPaymentPhoneBinding === true,
++          sentinelSoEnabled: configSnapshot.sentinelSoEnabled !== false,
++          protocolSetupCredentials: protocol,
+           registrationMode: mode,
+           registrationProxyMode: configSnapshot.registrationProxyMode,
+           registrationProxyCountry: configSnapshot.registrationProxyCountry,
+@@ -4540,6 +4550,15 @@
+         localStorage.setItem("hme_card_link_target_amount", value);
+         this.renderer.renderCardSelection(this.store.state);
+       });
++      $("cardLinkSentinelSo").addEventListener("change", (event) => {
++        localStorage.setItem(
++          "hme_card_link_paypal_sentinel_so_enabled",
++          event.target.checked ? "1" : "0",
++        );
++        this.toast(event.target.checked
++          ? "PayPal Checkout 已启用 SEN + SO"
++          : "PayPal Checkout 已关闭 SEN + SO");
++      });
+       $("cardLinkProxyMode").addEventListener("change", async (event) => {
+         const method = $("cardLinkMethod").value;
+         try {
+@@ -4935,6 +4954,8 @@
+       const savedQuickMode = localStorage.getItem("hme_quick_registration_mode");
+       $("cardLinkTargetAmount").value =
+         localStorage.getItem("hme_card_link_target_amount") || "";
++      $("cardLinkSentinelSo").checked =
++        localStorage.getItem("hme_card_link_paypal_sentinel_so_enabled") !== "0";
+       $("quickRegistrationMode").value = ["headless", "headed", "roxy", "protocol"].includes(savedQuickMode)
+         ? savedQuickMode : "headless";
+       const savedQuickConcurrency = Number(localStorage.getItem("hme_quick_registration_concurrency") || 1);
+diff --git a/src/hidemyemail_generator/web_ui/templates/app.html b/src/hidemyemail_generator/web_ui/templates/app.html
+index d16eac5..028d4e1 100644
+--- a/src/hidemyemail_generator/web_ui/templates/app.html
++++ b/src/hidemyemail_generator/web_ui/templates/app.html
+@@ -284,6 +284,7 @@
+                   <label id="quickPromotionProxyChoiceLabel" class="field-label">更新优惠使用 IP<select id="quickPromotionProxyChoice"><option value="first">第一提链 IP</option><option value="second">第二提链 IP</option></select></label>
+                   <label id="quickCardLinkTargetAmountLabel" class="field-label" hidden>目标金额<input id="quickCardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
+                 </div>
++                <label id="quickPaypalSentinelSoLabel" class="quick-flow-post-payment-option" for="quickPaypalSentinelSo"><input id="quickPaypalSentinelSo" type="checkbox" checked><span><strong>SEN + SO</strong><small>Checkout 创建时同时生成并提交主 Sentinel 令牌与 SO 附加令牌</small></span></label>
+                 <label class="quick-flow-post-payment-option" for="quickPostPaymentPhoneBinding"><input id="quickPostPaymentPhoneBinding" type="checkbox"><span><strong>确认 Plus 后继续接码</strong><small>用于绑定 OpenAI 手机号并获取 Codex OAuth；不勾选则确认 Plus 后直接结束任务</small></span></label>
+                 <div class="quick-flow-context-group"><div id="quickCardLinkHint" class="mode-label">返回 cs_live 时自动继续同模式提链，直到单账号次数用完；首次使用第一代理出口，重试切换第二代理出口。</div><div id="quickExtractionProxySummary" class="mode-label">提链代理：请选择模式与两个出口</div></div>
+                 <div id="quickCardLinkChecks" class="check-grid"><span>✓ Session 可用</span><span>✓ 未生成同模式链接</span><span>✓ DE / EUR</span><span>✓ 金额必须为 0</span><span>✓ 自动协议支付</span></div>
+@@ -382,6 +383,7 @@
+               <label id="cardLinkTargetAmountLabel" class="field-label">目标金额<input id="cardLinkTargetAmount" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="留空表示不校验"></label>
+               <div id="cardLinkBillingCountryState" class="card-link-billing-state"><span>账单国家</span><strong>跟随 IP 地址</strong></div>
+             </div>
++            <label id="cardLinkSentinelSoLabel" class="quick-flow-post-payment-option" for="cardLinkSentinelSo"><input id="cardLinkSentinelSo" type="checkbox" checked><span><strong>SEN + SO</strong><small>PayPal Checkout 创建时同时提交主 Sentinel 令牌与 SO 附加令牌</small></span></label>
+             <label class="field-label">提链代理模式<select id="cardLinkProxyMode" aria-label="提链代理模式"></select></label>
+             <label id="cardLinkCreateProxyLabel" class="field-label">建单代理国家<select id="cardLinkCreateProxyCountry" aria-label="建单代理国家"></select></label>
+             <label id="cardLinkPromotionProxyLabel" class="field-label">优惠代理国家<select id="cardLinkPromotionProxyCountry" aria-label="优惠代理国家"></select></label>
+diff --git a/src/hidemyemail_generator/webapp.py b/src/hidemyemail_generator/webapp.py
+index f74bf87..43c02b8 100644
+--- a/src/hidemyemail_generator/webapp.py
++++ b/src/hidemyemail_generator/webapp.py
+@@ -3356,13 +3356,14 @@ async def _run_card_link_bridge(
+     create_proxy_url: str = "",
+     promotion_proxy_url: str = "",
+     target_amount: str = "",
++    sentinel_so_enabled: bool = False,
+     shared_presenter: SharedCardLinkBridgePresenter | None = None,
+     progress_callback: Callable[[str], None] | None = None,
+ ) -> dict:
+     token = str(access_token or "").strip()
+     create_proxy = str(create_proxy_url or "").strip()
+     promotion_proxy = str(promotion_proxy_url or "").strip()
+-    if shared_presenter is not None and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
++    if shared_presenter is not None and method in PAYPAL_CARD_LINK_METHODS:
+         try:
+             shared_result = await shared_presenter.generate(
+                 CardLinkBridgeCommand(
+@@ -3375,6 +3376,7 @@ async def _run_card_link_bridge(
+                     create_proxy_url=create_proxy,
+                     promotion_proxy_url=promotion_proxy,
+                     target_amount=target_amount,
++                    sentinel_so_enabled=sentinel_so_enabled,
+                 ),
+                 on_log=progress_callback,
+             )
+@@ -6050,6 +6052,10 @@ def create_app(
+                 {"ok": False, "error": "提链进度 ID 无效"}, status=400
+             )
+         force_retry = body.get("force_retry") is True
++        sentinel_so_enabled = (
++            method in PAYPAL_CARD_LINK_METHODS
++            and body.get("sentinel_so_enabled", True) is not False
++        )
+         try:
+             attempt_limit = int(body.get("attempt_limit") or 1)
+         except (TypeError, ValueError):
+@@ -6402,14 +6408,14 @@ def create_app(
+             )
+         browser_manager: BrowserTaskManager = app["browser_manager"]
+         if (
+-            method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
++            method not in PAYPAL_CARD_LINK_METHODS
+             and not browser_manager.target_project_dir.is_dir()
+         ):
+             return web.json_response(
+                 {"ok": False, "error": "OpenAI 支付运行目录不存在"}, status=503
+             )
+         if (
+-            method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
++            method not in PAYPAL_CARD_LINK_METHODS
+             and not browser_manager.python_executable.is_file()
+         ):
+             return web.json_response(
+@@ -6449,12 +6455,12 @@ def create_app(
+                         result = await _run_card_link_bridge(
+                             target_project_dir=(
+                                 app["card_link_bridge_file"].parents[2]
+-                                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
++                                if method in PAYPAL_CARD_LINK_METHODS
+                                 else browser_manager.target_project_dir
+                             ),
+                             python_executable=(
+                                 Path(sys.executable)
+-                                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
++                                if method in PAYPAL_CARD_LINK_METHODS
+                                 else browser_manager.python_executable
+                             ),
+                             bridge_file=app["card_link_bridge_file"],
+@@ -6467,6 +6473,7 @@ def create_app(
+                             create_proxy_url=attempt_create_proxy,
+                             promotion_proxy_url=attempt_promotion_proxy,
+                             target_amount=target_amount,
++                            sentinel_so_enabled=sentinel_so_enabled,
+                             shared_presenter=app["card_link_bridge_service"],
+                             progress_callback=publish_card_link_progress,
+                         )
+diff --git a/tests/test_card_link_bridge.py b/tests/test_card_link_bridge.py
+index b940c17..a16077a 100644
+--- a/tests/test_card_link_bridge.py
++++ b/tests/test_card_link_bridge.py
+@@ -1,4 +1,5 @@
+ import ast
++import inspect
+ import json
+ import os
+ import subprocess
+@@ -13,6 +14,7 @@ from hidemyemail_generator.openai_card_link_bridge import (
+     EVENT_PREFIX,
+     card_link_error_is_retryable,
+     generate_paypal_gb_event,
++    generate_paypal_de_event,
+     generate_paypal_us_event,
+ )
+ from scripts.vendor_card_link_runtime import source_segment_with_decorators
+@@ -327,6 +329,8 @@ class CardLinkBridgeTests(unittest.TestCase):
+             self.assertEqual(approve, create)
+             self.assertEqual(target, "1933")
+             self.assertEqual(options["account_email"], "member@icloud.com")
++            self.assertTrue(options["checkout_create_promotion_only"])
++            self.assertTrue(options["sentinel_so_enabled"])
+             return {
+                 "cs_id": "cs_test_us",
+                 "billing_country": "US",
+@@ -347,6 +351,7 @@ class CardLinkBridgeTests(unittest.TestCase):
+             "socks5://ignored-followup.example:9000",
+             "1933",
+             account_email="member@icloud.com",
++            sentinel_so_enabled=True,
+             runtime=runtime,
+         )
+ 
+@@ -378,6 +383,8 @@ class CardLinkBridgeTests(unittest.TestCase):
+             self.assertEqual((create, followup, approve), (first_proxy,) * 3)
+             self.assertEqual(target, "0")
+             self.assertEqual(options["account_email"], "member@icloud.com")
++            self.assertTrue(options["checkout_create_promotion_only"])
++            self.assertTrue(options["sentinel_so_enabled"])
+             return {
+                 "cs_id": "cs_test_gb",
+                 "billing_country": "GB",
+@@ -402,6 +409,7 @@ class CardLinkBridgeTests(unittest.TestCase):
+             "socks5://ignored-second.example:9000",
+             "999",
+             account_email="member@icloud.com",
++            sentinel_so_enabled=True,
+             runtime=runtime,
+         )
+ 
+@@ -412,6 +420,53 @@ class CardLinkBridgeTests(unittest.TestCase):
+         self.assertEqual(event["link_proxy_country"], "GB")
+         self.assertEqual(event["link_proxy_ip"], "203.0.113.44")
+ 
++    def test_de_paypal_uses_checkout_create_promotion_without_update_proxy(self):
++        first_proxy = "http://de-first.example:8000"
++
++        def generate(token, country, currency, create, followup, approve, target, **options):
++            self.assertEqual((country, currency), ("DE", "EUR"))
++            self.assertEqual((create, followup, approve), (first_proxy,) * 3)
++            self.assertEqual(target, "0")
++            self.assertTrue(options["checkout_includes_trial_promo"])
++            self.assertTrue(options["checkout_create_promotion_only"])
++            self.assertTrue(options["sentinel_so_enabled"])
++            return {
++                "cs_id": "oaics_test_de",
++                "billing_country": "DE",
++                "currency": "EUR",
++                "paypal_ba_approve_url": "https://www.paypal.com/agreements/approve?ba_token=de_create",
++                "stripe_amount": "0",
++                "promotion_applied": True,
++                "promotion_strategy": "checkout_create",
++            }
++
++        runtime = SimpleNamespace(
++            PAYPAL_BR_DE_STRICT_ZERO_FLOW="br_de_strict_zero",
++            detect_proxy_health=lambda *_args, **_kwargs: SimpleNamespace(
++                success=True, country="DE", ip="203.0.113.49", error="", failed_stage="",
++            ),
++            generate_opll_paypal_long_link=generate,
++            opll_is_paypal_success_url=lambda value: value.endswith("de_create"),
++        )
++        event = generate_paypal_de_event(
++            "at-test",
++            first_proxy,
++            "http://ignored-promo.example:9000",
++            "0",
++            account_email="member@icloud.com",
++            sentinel_so_enabled=True,
++            runtime=runtime,
++        )
++
++        self.assertEqual(event["method"], "de_oaics_paypal")
++        self.assertEqual(event["promotion_strategy"], "checkout_create")
++
++    def test_us_zero_flow_source_has_no_checkout_promotion_update_call(self):
++        source = inspect.getsource(card_link_runtime.generate_opll_paypal_us_tr_long_link)
++
++        self.assertNotIn("opll_chatgpt_update_checkout_promotion(", source)
++        self.assertIn("include_trial_promo=True", source)
++
+     def test_us_paypal_zero_target_uses_embedded_zero_amount_flow(self):
+         logs = []
+ 
+diff --git a/tests/test_card_link_bridge_service.py b/tests/test_card_link_bridge_service.py
+index afac76a..f66889f 100644
+--- a/tests/test_card_link_bridge_service.py
++++ b/tests/test_card_link_bridge_service.py
+@@ -216,6 +216,7 @@ class SharedCardLinkBridgePresenterTests(unittest.IsolatedAsyncioTestCase):
+                     "http://first-user:first-pass@first-proxy.test:8000"
+                 ),
+                 "target_amount": "0",
++                "sentinel_so_enabled": False,
+             },
+         )
+         self.assertEqual(
+@@ -234,6 +235,7 @@ class SharedCardLinkBridgePresenterTests(unittest.IsolatedAsyncioTestCase):
+                     "http://second-user:second-pass@second-proxy.test:9000"
+                 ),
+                 "target_amount": "0",
++                "sentinel_so_enabled": False,
+             },
+         )
+ 
+@@ -569,8 +571,10 @@ class CardLinkBridgeWorkerTests(unittest.TestCase):
+             target_amount,
+             *,
+             account_email,
++            sentinel_so_enabled,
+             diagnostic_log,
+         ):
++            self.assertFalse(sentinel_so_enabled)
+             observed.append(
+                 {
+                     "method": "paypal_gb",
+@@ -595,8 +599,10 @@ class CardLinkBridgeWorkerTests(unittest.TestCase):
+             target_amount,
+             *,
+             account_email,
++            sentinel_so_enabled,
+             diagnostic_log,
+         ):
++            self.assertFalse(sentinel_so_enabled)
+             observed.append(
+                 {
+                     "method": "paypal_us",
+diff --git a/tests/test_paypal_link_web_ui.py b/tests/test_paypal_link_web_ui.py
+index ebc6f52..313191c 100644
+--- a/tests/test_paypal_link_web_ui.py
++++ b/tests/test_paypal_link_web_ui.py
+@@ -17,6 +17,10 @@ class PayPalLinkWebUiTests(unittest.TestCase):
+         self.assertIn('id="cardLinkBillingCountryState"', page)
+         self.assertIn("跟随 IP 地址", page)
+         self.assertIn("cardLinkPaymentPayload", page)
++        self.assertIn('id="quickPaypalSentinelSo" type="checkbox" checked', page)
++        self.assertIn('id="cardLinkSentinelSo" type="checkbox" checked', page)
++        self.assertIn("sentinel_so_enabled", page)
++        self.assertIn("Checkout 创建时携带", page)
+ 
+     def test_proxy_store_accepts_new_paypal_mode_preferences(self):
+         with tempfile.TemporaryDirectory() as temp_dir:
+diff --git a/tests/test_webapp_stdio.py b/tests/test_webapp_stdio.py
+index 67b2e97..32ce031 100644
+--- a/tests/test_webapp_stdio.py
++++ b/tests/test_webapp_stdio.py
+@@ -1855,6 +1855,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(
+             bridge.await_args.kwargs["account_email"], "card-link@icloud.com"
+         )
++        self.assertTrue(bridge.await_args.kwargs["sentinel_so_enabled"])
+ 
+     async def test_generates_us_paypal_link_with_desktop_flow_options(self):
+         browser_manager = self.app["browser_manager"]
+@@ -1892,6 +1893,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+                     "independent_proxy_pair": True,
+                     "use_secondary_proxy": True,
+                     "promotion_proxy_choice": "second",
++                    "sentinel_so_enabled": False,
+                 },
+                 headers={"X-Local-Token": self.app["local_token"]},
+             )
+@@ -1901,6 +1903,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(call["country"], "US")
+         self.assertEqual(call["currency"], "USD")
+         self.assertEqual(call["target_amount"], "1933")
++        self.assertFalse(call["sentinel_so_enabled"])
+         self.assertIn("create.example:8000", call["create_proxy_url"])
+         self.assertEqual(call["promotion_proxy_url"], call["create_proxy_url"])
+         self.assertEqual(call["python_executable"], Path(sys.executable))

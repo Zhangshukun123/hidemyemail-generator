@@ -1,0 +1,14 @@
+{
+  "host": "imap.qq.com",
+  "port": 993,
+  "username": "352121354@qq.com",
+  "folder": "INBOX",
+  "useSsl": true,
+  "domains": [
+    "cclgmail.com",
+    "zkgmail.com",
+    "shukunlabs.xyz"
+  ],
+  "activeDomain": "zkgmail.com",
+  "updatedAt": "2026-08-19T02:59:29.032088+00:00"
+}

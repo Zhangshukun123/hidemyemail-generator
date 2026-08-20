@@ -1,0 +1,39 @@
+services:
+  hidemyemail-web:
+    image: hidemyemail-generator-browser:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.remote-browser
+    container_name: hidemyemail-web
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - .env
+    command:
+      - --host
+      - 127.0.0.1
+      - --port
+      - "18765"
+      - --region
+      - china
+      - --data-dir
+      - /data
+    volumes:
+      - ./data:/data
+    # Keep the root filesystem read-only, but allow Firefox to initialize its
+    # own process sandbox (Docker's no-new-privileges option prevents startup).
+    read_only: true
+    shm_size: 512mb
+    tmpfs:
+      # The image redirects Camoufox's runtime-generated fontconfig here too.
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:18765/healthz', timeout=3).read(2)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

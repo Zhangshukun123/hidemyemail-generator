@@ -1,0 +1,16 @@
+.git
+.env
+.venv
+.cookie-browser-profile
+__pycache__
+*.pyc
+*.pyo
+*.log
+cookies.txt
+cookies.txt.bak
+emails.txt
+inbox_config.json
+hidemyemail.db
+hidemyemail.db-*
+exports
+data

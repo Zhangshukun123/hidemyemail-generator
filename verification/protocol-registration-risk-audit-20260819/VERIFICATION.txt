@@ -1,0 +1,60 @@
+Protocol registration risk-review verification
+
+BRANCH: codex/editable-quick-flow-target-count
+CHANGED_BRANCH_FIELD: review-copy-only / ServerRegistrationPresenter.start
+CHANGED_FIELDS:
+- count: 1-100 -> exactly 1
+- concurrency: 1-10 -> exactly 1
+- use_registration_kookeey=True -> blocked in the review copy
+- check_offer=True -> blocked in the review copy
+- production source remains unchanged
+
+ARTIFACT_PATHS:
+- MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\presenter.reviewed.py
+- DIFF_FILE: D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\presenter.reviewed.diff
+- VERIFICATION.txt: D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\VERIFICATION.txt
+- ROLLBACK.sh: D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\ROLLBACK.sh
+
+HASHES:
+- ORIGINAL_FILE: D:\AI\hidemyemail-generator\protocol-registration-server\protocol_registration_server\presenter.py
+- ORIGINAL_SHA256: 1e93c395dc3789bd1af92baa036106eeef0e08f1e8c7c02467bb2fffb5d844ab
+- MODIFIED_SHA256: 6d2c1b27a02a6fbb0cb57660abc2d703143f998f5146aa531a0e8a03839858fa
+- DIFF_SHA256: 6ceeaf5128f48d36f387b82acc222275531c4484df4d730829dbf4acfb51f66c
+- ROLLBACK_SHA256: 1f6e0721f015afb78412a572ab4b6fda74bfc536ffeed9d07162d49093ecec62
+
+BASELINE:
+- COMMAND: $env:PYTHONPATH = "D:\AI\hidemyemail-generator\src;D:\AI\hidemyemail-generator\protocol-registration-server"; & .\.venv\Scripts\python.exe -m pytest -q protocol-registration-server\tests
+- INPUT: D:\AI\hidemyemail-generator\protocol-registration-server\protocol_registration_server\presenter.py (SHA256 1e93c395dc3789bd1af92baa036106eeef0e08f1e8c7c02467bb2fffb5d844ab) and protocol-registration-server\tests
+- LITERAL_OUTPUT:
+....................                                                     [100%]
+20 passed in 1.56s
+- RESULT: original server registration test suite passed
+- EXIT_STATUS: 0
+
+MODIFIED:
+- COMMAND: $env:PYTHONPATH = "D:\AI\hidemyemail-generator\src;D:\AI\hidemyemail-generator\protocol-registration-server"; & .\.venv\Scripts\python.exe -c "import ast, pathlib; p=pathlib.Path(r'D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\presenter.reviewed.py'); s=p.read_text(encoding='utf-8'); ast.parse(s); assert 'MAX_REVIEW_REGISTRATIONS_PER_TASK = 1' in s; assert 'MAX_REVIEW_CONCURRENCY = 1' in s; assert 'if use_registration_kookeey:' in s; assert 'if check_offer:' in s; print('MODIFIED syntax=ok count=1 concurrency=1 rotating_proxy=blocked offer_probe=blocked')"
+- INPUT: D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\presenter.reviewed.py (SHA256 6d2c1b27a02a6fbb0cb57660abc2d703143f998f5146aa531a0e8a03839858fa)
+- LITERAL_OUTPUT:
+MODIFIED syntax=ok count=1 concurrency=1 rotating_proxy=blocked offer_probe=blocked
+- RESULT: review copy parsed successfully and all four conservative fields were present
+- EXIT_STATUS: 0
+
+ROLLBACK:
+- COMMAND:
+set -euo pipefail
+DIR='/d/AI/hidemyemail-generator/verification/protocol-registration-risk-audit-20260819'
+TEST="$DIR/presenter.rollback-test.py"
+cp "$DIR/presenter.reviewed.py" "$TEST"
+"$DIR/ROLLBACK.sh" "$TEST"
+ORIGINAL="$(sha256sum '/d/AI/hidemyemail-generator/protocol-registration-server/protocol_registration_server/presenter.py' | cut -d' ' -f1)"
+RESTORED="$(sha256sum "$TEST" | cut -d' ' -f1)"
+test "$ORIGINAL" = "$RESTORED"
+printf 'ROLLBACK_COMPARE restored_behavior=original source_sha256=%s target_sha256=%s\n' "$ORIGINAL" "$RESTORED"
+- INPUT: another copy at D:\AI\hidemyemail-generator\verification\protocol-registration-risk-audit-20260819\presenter.rollback-test.py
+- LITERAL_OUTPUT:
+ROLLBACK restored presenter.py sha256=1e93c395dc3789bd1af92baa036106eeef0e08f1e8c7c02467bb2fffb5d844ab
+ROLLBACK_COMPARE restored_behavior=original source_sha256=1e93c395dc3789bd1af92baa036106eeef0e08f1e8c7c02467bb2fffb5d844ab target_sha256=1e93c395dc3789bd1af92baa036106eeef0e08f1e8c7c02467bb2fffb5d844ab
+- RESULT: rollback test copy restored byte-for-byte to the original behavior; production source stayed unchanged; MODIFIED_FILE remains changed
+- EXIT_STATUS: 0
+
+RESTORED_BEHAVIOR_STATUS: rollback target accepted the original 1-100 count, 1-10 concurrency, proxy-selection, and offer-check behavior because it matched ORIGINAL_SHA256 byte-for-byte. MODIFIED_FILE still retains the conservative one-account, one-concurrency, no-rotating-proxy, no-offer-probe review state.

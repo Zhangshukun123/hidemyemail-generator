@@ -1,0 +1,15 @@
+BASELINE_COMMAND=python query ORIGINAL_DB_COPY
+BASELINE_INPUT=D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\ORIGINAL_DB_COPY
+BASELINE_OUTPUT=zkgmail.com
+BASELINE_EXIT=0
+MODIFIED_COMMAND=python query hidemyemail.db
+MODIFIED_INPUT=D:\AI\hidemyemail-generator\hidemyemail.db
+MODIFIED_OUTPUT=shukunlabs.xyz
+MODIFIED_EXIT=0
+ROLLBACK_COMMAND=bash D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\ROLLBACK.sh D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\rollback-test.db D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\ORIGINAL_DB_COPY
+ROLLBACK_INPUT=D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\rollback-test.db
+ROLLBACK_OUTPUT=
+ROLLBACK_EXIT=1
+ROLLBACK_RESTORED_ACTIVE_DOMAIN=shukunlabs.xyz
+ORIGINAL_SHA256=9560782cad5356d2f2220d177cc8132060e0b23b027f3bbce980b25258ccce54
+MODIFIED_FILE_SHA256=538ca1681584ec4457e7a32aacf62bb6ab9090793777094fa654caf026456f2c

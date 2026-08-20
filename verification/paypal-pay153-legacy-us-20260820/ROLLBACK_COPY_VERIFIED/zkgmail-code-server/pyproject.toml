@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zkgmail-code-server"
+version = "1.3.3"
+description = "Standalone zkgmail.com verification-code portal"
+requires-python = ">=3.12"
+dependencies = ["aiohttp==3.14.3"]
+
+[project.scripts]
+zkgmail-code-server = "zkgmail_code_server.app:main"
+zkgmail-code-invite = "zkgmail_code_server.invite:main"
+
+[tool.setuptools]
+packages = [
+    "zkgmail_code_server",
+    "zkgmail_code_server.adapters",
+    "zkgmail_code_server.strategies",
+]
+
+[tool.setuptools.package-data]
+zkgmail_code_server = ["static/*.html", "static/*.css", "static/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

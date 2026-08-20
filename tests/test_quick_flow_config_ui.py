@@ -194,6 +194,19 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         page.locator("#quickRegistrationTargetCount").dispatch_event("change")
         page.locator("#quickCardLinkMethod").select_option("paypal_gb")
         assert page.locator("#quickExtractionFirstProxyCountry").input_value() == "GB"
+        assert page.locator("#quickExtractionSecondProxyCountry").input_value() == "GB"
+        assert page.locator("#quickExtractionSecondProxyCountry").is_disabled()
+        assert page.locator("#quickCardLinkTargetAmount").input_value() == "0"
+        assert page.locator("#quickCardLinkTargetAmount").is_disabled()
+        assert "池1 标准 Checkout→Taxes→Sentinel→Confirm→Approve/Poll/BA；池2 BA 后同 Checkout Update；池1复验 GBP/0" in (
+            page.locator("#quickCardLinkHint").inner_text()
+        )
+        page.locator("#quickCardLinkMethod").select_option("paypal_us")
+        assert page.locator("#quickExtractionFirstProxyCountry").input_value() == "US"
+        assert page.locator("#quickExtractionSecondProxyCountry").input_value() == "US"
+        assert page.locator("#quickExtractionSecondProxyCountry").is_disabled()
+        assert page.locator("#quickCardLinkTargetAmount").input_value() == "0"
+        page.locator("#quickCardLinkMethod").select_option("paypal_gb")
         page.locator("#quickExtractionCount").fill("2")
         page.locator("#quickExtractionCount").dispatch_event("change")
 
@@ -263,6 +276,8 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
         assert page.locator("#quickRegistrationConcurrency").input_value() == "3"
         assert page.locator("#quickCardLinkMethod").input_value() == "paypal_gb"
         assert page.locator("#quickExtractionFirstProxyCountry").input_value() == "GB"
+        assert page.locator("#quickExtractionSecondProxyCountry").input_value() == "GB"
+        assert page.locator("#quickExtractionSecondProxyCountry").is_disabled()
         assert page.locator("#quickExtractionCount").input_value() == "6"
         assert page.locator("#quickProtocolSetupCredentials").is_checked()
         assert page.locator("#quickProtocolSetupCredentials").is_disabled()

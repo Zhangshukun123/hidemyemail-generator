@@ -79,6 +79,7 @@ from .main import _generate, fetch_account_info
 from .main import RichHideMyEmail
 from .openai_mfa import generate_totp
 from .paypal_protocol_service import PayPalProtocolService
+from .paypal_payment_protocol import PAYPAL_PAYMENT_PROTOCOL_PRESENTER
 from .payment_completion import (
     PaymentCompletionModel,
     PaymentCompletionPresenter,
@@ -200,7 +201,9 @@ CARD_LINK_METHODS = {
     "paypal_gb",
 }
 PAYPAL_CARD_LINK_METHODS = {"de_oaics_paypal", "paypal_us", "paypal_gb"}
-SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS = {"paypal_us", "paypal_gb"}
+TWO_PROXY_PAYPAL_CARD_LINK_METHODS = {"paypal_us", "paypal_gb"}
+FIXED_COUNTRY_PAYPAL_CARD_LINK_METHODS = TWO_PROXY_PAYPAL_CARD_LINK_METHODS
+RETRYABLE_PAYPAL_CARD_LINK_METHODS = TWO_PROXY_PAYPAL_CARD_LINK_METHODS
 PAYPAL_US_SMSBOWER_MAX_PRICE = 0.25
 PAYPAL_GB_SMSBOWER_MAX_PRICE = 0.30
 CARD_LINK_PROGRESS_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,80}")
@@ -6075,7 +6078,7 @@ def create_app(
                 status=400,
             )
         target_amount = str(body.get("target_amount") or "").strip()
-        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS and (
+        if method in TWO_PROXY_PAYPAL_CARD_LINK_METHODS and (
             len(target_amount) > 12
             or (target_amount and not re.fullmatch(r"\d+", target_amount))
         ):
@@ -6101,6 +6104,7 @@ def create_app(
         elif method == "paypal_us":
             country = "US"
             region = {"currency": "USD", "locale": "en-US"}
+            target_amount = "0"
         elif method == "paypal_gb":
             country = "GB"
             region = {"currency": "GBP", "locale": "en-GB"}
@@ -6156,12 +6160,6 @@ def create_app(
         previous_link_exit_ip = str(
             existing_card_link.get("link_proxy_ip") or ""
         ).strip()
-        country_routing_requested = bool(
-            requested_proxy_mode
-            or body.get("create_proxy_country")
-            or body.get("promotion_proxy_country")
-            or body.get("secondary_proxy_country")
-        )
         create_proxy_country = str(
             body.get("create_proxy_country") or ""
         ).strip().upper()
@@ -6182,15 +6180,13 @@ def create_app(
             or registration_environment.get("proxy_country")
             or ""
         ).strip().upper()
-        if (
-            method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-            and country_routing_requested
-        ):
+        if method in FIXED_COUNTRY_PAYPAL_CARD_LINK_METHODS:
             fixed_proxy_country = CardLinkProxyCountryPolicy.for_method(method)
             create_proxy_country = fixed_proxy_country
             promotion_proxy_country = fixed_proxy_country
             secondary_proxy_country = fixed_proxy_country
         proxy_candidate_logs: list[str] = []
+        verified_proxy_identities: dict[str, tuple[str, str]] = {}
 
         async def configured_proxy_for_country(
             selected_country: str, legacy_value: object
@@ -6198,7 +6194,7 @@ def create_app(
             legacy_proxy = _normalize_card_link_proxy_url(str(legacy_value or ""))
             if (
                 not selected_country
-                and method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                and method in FIXED_COUNTRY_PAYPAL_CARD_LINK_METHODS
             ):
                 selected_country = CardLinkProxyCountryPolicy.for_method(method)
             if selected_country:
@@ -6222,7 +6218,7 @@ def create_app(
                         raise RuntimeError("请先在“代理与线路”中保存代理配置")
                     return proxy_url
 
-                if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
+                if method in FIXED_COUNTRY_PAYPAL_CARD_LINK_METHODS:
                     if (
                         proxy_mode == "clash"
                         and not stored_proxy_state.get("fixedPortsEnabled")
@@ -6249,6 +6245,10 @@ def create_app(
                         selection.actual_ip,
                         selection.actual_country,
                     )
+                    verified_proxy_identities[selection.proxy_url] = (
+                        selection.actual_ip,
+                        selection.actual_country,
+                    )
                     if selection.candidates_tested > 1:
                         proxy_candidate_logs.append(
                             f"[提链代理] {selected_country} 真实出口预检丢弃了 "
@@ -6267,24 +6267,55 @@ def create_app(
                 return await asyncio.to_thread(build_proxy_candidate)
             return legacy_proxy
 
+        async def allocate_two_proxy_paypal_pair() -> tuple[str, str]:
+            fixed_country = CardLinkProxyCountryPolicy.for_method(method)
+            registration_proxy = (
+                account_registration_proxy_url(record)
+                if reuse_registration_proxy
+                else ""
+            )
+            checkout_proxy = await configured_proxy_for_country(
+                fixed_country,
+                registration_proxy or body.get("create_proxy"),
+            )
+            final_proxy = await configured_proxy_for_country(
+                fixed_country,
+                body.get("promotion_proxy") or body.get("secondary_proxy"),
+            )
+            if (
+                not checkout_proxy
+                or not final_proxy
+                or checkout_proxy == final_proxy
+            ):
+                raise RuntimeError(
+                    f"PayPal {fixed_country} 必须配置两条不同的"
+                    f" {fixed_country} 粘性代理"
+                )
+            proxy_candidate_logs.append(
+                f"[提链代理] PayPal {fixed_country} 已分配双代理："
+                "池1负责 Create/优惠检查，池2负责 Update/Taxes/Stripe/Approve/Poll"
+            )
+            return checkout_proxy, final_proxy
+
         retry_create_proxy = ""
         if method == "standard":
             create_proxy = ""
             promotion_proxy = ""
         else:
             try:
-                if not reuse_registration_proxy and independent_proxy_pair:
+                if method in TWO_PROXY_PAYPAL_CARD_LINK_METHODS:
+                    create_proxy, promotion_proxy = (
+                        await allocate_two_proxy_paypal_pair()
+                    )
+                elif not reuse_registration_proxy and independent_proxy_pair:
                     first_proxy = await configured_proxy_for_country(
                         create_proxy_country,
                         body.get("create_proxy"),
                     )
                     needs_second_proxy = (
-                        method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-                        and (
-                            use_secondary_proxy
-                            or promotion_proxy_choice == "second"
-                            or attempt_limit > 1
-                        )
+                        use_secondary_proxy
+                        or promotion_proxy_choice == "second"
+                        or attempt_limit > 1
                     )
                     second_proxy = ""
                     if needs_second_proxy:
@@ -6302,14 +6333,11 @@ def create_app(
                     create_proxy = (
                         second_proxy
                         if use_secondary_proxy
-                        and method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
                         else first_proxy
                     )
                     retry_create_proxy = second_proxy or create_proxy
                     promotion_proxy = (
-                        first_proxy
-                        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-                        else second_proxy
+                        second_proxy
                         if promotion_proxy_choice == "second"
                         else first_proxy
                     )
@@ -6319,9 +6347,7 @@ def create_app(
                         body.get("create_proxy"),
                     )
                     promotion_proxy = (
-                        create_proxy
-                        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-                        else ""
+                        ""
                         if method == "de_oaics_paypal"
                         else await configured_proxy_for_country(
                             promotion_proxy_country,
@@ -6331,27 +6357,16 @@ def create_app(
                     retry_create_proxy = create_proxy
                 else:
                     registration_proxy = account_registration_proxy_url(record)
-                    if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS:
+                    first_proxy = registration_proxy
+                    if not first_proxy and proxy_mode:
                         first_proxy = await configured_proxy_for_country(
-                            create_proxy_country
-                            or secondary_proxy_country
-                            or country,
-                            registration_proxy or body.get("create_proxy"),
+                            create_proxy_country or secondary_proxy_country,
+                            body.get("create_proxy"),
                         )
-                    else:
-                        first_proxy = registration_proxy
-                        if not first_proxy and proxy_mode:
-                            first_proxy = await configured_proxy_for_country(
-                                create_proxy_country or secondary_proxy_country,
-                                body.get("create_proxy"),
-                            )
                     needs_second_proxy = (
-                        method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-                        and (
-                            use_secondary_proxy
-                            or promotion_proxy_choice == "second"
-                            or attempt_limit > 1
-                        )
+                        use_secondary_proxy
+                        or promotion_proxy_choice == "second"
+                        or attempt_limit > 1
                     )
                     second_proxy = ""
                     if needs_second_proxy:
@@ -6369,14 +6384,11 @@ def create_app(
                     create_proxy = (
                         second_proxy
                         if use_secondary_proxy
-                        and method not in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
                         else first_proxy
                     )
                     retry_create_proxy = second_proxy or create_proxy
                     promotion_proxy = (
-                        first_proxy
-                        if method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
-                        else second_proxy
+                        second_proxy
                         if promotion_proxy_choice == "second"
                         else first_proxy
                     )
@@ -6437,15 +6449,13 @@ def create_app(
                     )
                     attempt_promotion_proxy = promotion_proxy
                     if (
-                        method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                        method in TWO_PROXY_PAYPAL_CARD_LINK_METHODS
                         and attempt_count > 1
                     ):
-                        if create_proxy_country:
-                            attempt_create_proxy = await configured_proxy_for_country(
-                                create_proxy_country,
-                                body.get("create_proxy"),
-                            )
-                        attempt_promotion_proxy = attempt_create_proxy
+                        (
+                            attempt_create_proxy,
+                            attempt_promotion_proxy,
+                        ) = await allocate_two_proxy_paypal_pair()
                     try:
                         result = await _run_card_link_bridge(
                             target_project_dir=(
@@ -6476,14 +6486,14 @@ def create_app(
                     except CardLinkBridgeError as error:
                         accumulated_logs.extend(error.logs)
                         should_retry = (
-                            method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                            method in RETRYABLE_PAYPAL_CARD_LINK_METHODS
                             and error.retryable is not False
                             and attempt_count < attempt_limit
                         )
                         if not should_retry:
                             detail = str(error)
                             if (
-                                method in SINGLE_PROXY_PAYPAL_CARD_LINK_METHODS
+                                method in RETRYABLE_PAYPAL_CARD_LINK_METHODS
                                 and attempt_count > 1
                             ):
                                 detail = (
@@ -6497,7 +6507,7 @@ def create_app(
                             ) from error
                         retry_message = (
                             f"[提链重试] 第 {attempt_count}/{attempt_limit} 次失败："
-                            f"{error}；正在刷新 {country} 第一代理后重试"
+                            f"{error}；正在刷新完整的 {country} 双代理并从 Create 重建"
                         )
                         accumulated_logs.append(retry_message)
                         publish_card_link_progress(retry_message)
@@ -6510,9 +6520,18 @@ def create_app(
                         and result.get("classification") == "cs_live"
                     ):
                         break
-                result_link_proxy_ip = str(result.get("link_proxy_ip") or "").strip()
+                verified_link_proxy_ip, verified_link_proxy_country = (
+                    verified_proxy_identities.get(
+                        attempt_promotion_proxy,
+                        ("", ""),
+                    )
+                )
+                result_link_proxy_ip = str(
+                    result.get("link_proxy_ip") or verified_link_proxy_ip
+                ).strip()
                 result_link_proxy_country = str(
-                    result.get("link_proxy_country") or ""
+                    result.get("link_proxy_country")
+                    or verified_link_proxy_country
                 ).strip().upper()
                 if result_link_proxy_ip and result_link_proxy_country:
                     await asyncio.to_thread(
@@ -6547,10 +6566,8 @@ def create_app(
                     promotion_strategy=str(
                         result.get("promotion_strategy") or ""
                     ),
-                    link_proxy_country=str(
-                        result.get("link_proxy_country") or ""
-                    ),
-                    link_proxy_ip=str(result.get("link_proxy_ip") or ""),
+                    link_proxy_country=result_link_proxy_country,
+                    link_proxy_ip=result_link_proxy_ip,
                     status=(
                         "cs_live"
                         if result.get("classification") == "cs_live"
@@ -8668,7 +8685,7 @@ def create_app(
             return web.json_response(
                 {
                     "ok": False,
-                    "error": "美国 PayPal 提链记录必须使用 US Checkout 与 US 第一代理，请重新提链",
+                    "error": "美国 PayPal 提链记录必须使用 US Checkout 与 US 池2最终代理，请重新提链",
                 },
                 status=409,
             )
@@ -8678,7 +8695,7 @@ def create_app(
             return web.json_response(
                 {
                     "ok": False,
-                    "error": "英国 PayPal 提链记录必须使用 GB Checkout 与 GB 第一代理，请重新提链",
+                    "error": "英国 PayPal 提链记录必须使用 GB 标准 Checkout 与 GB 池2后置优惠代理，请重新提链",
                 },
                 status=409,
             )
@@ -8812,9 +8829,12 @@ def create_app(
             await payment_guard.release(email=email)
             raise
         device_id = paypal_auto_device_id(request, create=True)
+        payment_protocol = PAYPAL_PAYMENT_PROTOCOL_PRESENTER.present(link_method)
         protocol_payload = {
             "paypal_url": paypal_url,
             "country": protocol_country,
+            "buyer_mode": payment_protocol.buyer_mode,
+            "payment_protocol": payment_protocol.payment_protocol,
             "sms_provider": sms_provider,
             "sms_service": "paypal",
             "sms_country": protocol_country,
@@ -8854,6 +8874,7 @@ def create_app(
                 "ok": True,
                 "email": email,
                 "country": protocol_country,
+                "paymentProtocol": payment_protocol.payment_protocol,
                 "checkoutCountry": link_country,
                 "linkProxyCountry": link_proxy_country,
                 "cookieCount": len(cookies),

@@ -1,0 +1,17 @@
+[Unit]
+Description=ZKGMail verification code portal
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/zkgmail-code-server
+ExecStartPre=/usr/bin/docker compose config -q
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStartPost=/bin/sh -c 'attempt=0; until [ "$attempt" -ge 30 ]; do /usr/bin/curl --fail --silent --max-time 3 http://127.0.0.1:18768/healthz >/dev/null && exit 0; attempt=$((attempt + 1)); sleep 2; done; exit 1'
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

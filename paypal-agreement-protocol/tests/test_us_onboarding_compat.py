@@ -1,9 +1,15 @@
 from types import SimpleNamespace
 
+import pytest
+
 import web as paypal_web
 from paypal.flow import PayPalFlow
 from paypal.manual_browser import ManualBrowserController
 from paypal.models import SessionState
+from paypal.payment_protocol import (
+    PAY153_LEGACY_US_PAYMENT_PROTOCOL,
+    PAYMENT_PROTOCOL_PRESENTER,
+)
 from paypal.onboarding_compat import (
     OnboardingCompatibilityPresenter,
     OnboardingFailureModel,
@@ -120,6 +126,20 @@ def test_signup_flow_continues_after_us_official_member_handoff():
     assert flow.handoff_urls == [signup_url]
     assert flow.state.euat_token == "fixture-euat"
     assert flow.state.user_id == "fixture-user"
+
+
+def test_legacy_pay153_us_oas_is_terminal_without_member_handoff():
+    flow = RecoveringPayPalFlow()
+    flow.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
+        PAY153_LEGACY_US_PAYMENT_PROTOCOL,
+        "US",
+    )
+    signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-fixture"
+
+    with pytest.raises(RuntimeError, match="verified OTP session is now terminal"):
+        flow._signup_with_card_retry("EC-fixture", signup_url)
+
+    assert flow.handoff_urls == []
 
 
 def test_member_completion_requires_euat_and_paypal_review_route():

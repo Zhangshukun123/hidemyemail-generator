@@ -10,6 +10,8 @@ from __future__ import annotations
 PAYPAL_STRICT_ZERO_MODE = "PayPal严格0链接 DE/EUR"
 PAYPAL_US_TR_MODE = "PayPal推断模式 US/TR"
 PAYPAL_US_TR_FLOW = "us_tr_promotion"
+PAYPAL_PAY153_PROTOCOL_FLOW = "pay153_protocol"
+PAYPAL_GB_TWO_PROXY_FLOW = "gb_two_proxy_promotion"
 PHILIPPINES_SHORT_LINK_MODE = "菲律宾短链"
 PHILIPPINES_PAYPAL_CHECK_MODE = "菲律宾 PayPal 支付链接"
 PHILIPPINES_CUSTOM_PROMO_FLOW = "ph_custom_promotion"  # 旧结果兼容
@@ -48,8 +50,8 @@ PAYMENT_MODES = {
     "PayPal支付链接 US/USD": {
         "country": "US",
         "currency": "USD",
-        # 常规美区仍允许非零金额；只有用户把目标设为 0 时才先更新优惠。
-        "zero_target_paypal_flow": PAYPAL_US_TR_FLOW,
+        # 目标为 0 时使用两条 US 粘性代理的 PAY153 流程。
+        "zero_target_paypal_flow": PAYPAL_PAY153_PROTOCOL_FLOW,
     },
     PAYPAL_US_TR_MODE: {
         "country": "US",
@@ -100,7 +102,12 @@ PAYMENT_MODES = {
         "target_amount": "0",
         "paypal_flow": PAYPAL_FR_IDEAL_STYLE_ZERO_FLOW,
     },
-    "PayPal支付链接 GB/GBP": {"country": "GB", "currency": "GBP"},
+    "PayPal支付链接 GB/GBP": {
+        "country": "GB",
+        "currency": "GBP",
+        # 英区使用独立后置优惠拓扑：标准 Checkout/BA 后再 Update。
+        "zero_target_paypal_flow": PAYPAL_GB_TWO_PROXY_FLOW,
+    },
     "PayPal支付链接 CA/CAD": {"country": "CA", "currency": "CAD"},
     "PayPal支付链接 AU/AUD": {"country": "AU", "currency": "AUD"},
     PAYPAL_JP_STRICT_ZERO_MODE: {

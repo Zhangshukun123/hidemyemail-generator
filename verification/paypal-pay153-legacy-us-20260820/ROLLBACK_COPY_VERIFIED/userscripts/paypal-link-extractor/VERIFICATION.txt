@@ -1,0 +1,48 @@
+PayPal 提链结果提取器 v1.1.0 修复验证记录
+Date: 2026-08-20 Asia/Shanghai
+Git branch: main
+Screenshot reproduction: the visible '-' placeholder was normalized by v1.0.0 to https://pp.uplw.uno/-.
+Changed logic branches: URL normalization branch; document-start Fetch/SSE capture branch; active Job API polling branch.
+Changed fields: #resultReturn.href and paypal_approve_url > final_redirect_url > paypal_return_url, plus paypal_approval_url/approve_url/approval_url/ba_link/ba_url aliases.
+
+ARTIFACTS
+MODIFIED_FILE: D:\AI\hidemyemail-generator\userscripts\paypal-link-extractor\MODIFIED_FILE.user.js
+DIFF_FILE: D:\AI\hidemyemail-generator\userscripts\paypal-link-extractor\DIFF_FILE.patch
+VERIFICATION: D:\AI\hidemyemail-generator\userscripts\paypal-link-extractor\VERIFICATION.txt
+ROLLBACK: D:\AI\hidemyemail-generator\userscripts\paypal-link-extractor\ROLLBACK.sh
+ORIGINAL_COPY: D:\AI\hidemyemail-generator\userscripts\paypal-link-extractor\ORIGINAL_FILE_v1.0.0.user.js
+
+HASHES
+Pre-change MODIFIED_FILE SHA256 recorded before editing: 846F3ECF3311D6A95B1A837492F3C8C67F9BD383C2064A6B515B735ED8388E00
+ORIGINAL_COPY normalized SHA256: 5E5557970680102670FFD0FFA95F796F655D962ACB055C7424807737FF419F55
+MODIFIED_FILE v1.1.0 SHA256: 99CFAD3381CBD46D1AAE48DA50A37A97E5D825DC0132084596049972F917EDE6
+MODIFIED_FILE lines: 514 (below the 10000-line limit)
+
+BASELINE
+Command: node .\tests\paypal_link_extractor.test.cjs .\userscripts\paypal-link-extractor\ORIGINAL_FILE_v1.0.0.user.js v1-baseline
+Input: literal placeholder '-' and the v1.0.0 exported API.
+Literal output: BASELINE PASS: placeholder '-' reproduces https://pp.uplw.uno/-; Job API bridge unavailable
+Exit status: 0
+Behavior/status: the screenshot bug is reproduced; no Fetch/SSE bridge or Job polling exists.
+
+MODIFIED
+Command: node .\tests\paypal_link_extractor.test.cjs .\userscripts\paypal-link-extractor\MODIFIED_FILE.user.js modified
+Input: '-', https://pp.uplw.uno/-, a POST /api/jobs response with job_id, Job API URL construction, result-field priority, PayPal DOM/text fixtures, duplicate candidates, and a proxy log URL.
+Literal output: MODIFIED PASS: placeholders rejected; Job API capture/polling, field priority, DOM/text capture, and dedupe verified
+Exit status: 0
+Behavior/status: same-origin placeholders and proxy log URLs are rejected; the bridge captures job_id at document-start, watches Fetch/SSE payloads, and polls /api/jobs/{job_id} every 650ms until a PayPal BA URL appears or the task terminates.
+
+SYNTAX
+Command: node --check .\userscripts\paypal-link-extractor\MODIFIED_FILE.user.js
+Input: MODIFIED_FILE.user.js v1.1.0
+Literal output: <empty>
+Exit status: 0
+
+ROLLBACK
+Command: & 'C:\Program Files\Git\bin\bash.exe' .\userscripts\paypal-link-extractor\ROLLBACK.sh .\userscripts\paypal-link-extractor\ROLLBACK_TEST_COPY_3.user.js; node .\tests\paypal_link_extractor.test.cjs .\userscripts\paypal-link-extractor\ROLLBACK_TEST_COPY_3.user.js v1-baseline
+Input: ROLLBACK_TEST_COPY_3.user.js containing v1.1.0; ORIGINAL_FILE_v1.0.0.user.js containing the preserved v1.0.0 behavior.
+Literal output/result:
+ROLLBACK PASS: restored baseline extractor to .\userscripts\paypal-link-extractor\ROLLBACK_TEST_COPY_3.user.js
+BASELINE PASS: placeholder '-' reproduces https://pp.uplw.uno/-; Job API bridge unavailable
+Exit status: 0
+Restored behavior/status: ROLLBACK_TEST_COPY_3.user.js SHA256 is 5E5557970680102670FFD0FFA95F796F655D962ACB055C7424807737FF419F55, exactly matching ORIGINAL_COPY; MODIFIED_FILE.user.js remains v1.1.0 with SHA256 99CFAD3381CBD46D1AAE48DA50A37A97E5D825DC0132084596049972F917EDE6.

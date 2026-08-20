@@ -1,0 +1,31 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    OPENAI_REGISTER_PROJECT_DIR=/opt/openai-register-runtime \
+    OPENAI_REGISTER_PYTHON=/usr/local/bin/python \
+    HIDEMYEMAIL_FORCE_BROWSER_HEADLESS=1
+
+WORKDIR /app
+
+COPY browser-runtime-requirements.txt ./
+RUN pip install --no-cache-dir -r browser-runtime-requirements.txt \
+    && python -m playwright install-deps firefox \
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
+
+USER app
+RUN python -m camoufox fetch
+
+USER root
+RUN rm -rf /home/app/.cache/camoufox/fontconfig /home/app/.cache/fontconfig \
+    && ln -s /tmp/camoufox-fontconfig /home/app/.cache/camoufox/fontconfig \
+    && ln -s /tmp/fontconfig-cache /home/app/.cache/fontconfig
+
+COPY pyproject.toml README.md README.zh-CN.md ./
+COPY src ./src
+COPY openai-register-runtime /opt/openai-register-runtime
+RUN pip install --no-cache-dir .
+
+USER app
+ENTRYPOINT ["sh", "-c", "mkdir -p /tmp/camoufox-fontconfig /tmp/fontconfig-cache && exec hidemyemail-web \"$@\"", "--"]

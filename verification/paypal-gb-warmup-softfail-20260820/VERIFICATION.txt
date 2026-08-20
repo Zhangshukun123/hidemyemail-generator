@@ -1,0 +1,53 @@
+CHANGE
+branch: PayPal GB/GBP hosted Checkout warmup -> repeated retryable HTTP 5xx -> continue to Stripe Init and pre-Confirm Sentinel
+field: allow_retryable_status_failure (GB caller=true; all other callers=false)
+restored behavior/status: ROLLBACK_TEST_COPY matches the pre-change SHA-256 and restores repeated warmup HTTP 5xx as a hard failure before Stripe Init.
+
+PATHS
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\paypal-gb-warmup-softfail-20260820\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\paypal-gb-warmup-softfail-20260820\DIFF_FILE.diff
+VERIFICATION.txt: D:\AI\hidemyemail-generator\verification\paypal-gb-warmup-softfail-20260820\VERIFICATION.txt
+ROLLBACK.sh: D:\AI\hidemyemail-generator\verification\paypal-gb-warmup-softfail-20260820\ROLLBACK.sh
+
+HASHES
+ORIGINAL_FILE SHA256: 39E9825124C601B34DD67927FB777D1E1298F2D0C43B109D60F5378641DDBD9D
+MODIFIED_FILE SHA256: 4B7790A037F95B78D5297254A4374F3418CEE6253F35288B27F262A56A11E9F5
+
+BASELINE
+command: .\.venv\Scripts\python.exe -m pytest tests/test_paypal_gb_transport_recovery.py tests/test_pay153_two_proxy_protocol.py -q
+input: none
+literal output/result:
+....................                                                [100%]
+20 passed, 5 subtests passed in 0.34s
+exit status: 0
+
+MODIFIED
+command: .\.venv\Scripts\python.exe -m pytest tests/test_paypal_gb_transport_recovery.py tests/test_pay153_two_proxy_protocol.py tests/test_paypal_checkout_sentinel.py tests/test_card_link_stripe_context.py -q
+input: repeated HTTP 500 fixture plus default hard-failure fixture
+literal output/result:
+...............................                                     [100%]
+31 passed, 5 subtests passed in 2.45s
+exit status: 0
+
+RELATED REGRESSION
+command: $files=Get-ChildItem tests -File -Filter 'test_*card_link*.py' | ForEach-Object {$_.FullName}; $files += (Get-ChildItem tests -File -Filter 'test_pay*.py' | Where-Object {$_.Name -match 'pay153|paypal|payment_proxy'} | ForEach-Object {$_.FullName}); $files=$files | Sort-Object -Unique; .\.venv\Scripts\python.exe -m pytest @files -q
+input: 17 discovered card-link/PayPal/payment-proxy test files
+literal output/result:
+114 passed, 432 warnings, 37 subtests passed in 32.81s
+exit status: 0
+
+LINT
+command: .\.venv\Scripts\ruff.exe check src/hidemyemail_generator/card_link_runtime.py tests/test_paypal_gb_transport_recovery.py
+input: none
+literal output/result:
+All checks passed!
+exit status: 0
+
+ROLLBACK
+command: $dir='D:/AI/hidemyemail-generator/verification/paypal-gb-warmup-softfail-20260820'; Copy-Item -LiteralPath "$dir/MODIFIED_FILE" -Destination "$dir/ROLLBACK_TEST_COPY" -Force; & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x '$dir/ROLLBACK.sh' && test -x '$dir/ROLLBACK.sh' && '$dir/ROLLBACK.sh' '$dir/ROLLBACK_TEST_COPY'"; $exit=$LASTEXITCODE; $hash=(Get-FileHash -Algorithm SHA256 "$dir/ROLLBACK_TEST_COPY").Hash; Write-Output "RESTORED_HASH=$hash"; Write-Output "EXIT_STATUS=$exit"; exit $exit
+input: MODIFIED_FILE copied to ROLLBACK_TEST_COPY
+literal output/result:
+ROLLBACK_OK sha256=39E9825124C601B34DD67927FB777D1E1298F2D0C43B109D60F5378641DDBD9D
+RESTORED_HASH=39E9825124C601B34DD67927FB777D1E1298F2D0C43B109D60F5378641DDBD9D
+EXIT_STATUS=0
+exit status: 0

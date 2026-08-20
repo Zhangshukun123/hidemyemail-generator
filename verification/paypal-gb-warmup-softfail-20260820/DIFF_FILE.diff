@@ -1,0 +1,54 @@
+diff --git a/verification/paypal-gb-warmup-softfail-20260820/ORIGINAL_FILE b/verification/paypal-gb-warmup-softfail-20260820/MODIFIED_FILE
+index 263746f..96f9965 100644
+--- a/verification/paypal-gb-warmup-softfail-20260820/ORIGINAL_FILE
++++ b/verification/paypal-gb-warmup-softfail-20260820/MODIFIED_FILE
+@@ -4373,7 +4373,8 @@ def opll_chatgpt_checkout_warmup(
+     diagnostic_prefix: str = "",
+     network_attempts: int = 1,
+     network_retry_delays: tuple[float, ...] = (),
+-) -> None:
++    allow_retryable_status_failure: bool = False,
++) -> bool:
+     """Warm the exact Checkout page inside one clean approval session."""
+ 
+     entity = opll_processor_entity_for_country(
+@@ -4424,13 +4425,25 @@ def opll_chatgpt_checkout_warmup(
+                 f"request_id={opll_response_request_id(response) or '<missing>'}",
+             )
+             if response.status_code < 400:
+-                return
+-            if not (
+-                attempt_no < total_attempts
+-                and OPLL_TRANSIENT_REQUEST_RETRY.retries_status(
+-                    response.status_code
++                return True
++            retryable_status = OPLL_TRANSIENT_REQUEST_RETRY.retries_status(
++                response.status_code
++            )
++            if not retryable_status:
++                raise OpllChatgptSentinelError(
++                    "Checkout 页面预热失败: "
++                    f"HTTP {response.status_code} "
++                    f"{opll_complete_response_body(response)}"
+                 )
+-            ):
++            if attempt_no >= total_attempts:
++                if allow_retryable_status_failure:
++                    opll_emit_diagnostic(
++                        diagnostic_log,
++                        f"{prefix}Checkout 页面连续返回 HTTP "
++                        f"{response.status_code}；页面渲染预热按 best-effort "
++                        "跳过，继续由 Stripe Init 与 Confirm 前 Sentinel 硬校验",
++                    )
++                    return False
+                 raise OpllChatgptSentinelError(
+                     "Checkout 页面预热失败: "
+                     f"HTTP {response.status_code} "
+@@ -7480,6 +7493,7 @@ def _generate_opll_paypal_gb_post_approve_long_link(
+             diagnostic_prefix="[PayPal GB/GBP] ",
+             network_attempts=OPLL_TRANSIENT_REQUEST_RETRY.attempts,
+             network_retry_delays=OPLL_TRANSIENT_REQUEST_RETRY.retry_delays,
++            allow_retryable_status_failure=True,
+         )
+ 
+         stripe_factory = browser_runtime.get("stripe_session_factory")

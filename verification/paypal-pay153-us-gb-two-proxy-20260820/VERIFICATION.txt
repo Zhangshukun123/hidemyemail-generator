@@ -1,0 +1,133 @@
+PAYPAL US/GB TWO-PROXY PORT VERIFICATION
+Date: 2026-08-20 Asia/Shanghai
+Workspace: D:\AI\hidemyemail-generator
+Branch: main
+Original HEAD: 3325894f7990b86a51edac754d10c3dd00622afe
+
+CHANGED BRANCH / FIELDS
+- paypal_us: paypal_flow=pay153_protocol; country/currency=US/USD.
+- paypal_gb: paypal_flow=gb_two_proxy_promotion; country/currency=GB/GBP.
+- Proxy ownership: pool 1 performs Checkout/Create and promotion inspection;
+  pool 2 performs the single Update, Taxes, Stripe, PaymentMethod, Confirm,
+  Sentinel, Approve, Poll, and BA extraction.
+- Required result fields: promotion_update_count=1,
+  checkout_taxes_count=1, independent_proxy_pair=true; link_proxy_country and
+  link_proxy_ip represent pool 2. Only paypal_ba_approve_url is accepted.
+- Strategy/MVP files: paypal_protocol_profile.py and paypal_two_proxy_flow.py.
+
+FOUR ARTIFACTS
+MODIFIED_FILE:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\MODIFIED_FILE
+DIFF_FILE:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\DIFF_FILE
+VERIFICATION.txt:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\VERIFICATION.txt
+ROLLBACK.sh:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK.sh
+
+ARTIFACT SHA256
+MODIFIED_FILE 4569e120b628709200f662281503cf93224cfb84d605b2f68bf8194af9385269
+DIFF_FILE e8efa50446a832c333ee78e730f13e2b679de28d0bec3418cfd0eba0c6e711df
+ROLLBACK.sh 389019fd0969897b5b127c57eaf6bf1e6cabfce5c710bfdc3fcb592b7cdc2c44
+
+SOURCE REFERENCE TEST
+CWD: D:\AI\openai-register-paylink-ui-dist-20260706-README-deploy
+COMMAND / INPUT:
+python -m pytest tests/test_paypal_us_flow.py tests/test_pay153_protocol.py -q -p no:cacheprovider
+LITERAL RESULT:
+25 passed, 1 warning, 5 subtests passed in 1.99s
+EXIT STATUS: 0
+
+BASELINE TEST (clean rollback copy, imports pinned to that copy)
+CWD:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK_COPY
+COMMAND / INPUT (PowerShell):
+$env:PYTHONPATH = 'D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK_COPY\src;D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK_COPY'
+D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests\test_card_link_bridge.py tests\test_webapp_stdio.py::CardLinkEndpointTests tests\test_web_ui.py -q -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+........................................................................ [ 66%]
+....................................                                     [100%]
+108 passed, 4401 warnings in 13.73s
+EXIT STATUS: 0
+BASELINE BEHAVIOR: original one-proxy US/GB implementation and its original
+test expectations are restored and pass in the clean rollback copy.
+
+MODIFIED TEST (patched independent copy, imports pinned to that copy)
+CWD:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK_COPY
+COMMAND / INPUT (PowerShell):
+$env:PYTHONPATH = 'D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK_COPY\src;D:\AI\hidemyemail-generator\verification\paypal-pay153-us-gb-two-proxy-20260820\ROLLBACK_COPY'
+D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests\test_paypal_two_proxy_flow.py tests\test_pay153_two_proxy_protocol.py tests\test_card_link_approve_retry.py tests\test_card_link_bridge.py tests\test_card_link_bridge_service.py tests\test_webapp_stdio.py::CardLinkEndpointTests tests\test_web_ui.py tests\test_quick_flow_config_ui.py tests\test_account_actions.py::AccountActionFrontendTests tests\test_paypal_link_web_ui.py -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+............................................. [ 29%]
+........................................................................ [ 76%]
+...................................                                      [100%]
+152 passed, 4475 warnings, 27 subtests passed in 22.63s
+EXIT STATUS: 0
+MODIFIED BEHAVIOR: US and GB each require two distinct same-country real
+proxy exits; pool 2 performs exactly one Update and one Taxes call; OAICS only
+sends a real cs_ to Stripe; SetupIntent divergence is rejected; approval runs
+warmup -> Sentinel -> Approve -> Poll; only a PayPal BA approval URL succeeds.
+
+FINAL FULL WORKSPACE REGRESSION
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT:
+.\.venv\Scripts\python.exe -m pytest -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+1020 passed, 10140 warnings, 64 subtests passed in 122.81s (0:02:02)
+EXIT STATUS: 0
+
+ROLLBACK TEST (run against another copy)
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT (PowerShell invoking Git Bash):
+& 'C:\Program Files\Git\bin\bash.exe' '/d/AI/hidemyemail-generator/verification/paypal-pay153-us-gb-two-proxy-20260820/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/paypal-pay153-us-gb-two-proxy-20260820/ROLLBACK_COPY'
+LITERAL OUTPUT / RESULT:
+ROLLBACK_RESULT=restored
+ROLLBACK_STATUS=tracked-files-match-HEAD; added-files-absent
+ROLLBACK_TARGET=/d/AI/hidemyemail-generator/verification/paypal-pay153-us-gb-two-proxy-20260820/ROLLBACK_COPY
+EXIT_STATUS=0
+EXIT STATUS: 0
+RESTORED STATUS:
+- git diff --quiet exit status: 0.
+- git status --short output: empty.
+- paypal_protocol_profile.py present: False.
+- paypal_two_proxy_flow.py present: False.
+- The BASELINE command above passed again: 108 passed, 4401 warnings.
+- The current workspace remains modified; MODIFIED_FILE remains the changed
+  snapshot and was not rolled back.
+
+STATIC VALIDATION
+COMMAND / INPUT:
+node --check src\hidemyemail_generator\web_ui\static\app.js
+node --check src\hidemyemail_generator\web_ui\static\account_actions.js
+.\.venv\Scripts\ruff.exe check <all task Python files>
+git diff --check
+LITERAL RESULT:
+All checks passed!
+Node syntax checks produced no output.
+git diff --check produced no errors (only Git CRLF conversion notices).
+EXIT STATUS: 0
+
+ORIGINAL GIT BLOB -> MODIFIED SHA256
+src/hidemyemail_generator/_card_link_payment_modes.py
+  65fbddbdce7648bb3f87805e027ad5da5991fd55 -> a46d3dbd25534647b497251043174f7921665f813fc9df3f27e5253e8231250f
+src/hidemyemail_generator/paypal_protocol_profile.py
+  ABSENT -> 29af3598faa79a8eb24c66906a467ee64f928558ce0cf8fec53cd70568102bfe
+src/hidemyemail_generator/paypal_two_proxy_flow.py
+  ABSENT -> f587d5fe2af750cc3c93be577f0754885949d0616f73d437bc6337d8ab3677ac
+src/hidemyemail_generator/card_link_runtime.py
+  525364b960ce33bce383077b76d45be61ffaabbc -> 3c9a882cca05a890798d4aa3d1391b65ad5e866b082e523e2c9bb413332e4c90
+src/hidemyemail_generator/openai_card_link_bridge.py
+  8bc036fc7ee678735ade8ea7f289b16838586022 -> 46a3fdccb487fcc3c95b98b4332153167f52dbf626afcffba2c1a6fe194afbf5
+src/hidemyemail_generator/webapp.py
+  527f99f0400be510dd03bdb5406020d04cf81a18 -> 08051dfa24b9374d10aed7d37f08b6625b518258c561b775dbc0ab758440451c
+src/hidemyemail_generator/web_ui/static/app.js
+  46b4cdbfc125d7036a4cc76d68174193bf7a0443 -> 548c1270c91e6dbe3ed381f7d0b51ab5a8c804020f0450ea225ea109b57ac898
+src/hidemyemail_generator/web_ui/static/account_actions.js
+  1d1776118382f5618cf83cfdd3067648ad854a57 -> cb74ca5d5475abfd2c9b50128eedafae1f64d189789480bdc5036feb9d5c192d
+
+PATCH SCOPE
+DIFF_FILE contains exactly 17 task files (runtime, bridge, WebApp, UI,
+Strategy/MVP modules, and their tests). Existing unrelated changes in
+protocol_registration_worker.py, test_protocol_registration.py, userscripts,
+and prior verification directories are excluded and preserved.

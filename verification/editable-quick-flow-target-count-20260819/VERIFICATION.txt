@@ -1,0 +1,65 @@
+目标数量可编辑修复验证
+======================
+
+CHANGED_BRANCH: codex/editable-quick-flow-target-count
+CHANGED_FIELD: quickRegistrationTargetCount / target_count
+RESULT: “目标账号数”在 Mail Auth、Roxy、有头和无头模式中均可编辑；数值不再被并发数或协议模式覆盖，前端持久化后会传给相应后端；协议注册按目标数领取邮箱，并按单独的并发数执行。
+RESTORED_BEHAVIOR_STATUS: 回滚副本恢复为原始状态——非 Roxy 模式锁定目标数，协议目标数强制为 1；6 个文件的 SHA-256 均与原始副本一致。
+
+ARTIFACT_PATHS:
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\editable-quick-flow-target-count-20260819\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\editable-quick-flow-target-count-20260819\DIFF_FILE
+VERIFICATION.txt: D:\AI\hidemyemail-generator\verification\editable-quick-flow-target-count-20260819\VERIFICATION.txt
+ROLLBACK.sh: D:\AI\hidemyemail-generator\verification\editable-quick-flow-target-count-20260819\ROLLBACK.sh
+
+HASHES:
+ORIGINAL_APP_SHA256: 7c8739740f0df86e6f1a8aa6ddb8739352a8068b2faa3e757985eeb740f94eb2
+MODIFIED_APP_SHA256: 409550498a4d41982e0ad3a339f9376ac58b7d98763bec848508bb835286503d
+MODIFIED_FILE_SHA256: 409550498a4d41982e0ad3a339f9376ac58b7d98763bec848508bb835286503d
+DIFF_FILE_SHA256: 94d0bdb211ed28a1fac9a2bcf635dbc957cde873750be569f51036e09ea88373
+
+BASELINE
+COMMAND: .\.venv\Scripts\python.exe -m pytest tests/test_quick_flow_config_ui.py tests/test_registration_tasks.py::RegistrationTaskManagerTests::test_roxy_target_count_claims_all_accounts_but_keeps_five_windows -q
+INPUT: 原始工作树；目标数只允许 Roxy 使用，协议模式会把目标数强制为 1。
+LITERAL_OUTPUT:
+..                                                                       [100%]
+2 passed in 8.57s
+EXIT_STATUS: 0
+
+MODIFIED
+COMMAND: .\.venv\Scripts\python.exe -m pytest tests/test_quick_flow_config_ui.py tests/test_web_ui.py::StructuredWebUiTests::test_one_click_registration_and_card_link_is_a_separate_pipeline_module tests/test_web_ui.py::StructuredWebUiRouteTests::test_browser_registration_keeps_target_count_separate_from_concurrency tests/test_web_ui.py::StructuredWebUiRouteTests::test_protocol_registration_claims_the_editable_target_count tests/test_registration_tasks.py::RegistrationTaskManagerTests::test_roxy_target_count_claims_all_accounts_but_keeps_five_windows tests/test_registration_tasks.py::RegistrationTaskManagerTests::test_camoufox_target_count_is_independent_from_concurrency -q --disable-warnings
+INPUT: 修改后的 MVP 配置链路、浏览器/协议 API 路由和注册任务管理器；验证协议模式可编辑、跨模式保持、协议目标 3/并发 2、Camoufox 目标 7/并发 3。
+LITERAL_OUTPUT:
+......                                                                   [100%]
+6 passed, 152 warnings in 4.31s
+EXIT_STATUS: 0
+
+FULL_RELATED_REGRESSION
+COMMAND: .\.venv\Scripts\python.exe -m pytest tests/test_quick_flow_config_ui.py tests/test_web_ui.py tests/test_registration_tasks.py -q --disable-warnings
+INPUT: 修改后的全部快速流水线 UI、Web UI 路由和注册任务测试。
+LITERAL_RESULT: 88 passed, 1549 warnings in 26.93s
+EXIT_STATUS: 0
+
+ROLLBACK
+COMMAND: & 'C:\Program Files\Git\bin\bash.exe' verification/editable-quick-flow-target-count-20260819/ROLLBACK.sh verification/editable-quick-flow-target-count-20260819/ROLLBACK_TEST_COPY
+INPUT: ROLLBACK_TEST_COPY 中的 6 个修改后文件；原始副本来自 original/，主工作树保持修改状态。
+LITERAL_OUTPUT:
+RESTORED src/hidemyemail_generator/web_ui/static/app.js
+RESTORED src/hidemyemail_generator/webapp.py
+RESTORED src/hidemyemail_generator/registration_tasks.py
+RESTORED tests/test_quick_flow_config_ui.py
+RESTORED tests/test_web_ui.py
+RESTORED tests/test_registration_tasks.py
+ROLLBACK_OK target=/d/AI/hidemyemail-generator/verification/editable-quick-flow-target-count-20260819/ROLLBACK_TEST_COPY files=6
+EXIT_STATUS: 0
+
+ROLLBACK_VERIFICATION
+COMMAND: $verify='verification/editable-quick-flow-target-count-20260819'; compare SHA-256 for six original and rollback-copy files; inspect restored app.js branch predicates
+INPUT: original/ 与 ROLLBACK_TEST_COPY/。
+LITERAL_OUTPUT: {"hashes_restored":true,"restored_behavior":"target locked outside Roxy and protocol target forced to 1","restored_behavior_confirmed":true,"files":6}
+EXIT_STATUS: 0
+
+SOURCE_FILE_LINE_COUNTS:
+src/hidemyemail_generator/web_ui/static/app.js: 4976
+src/hidemyemail_generator/webapp.py: 9279
+STATUS: MODIFIED_FILE 保持修改状态；回滚只在 ROLLBACK_TEST_COPY 上执行。

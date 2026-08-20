@@ -1,0 +1,7 @@
+ROLLBACK_COMMAND=C:\Program Files\Git\bin\bash.exe -lc bash 'D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/ROLLBACK.sh' 'D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/rollback-test.db' 'D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/ORIGINAL_DB_COPY'
+ROLLBACK_OUTPUT=ROLLBACK_TARGET=D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/rollback-test.db | ROLLBACK_SOURCE=D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/ORIGINAL_DB_COPY | ROLLBACK_SHA256=9560782cad5356d2f2220d177cc8132060e0b23b027f3bbce980b25258ccce54 *D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/rollback-test.db
+ROLLBACK_EXIT=0
+ROLLBACK_RESTORED_ACTIVE_DOMAIN=zkgmail.com
+ROLLBACK_RESTORED_SHA256=9560782cad5356d2f2220d177cc8132060e0b23b027f3bbce980b25258ccce54
+ORIGINAL_SHA256=9560782cad5356d2f2220d177cc8132060e0b23b027f3bbce980b25258ccce54
+LIVE_ACTIVE_DOMAIN=shukunlabs.xyz

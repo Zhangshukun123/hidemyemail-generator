@@ -1,0 +1,257 @@
+diff --git a/verification/paypal-gb-transport-recovery-20260820/ORIGINAL_FILE b/verification/paypal-gb-transport-recovery-20260820/MODIFIED_FILE
+index 748bc5a..263746f 100644
+--- a/verification/paypal-gb-transport-recovery-20260820/ORIGINAL_FILE
++++ b/verification/paypal-gb-transport-recovery-20260820/MODIFIED_FILE
+@@ -168,6 +168,26 @@ PIX_TRIAL_PROMOTION_ID = "plus-1-month-free"
+ 
+ PAY_LONG_LINK_TIMEOUT = 30
+ 
++
++@dataclasses.dataclass(frozen=True)
++class OpllTransientRequestRetryPolicy:
++    """Strategy for bounded, in-place retries before a payment mutation."""
++
++    attempts: int = 2
++    retry_delays: tuple[float, ...] = (1.0,)
++    retryable_statuses: frozenset[int] = frozenset({500, 502, 503, 504})
++
++    def delay_after(self, attempt_index: int) -> float:
++        if attempt_index < len(self.retry_delays):
++            return max(0.0, float(self.retry_delays[attempt_index]))
++        return 0.0
++
++    def retries_status(self, status_code: int) -> bool:
++        return int(status_code or 0) in self.retryable_statuses
++
++
++OPLL_TRANSIENT_REQUEST_RETRY = OpllTransientRequestRetryPolicy()
++
+ PAYPAL_NATIVE_PROMO_SYNC_ATTEMPTS = 6
+ 
+ PAYPAL_NATIVE_PROMO_SYNC_INTERVAL_SECONDS = 2.0
+@@ -1851,6 +1871,10 @@ def opll_stripe_init(
+     eid: str = "",
+     saved_payment_method_mode: str = "never",
+     elements_locale_override: str = "",
++    network_attempts: int = 1,
++    network_retry_delays: tuple[float, ...] = (),
++    diagnostic_log=None,
++    diagnostic_prefix: str = "",
+ ) -> dict:
+     cs_id = str(cs_id or "").strip()
+     if not cs_id.startswith("cs_"):
+@@ -1895,14 +1919,63 @@ def opll_stripe_init(
+         request_data["redirect_type"] = str(redirect_type).strip()
+     if str(eid or "").strip():
+         request_data["eid"] = str(eid).strip()
+-    response = stripe_session.post(
+-        f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
+-        data=request_data,
+-        timeout=PAY_LONG_LINK_TIMEOUT,
+-    )
+-    if response.status_code >= 400:
+-        raise RuntimeError(f"stripe init failed: HTTP {response.status_code} {opll_complete_response_body(response)}")
+-    return response.json() or {}
++    total_attempts = max(1, int(network_attempts or 1))
++    prefix = str(diagnostic_prefix or "").strip()
++    if prefix:
++        prefix += " "
++    for attempt_index in range(total_attempts):
++        attempt_no = attempt_index + 1
++        try:
++            response = stripe_session.post(
++                f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
++                data=request_data,
++                timeout=PAY_LONG_LINK_TIMEOUT,
++            )
++        except Exception as exc:
++            if (
++                attempt_no >= total_attempts
++                or not opll_is_retryable_http_transport_error(exc)
++            ):
++                raise
++            delay = (
++                float(network_retry_delays[attempt_index])
++                if attempt_index < len(network_retry_delays)
++                else 0.0
++            )
++            opll_emit_diagnostic(
++                diagnostic_log,
++                f"{prefix}Stripe Init 连接异常，第 {attempt_no}/{total_attempts} "
++                "次失败；保持原 Checkout、原代理、原 Session 与原 Context 重试: "
++                f"{opll_short_error(str(exc), 180)}",
++            )
++            if delay > 0:
++                time.sleep(delay)
++            continue
++        if response.status_code < 400:
++            return response.json() or {}
++        if (
++            attempt_no < total_attempts
++            and OPLL_TRANSIENT_REQUEST_RETRY.retries_status(response.status_code)
++        ):
++            delay = (
++                float(network_retry_delays[attempt_index])
++                if attempt_index < len(network_retry_delays)
++                else 0.0
++            )
++            opll_emit_diagnostic(
++                diagnostic_log,
++                f"{prefix}Stripe Init 暂时返回 HTTP {response.status_code}，第 "
++                f"{attempt_no}/{total_attempts} 次失败；保持原 Checkout、原代理、"
++                "原 Session 与原 Context 重试",
++            )
++            if delay > 0:
++                time.sleep(delay)
++            continue
++        raise RuntimeError(
++            f"stripe init failed: HTTP {response.status_code} "
++            f"{opll_complete_response_body(response)}"
++        )
++    raise RuntimeError("stripe init retry loop ended unexpectedly")
+ 
+ def opll_build_stripe_session(
+     proxy_url: str = "",
+@@ -3829,7 +3902,8 @@ def opll_chatgpt_checkout_taxes(
+ 
+ def opll_is_retryable_http_transport_error(exc: Exception | str) -> bool:
+     """Return True only for transport failures that are safe to retry in-place."""
+-    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
++    request_error_type = getattr(requests, "RequestsError", None)
++    if isinstance(request_error_type, type) and isinstance(exc, request_error_type):
+         return True
+     detail = str(exc or "").strip().lower()
+     if re.search(r"curl:\s*\((?:28|35|52|55|56|92)\)", detail):
+@@ -4297,6 +4371,8 @@ def opll_chatgpt_checkout_warmup(
+     *,
+     diagnostic_log=None,
+     diagnostic_prefix: str = "",
++    network_attempts: int = 1,
++    network_retry_delays: tuple[float, ...] = (),
+ ) -> None:
+     """Warm the exact Checkout page inside one clean approval session."""
+ 
+@@ -4308,29 +4384,71 @@ def opll_chatgpt_checkout_warmup(
+         str(checkout.get("billing_country") or "US"),
+         entity,
+     )
+-    response = chatgpt.get(
+-        checkout_url,
+-        headers={
+-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+-            "Referer": "https://chatgpt.com/",
+-            "sec-fetch-dest": "document",
+-            "sec-fetch-mode": "navigate",
+-            "sec-fetch-site": "same-origin",
+-            "upgrade-insecure-requests": "1",
+-        },
+-        timeout=PAY_LONG_LINK_TIMEOUT,
+-    )
+     prefix = str(diagnostic_prefix or "")
+-    opll_emit_diagnostic(
+-        diagnostic_log,
+-        f"{prefix}Checkout 页面预热: HTTP {response.status_code} "
+-        f"request_id={opll_response_request_id(response) or '<missing>'}",
+-    )
+-    if response.status_code >= 400:
+-        raise OpllChatgptSentinelError(
+-            "Checkout 页面预热失败: "
+-            f"HTTP {response.status_code} {opll_complete_response_body(response)}"
++    total_attempts = max(1, int(network_attempts or 1))
++    response = None
++    for attempt_index in range(total_attempts):
++        attempt_no = attempt_index + 1
++        try:
++            response = chatgpt.get(
++                checkout_url,
++                headers={
++                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
++                    "Referer": "https://chatgpt.com/",
++                    "sec-fetch-dest": "document",
++                    "sec-fetch-mode": "navigate",
++                    "sec-fetch-site": "same-origin",
++                    "upgrade-insecure-requests": "1",
++                },
++                timeout=PAY_LONG_LINK_TIMEOUT,
++            )
++        except Exception as exc:
++            if (
++                attempt_no >= total_attempts
++                or not opll_is_retryable_http_transport_error(exc)
++            ):
++                raise OpllChatgptSentinelError(
++                    "Checkout 页面预热网络失败: "
++                    f"{opll_short_error(str(exc), 220)}"
++                ) from exc
++            opll_emit_diagnostic(
++                diagnostic_log,
++                f"{prefix}Checkout 页面预热连接异常，第 {attempt_no}/{total_attempts} "
++                "次失败；保持原 Checkout 与原代理重试: "
++                f"{opll_short_error(str(exc), 180)}",
++            )
++        else:
++            opll_emit_diagnostic(
++                diagnostic_log,
++                f"{prefix}Checkout 页面预热: HTTP {response.status_code} "
++                f"request_id={opll_response_request_id(response) or '<missing>'}",
++            )
++            if response.status_code < 400:
++                return
++            if not (
++                attempt_no < total_attempts
++                and OPLL_TRANSIENT_REQUEST_RETRY.retries_status(
++                    response.status_code
++                )
++            ):
++                raise OpllChatgptSentinelError(
++                    "Checkout 页面预热失败: "
++                    f"HTTP {response.status_code} "
++                    f"{opll_complete_response_body(response)}"
++                )
++            opll_emit_diagnostic(
++                diagnostic_log,
++                f"{prefix}Checkout 页面预热暂时返回 HTTP "
++                f"{response.status_code}，保持原 Checkout 与原代理重试",
++            )
++        delay = (
++            float(network_retry_delays[attempt_index])
++            if attempt_index < len(network_retry_delays)
++            else 0.0
+         )
++        if delay > 0:
++            time.sleep(delay)
++    raise OpllChatgptSentinelError("Checkout 页面预热重试结束但没有成功响应")
+ 
+ def opll_chatgpt_sentinel_ping(
+     chatgpt: requests.Session | OpllBrowserFetchSession,
+@@ -7360,6 +7478,8 @@ def _generate_opll_paypal_gb_post_approve_long_link(
+             checkout,
+             diagnostic_log=diagnostic_log,
+             diagnostic_prefix="[PayPal GB/GBP] ",
++            network_attempts=OPLL_TRANSIENT_REQUEST_RETRY.attempts,
++            network_retry_delays=OPLL_TRANSIENT_REQUEST_RETRY.retry_delays,
+         )
+ 
+         stripe_factory = browser_runtime.get("stripe_session_factory")
+@@ -7388,6 +7508,10 @@ def _generate_opll_paypal_gb_post_approve_long_link(
+             checkout=checkout,
+             browser_timezone=profile.browser_timezone,
+             elements_locale_override=profile.elements_locale,
++            network_attempts=OPLL_TRANSIENT_REQUEST_RETRY.attempts,
++            network_retry_delays=OPLL_TRANSIENT_REQUEST_RETRY.retry_delays,
++            diagnostic_log=diagnostic_log,
++            diagnostic_prefix="[PayPal GB/GBP]",
+         )
+         initial_page = opll_merge_payment_page_payload(init_payload)
+         stripe_hosted_url = str(
+@@ -7791,6 +7915,10 @@ def _generate_opll_paypal_gb_post_approve_long_link(
+                     checkout=checkout,
+                     browser_timezone=profile.browser_timezone,
+                     elements_locale_override=profile.elements_locale,
++                    network_attempts=OPLL_TRANSIENT_REQUEST_RETRY.attempts,
++                    network_retry_delays=OPLL_TRANSIENT_REQUEST_RETRY.retry_delays,
++                    diagnostic_log=diagnostic_log,
++                    diagnostic_prefix="[PayPal GB/GBP 后置优惠]",
+                 )
+                 promoted_page = opll_merge_payment_page_payload(
+                     post_promotion_init

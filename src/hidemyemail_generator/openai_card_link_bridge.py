@@ -83,7 +83,7 @@ def card_link_error_is_retryable(
 
 
 def detect_link_proxy_identity(app_backend, proxy_url: str) -> dict[str, str]:
-    """Resolve the real create-proxy exit used as the payment identity country."""
+    """Resolve one real proxy exit as a non-secret link identity."""
 
     proxy = str(proxy_url or "").strip()
     detector = getattr(app_backend, "detect_proxy_health", None)
@@ -109,6 +109,239 @@ def detect_link_proxy_identity(app_backend, proxy_url: str) -> dict[str, str]:
     }
 
 
+def detect_paypal_proxy_pair(
+    app_backend,
+    checkout_proxy_url: str,
+    final_proxy_url: str,
+    expected_country: str,
+) -> dict[str, object]:
+    """Validate the PAY153 two-proxy contract and expose safe identities only."""
+
+    checkout_proxy = str(checkout_proxy_url or "").strip()
+    final_proxy = str(final_proxy_url or "").strip()
+    country = str(expected_country or "").strip().upper()
+    if not checkout_proxy or not final_proxy or checkout_proxy == final_proxy:
+        raise RuntimeError(
+            f"PayPal {country}/PAY153 需要两条不同的 {country} 粘性代理"
+        )
+
+    checkout_identity = detect_link_proxy_identity(
+        app_backend,
+        checkout_proxy,
+    )
+    final_identity = detect_link_proxy_identity(
+        app_backend,
+        final_proxy,
+    )
+    checkout_country = str(
+        checkout_identity.get("link_proxy_country") or ""
+    ).upper()
+    final_country = str(final_identity.get("link_proxy_country") or "").upper()
+    checkout_ip = str(checkout_identity.get("link_proxy_ip") or "").strip()
+    final_ip = str(final_identity.get("link_proxy_ip") or "").strip()
+    if not checkout_country or not checkout_ip:
+        raise RuntimeError("代理池 1 提链代理真实出口解析失败")
+    if not final_country or not final_ip:
+        raise RuntimeError("代理池 2 提链代理真实出口解析失败")
+    if checkout_country != country:
+        raise RuntimeError(
+            f"代理池 1 提链代理真实出口国家与 {country} 不一致："
+            f"当前={checkout_country}"
+        )
+    if final_country != country:
+        raise RuntimeError(
+            f"代理池 2 提链代理真实出口国家与 {country} 不一致："
+            f"当前={final_country}"
+        )
+    if checkout_ip == final_ip:
+        raise RuntimeError(
+            f"PayPal {country}/PAY153 两条粘性代理解析到同一出口 IP"
+        )
+    return {
+        "checkout_proxy_country": checkout_country,
+        "checkout_proxy_ip": checkout_ip,
+        "link_proxy_country": final_country,
+        "link_proxy_ip": final_ip,
+        "independent_proxy_pair": True,
+    }
+
+
+def paypal_two_proxy_event_metadata(
+    checkout: dict,
+    *,
+    default_flow: str,
+    expected_country: str,
+) -> dict[str, object]:
+    """Present verified, non-secret two-proxy protocol facts."""
+
+    country = str(expected_country or "").strip().upper()
+    update_count = int(checkout.get("promotion_update_count") or 0)
+    update_country = str(
+        checkout.get("promotion_update_country") or ""
+    ).strip().upper()
+    taxes_performed = bool(checkout.get("checkout_taxes_performed"))
+    taxes_count = int(checkout.get("checkout_taxes_count") or 0)
+    promotion_timing = str(checkout.get("promotion_timing") or "").strip()
+    approval_before_promotion = bool(
+        checkout.get("approval_completed_before_promotion")
+    )
+    same_checkout_promotion = bool(checkout.get("same_checkout_promotion"))
+    if update_count != 1:
+        raise RuntimeError("PayPal 双代理流程必须且只能完成一次 Checkout Update")
+    if update_country != country:
+        raise RuntimeError(
+            "PayPal 双代理优惠 Update 国家不匹配："
+            f"期望={country}，当前={update_country or '<missing>'}"
+        )
+
+    metadata = {
+        "paypal_flow": str(checkout.get("paypal_flow") or default_flow),
+        "variant": str(checkout.get("variant") or default_flow),
+        "promotion_update_count": update_count,
+        "promotion_update_country": update_country,
+        "checkout_taxes_performed": taxes_performed,
+        "checkout_taxes_count": taxes_count,
+        "checkout_taxes_country": str(
+            checkout.get("checkout_taxes_country") or ""
+        ).upper(),
+        "checkout_taxes_currency": str(
+            checkout.get("checkout_taxes_currency") or ""
+        ).upper(),
+        "approval_strategy": str(checkout.get("approval_strategy") or ""),
+        "promotion_timing": promotion_timing,
+        "promotion_checkout_id": str(
+            checkout.get("promotion_checkout_id") or ""
+        ),
+        "approval_completed_before_promotion": approval_before_promotion,
+        "same_checkout_promotion": same_checkout_promotion,
+        "session_proxy_consistent": bool(
+            checkout.get("session_proxy_consistent")
+        ),
+        "stripe_context_consistent": bool(
+            checkout.get("stripe_context_consistent")
+        ),
+        "browser_http_used": bool(checkout.get("browser_http_used")),
+    }
+    if country == "US":
+        taxes_country = str(
+            checkout.get("checkout_taxes_country") or ""
+        ).strip().upper()
+        taxes_currency = str(
+            checkout.get("checkout_taxes_currency") or ""
+        ).strip().upper()
+        if (
+            not taxes_performed
+            or taxes_count != 1
+            or taxes_country != "US"
+            or taxes_currency != "USD"
+        ):
+            raise RuntimeError(
+                "PayPal US/PAY153 必须完成一次 US/USD Checkout Taxes"
+            )
+        return metadata
+
+    if country != "GB":
+        raise RuntimeError(f"PayPal 双代理事件不支持国家：{country or '<missing>'}")
+
+    checkout_id = str(checkout.get("cs_id") or "").strip()
+    promotion_checkout_id = str(
+        checkout.get("promotion_checkout_id") or ""
+    ).strip()
+    stripe_tax_region_count = int(
+        checkout.get("stripe_tax_region_count") or 0
+    )
+    stripe_tax_region_country = str(
+        checkout.get("stripe_tax_region_country") or ""
+    ).strip().upper()
+    snapshot_count = int(checkout.get("checkout_snapshot_count") or 0)
+    update_attempts = int(checkout.get("promotion_update_attempts") or 0)
+    post_init_count = int(checkout.get("post_approval_init_count") or 0)
+    post_init_proxy = str(
+        checkout.get("post_approval_init_proxy_used") or ""
+    ).strip()
+    promotion_proxy = str(checkout.get("promotion_proxy") or "").strip()
+    amount = str(checkout.get("stripe_amount") or "").strip()
+    amount_currency = str(
+        checkout.get("amount_currency")
+        or checkout.get("currency")
+        or ""
+    ).strip().upper()
+    approval_state = str(checkout.get("approval_state") or "").strip().lower()
+    paypal_ba_state = str(
+        checkout.get("paypal_ba_state") or ""
+    ).strip().lower()
+
+    if promotion_timing != "post_approve":
+        raise RuntimeError("PayPal GB 优惠时序必须为 post_approve")
+    if not approval_before_promotion:
+        raise RuntimeError("PayPal GB 优惠 Update 必须发生在 Approval 完成后")
+    if (
+        not checkout_id.startswith("cs_")
+        or promotion_checkout_id != checkout_id
+        or not same_checkout_promotion
+        or not bool(checkout.get("checkout_identity_preserved"))
+    ):
+        raise RuntimeError("PayPal GB 后置优惠必须复用同一标准 Checkout")
+    if not bool(checkout.get("stripe_context_consistent")):
+        raise RuntimeError("PayPal GB 池 1/池 2 必须复用一致的 Stripe Context")
+    if not bool(checkout.get("session_proxy_consistent")):
+        raise RuntimeError("PayPal GB 会话与代理绑定不一致")
+    if taxes_performed or taxes_count != 0:
+        raise RuntimeError("PayPal GB 后置优惠流程不得使用 ChatGPT Checkout Taxes")
+    if stripe_tax_region_count != 1 or stripe_tax_region_country != "GB":
+        raise RuntimeError("PayPal GB 必须完成一次 Stripe tax_region")
+    if snapshot_count != 1:
+        raise RuntimeError("PayPal GB 必须尝试一次 Checkout snapshot")
+    if not 1 <= update_attempts <= 3:
+        raise RuntimeError("PayPal GB 优惠 Update 尝试次数必须在 1 到 3 次之间")
+    if not 1 <= post_init_count <= 3:
+        raise RuntimeError("PayPal GB 池 2 后置 Stripe Init 次数必须在 1 到 3 次之间")
+    if not post_init_proxy or (
+        post_init_proxy.casefold() != "pool2"
+        and (not promotion_proxy or post_init_proxy != promotion_proxy)
+    ):
+        raise RuntimeError("PayPal GB 优惠后 Stripe Init 必须使用池 2")
+    if approval_state != "approved" or paypal_ba_state != "approved":
+        raise RuntimeError("PayPal GB 优惠后 Payment Page 与 PayPal BA 必须保持 approved")
+    if not bool(checkout.get("ba_preserved_after_promotion")):
+        raise RuntimeError("PayPal GB 优惠后必须保留已批准的 PayPal BA")
+    if amount != "0" or amount_currency != "GBP":
+        raise RuntimeError(
+            "PayPal GB 优惠后 Payment Page 必须为 approved + GBP/0"
+        )
+
+    metadata.update(
+        {
+            "promotion_update_attempts": update_attempts,
+            "post_approval_init_count": post_init_count,
+            "post_approval_init_proxy_used": "pool2",
+            "checkout_snapshot_performed": bool(
+                checkout.get("checkout_snapshot_performed")
+            ),
+            "checkout_snapshot_count": snapshot_count,
+            "stripe_tax_region_count": stripe_tax_region_count,
+            "stripe_tax_region_country": stripe_tax_region_country,
+            "approval_state": approval_state,
+            "paypal_ba_state": paypal_ba_state,
+            "ba_preserved_after_promotion": True,
+            "checkout_identity_preserved": True,
+        }
+    )
+    return metadata
+
+
+def paypal_ba_approve_url(runtime, checkout: dict) -> str:
+    """Return a validated PayPal Billing Agreement approval URL."""
+
+    link = str(checkout.get("paypal_ba_approve_url") or "").strip()
+    validator = getattr(runtime, "opll_is_paypal_ba_approve_url", None)
+    if not link or not callable(validator) or not validator(link):
+        raise RuntimeError(
+            "PayPal Checkout 已创建，但未生成有效的 PayPal BA 授权地址"
+        )
+    return link
+
+
 def generate_paypal_us_event(
     token: str,
     create_proxy_url: str,
@@ -121,59 +354,39 @@ def generate_paypal_us_event(
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
-    """Run the embedded PayPal US/USD extractor without another project."""
+    """Run the embedded PayPal US/USD PAY153 two-proxy extractor."""
 
-    promotion_proxy_url = str(create_proxy_url or "").strip()
-    link_proxy_identity = detect_link_proxy_identity(runtime, create_proxy_url)
-    detected_country = str(
-        link_proxy_identity.get("link_proxy_country") or ""
-    ).upper()
-    if detected_country and detected_country != "US":
+    proxy_pair = detect_paypal_proxy_pair(
+        runtime,
+        create_proxy_url,
+        promotion_proxy_url,
+        "US",
+    )
+    normalized_target = str(target_amount or "0").strip() or "0"
+    checkout = runtime.generate_opll_paypal_pay153_long_link(
+        token,
+        create_proxy_url,
+        promotion_proxy_url,
+        normalized_target,
+        account_email=str(account_email or "").strip(),
+        diagnostic_log=diagnostic_log,
+        sentinel_so_enabled=sentinel_so_enabled,
+        session_context=session_context,
+    )
+    link = paypal_ba_approve_url(runtime, checkout)
+    checkout_country = str(checkout.get("billing_country") or "US").upper()
+    checkout_currency = str(checkout.get("currency") or "USD").upper()
+    if (checkout_country, checkout_currency) != ("US", "USD"):
         raise RuntimeError(
-            "提链代理真实出口国家与 US 不一致："
-            f"当前={detected_country}"
+            "PayPal 美国模式返回了错误的 Checkout 国家或币种："
+            f"{checkout_country}/{checkout_currency}"
         )
-    normalized_target = str(target_amount or "").strip()
-    if normalized_target == "0":
-        checkout = runtime.generate_opll_paypal_us_tr_long_link(
-            token,
-            create_proxy_url,
-            promotion_proxy_url,
-            normalized_target,
-            account_email=str(account_email or "").strip(),
-            diagnostic_log=diagnostic_log,
-            sentinel_so_enabled=sentinel_so_enabled,
-            session_context=session_context,
-        )
-    else:
-        checkout = runtime.generate_opll_paypal_long_link(
-            token,
-            "US",
-            "USD",
-            create_proxy_url,
-            promotion_proxy_url,
-            create_proxy_url,
-            normalized_target,
-            account_email=str(account_email or "").strip(),
-            diagnostic_log=diagnostic_log,
-            checkout_create_promotion_only=True,
-            sentinel_so_enabled=sentinel_so_enabled,
-            session_context=session_context,
-        )
-    link = str(
-        checkout.get("paypal_ba_approve_url")
-        or checkout.get("provider_redirect_url")
-        or checkout.get("long_url")
-        or ""
-    ).strip()
-    if not link or not runtime.opll_is_paypal_success_url(link):
-        raise RuntimeError("PayPal Checkout 已创建，但未生成有效的 PayPal 授权地址")
     return {
         "status": "success",
         "url": link,
         "method": "paypal_us",
-        "country": str(checkout.get("billing_country") or "US").upper(),
-        "currency": str(checkout.get("currency") or "USD").upper(),
+        "country": checkout_country,
+        "currency": checkout_currency,
         "payment_link_type": str(checkout.get("payment_link_type") or ""),
         "checkout_ui_mode": str(checkout.get("checkout_ui_mode") or "custom"),
         "checkout_id_type": checkout_id_type(checkout.get("cs_id")),
@@ -186,7 +399,12 @@ def generate_paypal_us_event(
         "amount_verification": str(checkout.get("amount_verification") or ""),
         "promotion_applied": bool(checkout.get("promotion_applied")),
         "promotion_strategy": str(checkout.get("promotion_strategy") or ""),
-        **link_proxy_identity,
+        **paypal_two_proxy_event_metadata(
+            checkout,
+            default_flow="pay153_protocol",
+            expected_country="US",
+        ),
+        **proxy_pair,
     }
 
 
@@ -199,44 +417,50 @@ def generate_paypal_gb_event(
     account_email: str = "",
     sentinel_so_enabled: bool = False,
     session_context: dict | None = None,
+    browser_runtime: dict | None = None,
     diagnostic_log=emit_progress,
     runtime=card_link_runtime,
 ) -> dict:
-    """Run the embedded PayPal GB/GBP zero-amount flow on one GB proxy."""
+    """Run the embedded PayPal GB/GBP PAY153 two-proxy extractor."""
 
     create_proxy_url = str(create_proxy_url or "").strip()
-    promotion_proxy_url = create_proxy_url
-    link_proxy_identity = detect_link_proxy_identity(runtime, create_proxy_url)
-    detected_country = str(
-        link_proxy_identity.get("link_proxy_country") or ""
-    ).upper()
-    if detected_country and detected_country != "GB":
-        raise RuntimeError(
-            "提链代理真实出口国家与 GB 不一致："
-            f"当前={detected_country}"
-        )
-    checkout = runtime.generate_opll_paypal_long_link(
-        token,
-        "GB",
-        "GBP",
+    promotion_proxy_url = str(promotion_proxy_url or "").strip()
+    proxy_pair = detect_paypal_proxy_pair(
+        runtime,
         create_proxy_url,
         promotion_proxy_url,
-        create_proxy_url,
-        "0",
-        account_email=str(account_email or "").strip(),
-        diagnostic_log=diagnostic_log,
-        checkout_create_promotion_only=True,
-        sentinel_so_enabled=sentinel_so_enabled,
-        session_context=session_context,
+        "GB",
     )
-    link = str(
-        checkout.get("paypal_ba_approve_url")
-        or checkout.get("provider_redirect_url")
-        or checkout.get("long_url")
-        or ""
-    ).strip()
-    if not link or not runtime.opll_is_paypal_success_url(link):
-        raise RuntimeError("PayPal Checkout 已创建，但未生成有效的 PayPal 授权地址")
+    normalized_target = str(target_amount or "0").strip() or "0"
+    generator = getattr(
+        runtime,
+        "generate_opll_paypal_gb_two_proxy_long_link",
+        None,
+    )
+    if not callable(generator):
+        generator = getattr(
+            runtime,
+            "generate_opll_paypal_gb_pay153_long_link",
+            None,
+        )
+    if not callable(generator):
+        raise RuntimeError("PayPal GB 双代理运行时入口缺失")
+    generator_kwargs = {
+        "account_email": str(account_email or "").strip(),
+        "diagnostic_log": diagnostic_log,
+        "sentinel_so_enabled": sentinel_so_enabled,
+        "session_context": session_context,
+    }
+    if isinstance(browser_runtime, dict) and browser_runtime:
+        generator_kwargs["browser_runtime"] = browser_runtime
+    checkout = generator(
+        token,
+        create_proxy_url,
+        promotion_proxy_url,
+        normalized_target,
+        **generator_kwargs,
+    )
+    link = paypal_ba_approve_url(runtime, checkout)
     checkout_country = str(checkout.get("billing_country") or "GB").upper()
     checkout_currency = str(checkout.get("currency") or "GBP").upper()
     if (checkout_country, checkout_currency) != ("GB", "GBP"):
@@ -262,7 +486,12 @@ def generate_paypal_gb_event(
         "amount_verification": str(checkout.get("amount_verification") or ""),
         "promotion_applied": bool(checkout.get("promotion_applied")),
         "promotion_strategy": str(checkout.get("promotion_strategy") or ""),
-        **link_proxy_identity,
+        **paypal_two_proxy_event_metadata(
+            checkout,
+            default_flow="gb_two_proxy_promotion",
+            expected_country="GB",
+        ),
+        **proxy_pair,
     }
 
 
@@ -404,7 +633,11 @@ def _worker_generate(
     if not token:
         raise ValueError("Access Token 为空")
     create_proxy_url = str(payload.get("create_proxy_url") or "").strip()
-    promotion_proxy_url = create_proxy_url
+    promotion_proxy_url = str(
+        payload.get("promotion_proxy_url") or ""
+    ).strip()
+    if method == "de_oaics_paypal":
+        promotion_proxy_url = create_proxy_url
     account_email = str(payload.get("account_email") or "").strip()
     target_amount = str(payload.get("target_amount") or "").strip()
     sentinel_so_enabled = payload.get("sentinel_so_enabled") is True
@@ -619,10 +852,6 @@ def main() -> int:
     promotion_proxy_url = str(
         os.environ.get("HME_CARD_LINK_PROMO_PROXY_URL") or ""
     ).strip()
-    if args.method in {"paypal_us", "paypal_gb"}:
-        # PayPal US and GB are intentionally single-proxy: Update, Stripe,
-        # Confirm and Approve keep the same exit identity as Checkout creation.
-        promotion_proxy_url = create_proxy_url
     if not token:
         emit(
             {

@@ -1,0 +1,592 @@
+diff --git a/src/hidemyemail_generator/registration_tasks.py b/src/hidemyemail_generator/registration_tasks.py
+index aaa18d5..bae428c 100644
+--- a/src/hidemyemail_generator/registration_tasks.py
++++ b/src/hidemyemail_generator/registration_tasks.py
+@@ -183,8 +183,6 @@ class RegistrationTaskManager:
+             1
+             if manual_email or provider == "smsbower"
+             else max(1, min(100, requested_target_count))
+-            if selected_browser_engine == "roxy"
+-            else concurrency
+         )
+         reset_browser_state = getattr(self.browser_manager, "reset", None)
+         if callable(reset_browser_state):
+@@ -1539,8 +1537,8 @@ class ConcurrentRegistrationTaskManager:
+         )
+         if selected_browser_engine != "camoufox":
+             process_start_options["browser_engine"] = selected_browser_engine
+-            if target_count is not None:
+-                process_start_options["target_count"] = target_count
++        if target_count is not None:
++            process_start_options["target_count"] = target_count
+         task = manager.start(**process_start_options)
+         process_id = str(task.get("id") or uuid.uuid4().hex)
+         self._processes[process_id] = manager
+diff --git a/src/hidemyemail_generator/web_ui/static/app.js b/src/hidemyemail_generator/web_ui/static/app.js
+index 135ad7b..8ec727c 100644
+--- a/src/hidemyemail_generator/web_ui/static/app.js
++++ b/src/hidemyemail_generator/web_ui/static/app.js
+@@ -787,7 +787,7 @@
+         registrationMode: "hme_quick_registration_mode",
+         protocolSetupCredentials: "hme_quick_protocol_setup_credentials",
+         concurrency: "hme_quick_registration_concurrency",
+-        roxyTargetCount: "hme_quick_registration_target",
++        targetCount: "hme_quick_registration_target",
+         registrationProxyMode: "hme_quick_registration_proxy_mode",
+         registrationProxyCountry: "hme_quick_registration_proxy_country",
+         cardLinkMethod: "hme_quick_card_link_method",
+@@ -818,8 +818,8 @@
+       const textValue = (value, fallback = "") => String(value ?? fallback).trim();
+       const booleanValue = (value, fallback = false) => value === null || value === undefined || value === "" ? Boolean(fallback)
+         : typeof value === "boolean" ? value : ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+-      const roxyTargetCount = integerValue(
+-        candidate.roxyTargetCount ?? candidate.targetCount,
++      const targetCount = integerValue(
++        candidate.targetCount ?? candidate.roxyTargetCount,
+         1,
+         100,
+         1,
+@@ -829,8 +829,9 @@
+         registrationMode: enumValue(candidate.registrationMode, ["headless", "headed", "roxy", "protocol"], "headless"),
+         protocolSetupCredentials: true,
+         concurrency: integerValue(candidate.concurrency, 1, 10, 1),
+-        targetCount: integerValue(candidate.targetCount, 1, 100, Number(roxyTargetCount)),
+-        roxyTargetCount,
++        targetCount,
++        // Retain the legacy field while target count is promoted to a mode-independent setting.
++        roxyTargetCount: targetCount,
+         registrationProxyMode: textValue(candidate.registrationProxyMode, "direct") || "direct",
+         registrationProxyCountry: textValue(candidate.registrationProxyCountry, "NL") || "NL",
+         cardLinkMethod: enumValue(candidate.cardLinkMethod, ["de_oaics_paypal", "paypal_us", "paypal_gb"], "de_oaics_paypal"),
+@@ -990,11 +991,9 @@
+ 
+     persist(stateLabel = "配置已自动保存") {
+       const current = this.view.read();
+-      const previous = this.model.load();
+       const snapshot = this.model.save({
+         ...current,
+-        roxyTargetCount: current.registrationMode === "roxy"
+-          ? current.targetCount : previous.roxyTargetCount,
++        roxyTargetCount: current.targetCount,
+       });
+       this.view.render(snapshot, stateLabel);
+       return snapshot;
+@@ -1976,16 +1975,16 @@
+       $("quickProtocolSetupCredentialsLabel").hidden = !protocolMode;
+       $("quickRegistrationConcurrency").max = protocolMode || roxyMode ? "5" : "10";
+       const quickTargetCount = $("quickRegistrationTargetCount");
+-      quickTargetCount.disabled = !roxyMode;
+-      if (!roxyMode) {
+-        quickTargetCount.value = protocolMode
+-          ? "1" : $("quickRegistrationConcurrency").value;
+-      } else {
+-        const savedTargetCount = Number(localStorage.getItem("hme_quick_registration_target") || 1);
++      quickTargetCount.disabled = false;
++      if (quickTargetCount.dataset.ready !== "1") {
++        const savedTargetCount = Number(
++          localStorage.getItem("hme_quick_registration_target") || quickTargetCount.value || 1
++        );
+         quickTargetCount.value = String(
+           Number.isInteger(savedTargetCount) && savedTargetCount >= 1 && savedTargetCount <= 100
+             ? savedTargetCount : 1
+         );
++        quickTargetCount.dataset.ready = "1";
+       }
+       const targetCount = Number(quickTargetCount.value || 1);
+       const extractionCount = $("quickExtractionCount");
+@@ -1996,7 +1995,7 @@
+       $("quickRegistrationHint").textContent = !registrationProviderReady
+         ? (state.zkgmail?.domain || "cclgmail.com") + " 需要 QQ 邮箱授权码，请先在账号管理中完成配置。"
+         : protocolMode
+-        ? "Mail Auth 协议将获取 1 个" + (registrationProvider === "zkgmail"
++        ? "Mail Auth 协议将按目标数获取 " + targetCount + " 个" + (registrationProvider === "zkgmail"
+           ? " " + (state.zkgmail?.domain || "cclgmail.com") + " 邮箱并从 QQ 邮箱自动取码"
+           : " iCloud 库存邮箱") +
+           "，并强制设置密码与 TOTP 2FA，无需启动浏览器。"
+@@ -2010,7 +2009,6 @@
+               (registrationProvider === "zkgmail" ? " QQ 转发邮箱" : " iCloud 收件箱") + "读取。";
+ 
+       methodSelect.disabled = false;
+-      if (!roxyMode) quickTargetCount.disabled = true;
+       registrationProxyCountrySelect.disabled = registrationProxyModeSelect.value === "direct" ||
+         registrationProxyModeSelect.value === "clash";
+       extractionFirstCountrySelect.disabled = config.fixedProxyCountry ||
+@@ -3780,20 +3778,14 @@
+         }
+         const protocol = mode === "protocol";
+         const roxy = mode === "roxy";
+-        let concurrency = Number($("quickRegistrationConcurrency").value);
+-        let targetCount = Number($("quickRegistrationTargetCount").value);
++        const concurrency = Number($("quickRegistrationConcurrency").value);
++        const targetCount = Number($("quickRegistrationTargetCount").value);
+         const extractionCount = Number($("quickExtractionCount").value);
+         const concurrencyLimit = protocol || roxy ? 5 : 10;
+         if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > concurrencyLimit) {
+           throw new Error("并发窗口必须是 1–" + concurrencyLimit + " 的整数");
+         }
+-        if (protocol) {
+-          concurrency = 1;
+-          targetCount = 1;
+-          this.assertProtocolRuntime();
+-        } else if (!roxy) {
+-          targetCount = concurrency;
+-        }
++        if (protocol) this.assertProtocolRuntime();
+         if (!Number.isInteger(targetCount) || targetCount < 1 || targetCount > 100) {
+           throw new Error("目标账号数必须是 1–100 的整数");
+         }
+@@ -3865,7 +3857,8 @@
+           await this.quickFlowHistoryPresenter.persist(flow);
+           const data = protocol
+             ? await this.api.post("/api/protocol-registration/start", {
+-                provider: registrationProvider, concurrency: 1, setup_credentials: true,
++                provider: registrationProvider, concurrency,
++                target_count: targetCount, setup_credentials: true,
+               })
+             : await this.api.post("/api/registration/start", {
+                 label: registrationProviderLabel + "一键注册、提链并协议支付",
+diff --git a/src/hidemyemail_generator/webapp.py b/src/hidemyemail_generator/webapp.py
+index c335931..f74bf87 100644
+--- a/src/hidemyemail_generator/webapp.py
++++ b/src/hidemyemail_generator/webapp.py
+@@ -6771,8 +6771,6 @@ def create_app(
+         if provider in {"manual", "smsbower"}:
+             concurrency = 1
+             target_count = 1
+-        elif browser_engine != "roxy":
+-            target_count = concurrency
+         email = str(payload.get("email") or "").strip().lower()
+         if provider == "manual" and (
+             not email
+@@ -6790,12 +6788,12 @@ def create_app(
+                 label=label,
+                 headless=bool(payload.get("headless", False)),
+                 concurrency=concurrency,
++                target_count=target_count,
+                 email=email,
+                 provider=provider,
+             )
+             if browser_engine != "camoufox":
+                 registration_options["browser_engine"] = browser_engine
+-                registration_options["target_count"] = target_count
+             task = app["registration_manager"].start(**registration_options)
+         except (RuntimeError, ValueError) as error:
+             return web.json_response(
+@@ -6928,6 +6926,14 @@ def create_app(
+             return web.json_response(
+                 {"ok": False, "error": "协议注册并发必须是 1–5"}, status=400
+             )
++        try:
++            target_count = int(payload.get("target_count") or 1)
++        except (TypeError, ValueError):
++            target_count = 0
++        if not 1 <= target_count <= 100:
++            return web.json_response(
++                {"ok": False, "error": "目标账号数必须是 1–100"}, status=400
++            )
+         # Every user-facing protocol registration must finish with a confirmed
+         # password and an enabled TOTP factor.  Older clients may still send
+         # setup_credentials=false; keep accepting the field for compatibility,
+@@ -6938,63 +6944,77 @@ def create_app(
+             return web.json_response(
+                 {"ok": False, "error": "协议注册暂不支持该邮箱来源"}, status=400
+             )
+-        inventory_email = ""
+-        zkgmail_email = ""
++        inventory_emails: list[str] = []
++        zkgmail_emails: list[str] = []
++
++        async def release_acquired_emails(message: str) -> None:
++            for email in inventory_emails:
++                await complete_registration_inventory_email(email, False, message)
++            for email in zkgmail_emails:
++                await app["zkgmail_client"].cancel_email(email, message)
++
+         if provider == "inventory":
+-            try:
+-                inventory_email = await acquire_registration_inventory_email(
+-                    "iCloud 邮箱协议注册"
+-                )
+-            except RuntimeError as error:
+-                return web.json_response(
+-                    {"ok": False, "error": str(error)}, status=409
+-                )
+-            if not inventory_email:
+-                return web.json_response(
+-                    {
+-                        "ok": False,
+-                        "code": "inventory_empty",
+-                        "error": "iCloud 未注册库存为空",
+-                    },
+-                    status=409,
+-                )
++            for index in range(target_count):
++                try:
++                    email = await acquire_registration_inventory_email(
++                        f"iCloud 邮箱协议注册 {index + 1}/{target_count}"
++                    )
++                except RuntimeError as error:
++                    await release_acquired_emails(str(error))
++                    return web.json_response(
++                        {"ok": False, "error": str(error)}, status=409
++                    )
++                if not email:
++                    await release_acquired_emails("协议注册目标数量领取未完成")
++                    return web.json_response(
++                        {
++                            "ok": False,
++                            "code": "inventory_empty",
++                            "error": (
++                                f"iCloud 未注册库存不足：目标 {target_count} 个，"
++                                f"实际领取 {len(inventory_emails)} 个"
++                            ),
++                        },
++                        status=409,
++                    )
++                inventory_emails.append(email)
+         elif provider == "zkgmail":
+-            try:
+-                zkgmail_email = str(
+-                    await app["zkgmail_client"].acquire_email(
+-                        "QQ 转发邮箱协议注册"
++            for index in range(target_count):
++                try:
++                    email = str(
++                        await app["zkgmail_client"].acquire_email(
++                            f"QQ 转发邮箱协议注册 {index + 1}/{target_count}"
++                        )
++                    ).strip().lower()
++                except (ValueError, RuntimeError) as error:
++                    await release_acquired_emails(str(error))
++                    return web.json_response(
++                        {"ok": False, "error": str(error)}, status=409
+                     )
+-                ).strip().lower()
+-            except (ValueError, RuntimeError) as error:
+-                return web.json_response(
+-                    {"ok": False, "error": str(error)}, status=409
+-                )
+-            if not valid_account_email(zkgmail_email):
+-                return web.json_response(
+-                    {
+-                        "ok": False,
+-                        "code": "zkgmail_generation_failed",
+-                        "error": "未生成有效的 QQ 转发注册邮箱",
+-                    },
+-                    status=409,
+-                )
+-
+-        acquired_email = inventory_email or zkgmail_email
++                if not valid_account_email(email):
++                    await release_acquired_emails("QQ 转发注册邮箱生成未完成")
++                    return web.json_response(
++                        {
++                            "ok": False,
++                            "code": "zkgmail_generation_failed",
++                            "error": (
++                                f"QQ 转发注册邮箱生成不足：目标 {target_count} 个，"
++                                f"实际生成 {len(zkgmail_emails)} 个"
++                            ),
++                        },
++                        status=409,
++                    )
++                zkgmail_emails.append(email)
+ 
+-        async def release_acquired_email(message: str) -> None:
+-            if inventory_email:
+-                await complete_registration_inventory_email(
+-                    inventory_email, False, message
+-                )
+-            elif zkgmail_email:
+-                await app["zkgmail_client"].cancel_email(zkgmail_email, message)
++        acquired_emails = [*inventory_emails, *zkgmail_emails]
++        acquired_email = acquired_emails[0] if acquired_emails else ""
+ 
+         async def complete_acquired_email(
+             email: str, success: bool, message: str
+         ) -> None:
+-            if inventory_email:
++            if email in inventory_emails:
+                 await complete_registration_inventory_email(email, success, message)
+-            elif zkgmail_email:
++            elif email in zkgmail_emails:
+                 await app["zkgmail_client"].complete_email(
+                     email, success, message
+                 )
+@@ -7015,20 +7035,22 @@ def create_app(
+             }
+         # A newly acquired provider address is a valid registration input even
+         # though it is not yet an active Apple identity or a stored GPT account.
+-        if acquired_email and acquired_email not in accounts_by_email:
++        for acquired in acquired_emails:
++            if acquired in accounts_by_email:
++                continue
+             account = await asyncio.to_thread(
+-                load_account_record, app["db_file"], acquired_email
++                load_account_record, app["db_file"], acquired
+             )
+             session = account_session(account)
+             access_token = account_session_access_token(account)
+-            accounts_by_email[acquired_email] = {
+-                "email": acquired_email,
++            accounts_by_email[acquired] = {
++                "email": acquired,
+                 "registrationComplete": bool(session and access_token),
+             }
+         run_all = bool(payload.get("all"))
+         force_recheck = bool(payload.get("force"))
+-        if acquired_email:
+-            requested = [acquired_email]
++        if acquired_emails:
++            requested = acquired_emails
+         elif run_all:
+             requested = list(accounts_by_email)
+         else:
+@@ -7047,7 +7069,7 @@ def create_app(
+             or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
+         ]
+         if invalid:
+-            await release_acquired_email("注册邮箱未能导入本地账号列表")
++            await release_acquired_emails("注册邮箱未能导入本地账号列表")
+             return web.json_response(
+                 {
+                     "ok": False,
+@@ -7067,7 +7089,7 @@ def create_app(
+         ]
+         skipped = len(requested) - len(pending)
+         if not pending:
+-            await release_acquired_email("邮箱已完成协议注册")
++            await release_acquired_emails("邮箱已完成协议注册")
+             message = (
+                 (
+                     "全部账号的密码、Session 与 TOTP 2FA 均已完成"
+@@ -7087,16 +7109,16 @@ def create_app(
+                 "concurrency": concurrency,
+                 "setup_credentials": setup_credentials,
+             }
+-            if acquired_email:
++            if acquired_emails:
+                 start_options["on_account_finished"] = complete_acquired_email
+             task = app["protocol_registration_manager"].start(**start_options)
+         except ValueError as error:
+-            await release_acquired_email(str(error))
++            await release_acquired_emails(str(error))
+             return web.json_response(
+                 {"ok": False, "error": str(error)}, status=400
+             )
+         except RuntimeError as error:
+-            await release_acquired_email(str(error))
++            await release_acquired_emails(str(error))
+             return web.json_response(
+                 {"ok": False, "error": str(error)}, status=409
+             )
+@@ -7108,6 +7130,8 @@ def create_app(
+                 "skipped": skipped,
+                 "provider": provider or "selected",
+                 "email": acquired_email,
++                "emails": acquired_emails,
++                "targetCount": len(pending),
+                 "task": task,
+             }
+         )
+diff --git a/tests/test_quick_flow_config_ui.py b/tests/test_quick_flow_config_ui.py
+index 5e439cf..0028cf0 100644
+--- a/tests/test_quick_flow_config_ui.py
++++ b/tests/test_quick_flow_config_ui.py
+@@ -178,8 +178,16 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
+             "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).protocolSetupCredentials"
+         ) is True
+         assert "密码 + 2FA" in page.locator("#quickFlowSavedConfigSummary").inner_text()
++        protocol_target = page.locator("#quickRegistrationTargetCount")
++        assert protocol_target.is_enabled()
++        protocol_target.fill("4")
++        protocol_target.dispatch_event("change")
++        assert page.evaluate(
++            "JSON.parse(localStorage.getItem('hme_quick_flow_config_v1')).targetCount"
++        ) == "4"
+ 
+         page.locator("#quickRegistrationMode").select_option("roxy")
++        assert page.locator("#quickRegistrationTargetCount").input_value() == "4"
+         page.locator("#quickRegistrationConcurrency").fill("3")
+         page.locator("#quickRegistrationConcurrency").dispatch_event("change")
+         page.locator("#quickRegistrationTargetCount").fill("7")
+@@ -190,7 +198,11 @@ def test_quick_flow_restores_saved_config_and_keeps_start_visible_when_collapsed
+         page.locator("#quickExtractionCount").dispatch_event("change")
+ 
+         page.locator("#quickRegistrationMode").select_option("headed")
+-        assert page.locator("#quickRegistrationTargetCount").input_value() == "3"
++        assert page.locator("#quickRegistrationTargetCount").is_enabled()
++        assert page.locator("#quickRegistrationTargetCount").input_value() == "7"
++        page.locator("#quickRegistrationMode").select_option("protocol")
++        assert page.locator("#quickRegistrationTargetCount").is_enabled()
++        assert page.locator("#quickRegistrationTargetCount").input_value() == "7"
+         page.locator("#quickRegistrationMode").select_option("roxy")
+         assert page.locator("#quickRegistrationTargetCount").input_value() == "7"
+ 
+diff --git a/tests/test_registration_tasks.py b/tests/test_registration_tasks.py
+index c08b842..a9627ef 100644
+--- a/tests/test_registration_tasks.py
++++ b/tests/test_registration_tasks.py
+@@ -1531,6 +1531,36 @@ class RegistrationTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(browser.start_options["concurrency"], 5)
+         self.assertEqual(len(browser.started_accounts), 12)
+ 
++    async def test_camoufox_target_count_is_independent_from_concurrency(self):
++        browser = FakeBrowserManager()
++        inventory = [f"target-{index}@icloud.com" for index in range(1, 8)]
++
++        async def acquire(_label):
++            return inventory.pop(0) if inventory else ""
++
++        manager = RegistrationTaskManager(
++            browser_manager=browser,
++            acquire_email=acquire,
++            confirm_email=lambda _email: asyncio.sleep(0),
++            release_email=lambda _email: asyncio.sleep(0),
++        )
++        state = manager.start(
++            label="Camoufox 目标注册",
++            headless=True,
++            concurrency=3,
++            target_count=7,
++        )
++
++        self.assertEqual(state["targetCount"], 7)
++        self.assertEqual(state["concurrency"], 3)
++        await asyncio.wait_for(manager._task, timeout=5)
++
++        snapshot = manager.snapshot()
++        self.assertEqual(snapshot["status"], "completed")
++        self.assertEqual(snapshot["claimed"], 7)
++        self.assertEqual(browser.start_options["concurrency"], 3)
++        self.assertEqual(len(browser.started_accounts), 7)
++
+     async def test_single_roxy_browser_finalizes_first_account_before_second(self):
+         events = []
+ 
+diff --git a/tests/test_web_ui.py b/tests/test_web_ui.py
+index 32c1bd3..b091372 100644
+--- a/tests/test_web_ui.py
++++ b/tests/test_web_ui.py
+@@ -352,6 +352,8 @@ class StructuredWebUiTests(unittest.TestCase):
+         )
+         self.assertIn('this.api.post("/api/registration/start"', page)
+         self.assertIn('this.api.post("/api/protocol-registration/start"', page)
++        self.assertIn("quickTargetCount.disabled = false", page)
++        self.assertIn("target_count: targetCount, setup_credentials: true", page)
+         self.assertIn('this.api.post("/api/account/card-link"', page)
+         self.assertIn('this.commands.register("retry-quick-card-link"', page)
+         self.assertIn('data-action="retry-quick-card-link"', page)
+@@ -1059,6 +1061,38 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
+         self.assertNotIn("stale", payload["runtime"])
+         self.assertIn("available", payload["runtime"])
+ 
++    async def test_browser_registration_keeps_target_count_separate_from_concurrency(self):
++        class RegistrationManagerStub:
++            def __init__(self):
++                self.options = None
++
++            def start(self, **options):
++                self.options = options
++                return {"status": "running", "running": True}
++
++            async def close(self):
++                return None
++
++        manager = RegistrationManagerStub()
++        self.app["registration_manager"] = manager
++
++        response = await self.client.post(
++            "/api/registration/start",
++            headers={"X-Local-Token": self.app["local_token"]},
++            json={
++                "provider": "inventory",
++                "browser_engine": "camoufox",
++                "concurrency": 2,
++                "target_count": 6,
++            },
++        )
++        payload = await response.json()
++
++        self.assertEqual(response.status, 200)
++        self.assertTrue(payload["started"])
++        self.assertEqual(manager.options["concurrency"], 2)
++        self.assertEqual(manager.options["target_count"], 6)
++
+     async def test_protocol_registration_start_rejects_empty_account_pool(self):
+         response = await self.client.post(
+             "/api/protocol-registration/start",
+@@ -1132,6 +1166,73 @@ class StructuredWebUiRouteTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(inventory.completed[0][:3], (email, True, "registered"))
+         self.assertIsNotNone(inventory.completed[0][3])
+ 
++    async def test_protocol_registration_claims_the_editable_target_count(self):
++        emails = [f"inventory-protocol-{index}@icloud.com" for index in range(1, 4)]
++
++        class InventoryClientStub:
++            def __init__(self):
++                self.available = list(emails)
++                self.completed = []
++
++            async def acquire_email(self, _label):
++                return self.available.pop(0) if self.available else ""
++
++            def leased_record(self, leased_email):
++                return {
++                    "email": leased_email,
++                    "address": {
++                        "email": leased_email,
++                        "state": "unused",
++                        "source": "generated",
++                    },
++                }
++
++            async def complete_email(
++                self, completed_email, success, message, *, record=None
++            ):
++                self.completed.append((completed_email, success, message, record))
++
++        class ProtocolManagerStub:
++            def __init__(self):
++                self.options = None
++
++            def start(self, **options):
++                self.options = options
++                return {"status": "running", "running": True}
++
++            async def close(self):
++                return None
++
++        inventory = InventoryClientStub()
++        manager = ProtocolManagerStub()
++        self.app["inventory_client"] = inventory
++        self.app["inventory_initial_sync_complete"] = True
++        self.app["protocol_registration_manager"] = manager
++
++        response = await self.client.post(
++            "/api/protocol-registration/start",
++            headers={"X-Local-Token": self.app["local_token"]},
++            json={
++                "provider": "inventory",
++                "concurrency": 2,
++                "target_count": 3,
++            },
++        )
++        payload = await response.json()
++
++        self.assertEqual(response.status, 200)
++        self.assertEqual(payload["emails"], emails)
++        self.assertEqual(payload["targetCount"], 3)
++        self.assertEqual(manager.options["emails"], emails)
++        self.assertEqual(manager.options["concurrency"], 2)
++        for email in emails:
++            await manager.options["on_account_finished"](
++                email, True, "registered"
++            )
++        self.assertEqual(
++            [completed[0] for completed in inventory.completed], emails
++        )
++
+     async def test_protocol_registration_can_generate_one_zkgmail_email(self):
+         email = "protocol-zkgmail@zkgmail.com"
+ 

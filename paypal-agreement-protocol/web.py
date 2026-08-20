@@ -48,6 +48,10 @@ from paypal.payment_completion import (
     is_strict_https_url,
     is_trusted_openai_checkout_url,
 )
+from paypal.payment_protocol import (
+    CURRENT_PAYMENT_PROTOCOL,
+    PAYMENT_PROTOCOL_PRESENTER,
+)
 from paypal.proxy import ProxyConfig, ProxyEntry, build_proxy_config
 from paypal.proxy_health import ProxyHealthChecker
 from paypal.runtime_country_resolver import infer_dynamic_kyc, resolve_runtime_country_schema, validate_runtime_address, validate_runtime_phone
@@ -883,6 +887,7 @@ class WebJob:
     sms_max_price: float = SMSBOWER_DEFAULT_MAX_PRICE
     sms_virtual: bool = False
     buyer_mode: str = "identity_elevation"
+    payment_protocol: str = CURRENT_PAYMENT_PROTOCOL
     debug: bool = False
     max_card_attempts: int = 5
     manual_funding: bool = False
@@ -1535,6 +1540,7 @@ class WebJob:
                 "phone_verification": sanitize_payload(self.phone_verification),
                 "us_onboarding": us_onboarding,
                 "buyer_mode": self.buyer_mode,
+                "payment_protocol": self.payment_protocol,
                 "debug": self.debug and ALLOW_DEBUG_LOGS,
                 "max_card_attempts": self.max_card_attempts,
                 "manual_funding": self.manual_funding,
@@ -1678,7 +1684,7 @@ class WebPayPalFlow(PayPalFlow):
             # onboarding presenter requests it instead of rejecting the empty
             # placeholder here.
             phone_error = ""
-            if self.user.phone or self.country != "US":
+            if self.user.phone or not self._uses_us_email_first():
                 phone_error = validate_runtime_phone(
                     runtime_schema, self.user.phone_local, self.user.phone
                 )
@@ -1812,7 +1818,7 @@ class WebPayPalFlow(PayPalFlow):
     def acquire_phone_after_email(self) -> str:
         """View: acquire/validate the US phone only after email submission."""
 
-        if self.country != "US":
+        if not self._uses_us_email_first():
             return str(self.user.phone or "")
         if not getattr(self.state, "email_submitted", False):
             raise RuntimeError(
@@ -1866,7 +1872,7 @@ class WebPayPalFlow(PayPalFlow):
     def _phase3_signup_and_2fa(self):
         self._set_stage(
             "Phase 3：手机验证登录与登录态绑卡"
-            if self.country == "US"
+            if self._uses_us_email_first()
             else "Phase 3：短信验证与注册"
         )
         return super()._phase3_signup_and_2fa()
@@ -2655,6 +2661,7 @@ def create_job(
     checkout_reference: str = "",
     country: str = "BR",
     buyer_mode: str = "identity_elevation",
+    payment_protocol: str = CURRENT_PAYMENT_PROTOCOL,
     proxy_pool: Any = None,
     exclude_public_metrics: bool = False,
     source_account_email: str = "",
@@ -2698,6 +2705,10 @@ def create_job(
     buyer_mode = str(buyer_mode or "identity_elevation").strip().lower()
     if buyer_mode not in {"original", "identity_elevation"}:
         raise ValueError("Buyer 模式参数不正确")
+    payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
+        payment_protocol,
+        country,
+    )
     allowed_countries = supported_country_codes() if ENABLE_DYNAMIC_COUNTRIES else VERIFIED_PROTOCOL_COUNTRIES
     if country not in allowed_countries:
         raise ValueError("PayPal 国家参数不正确")
@@ -2815,6 +2826,7 @@ def create_job(
         sms_country=sms_country if automatic_sms else "",
         sms_max_price=sms_max_price,
         buyer_mode=buyer_mode,
+        payment_protocol=payment_protocol_profile.name,
         debug=debug,
         max_card_attempts=max_card_attempts,
         manual_funding=bool(manual_funding),
@@ -2907,8 +2919,12 @@ def run_job(job: WebJob) -> None:
             )
             job._proxy_config = proxy_config
             job.check_cancelled()
+            payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
+                job.payment_protocol,
+                job.country,
+            )
             defer_us_phone = bool(
-                job.country == "US"
+                payment_protocol_profile.uses_us_email_first
                 and job.sms_provider in AUTOMATIC_SMS_PROVIDERS
             )
             if job.sms_provider in AUTOMATIC_SMS_PROVIDERS and not defer_us_phone:
@@ -2930,7 +2946,10 @@ def run_job(job: WebJob) -> None:
                     "US PayPal automatic phone acquisition deferred until the email step succeeds"
                 )
             user = generate_user(job.phone, country=job.country)
-            if job.country == "US" and job.source_account_email:
+            if (
+                payment_protocol_profile.uses_source_account_email
+                and job.source_account_email
+            ):
                 user.email = job.source_account_email
                 logger.info("US PayPal account creation will use the source account email")
             job.check_cancelled()
@@ -2960,6 +2979,7 @@ def run_job(job: WebJob) -> None:
                 "Buyer mode: {}",
                 "identity_elevation" if job.buyer_mode == "identity_elevation" else "original",
             )
+            logger.info("Payment protocol: {}", payment_protocol_profile.name)
             flow = flow_class(
                 ba_token=job.ba_token,
                 user=user,
@@ -2967,6 +2987,7 @@ def run_job(job: WebJob) -> None:
                 address=address,
                 max_card_attempts=max(job.max_card_attempts, 8 if job.country == "BH" else 1),
                 proxy_config=proxy_config,
+                payment_protocol=payment_protocol_profile.name,
                 job=job,
             )
             job._flow = flow
@@ -3327,6 +3348,9 @@ class WebHandler(BaseHTTPRequestHandler):
                     sms_max_price=data.get("sms_max_price") or SMSBOWER_DEFAULT_MAX_PRICE,
                     country=data.get("country") or data.get("paypal_country") or "BR",
                     buyer_mode=data.get("buyer_mode") or "identity_elevation",
+                    payment_protocol=(
+                        data.get("payment_protocol") or CURRENT_PAYMENT_PROTOCOL
+                    ),
                     debug=False,
                     max_card_attempts=5,
                     # Braintree link generation is now independent from the

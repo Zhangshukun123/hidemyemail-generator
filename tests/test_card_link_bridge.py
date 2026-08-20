@@ -14,9 +14,12 @@ from hidemyemail_generator import card_link_runtime
 from hidemyemail_generator.openai_card_link_bridge import (
     EVENT_PREFIX,
     card_link_error_is_retryable,
+    detect_paypal_proxy_pair,
     generate_paypal_gb_event,
     generate_paypal_de_event,
     generate_paypal_us_event,
+    paypal_ba_approve_url,
+    paypal_two_proxy_event_metadata,
 )
 from scripts.vendor_card_link_runtime import source_segment_with_decorators
 
@@ -71,9 +74,56 @@ class _ApprovalSession:
 
 
 class CardLinkBridgeTests(unittest.TestCase):
+    @staticmethod
+    def _gb_post_approve_checkout(**overrides):
+        checkout = {
+            "cs_id": "cs_test_gb",
+            "billing_country": "GB",
+            "currency": "GBP",
+            "paypal_ba_approve_url": (
+                "https://www.paypal.com/agreements/approve?ba_token=gb_test"
+            ),
+            "payment_link_type": "paypal_approve",
+            "stripe_amount": "0",
+            "amount_currency": "GBP",
+            "amount_verification": "checkout_update",
+            "promotion_applied": True,
+            "promotion_strategy": (
+                "standard_checkout_confirm_approve_then_same_checkout_update"
+            ),
+            "paypal_flow": "gb_two_proxy_promotion",
+            "variant": "gb_two_proxy_promotion",
+            "promotion_update_count": 1,
+            "promotion_update_attempts": 1,
+            "promotion_update_country": "GB",
+            "promotion_timing": "post_approve",
+            "promotion_checkout_id": "cs_test_gb",
+            "approval_completed_before_promotion": True,
+            "same_checkout_promotion": True,
+            "checkout_identity_preserved": True,
+            "session_proxy_consistent": True,
+            "stripe_context_consistent": True,
+            "checkout_taxes_performed": False,
+            "checkout_taxes_count": 0,
+            "checkout_snapshot_performed": False,
+            "checkout_snapshot_count": 1,
+            "stripe_tax_region_count": 1,
+            "stripe_tax_region_country": "GB",
+            "post_approval_init_count": 1,
+            "post_approval_init_proxy_used": "pool2",
+            "approval_state": "approved",
+            "paypal_ba_state": "approved",
+            "ba_preserved_after_promotion": True,
+            "approval_strategy": (
+                "pool1_prefetch_confirm_requires_approval_then_approve_poll"
+            ),
+        }
+        checkout.update(overrides)
+        return checkout
+
     def _run_us_oaics_promotion_case(self, create_amount):
         first_proxy = "http://us-sticky.example:8000"
-        ignored_proxy = "socks5://ignored-followup.example:9000"
+        second_proxy = "socks5://us-final.example:9000"
         oaics_id = "oaics_us_promotion_behavior"
         stripe_id = "cs_live_uspromotionbehavior"
         paypal_url = (
@@ -178,6 +228,13 @@ class CardLinkBridgeTests(unittest.TestCase):
                     },
                 )
             )
+            checkout_taxes = stack.enter_context(
+                patch.object(
+                    card_link_runtime,
+                    "opll_chatgpt_checkout_taxes",
+                    return_value={"status": "success"},
+                )
+            )
             create_method = stack.enter_context(
                 patch.object(
                     card_link_runtime,
@@ -214,7 +271,7 @@ class CardLinkBridgeTests(unittest.TestCase):
             result = card_link_runtime.generate_opll_paypal_us_tr_long_link(
                 "at-test",
                 first_proxy,
-                ignored_proxy,
+                second_proxy,
                 "0",
                 account_email="member@icloud.com",
                 diagnostic_log=diagnostics.append,
@@ -224,7 +281,7 @@ class CardLinkBridgeTests(unittest.TestCase):
         return SimpleNamespace(
             result=result,
             first_proxy=first_proxy,
-            ignored_proxy=ignored_proxy,
+            second_proxy=second_proxy,
             oaics_id=oaics_id,
             stripe_id=stripe_id,
             chatgpt_session=chatgpt_session,
@@ -240,6 +297,7 @@ class CardLinkBridgeTests(unittest.TestCase):
             apply_promotion=apply_promotion,
             wait_for_page=wait_for_page,
             billing=billing,
+            checkout_taxes=checkout_taxes,
             create_method=create_method,
             confirm=confirm,
             redirect=redirect,
@@ -277,6 +335,48 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.country, "US")
         self.assertEqual(result.ip, "203.0.113.1")
+
+    def test_pay153_proxy_pair_rejects_wrong_country_and_same_exit(self):
+        first_proxy = "http://first.example:8000"
+        second_proxy = "http://second.example:9000"
+        cases = (
+            ("GB", "203.0.113.20", "代理池 2.*国家与 US 不一致"),
+            ("US", "203.0.113.10", "同一出口 IP"),
+        )
+        for final_country, final_ip, message in cases:
+            with self.subTest(final_country=final_country, final_ip=final_ip):
+                def detect(proxy, **_options):
+                    if proxy == first_proxy:
+                        country, ip = "US", "203.0.113.10"
+                    else:
+                        country, ip = final_country, final_ip
+                    return SimpleNamespace(
+                        success=True,
+                        country=country,
+                        ip=ip,
+                        error="",
+                        failed_stage="",
+                    )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    detect_paypal_proxy_pair(
+                        SimpleNamespace(detect_proxy_health=detect),
+                        first_proxy,
+                        second_proxy,
+                        "US",
+                    )
+
+    def test_paypal_event_requires_explicit_ba_approve_field(self):
+        runtime = SimpleNamespace(
+            opll_is_paypal_ba_approve_url=lambda value: "ba_token=" in value,
+        )
+        checkout = {
+            "provider_redirect_url": "https://paypal.com/checkout?token=not-ba",
+            "long_url": "https://paypal.com/checkout?token=not-ba",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "PayPal BA 授权地址"):
+            paypal_ba_approve_url(runtime, checkout)
 
     def test_runtime_vendor_preserves_class_decorators(self):
         source = (
@@ -545,36 +645,68 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["method"], "de_oaics_paypal")
         self.assertNotIn("cs_live_private_checkout", process.stdout)
 
-    def test_runs_us_paypal_authorization_flow_with_embedded_runtime(self):
-        def generate(token, country, currency, create, followup, approve, target, **options):
+    def test_runs_us_pay153_with_two_us_proxy_identities(self):
+        first_proxy = "http://us-first.example:8000"
+        second_proxy = "socks5://us-second.example:9000"
+
+        def detect(proxy, **options):
+            self.assertEqual(
+                options,
+                {"check_stripe": False, "check_chatgpt": False},
+            )
+            ip = {
+                first_proxy: "203.0.113.40",
+                second_proxy: "203.0.113.41",
+            }[proxy]
+            return SimpleNamespace(
+                success=True,
+                country="US",
+                ip=ip,
+                error="",
+                failed_stage="",
+            )
+
+        def generate(token, create, final, target, **options):
             self.assertEqual(token, "at-test")
-            self.assertEqual((country, currency), ("US", "USD"))
-            self.assertEqual(create, "http://create.example:8000")
-            self.assertEqual(followup, create)
-            self.assertEqual(approve, create)
-            self.assertEqual(target, "1933")
+            self.assertEqual((create, final), (first_proxy, second_proxy))
+            self.assertEqual(target, "0")
             self.assertEqual(options["account_email"], "member@icloud.com")
-            self.assertTrue(options["checkout_create_promotion_only"])
             self.assertTrue(options["sentinel_so_enabled"])
             return {
-                "cs_id": "cs_test_us",
+                "cs_id": "oaics_test_us",
                 "billing_country": "US",
                 "currency": "USD",
                 "paypal_ba_approve_url": "https://www.paypal.com/agreements/approve?ba_token=us_test",
                 "payment_link_type": "paypal_approve",
-                "stripe_amount": "1933",
+                "stripe_amount": "0",
                 "amount_currency": "USD",
+                "amount_verification": "checkout_update",
+                "promotion_applied": True,
+                "promotion_strategy": "checkout_check_then_region_update",
+                "paypal_flow": "pay153_protocol",
+                "variant": "pay153_protocol",
+                "promotion_update_count": 1,
+                "promotion_update_country": "US",
+                "checkout_taxes_performed": True,
+                "checkout_taxes_count": 1,
+                "checkout_taxes_country": "US",
+                "checkout_taxes_currency": "USD",
+                "approval_strategy": "pool2_clean_session_sentinel_then_approve",
+                "promotion_proxy": "credential-bearing-value-must-not-leak",
             }
 
         runtime = SimpleNamespace(
-            generate_opll_paypal_long_link=generate,
+            detect_proxy_health=detect,
+            generate_opll_paypal_pay153_long_link=generate,
+            opll_is_paypal_ba_approve_url=lambda value: value.endswith("us_test"),
             opll_is_paypal_success_url=lambda value: value.endswith("us_test"),
         )
+
         event = generate_paypal_us_event(
             "at-test",
-            "http://create.example:8000",
-            "socks5://ignored-followup.example:9000",
-            "1933",
+            first_proxy,
+            second_proxy,
+            "0",
             account_email="member@icloud.com",
             sentinel_so_enabled=True,
             runtime=runtime,
@@ -583,13 +715,78 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["method"], "paypal_us")
         self.assertEqual(event["country"], "US")
         self.assertEqual(event["currency"], "USD")
-        self.assertEqual(event["amount"], "1933")
+        self.assertEqual(event["amount"], "0")
+        self.assertEqual(event["checkout_proxy_ip"], "203.0.113.40")
+        self.assertEqual(event["link_proxy_ip"], "203.0.113.41")
+        self.assertTrue(event["independent_proxy_pair"])
+        self.assertEqual(event["promotion_update_count"], 1)
+        self.assertTrue(event["checkout_taxes_performed"])
+        self.assertNotIn("promotion_proxy", event)
 
-    def test_runs_gb_paypal_zero_flow_entirely_on_first_proxy(self):
+    def test_us_bridge_still_requires_one_usd_checkout_taxes_call(self):
+        checkout = {
+            "promotion_update_count": 1,
+            "promotion_update_country": "US",
+            "checkout_taxes_performed": False,
+            "checkout_taxes_count": 0,
+            "checkout_taxes_country": "US",
+            "checkout_taxes_currency": "USD",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "US/USD Checkout Taxes"):
+            paypal_two_proxy_event_metadata(
+                checkout,
+                default_flow="pay153_protocol",
+                expected_country="US",
+            )
+
+    def test_cli_preserves_pay153_second_proxy_for_us_and_gb(self):
+        from hidemyemail_generator import openai_card_link_bridge
+
+        create_proxy = "http://pool1:user-secret@create.example:8000"
+        final_proxy = "socks5://pool2:user-secret@final.example:9000"
+        for method, generator_name in (
+            ("paypal_us", "generate_paypal_us_event"),
+            ("paypal_gb", "generate_paypal_gb_event"),
+        ):
+            with self.subTest(method=method):
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "HME_OPENAI_ACCESS_TOKEN": "at-cli-test",
+                            "HME_CARD_LINK_CREATE_PROXY_URL": create_proxy,
+                            "HME_CARD_LINK_PROMO_PROXY_URL": final_proxy,
+                        },
+                        clear=True,
+                    ),
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["openai_card_link_bridge.py", "--method", method],
+                    ),
+                    patch.object(
+                        openai_card_link_bridge,
+                        generator_name,
+                        return_value={
+                            "status": "success",
+                            "url": "https://www.paypal.com/agreements/approve?ba_token=test",
+                            "method": method,
+                        },
+                    ) as generator,
+                    patch.object(openai_card_link_bridge, "emit"),
+                ):
+                    exit_status = openai_card_link_bridge.main()
+
+                self.assertEqual(exit_status, 0)
+                self.assertEqual(generator.call_args.args[1], create_proxy)
+                self.assertEqual(generator.call_args.args[2], final_proxy)
+
+    def test_runs_gb_pay153_with_pool2_as_link_identity(self):
         first_proxy = "http://gb-first.example:8000"
+        second_proxy = "socks5://gb-second.example:9000"
 
         def detect(proxy, **options):
-            self.assertEqual(proxy, first_proxy)
             self.assertEqual(
                 options,
                 {"check_stripe": False, "check_chatgpt": False},
@@ -597,42 +794,33 @@ class CardLinkBridgeTests(unittest.TestCase):
             return SimpleNamespace(
                 success=True,
                 country="GB",
-                ip="203.0.113.44",
+                ip={
+                    first_proxy: "203.0.113.44",
+                    second_proxy: "203.0.113.45",
+                }[proxy],
                 error="",
                 failed_stage="",
             )
 
-        def generate(token, country, currency, create, followup, approve, target, **options):
+        def generate(token, create, final, target, **options):
             self.assertEqual(token, "at-test")
-            self.assertEqual((country, currency), ("GB", "GBP"))
-            self.assertEqual((create, followup, approve), (first_proxy,) * 3)
+            self.assertEqual((create, final), (first_proxy, second_proxy))
             self.assertEqual(target, "0")
             self.assertEqual(options["account_email"], "member@icloud.com")
-            self.assertTrue(options["checkout_create_promotion_only"])
             self.assertTrue(options["sentinel_so_enabled"])
-            return {
-                "cs_id": "cs_test_gb",
-                "billing_country": "GB",
-                "currency": "GBP",
-                "paypal_ba_approve_url": "https://www.paypal.com/agreements/approve?ba_token=gb_test",
-                "payment_link_type": "paypal_approve",
-                "stripe_amount": "0",
-                "amount_currency": "GBP",
-                "amount_verification": "checkout_update",
-                "promotion_applied": True,
-                "promotion_strategy": "post_init_update",
-            }
+            return self._gb_post_approve_checkout()
 
         runtime = SimpleNamespace(
             detect_proxy_health=detect,
-            generate_opll_paypal_long_link=generate,
+            generate_opll_paypal_gb_two_proxy_long_link=generate,
+            opll_is_paypal_ba_approve_url=lambda value: value.endswith("gb_test"),
             opll_is_paypal_success_url=lambda value: value.endswith("gb_test"),
         )
         event = generate_paypal_gb_event(
             "at-test",
             first_proxy,
-            "socks5://ignored-second.example:9000",
-            "999",
+            second_proxy,
+            "0",
             account_email="member@icloud.com",
             sentinel_so_enabled=True,
             runtime=runtime,
@@ -643,7 +831,86 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["currency"], "GBP")
         self.assertEqual(event["amount"], "0")
         self.assertEqual(event["link_proxy_country"], "GB")
-        self.assertEqual(event["link_proxy_ip"], "203.0.113.44")
+        self.assertEqual(event["checkout_proxy_ip"], "203.0.113.44")
+        self.assertEqual(event["link_proxy_ip"], "203.0.113.45")
+        self.assertEqual(event["promotion_update_country"], "GB")
+        self.assertFalse(event["checkout_taxes_performed"])
+        self.assertEqual(event["stripe_tax_region_count"], 1)
+        self.assertEqual(event["checkout_snapshot_count"], 1)
+        self.assertFalse(event["checkout_snapshot_performed"])
+        self.assertEqual(event["post_approval_init_proxy_used"], "pool2")
+        self.assertEqual(event["approval_state"], "approved")
+        self.assertEqual(event["paypal_flow"], "gb_two_proxy_promotion")
+        self.assertEqual(event["variant"], "gb_two_proxy_promotion")
+
+    def test_gb_bridge_accepts_failed_best_effort_snapshot_attempt(self):
+        metadata = paypal_two_proxy_event_metadata(
+            self._gb_post_approve_checkout(
+                checkout_snapshot_performed=False,
+                checkout_snapshot_count=1,
+            ),
+            default_flow="gb_two_proxy_promotion",
+            expected_country="GB",
+        )
+
+        self.assertFalse(metadata["checkout_snapshot_performed"])
+        self.assertEqual(metadata["checkout_snapshot_count"], 1)
+        self.assertEqual(metadata["stripe_tax_region_country"], "GB")
+
+    def test_gb_bridge_rejects_unverified_post_approve_results(self):
+        invalid_cases = (
+            (
+                {"stripe_tax_region_count": 0},
+                "Stripe tax_region",
+            ),
+            (
+                {"checkout_snapshot_count": 0},
+                "Checkout snapshot",
+            ),
+            (
+                {"stripe_amount": "1"},
+                "approved \\+ GBP/0",
+            ),
+            (
+                {"approval_state": "requires_approval"},
+                "必须保持 approved",
+            ),
+            (
+                {"promotion_checkout_id": "cs_other"},
+                "同一标准 Checkout",
+            ),
+            (
+                {"stripe_context_consistent": False},
+                "Stripe Context",
+            ),
+            (
+                {"post_approval_init_proxy_used": "pool1"},
+                "必须使用池 2",
+            ),
+            (
+                {"promotion_update_count": 2},
+                "且只能完成一次",
+            ),
+            (
+                {"promotion_update_attempts": 4},
+                "尝试次数",
+            ),
+            (
+                {
+                    "checkout_taxes_performed": True,
+                    "checkout_taxes_count": 1,
+                },
+                "不得使用 ChatGPT Checkout Taxes",
+            ),
+        )
+        for overrides, message in invalid_cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    paypal_two_proxy_event_metadata(
+                        self._gb_post_approve_checkout(**overrides),
+                        default_flow="gb_two_proxy_promotion",
+                        expected_country="GB",
+                    )
 
     def test_de_paypal_uses_checkout_create_promotion_without_update_proxy(self):
         first_proxy = "http://de-first.example:8000"
@@ -686,27 +953,41 @@ class CardLinkBridgeTests(unittest.TestCase):
         self.assertEqual(event["method"], "de_oaics_paypal")
         self.assertEqual(event["promotion_strategy"], "checkout_create")
 
-    def test_us_create_zero_amount_skips_checkout_promotion_update(self):
+    def test_us_create_zero_amount_still_updates_once_on_second_proxy(self):
         case = self._run_us_oaics_promotion_case(create_amount=0)
 
-        case.update_checkout.assert_not_called()
-        case.fetch_checkout.assert_called_once()
-        self.assertIs(case.fetch_checkout.call_args.kwargs["chatgpt"], case.chatgpt_session)
-        self.assertEqual(case.build_chatgpt.call_args.args[1], case.first_proxy)
+        case.update_checkout.assert_called_once()
+        update_args = case.update_checkout.call_args.args
+        update_kwargs = case.update_checkout.call_args.kwargs
+        self.assertEqual(update_args[0], "at-test")
+        self.assertEqual(update_args[1]["cs_id"], case.oaics_id)
+        self.assertEqual(update_args[2], case.second_proxy)
+        self.assertTrue(update_kwargs["include_checkout_context"])
+        case.fetch_checkout.assert_not_called()
+        self.assertEqual(
+            [call.args[1] for call in case.build_chatgpt.call_args_list],
+            [case.first_proxy, case.second_proxy, case.second_proxy],
+        )
         self.assertEqual(case.create_checkout.call_args.args[3], case.first_proxy)
         self.assertTrue(case.create_checkout.call_args.kwargs["include_trial_promo"])
         self.assertEqual(case.stripe_init.call_args.args[0], case.stripe_id)
-        self.assertEqual(case.stripe_init.call_args.args[3], case.first_proxy)
+        self.assertEqual(case.stripe_init.call_args.args[3], case.second_proxy)
         self.assertEqual(
             case.stripe_init.call_args.kwargs["browser_timezone"],
             "America/New_York",
         )
         case.apply_promotion.assert_not_called()
+        self.assertEqual(case.checkout_taxes.call_args.args[3], case.second_proxy)
         self.assertEqual(case.result["cs_id"], case.oaics_id)
-        self.assertEqual(case.result["promotion_strategy"], "checkout_create")
-        self.assertEqual(case.result["promotion_proxy"], "")
+        self.assertEqual(
+            case.result["promotion_strategy"],
+            "checkout_check_then_us_update",
+        )
+        self.assertEqual(case.result["promotion_proxy"], case.second_proxy)
+        self.assertEqual(case.result["promotion_update_count"], 1)
+        self.assertTrue(any("唯一一次 Update" in item for item in case.diagnostics))
 
-    def test_us_create_nonzero_amount_updates_original_oaics_once_on_same_proxy(self):
+    def test_us_create_nonzero_amount_updates_original_oaics_once_on_second_proxy(self):
         case = self._run_us_oaics_promotion_case(create_amount=1933)
 
         case.update_checkout.assert_called_once()
@@ -714,20 +995,21 @@ class CardLinkBridgeTests(unittest.TestCase):
         update_kwargs = case.update_checkout.call_args.kwargs
         self.assertEqual(update_args[0], "at-test")
         self.assertEqual(update_args[1]["cs_id"], case.oaics_id)
-        self.assertEqual(update_args[2], case.first_proxy)
+        self.assertEqual(update_args[2], case.second_proxy)
         self.assertIs(update_kwargs["session"], case.chatgpt_session)
         self.assertTrue(update_kwargs["include_checkout_context"])
-        self.assertEqual(case.build_chatgpt.call_args.args[1], case.first_proxy)
+        self.assertEqual(case.build_chatgpt.call_args.args[1], case.second_proxy)
         case.fetch_checkout.assert_not_called()
         case.apply_promotion.assert_not_called()
         self.assertEqual(case.stripe_init.call_args.args[0], case.stripe_id)
-        self.assertEqual(case.stripe_init.call_args.args[3], case.first_proxy)
+        self.assertEqual(case.stripe_init.call_args.args[3], case.second_proxy)
+        self.assertEqual(case.checkout_taxes.call_args.args[3], case.second_proxy)
         self.assertEqual(case.result["cs_id"], case.oaics_id)
         self.assertEqual(
             case.result["promotion_strategy"],
-            "checkout_create_then_single_update",
+            "checkout_check_then_us_update",
         )
-        self.assertEqual(case.result["promotion_proxy"], case.first_proxy)
+        self.assertEqual(case.result["promotion_proxy"], case.second_proxy)
         self.assertTrue(any("唯一一次 Update" in item for item in case.diagnostics))
 
     def test_approve_blocked_retries_with_fresh_session_on_same_proxy_in_order(self):
@@ -865,11 +1147,25 @@ class CardLinkBridgeTests(unittest.TestCase):
 
     def test_us_paypal_zero_target_uses_embedded_zero_amount_flow(self):
         logs = []
+        first_proxy = "http://us-first.example:8000"
+        second_proxy = "socks5://us-second.example:9000"
 
-        def generate(token, create, followup, target, **options):
+        def detect(proxy, **_options):
+            return SimpleNamespace(
+                success=True,
+                country="US",
+                ip={
+                    first_proxy: "192.0.2.10",
+                    second_proxy: "192.0.2.20",
+                }[proxy],
+                error="",
+                failed_stage="",
+            )
+
+        def generate(token, create, final, target, **options):
             self.assertEqual(token, "at-test")
-            self.assertEqual(create, "http://create.example:8000")
-            self.assertEqual(followup, create)
+            self.assertEqual(create, first_proxy)
+            self.assertEqual(final, second_proxy)
             self.assertEqual(target, "0")
             self.assertEqual(options["account_email"], "member@icloud.com")
             options["diagnostic_log"](
@@ -883,16 +1179,24 @@ class CardLinkBridgeTests(unittest.TestCase):
                 "payment_link_type": "paypal_approve",
                 "stripe_amount": "0",
                 "amount_currency": "USD",
+                "promotion_update_count": 1,
+                "promotion_update_country": "US",
+                "checkout_taxes_performed": True,
+                "checkout_taxes_count": 1,
+                "checkout_taxes_country": "US",
+                "checkout_taxes_currency": "USD",
             }
 
         runtime = SimpleNamespace(
-            generate_opll_paypal_us_tr_long_link=generate,
+            detect_proxy_health=detect,
+            generate_opll_paypal_pay153_long_link=generate,
+            opll_is_paypal_ba_approve_url=lambda value: value.endswith("us_zero"),
             opll_is_paypal_success_url=lambda value: value.endswith("us_zero"),
         )
         event = generate_paypal_us_event(
             "at-test",
-            "http://create.example:8000",
-            "socks5://ignored-followup.example:9000",
+            first_proxy,
+            second_proxy,
             "0",
             account_email="member@icloud.com",
             diagnostic_log=logs.append,

@@ -1,0 +1,115 @@
+icloud.8-208-13-52.sslip.io {
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:18765
+}
+
+icloud-code.8-208-13-52.sslip.io {
+	header Strict-Transport-Security "max-age=31536000"
+
+	@health {
+		method GET
+		path /healthz
+	}
+	handle @health {
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@favicon {
+		method GET
+		path /favicon.ico
+	}
+	handle @favicon {
+		respond 204
+	}
+
+	@openai_code {
+		method POST
+		path /api/integrations/workbench/openai-code
+	}
+	handle @openai_code {
+		request_body {
+			max_size 256KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@registration_inventory {
+		method GET POST
+		path /api/integrations/registration-inventory/*
+	}
+	handle @registration_inventory {
+		request_body {
+			max_size 4MB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_login {
+		method GET
+		path /login
+	}
+	handle @portal_login {
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_auth_api {
+		method POST
+		path /api/login /api/logout
+	}
+	handle @portal_auth_api {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_access {
+		method GET
+		path /access /code
+	}
+	handle @portal_access {
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@portal_code {
+		method POST
+		path /api/code/latest
+	}
+	handle @portal_code {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	@root path /
+	handle @root {
+		rewrite * /code
+		reverse_proxy 127.0.0.1:18767
+	}
+
+	handle {
+		respond 404
+	}
+}
+
+http://8.208.13.52 {
+	@autoreg_exact path /auto-reg
+	redir @autoreg_exact /auto-reg/ 308
+
+	handle_path /auto-reg/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:18080
+	}
+}
+
+http://grok.sub23ycy.top {
+	reverse_proxy 127.0.0.1:8765
+}
+
+sub23ycy.top, www.sub23ycy.top {
+	reverse_proxy 127.0.0.1:8080
+}

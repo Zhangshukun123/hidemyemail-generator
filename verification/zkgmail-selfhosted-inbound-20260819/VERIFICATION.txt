@@ -1,0 +1,45 @@
+# Self-hosted inbound email verification
+
+BRANCH: codex/editable-quick-flow-target-count
+CHANGED_FIELD: settings.zkgmail_qq_inbox_config_v1.activeDomain
+CHANGED_VALUE: zkgmail.com -> shukunlabs.xyz
+
+FIREWALL_CHANGE:
+- Alibaba SWAS instance: Hermes Agent-vwlh (8.208.13.52)
+- Added rule: TCP 25, source 0.0.0.0/0, remark SMTP 入站收件
+- Console result: 创建规则成功
+- Public TCP probe before: 5/5 external nodes timed out
+- Public TCP probe after: request 47f69fe2k660; br1 0.228573s, hk1 0.180937s, ir5 0.101543s, ir7 0.090315s, rs1 0.043259s
+
+ARTIFACTS:
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\DIFF_FILE
+VERIFICATION_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\VERIFICATION.txt
+ROLLBACK_FILE: D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\ROLLBACK.sh
+ORIGINAL_SHA256: 9560782cad5356d2f2220d177cc8132060e0b23b027f3bbce980b25258ccce54
+MODIFIED_FILE_SHA256: 538ca1681584ec4457e7a32aacf62bb6ab9090793777094fa654caf026456f2c
+
+BASELINE:
+COMMAND: $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe .\verification\zkgmail-selfhosted-inbound-20260819\verify_active_domain.py .\verification\zkgmail-selfhosted-inbound-20260819\ORIGINAL_DB_COPY
+INPUT: D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\ORIGINAL_DB_COPY
+LITERAL_OUTPUT: zkgmail.com
+EXIT_STATUS: 0
+
+MODIFIED:
+COMMAND: $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe .\verification\zkgmail-selfhosted-inbound-20260819\verify_active_domain.py .\hidemyemail.db
+INPUT: D:\AI\hidemyemail-generator\hidemyemail.db
+LITERAL_OUTPUT: shukunlabs.xyz
+EXIT_STATUS: 0
+
+ROLLBACK:
+COMMAND: C:\Program Files\Git\bin\bash.exe -lc "bash 'D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/ROLLBACK.sh' 'D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/rollback-test.db' 'D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/ORIGINAL_DB_COPY'"
+INPUT: MODIFIED_FILE copied to D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\rollback-test.db, then rollback source D:\AI\hidemyemail-generator\verification\zkgmail-selfhosted-inbound-20260819\ORIGINAL_DB_COPY
+LITERAL_OUTPUT: ROLLBACK_TARGET=D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/rollback-test.db | ROLLBACK_SOURCE=D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/ORIGINAL_DB_COPY | ROLLBACK_SHA256=9560782cad5356d2f2220d177cc8132060e0b23b027f3bbce980b25258ccce54 *D:/AI/hidemyemail-generator/verification/zkgmail-selfhosted-inbound-20260819/rollback-test.db
+EXIT_STATUS: 0
+RESTORED_BEHAVIOR: rollback-test.db activeDomain=zkgmail.com and SHA256 equals ORIGINAL_SHA256; live hidemyemail.db remains activeDomain=shukunlabs.xyz.
+
+SMTP_RUNTIME:
+- Postfix 3.5.8 active on mail.shukunlabs.xyz, local banner: 220 mail.shukunlabs.xyz ESMTP Postfix
+- Inbound log: out203-205-221-236.mail.qq.com connected and completed ehlo/starttls/mail/rcpt/data/quit
+- Delivery log: diagnostic test delivered locally and status=sent to 352121354@qq.com (250 OK: queued as.)
+- QQ IMAP verification: subject SMTP inbound firewall verification found in INBOX, count=1, exit status 0

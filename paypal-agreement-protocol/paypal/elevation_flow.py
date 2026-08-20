@@ -39,7 +39,7 @@ class IdentityElevationPayPalFlow(PayPalFlow):
             and getattr(self, "_ae_pre_hydrated", False)
         )
         preserve_us_email_first = bool(
-            country == "US"
+            self._uses_us_email_first()
             and getattr(self.state, "member_authenticated", False)
             and getattr(self.state, "funding_selected", False)
         )
@@ -250,9 +250,8 @@ class IdentityElevationPayPalFlow(PayPalFlow):
         logger.info("--- Identity elevation: guest checkout -> member checkout ---")
         self.session.set_euat_token(self.state.euat_token)
 
-        country = str(getattr(self.address, "country", "") or "").upper()
         if (
-            country == "US"
+            self._uses_us_email_first()
             and self.state.member_authenticated
             and self.state.funding_selected
         ):

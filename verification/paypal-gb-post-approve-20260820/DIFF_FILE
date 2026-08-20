@@ -1,0 +1,4483 @@
+--- a/src/hidemyemail_generator/_card_link_payment_modes.py
++++ b/src/hidemyemail_generator/_card_link_payment_modes.py
+@@ -105,7 +105,7 @@
+     "PayPal支付链接 GB/GBP": {
+         "country": "GB",
+         "currency": "GBP",
+-        # 英区零元流程与美区同拓扑，但保留独立协议标识。
++        # 英区使用独立后置优惠拓扑：标准 Checkout/BA 后再 Update。
+         "zero_target_paypal_flow": PAYPAL_GB_TWO_PROXY_FLOW,
+     },
+     "PayPal支付链接 CA/CAD": {"country": "CA", "currency": "CAD"},
+--- a/src/hidemyemail_generator/card_link_runtime.py
++++ b/src/hidemyemail_generator/card_link_runtime.py
+@@ -138,6 +138,11 @@
+     PAYPAL_US_PROTOCOL_PROFILE,
+     PayPalProtocolProfile,
+ )
++from .paypal_gb_post_approve_flow import (
++    DiagnosticPayPalGbPostApproveView,
++    PayPalGbPostApproveModel,
++    PayPalGbPostApprovePresenter,
++)
+ 
+ CHATGPT_BASE_URL = "https://chatgpt.com"
+ 
+@@ -182,12 +187,12 @@
+ PAYPAL_NATIVE_APPROVE_RETRY_INTERVAL_SECONDS = 1.0
+ 
+ 
+-def opll_paypal_checkout_sentinel_headers(
+-    proxy_url: str,
+-    device_id: str,
+-    request_locale: str,
+-) -> dict[str, str]:
+-    """Generate the flow-bound SEN + SO headers for one checkout creation."""
++def opll_paypal_checkout_sentinel_headers(
++    proxy_url: str,
++    device_id: str,
++    request_locale: str,
++) -> dict[str, str]:
++    """Generate the flow-bound SEN + SO headers for one checkout creation."""
+ 
+     from .vendor.gptfree_register.core.gpt_trial_protocol.models import (
+         BrowserProfile,
+@@ -218,15 +223,16 @@
+         proxy=str(proxy_url or "").strip() or None,
+         device_id=profile.device_id,
+     )
+-    bundle = provider.get_openai_sentinel(purpose="checkout")
+-    headers = bundle.sentinel.as_headers()
+-    if not headers.get("openai-sentinel-token"):
+-        raise OpllChatgptSentinelError("Checkout SEN 主令牌生成失败")
+-    if not headers.get("openai-sentinel-so-token"):
+-        raise OpllChatgptSentinelError("Checkout SO 附加令牌生成失败")
+-    return headers
+-
+-@dataclasses.dataclass(frozen=True)
++    bundle = provider.get_openai_sentinel(purpose="checkout")
++    headers = bundle.sentinel.as_headers()
++    if not headers.get("openai-sentinel-token"):
++        raise OpllChatgptSentinelError("Checkout SEN 主令牌生成失败")
++    if not headers.get("openai-sentinel-so-token"):
++        raise OpllChatgptSentinelError("Checkout SO 附加令牌生成失败")
++    return headers
++
++
++@dataclasses.dataclass(frozen=True)
+ class ProxyHealthResult:
+     success: bool
+     ip: str = ""
+@@ -1015,7 +1021,7 @@
+         f"{quote(opll_chatgpt_success_return_url(cs_id, country, processor_entity), safe='')}"
+     )
+ 
+-def opll_stripe_confirm_return_url(cs_id: str, checkout: dict, stripe_hosted_url: str) -> str:
++def opll_stripe_confirm_return_url(cs_id: str, checkout: dict, stripe_hosted_url: str) -> str:
+     hosted_url = opll_to_openai_pay_url(stripe_hosted_url) or opll_stripe_checkout_long_url(
+         cs_id,
+         checkout["billing_country"],
+@@ -1033,7 +1039,114 @@
+             ),
+         )
+         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+-    return hosted_url
++    return hosted_url
++
++
++def opll_paypal_gb_confirm_return_url(
++    cs_id: str,
++    checkout: dict,
++    stripe_hosted_url: str,
++) -> str:
++    """Build the exact hosted Stripe return URL used by the GB flow."""
++
++    checkout_id = str(cs_id or "").strip()
++    if not checkout_id.startswith("cs_"):
++        raise RuntimeError(
++            "PayPal GB Confirm 缺少有效 Stripe Checkout Session ID"
++        )
++    success_url = opll_chatgpt_success_return_url(
++        checkout_id,
++        str((checkout or {}).get("billing_country") or "GB"),
++        str((checkout or {}).get("processor_entity") or ""),
++    )
++    hosted_url = str(stripe_hosted_url or "").strip()
++    try:
++        parsed = urlsplit(hosted_url)
++        valid_hosted_url = bool(
++            parsed.scheme.lower() == "https"
++            and parsed.hostname == "checkout.stripe.com"
++            and parsed.username is None
++            and parsed.password is None
++            and parsed.port is None
++            and parsed.path == f"/c/pay/{checkout_id}"
++        )
++    except ValueError:
++        parsed = None
++        valid_hosted_url = False
++    if not valid_hosted_url or parsed is None:
++        raise RuntimeError(
++            "PayPal GB Confirm 的 Stripe hosted URL 与当前 Checkout "
++            "Session 不匹配"
++        )
++    query = urlencode(
++        (
++            ("returned_from_redirect", "true"),
++            ("ui_mode", "custom"),
++            ("return_url", success_url),
++        )
++    )
++    return urlunsplit(
++        (
++            "https",
++            parsed.netloc,
++            parsed.path,
++            query,
++            parsed.fragment,
++        )
++    )
++
++
++def opll_require_paypal_gb_confirm_return_url(
++    return_url: str,
++    cs_id: str,
++    stripe_hosted_url: str,
++) -> str:
++    """Validate the nested Stripe-to-ChatGPT GB return URL contract."""
++
++    value = str(return_url or "").strip()
++    parsed = urlsplit(value)
++    if parsed.scheme != "https" or parsed.netloc != "checkout.stripe.com":
++        raise RuntimeError(
++            "PayPal GB Confirm return_url must use checkout.stripe.com"
++        )
++    if parsed.path != f"/c/pay/{str(cs_id or '').strip()}":
++        raise RuntimeError("PayPal GB Confirm return_url has the wrong Checkout path")
++    query = parse_qs(parsed.query, keep_blank_values=True)
++    if set(query) != {"returned_from_redirect", "ui_mode", "return_url"}:
++        raise RuntimeError(
++            "PayPal GB Confirm return_url must contain only "
++            "returned_from_redirect, ui_mode and return_url"
++        )
++    if (
++        query["returned_from_redirect"] != ["true"]
++        or query["ui_mode"] != ["custom"]
++    ):
++        raise RuntimeError("PayPal GB Confirm return_url has invalid Stripe flags")
++    inner_values = query.get("return_url") or []
++    inner = urlsplit(inner_values[0] if len(inner_values) == 1 else "")
++    if (
++        inner.scheme != "https"
++        or inner.netloc != "chatgpt.com"
++        or inner.path != "/checkout/verify"
++    ):
++        raise RuntimeError(
++            "PayPal GB Confirm inner return_url must use ChatGPT verify"
++        )
++    inner_query = parse_qs(inner.query, keep_blank_values=True)
++    if inner_query.get("stripe_session_id") != [str(cs_id or "").strip()]:
++        raise RuntimeError(
++            "PayPal GB Confirm inner return_url has the wrong session"
++        )
++    if inner_query.get("processor_entity") != ["openai_llc"]:
++        raise RuntimeError(
++            "PayPal GB Confirm inner return_url has the wrong entity"
++        )
++    hosted_fragment = urlsplit(str(stripe_hosted_url or "").strip()).fragment
++    if hosted_fragment and parsed.fragment != hosted_fragment:
++        raise RuntimeError(
++            "PayPal GB Confirm return_url did not preserve Stripe fragment"
++        )
++    return value
+ 
+ def opll_new_http_session(*, fresh_connections: bool = False) -> requests.Session:
+     if CurlCffiSession is not None:
+@@ -1072,7 +1185,7 @@
+     def json(self):
+         return json.loads(self.text) if self.text else {}
+ 
+-class OpllBrowserFetchSession:
++class OpllBrowserFetchSession:
+     """Issue HTTP requests from inside a real Camoufox page via window.fetch."""
+ 
+     _FORBIDDEN_HEADER_NAMES = {
+@@ -1087,14 +1200,38 @@
+         "user-agent",
+     }
+ 
+-    def __init__(self, page, log=None, label: str = ""):
+-        self.page = page
+-        self.log = log
+-        self.label = str(label or "").strip() or "Camoufox"
+-        self.headers: dict[str, str] = {}
+-        self.proxies: dict[str, str] = {}
+-        self.trust_env = False
+-        self.opll_oai_device_id = ""
++    def __init__(
++        self,
++        page,
++        log=None,
++        label: str = "",
++        *,
++        proxy_url: str = "",
++    ):
++        self.page = page
++        self.log = log
++        self.label = str(label or "").strip() or "Camoufox"
++        self.headers: dict[str, str] = {}
++        self.proxies: dict[str, str] = {}
++        self.cookies = requests.cookies.Cookies()
++        self.trust_env = False
++        self.opll_oai_device_id = ""
++        self.bound_proxy_url = ""
++        if str(proxy_url or "").strip():
++            self.bind_proxy(proxy_url)
++
++    def bind_proxy(self, proxy_url: str) -> None:
++        """Bind metadata to the proxy already owning the BrowserContext."""
++
++        normalized = normalize_proxy_url(proxy_url)
++        if not normalized:
++            raise RuntimeError(f"{self.label} 浏览器 HTTP 层缺少有效绑定代理")
++        if self.bound_proxy_url and self.bound_proxy_url != normalized:
++            raise RuntimeError(
++                f"{self.label} 浏览器 HTTP 层禁止从已绑定代理切换到另一代理"
++            )
++        self.bound_proxy_url = normalized
++        self.proxies.update({"http": normalized, "https": normalized})
+ 
+     def close(self) -> None:
+         return None
+@@ -1117,29 +1254,53 @@
+             and not key.lower().startswith(("proxy-", "sec-"))
+         }
+ 
+-    def _sync_cookie_header(self) -> None:
+-        cookie_header = next(
+-            (
+-                str(value or "")
++    def _sync_cookie_header(self) -> None:
++        cookie_values: dict[str, str] = {}
++        cookie_jar = getattr(self, "cookies", None)
++        if cookie_jar is not None:
++            try:
++                iterable_jar = getattr(cookie_jar, "jar", cookie_jar)
++                for cookie in iterable_jar:
++                    name = str(getattr(cookie, "name", "") or "").strip()
++                    value = str(getattr(cookie, "value", "") or "")
++                    domain = str(getattr(cookie, "domain", "") or "").lower()
++                    if (
++                        name
++                        and value
++                        and (
++                            not domain
++                            or domain.lstrip(".") == "chatgpt.com"
++                            or domain.endswith(".chatgpt.com")
++                        )
++                    ):
++                        cookie_values[name] = value
++            except TypeError:
++                pass
++        cookie_header = next(
++            (
++                str(value or "")
+                 for key, value in self.headers.items()
+                 if str(key or "").lower() == "cookie"
+             ),
+             "",
+         )
+-        if not cookie_header or self.page.is_closed():
+-            return
+-        cookies = []
+-        for part in cookie_header.split(";"):
+-            name, separator, value = part.strip().partition("=")
+-            if not separator or not name:
+-                continue
+-            cookies.append({
+-                "name": name,
+-                "value": value,
+-                "url": "https://chatgpt.com/",
+-            })
+-        if cookies:
+-            self.page.context.add_cookies(cookies)
++        if self.page.is_closed():
++            return
++        for part in cookie_header.split(";"):
++            name, separator, value = part.strip().partition("=")
++            if not separator or not name:
++                continue
++            cookie_values[name] = value
++        cookies = [
++            {
++                "name": name,
++                "value": value,
++                "url": "https://chatgpt.com/",
++            }
++            for name, value in cookie_values.items()
++        ]
++        if cookies:
++            self.page.context.add_cookies(cookies)
+ 
+     @staticmethod
+     def _timeout_milliseconds(timeout) -> int:
+@@ -1453,18 +1614,56 @@
+         "sec-fetch-mode": "cors",
+         "sec-fetch-site": "same-origin",
+     })
+-    cookie_jar = getattr(session, "cookies", None)
+-    if cookie_jar is None:
+-        cookie_jar = requests.cookies.RequestsCookieJar()
++    cookie_jar = getattr(session, "cookies", None)
++    if cookie_jar is None:
++        cookie_jar = requests.cookies.Cookies()
+         session.cookies = cookie_jar  # type: ignore[attr-defined]
+-    for name, value in identity_cookies.items():
+-        cookie_jar.set(name, value, domain="chatgpt.com", path="/")
++    for name, value in identity_cookies.items():
++        cookie_jar.set(
++            name,
++            value,
++            domain="chatgpt.com",
++            path="/",
++            secure=name.startswith("__Secure-"),
++        )
+     # 供调用方读取本 session 实际使用的 device id（尤其是未传入时的新生成值）
+     session.opll_oai_device_id = resolved_device_id  # type: ignore[attr-defined]
+     session.opll_auth_cookie_names = tuple(sorted(identity_cookies))  # type: ignore[attr-defined]
+-    if proxy_url:
+-        session.proxies.update({"http": proxy_url, "https": proxy_url})
+-    return session
++    if proxy_url:
++        proxy_binder = getattr(session, "bind_proxy", None)
++        if callable(proxy_binder):
++            proxy_binder(proxy_url)
++        else:
++            session.proxies.update({"http": proxy_url, "https": proxy_url})
++    return session
++
++
++def opll_copy_chatgpt_identity_cookies(source, target) -> tuple[str, ...]:
++    """Copy only durable ChatGPT identity cookies between fixed-proxy sessions."""
++
++    source_jar = getattr(source, "cookies", None)
++    target_jar = getattr(target, "cookies", None)
++    if source_jar is None or target_jar is None:
++        return ()
++    copied: list[str] = []
++    try:
++        source_cookies = list(getattr(source_jar, "jar", source_jar))
++    except TypeError:
++        source_cookies = []
++    for cookie in source_cookies:
++        name = str(getattr(cookie, "name", "") or "").strip()
++        value = str(getattr(cookie, "value", "") or "")
++        if not value or not opll_is_chatgpt_identity_cookie_name(name):
++            continue
++        target_jar.set(
++            name,
++            value,
++            domain="chatgpt.com",
++            path="/",
++            secure=name.startswith("__Secure-"),
++        )
++        copied.append(name)
++    return tuple(sorted(set(copied)))
+ 
+ def opll_is_non_retryable_link_error(exc: Exception | str) -> bool:
+     explicit_retryable = getattr(exc, "retryable", None)
+@@ -1534,14 +1733,16 @@
+     *,
+     request_locale: str = "en-US",
+     include_trial_promo: bool = True,
+-    checkout_ui_mode: str = "custom",
+-    cancel_url: str = "",
++    checkout_ui_mode: str | None = "custom",
++    cancel_url: str = "",
++    referer_url: str = "",
+     device_id: str = "",
+     session: requests.Session | OpllBrowserFetchSession | None = None,
+     session_context: dict | None = None,
+     chatgpt_session: requests.Session | None = None,
+-    return_raw_payload: bool = False,
+-    request_timeout: float = PAY_LONG_LINK_TIMEOUT,
++    return_raw_payload: bool = False,
++    request_timeout: float = PAY_LONG_LINK_TIMEOUT,
++    compact_json: bool = False,
+     sentinel_so_enabled: bool = False,
+     sentinel_header_provider=None,
+     diagnostic_log=None,
+@@ -1568,12 +1769,15 @@
+         **({"session": session} if session is not None else {}),
+         **({"session_context": session_context} if session_context else {}),
+     )
+-    payload = {
+-        "entry_point": "all_plans_pricing_modal",
+-        "plan_name": "chatgptplusplan",
+-        "billing_details": {"country": country, "currency": currency},
+-        "checkout_ui_mode": str(checkout_ui_mode or "custom").strip() or "custom",
+-    }
++    payload = {
++        "entry_point": "all_plans_pricing_modal",
++        "plan_name": "chatgptplusplan",
++        "billing_details": {"country": country, "currency": currency},
++    }
++    if checkout_ui_mode is not None:
++        payload["checkout_ui_mode"] = (
++            str(checkout_ui_mode or "custom").strip() or "custom"
++        )
+     if str(cancel_url or "").strip():
+         payload["cancel_url"] = str(cancel_url).strip()
+     if include_trial_promo:
+@@ -1581,8 +1785,8 @@
+             "promo_campaign_id": "plus-1-month-free",
+             "is_coupon_from_query_param": False,
+         }
+-    checkout_headers = {
+-        "Referer": "https://chatgpt.com/",
++    checkout_headers = {
++        "Referer": str(referer_url or "").strip() or "https://chatgpt.com/",
+         "x-openai-target-path": "/backend-api/payments/checkout",
+         "x-openai-target-route": "/backend-api/payments/checkout",
+     }
+@@ -1595,12 +1799,22 @@
+             diagnostic_log,
+             "[PayPal] Checkout 已生成并提交 SEN + SO 双令牌",
+         )
+-    response = session.post(
+-        "https://chatgpt.com/backend-api/payments/checkout",
+-        json=payload,
+-        headers=checkout_headers,
+-        timeout=max(1.0, float(request_timeout or PAY_LONG_LINK_TIMEOUT)),
+-    )
++    request_options = {
++        "headers": checkout_headers,
++        "timeout": max(1.0, float(request_timeout or PAY_LONG_LINK_TIMEOUT)),
++    }
++    if compact_json:
++        request_options["data"] = json.dumps(
++            payload,
++            ensure_ascii=False,
++            separators=(",", ":"),
++        )
++    else:
++        request_options["json"] = payload
++    response = session.post(
++        "https://chatgpt.com/backend-api/payments/checkout",
++        **request_options,
++    )
+     if response.status_code >= 400:
+         raise RuntimeError(f"checkout create failed: HTTP {response.status_code} {opll_complete_response_body(response)}")
+     data = response.json() or {}
+@@ -1622,7 +1836,7 @@
+ def opll_stripe_key_for_checkout(checkout: dict | None = None) -> str:
+     return str((checkout or {}).get("stripe_publishable_key") or "").strip() or DEFAULT_STRIPE_PK
+ 
+-def opll_stripe_init(
++def opll_stripe_init(
+     cs_id: str,
+     country: str,
+     currency: str,
+@@ -1634,9 +1848,10 @@
+     browser_timezone: str = "",
+     stripe_version: str = "",
+     redirect_type: str = "",
+-    eid: str = "",
+-    saved_payment_method_mode: str = "never",
+-) -> dict:
++    eid: str = "",
++    saved_payment_method_mode: str = "never",
++    elements_locale_override: str = "",
++) -> dict:
+     cs_id = str(cs_id or "").strip()
+     if not cs_id.startswith("cs_"):
+         raise RuntimeError(
+@@ -1646,7 +1861,10 @@
+     locale_ctx = opll_locale_context_for_country(country)
+     resolved_payment_locale = str(payment_locale or "").strip() or locale_ctx["payment_locale"]
+     resolved_timezone = str(browser_timezone or "").strip() or locale_ctx["browser_timezone"]
+-    browser_locale, elements_locale = locale_parts(resolved_payment_locale)
++    browser_locale, elements_locale = locale_parts(resolved_payment_locale)
++    elements_locale = (
++        str(elements_locale_override or "").strip() or elements_locale
++    )
+     stripe_pk = opll_stripe_key_for_checkout(checkout)
+     stripe_session = stripe or opll_new_http_session()
+     if stripe is None:
+@@ -2006,8 +2224,16 @@
+     except Exception:
+         pass
+ 
+-def opll_stripe_payment_page_request_data(stripe_pk: str, ctx: dict) -> dict:
+-    return {
++def opll_stripe_payment_page_request_data(
++    stripe_pk: str,
++    ctx: dict,
++    *,
++    saved_payment_method_mode: str = "never",
++) -> dict:
++    saved_mode = (
++        str(saved_payment_method_mode or "never").strip().lower() or "never"
++    )
++    return {
+         "elements_session_client[session_id]": str(ctx.get("elements_session_id") or ""),
+         "elements_session_client[locale]": str(ctx.get("locale") or "en"),
+         "elements_session_client[referrer_host]": "chatgpt.com",
+@@ -2016,13 +2242,13 @@
+         "elements_session_client[stripe_js_id]": str(ctx.get("stripe_js_id") or ""),
+         "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
+         "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
+-        "elements_options_client[saved_payment_method][enable_save]": "never",
+-        "elements_options_client[saved_payment_method][enable_redisplay]": "never",
++        "elements_options_client[saved_payment_method][enable_save]": saved_mode,
++        "elements_options_client[saved_payment_method][enable_redisplay]": saved_mode,
+         "key": str(stripe_pk or "").strip() or DEFAULT_STRIPE_PK,
+         "_stripe_version": str(ctx.get("stripe_version") or STRIPE_VERSION_FULL),
+     }
+ 
+-def opll_merge_payment_page_payload(payload: dict) -> dict:
++def opll_merge_payment_page_payload(payload: dict) -> dict:
+     """合并 Stripe 顶层 envelope 与内层 payment_page，顶层状态/next_action 优先。"""
+     if not isinstance(payload, dict):
+         return {}
+@@ -2037,7 +2263,145 @@
+             merged[key] = value
+         elif key in {"next_action", "submission_attempt", "setup_intent", "payment_intent"}:
+             merged[key] = value
+-    return merged
++    return merged
++
++
++def opll_stripe_update_tax_region(
++    stripe: requests.Session,
++    cs_id: str,
++    stripe_pk: str,
++    ctx: dict,
++    billing: dict,
++    *,
++    network_attempts: int = 1,
++    network_retry_delays: tuple[float, ...] = (),
++    diagnostic_log=None,
++    diagnostic_prefix: str = "",
++    country_only: bool = False,
++    saved_payment_method_mode: str = "never",
++    additional_elements: tuple[str, ...] = ("payment", "address"),
++    omit_empty_address_fields: bool = False,
++) -> dict:
++    """Submit the hosted Checkout billing address through Stripe tax_region."""
++
++    body = {
++        "tax_region[country]": str(billing.get("country") or "GB"),
++        **opll_stripe_payment_page_request_data(
++            stripe_pk,
++            ctx,
++            saved_payment_method_mode=saved_payment_method_mode,
++        ),
++    }
++    if not country_only:
++        for field, billing_key in (
++            ("line1", "line1"),
++            ("city", "city"),
++            ("state", "state"),
++            ("postal_code", "postal_code"),
++        ):
++            value = str(billing.get(billing_key) or "")
++            if omit_empty_address_fields and not value.strip():
++                continue
++            body[f"tax_region[{field}]"] = value
++    for index, element in enumerate(additional_elements):
++        body[
++            "client_attribution_metadata"
++            f"[merchant_integration_additional_elements][{index}]"
++        ] = str(element)
++    body["_stripe_version"] = str(
++        ctx.get("stripe_version") or STRIPE_VERSION_FULL
++    )
++
++    total_attempts = max(1, int(network_attempts or 1))
++    prefix = str(diagnostic_prefix or "").strip()
++    if prefix:
++        prefix += " "
++    for attempt_index in range(total_attempts):
++        attempt_no = attempt_index + 1
++        try:
++            response = stripe.post(
++                f"https://api.stripe.com/v1/payment_pages/{cs_id}",
++                data=body,
++                timeout=PAY_LONG_LINK_TIMEOUT,
++            )
++            return opll_stripe_payment_page_response(
++                response,
++                "tax region/update failed",
++            )
++        except Exception as exc:
++            if (
++                attempt_no >= total_attempts
++                or not opll_is_retryable_http_transport_error(exc)
++            ):
++                raise
++            delay = (
++                float(network_retry_delays[attempt_index])
++                if attempt_index < len(network_retry_delays)
++                else 0.0
++            )
++            opll_emit_diagnostic(
++                diagnostic_log,
++                f"{prefix}Stripe tax_region 连接异常，第 "
++                f"{attempt_no}/{total_attempts} 次失败；保持原 Checkout、"
++                f"原代理与原 Context 重试: {opll_short_error(str(exc), 140)}",
++            )
++            if delay > 0:
++                time.sleep(delay)
++    raise RuntimeError("Stripe tax_region retry loop ended unexpectedly")
++
++
++def opll_paypal_gb_chatgpt_checkout_snapshot(
++    chatgpt,
++    checkout: dict,
++    billing: dict,
++    *,
++    timeout_seconds: float = PAY_LONG_LINK_TIMEOUT,
++) -> dict:
++    """Persist the GB hosted Checkout billing snapshot on the pool-1 session."""
++
++    checkout_id = str(checkout.get("cs_id") or "").strip()
++    processor_entity = str(
++        checkout.get("processor_entity") or "openai_llc"
++    ).strip()
++    payload = {
++        "snapshot": {
++            "billing_address": {
++                "name": str(billing.get("name") or "") or None,
++                "address": {
++                    "line1": str(billing.get("line1") or ""),
++                    "city": str(billing.get("city") or ""),
++                    "line2": str(billing.get("line2") or ""),
++                    "postal_code": str(billing.get("postal_code") or ""),
++                    "country": "GB",
++                },
++            }
++        }
++    }
++    response = chatgpt.post(
++        "https://chatgpt.com/backend-api/payments/checkout/snapshot",
++        data=json.dumps(
++            payload,
++            ensure_ascii=False,
++            separators=(",", ":"),
++        ),
++        headers={
++            "Referer": (
++                "https://chatgpt.com/checkout/"
++                f"{processor_entity}/{checkout_id}"
++            ),
++            "x-openai-target-path": "/backend-api/payments/checkout/snapshot",
++            "x-openai-target-route": "/backend-api/payments/checkout/snapshot",
++        },
++        timeout=max(1.0, float(timeout_seconds or PAY_LONG_LINK_TIMEOUT)),
++    )
++    status_code = int(getattr(response, "status_code", 0) or 0)
++    if status_code not in {200, 204}:
++        detail = str(getattr(response, "text", "") or "")[:500]
++        raise RuntimeError(
++            "PayPal GB Checkout Snapshot failed: "
++            f"HTTP {status_code} {detail}"
++        )
++    return {"status_code": status_code, "applied": True}
+ 
+ def opll_stripe_payment_page_response(
+     response,
+@@ -3218,23 +3582,24 @@
+     if not re.fullmatch(r"[1-9]\d{3} [A-Z]{2}", str(billing.get("postal_code") or "").strip().upper()):
+         raise RuntimeError("iDEAL NL 账单 postal_code 格式无效，应为 1234 AB")
+ 
+-def opll_stripe_create_paypal_method(stripe: requests.Session, cs_id: str, ctx: dict, billing: dict, stripe_pk: str = "", payment_method_type: str = "paypal") -> str:
+-    runtime_version = str(ctx.get("runtime_version") or DEFAULT_STRIPE_RUNTIME_VERSION)
+-    payment_method_type = str(payment_method_type or "paypal").strip().lower()
+-    if payment_method_type == "ideal":
+-        opll_require_ideal_billing_details(billing)
+-    body = {
++def opll_stripe_create_paypal_method(stripe: requests.Session, cs_id: str, ctx: dict, billing: dict, stripe_pk: str = "", payment_method_type: str = "paypal") -> str:
++    runtime_version = str(ctx.get("runtime_version") or DEFAULT_STRIPE_RUNTIME_VERSION)
++    payment_method_type = str(payment_method_type or "paypal").strip().lower()
++    if payment_method_type == "ideal":
++        opll_require_ideal_billing_details(billing)
++    billing_country = str(billing.get("country") or "US").strip().upper()
++    billing_state = str(billing.get("state") or "").strip()
++    body = {
+         "guid": str(ctx.get("guid") or ""),
+         "muid": str(ctx.get("muid") or ""),
+         "sid": str(ctx.get("sid") or ""),
+         "billing_details[name]": billing.get("name") or "John Doe",
+         "billing_details[email]": billing.get("email") or "",
+         "billing_details[phone]": billing.get("phone") or "",
+-        "billing_details[address][country]": billing.get("country") or "US",
++        "billing_details[address][country]": billing_country,
+         "billing_details[address][line1]": billing.get("line1") or "3110 Sunset Boulevard",
+         "billing_details[address][city]": billing.get("city") or "Los Angeles",
+         "billing_details[address][postal_code]": billing.get("postal_code") or "90026",
+-        "billing_details[address][state]": billing.get("state") or "CA",
+         "type": payment_method_type,
+         "payment_user_agent": f"stripe.js/{runtime_version}; stripe-js-v3/{runtime_version}; payment-element; deferred-intent",
+         "referrer": "https://chatgpt.com",
+@@ -3252,8 +3617,12 @@
+         "client_attribution_metadata[merchant_integration_additional_elements][0]": "payment",
+         "client_attribution_metadata[merchant_integration_additional_elements][1]": "address",
+         "key": stripe_pk or DEFAULT_STRIPE_PK,
+-        "_stripe_version": str(ctx.get("stripe_version") or STRIPE_VERSION_FULL),
+-    }
++        "_stripe_version": str(ctx.get("stripe_version") or STRIPE_VERSION_FULL),
++    }
++    if billing_state:
++        body["billing_details[address][state]"] = billing_state
++    elif billing_country == "US":
++        body["billing_details[address][state]"] = "CA"
+     if payment_method_type == "pix":
+         tax_id = str(billing.get("tax_id") or "").strip()
+         if not re.fullmatch(r"\d{11}", tax_id):
+@@ -3963,12 +4332,13 @@
+             f"HTTP {response.status_code} {opll_complete_response_body(response)}"
+         )
+ 
+-def opll_chatgpt_sentinel_ping(
+-    chatgpt: requests.Session,
+-    *,
+-    diagnostic_log=None,
+-    diagnostic_prefix: str = "",
+-    network_attempts: int = 1,
++def opll_chatgpt_sentinel_ping(
++    chatgpt: requests.Session | OpllBrowserFetchSession,
++    *,
++    diagnostic_log=None,
++    diagnostic_prefix: str = "",
++    referer_url: str = "https://chatgpt.com/",
++    network_attempts: int = 1,
+     network_retry_delays: tuple[float, ...] = (),
+ ) -> dict:
+     """Approve 前确认 Sentinel 可用；失败时禁止继续盲目提交审批。"""
+@@ -3980,9 +4350,12 @@
+         try:
+             response = chatgpt.post(
+                 "https://chatgpt.com/backend-api/sentinel/ping",
+-                json={},
+-                headers={
+-                    "Referer": "https://chatgpt.com/",
++                json={},
++                headers={
++                    "Referer": (
++                        str(referer_url or "").strip()
++                        or "https://chatgpt.com/"
++                    ),
+                     "x-openai-target-path": "/backend-api/sentinel/ping",
+                     "x-openai-target-route": "/backend-api/sentinel/ping",
+                 },
+@@ -4041,9 +4414,89 @@
+         raise OpllChatgptSentinelError(
+             f"sentinel ping backend exception, request_id={request_id or '<missing>'}"
+         )
+-    return payload
+-
+-def opll_chatgpt_approve(
++    return payload
++
++
++def opll_prefetch_paypal_approval_sentinel(
++    chatgpt: requests.Session | OpllBrowserFetchSession,
++    checkout_id: str,
++    checkout: dict,
++    proxy_url: str,
++    *,
++    request_locale: str,
++    device_id: str,
++    diagnostic_log=None,
++    warmup_required: bool = True,
++) -> dict:
++    """Warm one Checkout and prefetch its approval challenge before Confirm."""
++
++    expected_device_id = str(device_id or "").strip()
++    session_device_id = str(
++        getattr(chatgpt, "opll_oai_device_id", "") or ""
++    ).strip()
++    if (
++        expected_device_id
++        and session_device_id
++        and expected_device_id != session_device_id
++    ):
++        raise OpllChatgptSentinelError(
++            "PayPal GB Sentinel 会话设备 ID 与 Checkout 不一致"
++        )
++    expected_proxy = normalize_proxy_url(proxy_url)
++    session_proxies = getattr(chatgpt, "proxies", {}) or {}
++    bound_proxy = normalize_proxy_url(
++        getattr(chatgpt, "bound_proxy_url", "")
++        or session_proxies.get("https")
++        or session_proxies.get("http")
++        or ""
++    )
++    if expected_proxy and bound_proxy and expected_proxy != bound_proxy:
++        raise OpllChatgptSentinelError(
++            "PayPal GB Sentinel 会话代理与 Checkout 池 1 不一致"
++        )
++    expected_locale = str(request_locale or "").strip().casefold()
++    session_headers = getattr(chatgpt, "headers", {}) or {}
++    session_locale = str(
++        session_headers.get("oai-language")
++        or session_headers.get("OAI-Language")
++        or ""
++    ).strip().casefold()
++    if expected_locale and session_locale and expected_locale != session_locale:
++        raise OpllChatgptSentinelError(
++            "PayPal GB Sentinel 会话语言与 Checkout 不一致"
++        )
++    if warmup_required:
++        opll_chatgpt_checkout_warmup(
++            chatgpt,
++            checkout_id,
++            checkout,
++            diagnostic_log=diagnostic_log,
++            diagnostic_prefix="[PayPal GB Sentinel] ",
++        )
++    processor_entity = opll_processor_entity_for_country(
++        checkout["billing_country"],
++        checkout.get("processor_entity", ""),
++    )
++    checkout_referer = opll_chatgpt_checkout_page_url(
++        checkout_id,
++        str(checkout.get("billing_country") or "GB"),
++        processor_entity,
++    )
++    challenge = opll_chatgpt_sentinel_ping(
++        chatgpt,
++        diagnostic_log=diagnostic_log,
++        diagnostic_prefix="[PayPal GB Sentinel] ",
++        referer_url=checkout_referer,
++        network_attempts=2,
++    )
++    opll_emit_diagnostic(
++        diagnostic_log,
++        "[PayPal GB Sentinel] Confirm 前 approval challenge 已准备，"
++        "Approve 将复用同一 Checkout Session",
++    )
++    return challenge
++
++def opll_chatgpt_approve(
+     chatgpt: requests.Session,
+     cs_id: str,
+     checkout: dict,
+@@ -4052,9 +4505,9 @@
+     diagnostic_prefix: str = "",
+     sentinel_network_attempts: int = 1,
+     sentinel_network_retry_delays: tuple[float, ...] = (),
+-    request_access_token: str = "",
+-    sentinel_required: bool = True,
+-    provider_session_request: bool = False,
++    request_access_token: str = "",
++    sentinel_required: bool = True,
++    provider_session_request: bool = False,
+     warm_checkout_page: bool = False,
+ ) -> dict:
+     entity = opll_processor_entity_for_country(checkout["billing_country"], checkout.get("processor_entity", ""))
+@@ -4089,13 +4542,13 @@
+             "User-Agent": OPLL_USER_AGENT,
+             "Referer": f"https://chatgpt.com/checkout/{entity}/{cs_id}",
+         }
+-    else:
+-        approve_headers = {
+-            "Referer": f"https://chatgpt.com/checkout/{entity}/{cs_id}",
+-            "x-openai-target-path": "/backend-api/payments/checkout/approve",
+-            "x-openai-target-route": "/backend-api/payments/checkout/approve",
+-        }
+-    response = chatgpt.post(
++    else:
++        approve_headers = {
++            "Referer": f"https://chatgpt.com/checkout/{entity}/{cs_id}",
++            "x-openai-target-path": "/backend-api/payments/checkout/approve",
++            "x-openai-target-route": "/backend-api/payments/checkout/approve",
++        }
++    response = chatgpt.post(
+         "https://chatgpt.com/backend-api/payments/checkout/approve",
+         json={"checkout_session_id": cs_id, "processor_entity": entity},
+         headers=approve_headers,
+@@ -4497,8 +4950,24 @@
+         "redirect_last_url": last_url,
+     }
+ 
+-def opll_stripe_confirm(stripe: requests.Session, cs_id: str, pm_id: str, stripe_pk: str, init_payload: dict, ctx: dict, checkout: dict, stripe_hosted_url: str, payment_method_type: str = "paypal") -> dict:
+-    return_url = opll_stripe_confirm_return_url(cs_id, checkout, stripe_hosted_url)
++def opll_stripe_confirm(
++    stripe: requests.Session,
++    cs_id: str,
++    pm_id: str,
++    stripe_pk: str,
++    init_payload: dict,
++    ctx: dict,
++    checkout: dict,
++    stripe_hosted_url: str,
++    payment_method_type: str = "paypal",
++    *,
++    return_url: str = "",
++) -> dict:
++    return_url = str(return_url or "").strip() or opll_stripe_confirm_return_url(
++        cs_id,
++        checkout,
++        stripe_hosted_url,
++    )
+     runtime_version = str(ctx.get("runtime_version") or DEFAULT_STRIPE_RUNTIME_VERSION)
+     payment_method_type = str(payment_method_type or "paypal").strip().lower()
+     response = stripe.post(
+@@ -4758,8 +5227,8 @@
+                         chatgpt_session,
+                         approval_cs_id,
+                         checkout,
+-                        diagnostic_log=diagnostic_log,
+-                        diagnostic_prefix=f"[PayPal 页面内] [{attempt_no}/{total_attempts}] ",
++                        diagnostic_log=diagnostic_log,
++                        diagnostic_prefix=f"[PayPal 页面内] [{attempt_no}/{total_attempts}] ",
+                         warm_checkout_page=clean_session_blocked_retry,
+                         **(
+                             {"sentinel_required": False}
+@@ -6790,8 +7259,702 @@
+             if is_fr_ideal_style_zero and opll_is_non_retryable_link_error(exc):
+                 raise
+             failures.append(f"{checkout_country}+{pm_country}: {opll_short_error(str(exc))}")
+-    raise RuntimeError(f"所有组合均未提取到 PayPal BA approve 链；{'; '.join(failures)}")
+-
++    raise RuntimeError(f"所有组合均未提取到 PayPal BA approve 链；{'; '.join(failures)}")
++
++
++def _generate_opll_paypal_gb_post_approve_long_link(
++    access_token: str,
++    primary_proxy_url: str,
++    promotion_proxy_url: str,
++    target_amount: str,
++    *,
++    account_email: str,
++    diagnostic_log,
++    sentinel_so_enabled: bool,
++    session_context: dict | None,
++    protocol_profile: PayPalProtocolProfile,
++    browser_runtime: dict | None = None,
++) -> dict:
++    """Run standard GB Checkout, prove BA approval, then apply one promotion."""
++
++    profile = protocol_profile
++    browser_runtime = (
++        browser_runtime if isinstance(browser_runtime, dict) else {}
++    )
++    checkout: dict = {}
++    primary_chatgpt = None
++    promotion_chatgpt = None
++    stripe = None
++    promotion_stripe = None
++    owns_primary_chatgpt = False
++    owns_promotion_chatgpt = False
++    owns_stripe = False
++    owns_promotion_stripe = False
++    copied_identity_cookies: tuple[str, ...] = ()
++    presenter: PayPalGbPostApprovePresenter | None = None
++    checkout_snapshot_result = {"status_code": 0, "applied": False}
++
++    try:
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 1/9：池 1 建立固定 ChatGPT 会话并验证 Token",
++        )
++        supplied_primary = browser_runtime.get("primary_chatgpt_session")
++        primary_chatgpt = opll_build_chatgpt_session(
++            access_token,
++            primary_proxy_url,
++            request_locale=profile.request_locale,
++            session=(supplied_primary if supplied_primary is not None else None),
++            session_context=session_context,
++        )
++        owns_primary_chatgpt = supplied_primary is None
++        opll_validate_access_token(
++            access_token,
++            primary_proxy_url,
++            request_locale=profile.request_locale,
++            chatgpt_session=primary_chatgpt,
++            session_context=session_context,
++        )
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 2/9：池 1 创建不带优惠的 GB/GBP 标准 Checkout",
++        )
++        checkout = opll_create_checkout(
++            access_token,
++            profile.country,
++            profile.currency,
++            primary_proxy_url,
++            request_locale=profile.request_locale,
++            include_trial_promo=False,
++            checkout_ui_mode=None,
++            referer_url="https://chatgpt.com/",
++            chatgpt_session=primary_chatgpt,
++            return_raw_payload=True,
++            compact_json=True,
++            sentinel_so_enabled=sentinel_so_enabled,
++            diagnostic_log=diagnostic_log,
++            session_context=session_context,
++        )
++        raw_create_payload = checkout.pop("_checkout_payload", {})
++        if not isinstance(raw_create_payload, dict):
++            raw_create_payload = {}
++        checkout["checkout_ui_mode"] = "hosted"
++        checkout_id = str(checkout.get("cs_id") or "").strip()
++        if not checkout_id.startswith("cs_"):
++            raise OpllPay153CheckoutRebuildRequired(
++                "PAYPAL_GB_PROTOCOL_STANDARD_CHECKOUT_REQUIRED: GB 后置优惠在 "
++                "Approve 前禁止 Update；当前 Checkout 未直接提供 Stripe cs_，"
++                "已终止本轮且未应用优惠"
++            )
++        stripe_checkout_id = checkout_id
++        device_id = str(checkout.get("oai_device_id") or "").strip()
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 池 1 预热原 hosted Checkout 页面",
++        )
++        opll_chatgpt_checkout_warmup(
++            primary_chatgpt,
++            checkout_id,
++            checkout,
++            diagnostic_log=diagnostic_log,
++            diagnostic_prefix="[PayPal GB/GBP] ",
++        )
++
++        stripe_factory = browser_runtime.get("stripe_session_factory")
++        if callable(stripe_factory):
++            stripe = stripe_factory(checkout)
++        else:
++            stripe = opll_build_stripe_session(
++                primary_proxy_url,
++                request_locale=profile.request_locale,
++            )
++            owns_stripe = True
++        ctx = opll_stripe_context({}, profile.elements_locale or profile.payment_locale)
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 3/9：池 1 初始化优惠前 Stripe Payment Page",
++        )
++        init_payload = opll_stripe_init(
++            stripe_checkout_id,
++            profile.country,
++            profile.currency,
++            primary_proxy_url,
++            payment_locale=profile.payment_locale,
++            stripe=stripe,
++            ctx=ctx,
++            checkout=checkout,
++            browser_timezone=profile.browser_timezone,
++            elements_locale_override=profile.elements_locale,
++        )
++        initial_page = opll_merge_payment_page_payload(init_payload)
++        stripe_hosted_url = str(
++            initial_page.get("stripe_hosted_url") or ""
++        ).strip()
++        if not stripe_hosted_url:
++            raise RuntimeError(
++                "PayPal GB 标准 Checkout 的 Stripe Init 未返回 hosted URL"
++            )
++        initial_ctx = opll_stripe_context(
++            initial_page,
++            profile.elements_locale or profile.payment_locale,
++            ctx=ctx,
++        )
++        ctx.clear()
++        ctx.update(initial_ctx)
++        if not ctx.get("currency"):
++            ctx["currency"] = profile.currency.lower()
++        initial_amount, initial_amount_source = opll_stripe_amount_info(
++            initial_page
++        )
++        initial_currency = str(
++            initial_page.get("currency") or ""
++        ).strip().upper()
++        opll_require_payment_method_type(
++            initial_page,
++            "paypal",
++            require_declared=True,
++        )
++        if not initial_amount.isdigit() or int(initial_amount) <= 0:
++            raise RuntimeError(
++                "PayPal GB 标准 Checkout 的优惠前金额必须为正数；"
++                f"actual={initial_amount or '<missing>'}, "
++                f"source={initial_amount_source}"
++            )
++        if initial_currency != profile.currency:
++            raise RuntimeError(
++                "PayPal GB 标准 Checkout 的 Stripe 币种必须为 GBP；"
++                f"actual={initial_currency or '<missing>'}"
++            )
++
++        billing = opll_billing_for_country(
++            profile.country,
++            account_email=account_email,
++            access_token=access_token,
++            **profile.billing_location_kwargs,
++        )
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 4/9：池 1 提交 Stripe tax_region，"
++            "并 best-effort 保存 Checkout snapshot",
++        )
++        try:
++            tax_payload = opll_stripe_update_tax_region(
++                stripe,
++                stripe_checkout_id,
++                opll_stripe_key_for_checkout(checkout),
++                ctx,
++                billing,
++                country_only=False,
++                saved_payment_method_mode="never",
++                omit_empty_address_fields=True,
++                diagnostic_log=diagnostic_log,
++                diagnostic_prefix="[PayPal GB/GBP]",
++            )
++        except Exception as exc:
++            raise RuntimeError(
++                "PAYPAL_GB_PROTOCOL_TAX_REGION_FAILED: "
++                f"{opll_short_error(str(exc), 500)}"
++            ) from exc
++
++        effective_pre_promotion = {
++            **initial_page,
++            **opll_merge_payment_page_payload(tax_payload),
++        }
++        pre_confirm_amount, pre_confirm_amount_source = opll_stripe_amount_info(
++            effective_pre_promotion
++        )
++        pre_confirm_currency = str(
++            effective_pre_promotion.get("currency") or ""
++        ).strip().upper()
++        if not pre_confirm_amount.isdigit() or int(pre_confirm_amount) <= 0:
++            raise RuntimeError(
++                "PayPal GB tax_region 后必须保持非零金额；"
++                f"actual={pre_confirm_amount or '<missing>'}, "
++                f"source={pre_confirm_amount_source}"
++            )
++        if pre_confirm_currency != profile.currency:
++            raise RuntimeError(
++                "PayPal GB tax_region 后 Stripe 币种必须保持 GBP；"
++                f"actual={pre_confirm_currency or '<missing>'}"
++            )
++        opll_require_payment_method_type(
++            effective_pre_promotion,
++            "paypal",
++            require_declared=True,
++        )
++        refreshed_ctx = opll_stripe_context(
++            effective_pre_promotion,
++            profile.elements_locale or profile.payment_locale,
++            ctx=ctx,
++        )
++        ctx.clear()
++        ctx.update(refreshed_ctx)
++        ctx["checkout_amount"] = pre_confirm_amount
++
++        try:
++            checkout_snapshot_result = (
++                opll_paypal_gb_chatgpt_checkout_snapshot(
++                    primary_chatgpt,
++                    checkout,
++                    billing,
++                    timeout_seconds=PAY_LONG_LINK_TIMEOUT,
++                )
++            )
++        except Exception as exc:
++            opll_emit_diagnostic(
++                diagnostic_log,
++                "[PayPal GB/GBP] Checkout snapshot 保存失败，按 best-effort "
++                f"继续：{opll_short_error(str(exc), 240)}",
++            )
++
++        presenter = PayPalGbPostApprovePresenter(
++            PayPalGbPostApproveModel(
++                checkout_id=checkout_id,
++                stripe_checkout_id=stripe_checkout_id,
++                device_id=device_id,
++                primary_proxy_url=normalize_proxy_url(primary_proxy_url),
++                promotion_proxy_url=normalize_proxy_url(promotion_proxy_url),
++            ),
++            DiagnosticPayPalGbPostApproveView(
++                lambda message: opll_emit_diagnostic(diagnostic_log, message)
++            ),
++        )
++        presenter.bind_stripe(
++            primary_chatgpt_session=primary_chatgpt,
++            stripe_session=stripe,
++            stripe_context=ctx,
++            amount=pre_confirm_amount,
++            currency=pre_confirm_currency,
++            browser_http_used=isinstance(
++                primary_chatgpt, OpllBrowserFetchSession
++            ),
++        )
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 5/9：池 1 创建独立 PayPal PaymentMethod",
++        )
++        pm_id = opll_stripe_create_paypal_method(
++            stripe,
++            stripe_checkout_id,
++            ctx,
++            billing,
++            opll_stripe_key_for_checkout(checkout),
++        )
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 6/9：Confirm 前预热 Checkout 并准备 Sentinel approval challenge",
++        )
++        approval_challenge = opll_prefetch_paypal_approval_sentinel(
++            primary_chatgpt,
++            checkout_id,
++            checkout,
++            primary_proxy_url,
++            request_locale=profile.request_locale,
++            device_id=device_id,
++            diagnostic_log=diagnostic_log,
++            warmup_required=False,
++        )
++        if not isinstance(approval_challenge, dict):
++            raise OpllChatgptSentinelError(
++                "PayPal GB approval challenge 响应格式无效"
++            )
++        presenter.mark_sentinel_ready(
++            chatgpt_session=primary_chatgpt,
++            stripe_session=stripe,
++            stripe_context=ctx,
++        )
++        confirm_return_url = opll_require_paypal_gb_confirm_return_url(
++            opll_paypal_gb_confirm_return_url(
++                stripe_checkout_id,
++                checkout,
++                stripe_hosted_url,
++            ),
++            stripe_checkout_id,
++            stripe_hosted_url,
++        )
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] Sentinel 已准备；池 1 正在 Confirm 标准 Checkout",
++        )
++        confirm_payload = opll_stripe_confirm(
++            stripe,
++            stripe_checkout_id,
++            pm_id,
++            opll_stripe_key_for_checkout(checkout),
++            effective_pre_promotion,
++            ctx,
++            checkout,
++            stripe_hosted_url,
++            return_url=confirm_return_url,
++        )
++        confirm_state = str(
++            opll_find_submission_attempt(confirm_payload).get("state") or ""
++        ).strip().lower()
++        if confirm_state != "requires_approval":
++            raise OpllPay153CheckoutRebuildRequired(
++                "PAYPAL_GB_PROTOCOL_CONFIRM_STATE_INVALID: 标准 Checkout "
++                "Confirm 必须进入 requires_approval；"
++                f"当前={confirm_state or '<missing>'}"
++            )
++        presenter.mark_confirmed(
++            chatgpt_session=primary_chatgpt,
++            stripe_session=stripe,
++            stripe_context=ctx,
++        )
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 7/9：池 1 复用预热会话执行 Approve、Poll 并验证 PayPal BA",
++        )
++        stripe_pk = opll_stripe_key_for_checkout(checkout)
++        stripe_redirect_url = opll_redirect_url_after_confirm(
++            access_token,
++            stripe,
++            confirm_payload,
++            stripe_checkout_id,
++            stripe_pk,
++            ctx,
++            checkout,
++            primary_proxy_url,
++            chatgpt_session=primary_chatgpt,
++            approve_checkout_id=checkout_id,
++            session_context=session_context,
++            clean_session_blocked_retry=False,
++            approve_sentinel_required=False,
++            force_checkout_approval=True,
++            protocol_error_prefix=profile.error_prefix,
++            diagnostic_log=diagnostic_log,
++        )
++        redirect_result = opll_resolve_paypal_redirect_result(
++            stripe,
++            stripe_redirect_url,
++        )
++        provider_url = str(
++            redirect_result.get("paypal_ba_approve_url")
++            or redirect_result.get("selected_url")
++            or ""
++        ).strip()
++        if not opll_is_paypal_ba_approve_url(provider_url):
++            raise OpllPay153CheckoutRebuildRequired(
++                "PAYPAL_GB_PROTOCOL_BA_MISSING: Approve 与 Poll 后未确认 "
++                "PayPal BA；已停止且未调用优惠 Update"
++            )
++        if not opll_is_paypal_success_url(provider_url):
++            raise RuntimeError(
++                "PAYPAL_GB_PROTOCOL_BA_INVALID: 未提取到可用 PayPal BA 链"
++            )
++        presenter.mark_ba_approved(
++            checkout_id=checkout_id,
++            paypal_ba_approve_url=provider_url,
++            chatgpt_session=primary_chatgpt,
++            stripe_session=stripe,
++            stripe_context=ctx,
++        )
++
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 步骤 8/9：BA 已确认；池 2 对原 Checkout 执行唯一一次优惠 Update",
++        )
++        supplied_promotion = browser_runtime.get("promotion_chatgpt_session")
++        promotion_chatgpt = opll_build_chatgpt_session(
++            access_token,
++            promotion_proxy_url,
++            request_locale=profile.request_locale,
++            device_id=device_id,
++            session=(
++                supplied_promotion if supplied_promotion is not None else None
++            ),
++            session_context=session_context,
++        )
++        owns_promotion_chatgpt = supplied_promotion is None
++        supplied_promotion_stripe = browser_runtime.get(
++            "promotion_stripe_session"
++        )
++        promotion_stripe_factory = browser_runtime.get(
++            "promotion_stripe_session_factory"
++        )
++        if supplied_promotion_stripe is not None:
++            promotion_stripe = supplied_promotion_stripe
++        elif callable(promotion_stripe_factory):
++            promotion_stripe = promotion_stripe_factory(checkout)
++        else:
++            promotion_stripe = opll_build_stripe_session(
++                promotion_proxy_url,
++                request_locale=profile.payment_locale,
++                fresh_connections=True,
++            )
++            owns_promotion_stripe = True
++        copied_identity_cookies = opll_copy_chatgpt_identity_cookies(
++            primary_chatgpt,
++            promotion_chatgpt,
++        )
++
++        promotion_update_attempts = 0
++        post_approval_init_count = 0
++        update_payload: dict = {}
++        post_promotion_init: dict = {}
++        promoted_page: dict = {}
++        final_amount = ""
++        final_amount_source = "missing_payload"
++        final_currency = ""
++        post_approval_state = ""
++        last_post_error = ""
++        max_update_attempts = 3
++        for update_attempt in range(1, max_update_attempts + 1):
++            promotion_update_attempts += 1
++            opll_emit_diagnostic(
++                diagnostic_log,
++                "[PayPal GB/GBP] BA 已批准；池 2 正在对原 Checkout "
++                f"提交优惠 Update（{update_attempt}/{max_update_attempts}）",
++            )
++            try:
++                update_payload = presenter.apply_promotion(
++                    lambda: opll_chatgpt_update_checkout_promotion(
++                        access_token,
++                        checkout,
++                        promotion_proxy_url,
++                        request_locale=profile.request_locale,
++                        device_id=device_id,
++                        session=promotion_chatgpt,
++                        session_context=session_context,
++                        include_checkout_context=True,
++                    ),
++                    checkout_id=checkout_id,
++                    promotion_session=promotion_chatgpt,
++                    promotion_stripe_session=promotion_stripe,
++                    promotion_proxy_url=normalize_proxy_url(
++                        promotion_proxy_url
++                    ),
++                    stripe_context=ctx,
++                )
++            except Exception as exc:
++                last_post_error = str(exc)
++                retryable = bool(getattr(exc, "retryable", True))
++                category = str(getattr(exc, "category", "") or "").strip()
++                if (
++                    category == "edge_or_ip_blocked"
++                    or not retryable
++                    or update_attempt >= max_update_attempts
++                ):
++                    raise OpllPay153CheckoutRebuildRequired(
++                        "PAYPAL_GB_PROTOCOL_POST_APPROVE_PROMOTION_FAILED: "
++                        "BA 已确认，但同 Checkout 后置优惠失败；本轮不返回"
++                        "未归零结果: "
++                        f"{opll_short_error(str(exc), 260)}"
++                    ) from exc
++                time.sleep(1.0)
++                continue
++            break
++        else:
++            raise OpllPay153CheckoutRebuildRequired(
++                "PAYPAL_GB_PROTOCOL_POST_APPROVE_PROMOTION_FAILED: "
++                f"{opll_short_error(last_post_error or 'unknown', 260)}"
++            )
++
++        if not isinstance(update_payload, dict):
++            raise RuntimeError("PayPal GB 优惠 Update 响应格式无效")
++        updated_checkout_id = opll_extract_checkout_session_id(update_payload)
++        if updated_checkout_id and updated_checkout_id != checkout_id:
++            raise RuntimeError(
++                "PAYPAL_GB_PROTOCOL_CHECKOUT_CHANGED: 优惠 Update 返回了不同 Checkout"
++            )
++        updated_stripe_id = opll_extract_stripe_payment_page_id(update_payload)
++        if updated_stripe_id and updated_stripe_id != stripe_checkout_id:
++            raise RuntimeError(
++                "PAYPAL_GB_PROTOCOL_STRIPE_CHECKOUT_CHANGED: 优惠 Update "
++                "返回了不同 Stripe Checkout"
++            )
++
++        max_init_attempts = 3
++        for init_attempt in range(1, max_init_attempts + 1):
++            opll_emit_diagnostic(
++                diagnostic_log,
++                "[PayPal GB/GBP] 步骤 9/9：池 2 使用同一 Stripe Context "
++                "重新 Init 并校验 approved + GBP/0 "
++                f"（{init_attempt}/{max_init_attempts}）",
++            )
++            post_approval_init_count += 1
++            try:
++                post_promotion_init = opll_stripe_init(
++                    stripe_checkout_id,
++                    profile.country,
++                    profile.currency,
++                    promotion_proxy_url,
++                    payment_locale=profile.payment_locale,
++                    stripe=promotion_stripe,
++                    ctx=ctx,
++                    checkout=checkout,
++                    browser_timezone=profile.browser_timezone,
++                    elements_locale_override=profile.elements_locale,
++                )
++                promoted_page = opll_merge_payment_page_payload(
++                    post_promotion_init
++                )
++                final_amount, final_amount_source = opll_stripe_amount_info(
++                    promoted_page
++                )
++                final_currency = str(
++                    promoted_page.get("currency") or ""
++                ).strip().upper()
++                payment_method_types = opll_payment_method_types(promoted_page)
++                post_approval_state = str(
++                    opll_find_submission_attempt(promoted_page).get("state")
++                    or ""
++                ).strip().lower()
++                if not opll_strict_zero_promotion_applied(
++                    effective_pre_promotion,
++                    promoted_page,
++                ):
++                    raise RuntimeError(
++                        "PayPal GB 后置优惠 Init 未证明金额由非零降为 0"
++                    )
++                post_ctx = opll_stripe_context(
++                    promoted_page,
++                    profile.elements_locale or profile.payment_locale,
++                    ctx=ctx,
++                )
++                ctx.clear()
++                ctx.update(post_ctx)
++                presenter.mark_verified(
++                    checkout_id=checkout_id,
++                    stripe_checkout_id=stripe_checkout_id,
++                    amount=final_amount,
++                    currency=final_currency,
++                    submission_state=post_approval_state,
++                    payment_method_types=payment_method_types,
++                    stripe_session=promotion_stripe,
++                    stripe_context=ctx,
++                )
++                break
++            except Exception as exc:
++                last_post_error = str(exc)
++                retryable = bool(getattr(exc, "retryable", True))
++                if not retryable or init_attempt >= max_init_attempts:
++                    raise OpllPay153CheckoutRebuildRequired(
++                        "PAYPAL_GB_PROTOCOL_POST_APPROVE_VERIFY_FAILED: "
++                        "优惠 Update 已完成，但池 2 连续 3 次 Init 未得到 "
++                        "approved + GBP/0 + PayPal: "
++                        f"{opll_short_error(last_post_error, 300)}"
++                    ) from exc
++                time.sleep(1.0)
++        else:
++            raise OpllPay153CheckoutRebuildRequired(
++                "PAYPAL_GB_PROTOCOL_POST_APPROVE_VERIFY_FAILED: "
++                f"{opll_short_error(last_post_error or 'unknown', 300)}"
++            )
++
++        post_promotion_provider_url = provider_url
++        final_hosted_url = str(
++            promoted_page.get("stripe_hosted_url")
++            or post_promotion_init.get("stripe_hosted_url")
++            or stripe_hosted_url
++        ).strip()
++        result = {
++            **checkout,
++            "payment_method_country": profile.country,
++            "payment_method_id": pm_id,
++            "stripe_hosted_url": final_hosted_url,
++            "stripe_redirect_url": stripe_redirect_url,
++            "stripe_pm_redirect_url": str(
++                redirect_result.get("stripe_pm_redirect_url") or ""
++            ),
++            "paypal_ba_approve_url": post_promotion_provider_url,
++            "provider_redirect_url": post_promotion_provider_url,
++            "payment_link_type": str(
++                redirect_result.get("payment_link_type") or "paypal_approve"
++            ),
++            "fallback": False,
++            "provider_error": "",
++            "long_url": post_promotion_provider_url,
++            "stripe_amount": final_amount,
++            "stripe_amount_source": final_amount_source,
++            "stripe_payment_page_id": stripe_checkout_id,
++            "checkout_ui_mode": "hosted",
++            "promotion_id": PIX_TRIAL_PROMOTION_ID,
++            "promotion_required": True,
++            "promotion_requested": True,
++            "promotion_applied": True,
++            "promotion_strategy": profile.promotion_strategy,
++            "promotion_proof": profile.promotion_proof,
++            "promotion_proxy": promotion_proxy_url,
++            "variant": profile.flow_name,
++            "paypal_flow": profile.flow_name,
++            **presenter.model.result_metadata,
++            "promotion_update_count": presenter.model.promotion_update_count,
++            "promotion_update_attempts": promotion_update_attempts,
++            "promotion_update_country": profile.country,
++            "post_approval_init_count": post_approval_init_count,
++            "post_approval_init_proxy_used": promotion_proxy_url,
++            "merchant_snapshot_country": profile.country,
++            "checkout_taxes_performed": False,
++            "checkout_taxes_count": 0,
++            "checkout_taxes_country": profile.country,
++            "checkout_taxes_currency": profile.currency,
++            "checkout_taxes_proxy_used": "",
++            "checkout_snapshot_performed": bool(
++                checkout_snapshot_result.get("applied")
++            ),
++            "checkout_snapshot_count": 1,
++            "checkout_snapshot_status_code": int(
++                checkout_snapshot_result.get("status_code") or 0
++            ),
++            "stripe_tax_region_count": 1,
++            "stripe_tax_region_country": profile.country,
++            "stripe_tax_region_proxy_used": primary_proxy_url,
++            "checkout_promotion_present": False,
++            "checkout_promotion_amount": initial_amount,
++            "checkout_promotion_amount_source": initial_amount_source,
++            "pre_promotion_amount": initial_amount,
++            "pre_promotion_amount_source": initial_amount_source,
++            "pre_confirm_amount": pre_confirm_amount,
++            "pre_confirm_amount_source": pre_confirm_amount_source,
++            "approval_state": post_approval_state,
++            "paypal_ba_state": post_approval_state,
++            "ba_preserved_after_promotion": post_approval_state == "approved",
++            "account_precheck_proxy_used": primary_proxy_url,
++            "promotion_check_proxy_used": primary_proxy_url,
++            "create_proxy_used": primary_proxy_url,
++            "payment_proxy_used": primary_proxy_url,
++            "approve_proxy_used": primary_proxy_url,
++            "approval_strategy": (
++                "pool1_prefetch_confirm_requires_approval_then_approve_poll"
++            ),
++            "request_execution": (
++                "browser_http"
++                if presenter.model.browser_http_used
++                else "python_http"
++            ),
++            "identity_cookie_copy_count": len(copied_identity_cookies),
++            "checkout_attempt": 1,
++        }
++        opll_emit_diagnostic(
++            diagnostic_log,
++            "[PayPal GB/GBP] 成功：BA 已批准，原 Checkout 后置优惠已生效，"
++            "Stripe 应付金额为 0 GBP",
++        )
++        return opll_apply_amount_check(result, target_amount)
++    finally:
++        for session, owned in (
++            (promotion_chatgpt, owns_promotion_chatgpt),
++            (primary_chatgpt, owns_primary_chatgpt),
++            (promotion_stripe, owns_promotion_stripe),
++            (stripe, owns_stripe),
++        ):
++            if session is None or not owned:
++                continue
++            try:
++                close_session = getattr(session, "close", None)
++                if callable(close_session):
++                    close_session()
++            except Exception:
++                pass
++
++
+ def _generate_opll_paypal_pay153_region_long_link(
+     access_token: str,
+     checkout_proxy_url: str = "",
+@@ -6805,6 +7968,7 @@
+     diagnostic_log=None,
+     sentinel_so_enabled: bool = False,
+     session_context: dict | None = None,
++    browser_runtime: dict | None = None,
+ ) -> dict:
+     checkout_proxy_url = str(checkout_proxy_url or "").strip()
+     final_proxy_url = str(final_proxy_url or "").strip()
+@@ -6836,7 +8000,11 @@
+     ):
+         raise RuntimeError(
+             f"PayPal {country}/PAY153 需要两条不同的 {country} 粘性代理："
+-            "代理池 1 创建 Checkout 并检查优惠，代理池 2 从 Update 完成到 BA"
++            + (
++                "代理池 1 完成标准 Checkout/Approve/BA，代理池 2 仅在 BA 后 Update"
++                if active_profile.promotion_timing == "post_approve"
++                else "代理池 1 创建 Checkout 并检查优惠，代理池 2 从 Update 完成到 BA"
++            )
+         )
+     target_amount = str(target_amount or "0").strip()
+     if target_amount != "0":
+@@ -6850,6 +8018,19 @@
+     billing_location_kwargs = active_profile.billing_location_kwargs
+     flow_label = active_profile.flow_label
+     flow_error_prefix = active_profile.error_prefix
++    if active_profile.promotion_timing == "post_approve":
++        return _generate_opll_paypal_gb_post_approve_long_link(
++            access_token,
++            checkout_proxy_url,
++            final_proxy_url,
++            target_amount,
++            account_email=account_email,
++            diagnostic_log=diagnostic_log,
++            sentinel_so_enabled=sentinel_so_enabled,
++            session_context=session_context,
++            protocol_profile=active_profile,
++            browser_runtime=browser_runtime,
++        )
+     opll_emit_diagnostic(
+         diagnostic_log,
+         f"[{flow_label}] 步骤 1/7：正在验证 Access Token，并准备 "
+@@ -7548,8 +8729,9 @@
+     diagnostic_log=None,
+     sentinel_so_enabled: bool = False,
+     session_context: dict | None = None,
++    browser_runtime: dict | None = None,
+ ) -> dict:
+-    """Generate a GB PayPal BA link with pool-1 check and pool-2 finish."""
++    """Generate GB BA on pool 1, then apply promotion once through pool 2."""
+ 
+     return _generate_opll_paypal_pay153_region_long_link(
+         access_token,
+@@ -7563,6 +8745,7 @@
+         diagnostic_log=diagnostic_log,
+         sentinel_so_enabled=sentinel_so_enabled,
+         session_context=session_context,
++        browser_runtime=browser_runtime,
+     )
+ 
+ 
+@@ -7576,6 +8759,7 @@
+     diagnostic_log=None,
+     sentinel_so_enabled: bool = False,
+     session_context: dict | None = None,
++    browser_runtime: dict | None = None,
+ ) -> dict:
+     """Compatibility alias for the GB/GBP two-proxy protocol."""
+ 
+@@ -7588,6 +8772,7 @@
+         diagnostic_log=diagnostic_log,
+         sentinel_so_enabled=sentinel_so_enabled,
+         session_context=session_context,
++        browser_runtime=browser_runtime,
+     )
+ 
+ 
+--- a/src/hidemyemail_generator/openai_card_link_bridge.py
++++ b/src/hidemyemail_generator/openai_card_link_bridge.py
+@@ -170,23 +170,35 @@
+     checkout: dict,
+     *,
+     default_flow: str,
++    expected_country: str,
+ ) -> dict[str, object]:
+-    """Project only non-secret two-proxy protocol facts into a public event."""
++    """Present verified, non-secret two-proxy protocol facts."""
+ 
++    country = str(expected_country or "").strip().upper()
+     update_count = int(checkout.get("promotion_update_count") or 0)
++    update_country = str(
++        checkout.get("promotion_update_country") or ""
++    ).strip().upper()
+     taxes_performed = bool(checkout.get("checkout_taxes_performed"))
+     taxes_count = int(checkout.get("checkout_taxes_count") or 0)
++    promotion_timing = str(checkout.get("promotion_timing") or "").strip()
++    approval_before_promotion = bool(
++        checkout.get("approval_completed_before_promotion")
++    )
++    same_checkout_promotion = bool(checkout.get("same_checkout_promotion"))
+     if update_count != 1:
+         raise RuntimeError("PayPal 双代理流程必须且只能完成一次 Checkout Update")
+-    if not taxes_performed or taxes_count != 1:
+-        raise RuntimeError("PayPal 双代理流程必须完成一次 Checkout Taxes")
+-    return {
++    if update_country != country:
++        raise RuntimeError(
++            "PayPal 双代理优惠 Update 国家不匹配："
++            f"期望={country}，当前={update_country or '<missing>'}"
++        )
++
++    metadata = {
+         "paypal_flow": str(checkout.get("paypal_flow") or default_flow),
+         "variant": str(checkout.get("variant") or default_flow),
+         "promotion_update_count": update_count,
+-        "promotion_update_country": str(
+-            checkout.get("promotion_update_country") or ""
+-        ).upper(),
++        "promotion_update_country": update_country,
+         "checkout_taxes_performed": taxes_performed,
+         "checkout_taxes_count": taxes_count,
+         "checkout_taxes_country": str(
+@@ -196,7 +208,126 @@
+             checkout.get("checkout_taxes_currency") or ""
+         ).upper(),
+         "approval_strategy": str(checkout.get("approval_strategy") or ""),
++        "promotion_timing": promotion_timing,
++        "promotion_checkout_id": str(
++            checkout.get("promotion_checkout_id") or ""
++        ),
++        "approval_completed_before_promotion": approval_before_promotion,
++        "same_checkout_promotion": same_checkout_promotion,
++        "session_proxy_consistent": bool(
++            checkout.get("session_proxy_consistent")
++        ),
++        "stripe_context_consistent": bool(
++            checkout.get("stripe_context_consistent")
++        ),
++        "browser_http_used": bool(checkout.get("browser_http_used")),
+     }
++    if country == "US":
++        taxes_country = str(
++            checkout.get("checkout_taxes_country") or ""
++        ).strip().upper()
++        taxes_currency = str(
++            checkout.get("checkout_taxes_currency") or ""
++        ).strip().upper()
++        if (
++            not taxes_performed
++            or taxes_count != 1
++            or taxes_country != "US"
++            or taxes_currency != "USD"
++        ):
++            raise RuntimeError(
++                "PayPal US/PAY153 必须完成一次 US/USD Checkout Taxes"
++            )
++        return metadata
++
++    if country != "GB":
++        raise RuntimeError(f"PayPal 双代理事件不支持国家：{country or '<missing>'}")
++
++    checkout_id = str(checkout.get("cs_id") or "").strip()
++    promotion_checkout_id = str(
++        checkout.get("promotion_checkout_id") or ""
++    ).strip()
++    stripe_tax_region_count = int(
++        checkout.get("stripe_tax_region_count") or 0
++    )
++    stripe_tax_region_country = str(
++        checkout.get("stripe_tax_region_country") or ""
++    ).strip().upper()
++    snapshot_count = int(checkout.get("checkout_snapshot_count") or 0)
++    update_attempts = int(checkout.get("promotion_update_attempts") or 0)
++    post_init_count = int(checkout.get("post_approval_init_count") or 0)
++    post_init_proxy = str(
++        checkout.get("post_approval_init_proxy_used") or ""
++    ).strip()
++    promotion_proxy = str(checkout.get("promotion_proxy") or "").strip()
++    amount = str(checkout.get("stripe_amount") or "").strip()
++    amount_currency = str(
++        checkout.get("amount_currency")
++        or checkout.get("currency")
++        or ""
++    ).strip().upper()
++    approval_state = str(checkout.get("approval_state") or "").strip().lower()
++    paypal_ba_state = str(
++        checkout.get("paypal_ba_state") or ""
++    ).strip().lower()
++
++    if promotion_timing != "post_approve":
++        raise RuntimeError("PayPal GB 优惠时序必须为 post_approve")
++    if not approval_before_promotion:
++        raise RuntimeError("PayPal GB 优惠 Update 必须发生在 Approval 完成后")
++    if (
++        not checkout_id.startswith("cs_")
++        or promotion_checkout_id != checkout_id
++        or not same_checkout_promotion
++        or not bool(checkout.get("checkout_identity_preserved"))
++    ):
++        raise RuntimeError("PayPal GB 后置优惠必须复用同一标准 Checkout")
++    if not bool(checkout.get("stripe_context_consistent")):
++        raise RuntimeError("PayPal GB 池 1/池 2 必须复用一致的 Stripe Context")
++    if not bool(checkout.get("session_proxy_consistent")):
++        raise RuntimeError("PayPal GB 会话与代理绑定不一致")
++    if taxes_performed or taxes_count != 0:
++        raise RuntimeError("PayPal GB 后置优惠流程不得使用 ChatGPT Checkout Taxes")
++    if stripe_tax_region_count != 1 or stripe_tax_region_country != "GB":
++        raise RuntimeError("PayPal GB 必须完成一次 Stripe tax_region")
++    if snapshot_count != 1:
++        raise RuntimeError("PayPal GB 必须尝试一次 Checkout snapshot")
++    if not 1 <= update_attempts <= 3:
++        raise RuntimeError("PayPal GB 优惠 Update 尝试次数必须在 1 到 3 次之间")
++    if not 1 <= post_init_count <= 3:
++        raise RuntimeError("PayPal GB 池 2 后置 Stripe Init 次数必须在 1 到 3 次之间")
++    if not post_init_proxy or (
++        post_init_proxy.casefold() != "pool2"
++        and (not promotion_proxy or post_init_proxy != promotion_proxy)
++    ):
++        raise RuntimeError("PayPal GB 优惠后 Stripe Init 必须使用池 2")
++    if approval_state != "approved" or paypal_ba_state != "approved":
++        raise RuntimeError("PayPal GB 优惠后 Payment Page 与 PayPal BA 必须保持 approved")
++    if not bool(checkout.get("ba_preserved_after_promotion")):
++        raise RuntimeError("PayPal GB 优惠后必须保留已批准的 PayPal BA")
++    if amount != "0" or amount_currency != "GBP":
++        raise RuntimeError(
++            "PayPal GB 优惠后 Payment Page 必须为 approved + GBP/0"
++        )
++
++    metadata.update(
++        {
++            "promotion_update_attempts": update_attempts,
++            "post_approval_init_count": post_init_count,
++            "post_approval_init_proxy_used": "pool2",
++            "checkout_snapshot_performed": bool(
++                checkout.get("checkout_snapshot_performed")
++            ),
++            "checkout_snapshot_count": snapshot_count,
++            "stripe_tax_region_count": stripe_tax_region_count,
++            "stripe_tax_region_country": stripe_tax_region_country,
++            "approval_state": approval_state,
++            "paypal_ba_state": paypal_ba_state,
++            "ba_preserved_after_promotion": True,
++            "checkout_identity_preserved": True,
++        }
++    )
++    return metadata
+ 
+ 
+ def paypal_ba_approve_url(runtime, checkout: dict) -> str:
+@@ -218,8 +349,8 @@
+     target_amount: str,
+     *,
+     account_email: str = "",
+-    sentinel_so_enabled: bool = False,
+-    session_context: dict | None = None,
++    sentinel_so_enabled: bool = False,
++    session_context: dict | None = None,
+     diagnostic_log=emit_progress,
+     runtime=card_link_runtime,
+ ) -> dict:
+@@ -271,20 +402,22 @@
+         **paypal_two_proxy_event_metadata(
+             checkout,
+             default_flow="pay153_protocol",
++            expected_country="US",
+         ),
+         **proxy_pair,
+     }
+ 
+ 
+-def generate_paypal_gb_event(
++def generate_paypal_gb_event(
+     token: str,
+     create_proxy_url: str,
+     promotion_proxy_url: str,
+     target_amount: str,
+     *,
+     account_email: str = "",
+-    sentinel_so_enabled: bool = False,
+-    session_context: dict | None = None,
++    sentinel_so_enabled: bool = False,
++    session_context: dict | None = None,
++    browser_runtime: dict | None = None,
+     diagnostic_log=emit_progress,
+     runtime=card_link_runtime,
+ ) -> dict:
+@@ -312,15 +445,20 @@
+         )
+     if not callable(generator):
+         raise RuntimeError("PayPal GB 双代理运行时入口缺失")
++    generator_kwargs = {
++        "account_email": str(account_email or "").strip(),
++        "diagnostic_log": diagnostic_log,
++        "sentinel_so_enabled": sentinel_so_enabled,
++        "session_context": session_context,
++    }
++    if isinstance(browser_runtime, dict) and browser_runtime:
++        generator_kwargs["browser_runtime"] = browser_runtime
+     checkout = generator(
+         token,
+         create_proxy_url,
+         promotion_proxy_url,
+         normalized_target,
+-        account_email=str(account_email or "").strip(),
+-        diagnostic_log=diagnostic_log,
+-        sentinel_so_enabled=sentinel_so_enabled,
+-        session_context=session_context,
++        **generator_kwargs,
+     )
+     link = paypal_ba_approve_url(runtime, checkout)
+     checkout_country = str(checkout.get("billing_country") or "GB").upper()
+@@ -351,6 +489,7 @@
+         **paypal_two_proxy_event_metadata(
+             checkout,
+             default_flow="gb_two_proxy_promotion",
++            expected_country="GB",
+         ),
+         **proxy_pair,
+     }
+--- a/src/hidemyemail_generator/paypal_protocol_profile.py
++++ b/src/hidemyemail_generator/paypal_protocol_profile.py
+@@ -25,6 +25,12 @@
+     error_prefix: str
+     promotion_strategy: str
+     promotion_proof: str
++    promotion_timing: str = "pre_confirm"
++    checkout_includes_trial_promo: bool = True
++    primary_proxy_finishes_checkout: bool = False
++    requires_same_checkout_post_approve: bool = False
++    browser_http_policy: str = "bound_when_supplied"
++    elements_locale: str = ""
+     billing_city_hint: str = ""
+     billing_state_hint: str = ""
+ 
+@@ -54,6 +60,12 @@
+     promotion_proof=(
+         "pool1_checkout_check_pool2_us_update_then_stripe_validation"
+     ),
++    promotion_timing="pre_confirm",
++    checkout_includes_trial_promo=True,
++    primary_proxy_finishes_checkout=False,
++    requires_same_checkout_post_approve=False,
++    browser_http_policy="bound_when_supplied",
++    elements_locale="en",
+     billing_city_hint="New York",
+     billing_state_hint="NY",
+ )
+@@ -63,16 +75,25 @@
+     country="GB",
+     currency="GBP",
+     request_locale="en-GB",
+-    payment_locale="en",
++    payment_locale="en-GB",
+     browser_timezone="Europe/London",
+-    # Hosted and OAICS payloads may expose pre-tax, tax-inclusive, or
+-    # USD-parity snapshots before the mandatory GB Update/Taxes sequence.
++    # Standard Checkout may expose pre-tax or tax-inclusive snapshots before
++    # approval.  Any positive GBP amount is accepted by the Presenter; these
++    # values remain documented fixtures for regression tests.
+     standard_amounts=("1667", "1917", "2000"),
+     flow_name=PAYPAL_GB_TWO_PROXY_FLOW,
+     flow_label="PayPal GB/GBP",
+     error_prefix="PAYPAL_GB_PROTOCOL",
+-    promotion_strategy="checkout_check_then_gb_update",
++    promotion_strategy=(
++        "standard_checkout_confirm_approve_then_same_checkout_update"
++    ),
+     promotion_proof=(
+-        "pool1_checkout_check_pool2_gb_update_then_stripe_validation"
++        "ba_approved_then_checkout_update_then_stripe_zero"
+     ),
++    promotion_timing="post_approve",
++    checkout_includes_trial_promo=False,
++    primary_proxy_finishes_checkout=True,
++    requires_same_checkout_post_approve=True,
++    browser_http_policy="bound_when_supplied",
++    elements_locale="en",
+ )
+--- a/src/hidemyemail_generator/webapp.py
++++ b/src/hidemyemail_generator/webapp.py
+@@ -8695,7 +8695,7 @@
+             return web.json_response(
+                 {
+                     "ok": False,
+-                    "error": "英国 PayPal 提链记录必须使用 GB Checkout 与 GB 池2最终代理，请重新提链",
++                    "error": "英国 PayPal 提链记录必须使用 GB 标准 Checkout 与 GB 池2后置优惠代理，请重新提链",
+                 },
+                 status=409,
+             )
+--- a/src/hidemyemail_generator/web_ui/static/app.js
++++ b/src/hidemyemail_generator/web_ui/static/app.js
+@@ -34,7 +34,7 @@
+     },
+     paypal_gb: {
+       country: "GB",
+-      summary: "池1 Checkout/优惠检查；池2 Update→Taxes→Stripe→Approve/Poll",
++      summary: "池1 标准 Checkout→Taxes→Sentinel→Confirm→Approve/Poll/BA；池2 BA 后同 Checkout Update；池1复验 GBP/0",
+       label: "PayPal / 英国 · GBP · 双代理严格 0",
+       checks: ["✓ Session 可用", "✓ 地区 GB", "✓ 币种 GBP", "✓ 优惠后金额 0", "✓ 返回 PayPal BA 授权链接"],
+       button: "提取 PayPal 链接",
+@@ -46,7 +46,7 @@
+       promotionProxyPreference: "paypalGbCreate",
+       promotionProxyCountry: "GB",
+       createProxyLabel: "池1 Checkout 代理国家",
+-      promotionProxyLabel: "池2 Update/支付代理国家",
++      promotionProxyLabel: "池2 BA 后 Update 代理国家",
+       promotionProxyChoice: "second",
+       targetAmount: true,
+       fixedTargetAmount: "0",
+@@ -1956,7 +1956,7 @@
+         ? (config.singleProxy
+           ? "提链代理与注册代理独立。第一代理负责 " + config.country +
+             " Checkout 创建（直接携带优惠）、金额校验、Confirm 与 Approve；不会提交优惠 Update。"
+-          : "提链代理与注册代理独立。池1 Checkout/优惠检查；池2 Update→Taxes→Stripe→Approve/Poll。") +
++          : "提链代理与注册代理独立。" + config.summary + "。") +
+           `提链成功后会按链接国家自动选择支付代理，并由 ${paymentSmsLabel} 自动取号、取码和启动协议支付。`
+         : "所选提链代理尚未配置，请先到“提链代理独立配置”保存凭据。";
+       $("quickRegistrationProxySummary").textContent = "注册代理：" +
+@@ -1972,7 +1972,7 @@
+         "；第一出口：" + (extractionFirstCountrySelect.selectedOptions[0]?.textContent || "—") +
+         (config.singleProxy ? "；全程复用第一代理；优惠：Checkout 创建时携带" :
+           "；第二出口：" + (extractionSecondCountrySelect.selectedOptions[0]?.textContent || "—") +
+-          "；池1 Checkout/优惠检查；池2 Update→Taxes→Stripe→Approve/Poll");
++          "；" + config.summary);
+ 
+       const registrationMode = $("quickRegistrationMode").value || "headless";
+       const protocolMode = registrationMode === "protocol";
+--- a/tests/test_pay153_two_proxy_protocol.py
++++ b/tests/test_pay153_two_proxy_protocol.py
+@@ -15,6 +15,14 @@
+         self.closed = True
+ 
+ 
++class _RetryableProtocolError(RuntimeError):
++    retryable = True
++
++
++class _PermanentProtocolError(RuntimeError):
++    retryable = False
++
++
+ class _Response:
+     def __init__(self, status_code=200, payload=None, text=""):
+         self.status_code = status_code
+@@ -55,15 +63,27 @@
+     final_proxy = "http://pool2.example:8000"
+ 
+     @staticmethod
+-    def _page(currency, amount=0):
+-        return {
+-            "stripe_hosted_url": "https://checkout.stripe.com/c/pay/fixture",
++    def _page(
++        currency,
++        amount=0,
++        *,
++        state="",
++        checkout_id="cs_pay153_fixture",
++    ):
++        page = {
++            "stripe_hosted_url": (
++                f"https://checkout.stripe.com/c/pay/{checkout_id}"
++                "#stripe-fragment-fixture"
++            ),
+             "payment_method_types": ["card", "paypal"],
+             "total_summary": {"due": amount},
+             "currency": currency.lower(),
+             "config_id": "cfg_fixture",
+             "init_checksum": f"checksum_{currency}_{amount}",
+         }
++        if state:
++            page["submission_attempt"] = {"state": state}
++        return page
+ 
+     @classmethod
+     def _checkout(cls, country, currency, *, checkout_id="cs_pay153_fixture"):
+@@ -82,53 +102,175 @@
+         country,
+         currency,
+         *,
+-        initial_amount=0,
++        initial_amount=None,
++        tax_amount=None,
+         taxes_error=None,
++        tax_region_error=None,
++        snapshot_error=None,
++        approval_error=None,
++        ba_available=True,
++        update_effects=None,
++        post_init_effects=None,
++        post_init_states=None,
++        confirm_state="requires_approval",
++        expected_error_pattern="",
+     ):
++        if initial_amount is None:
++            initial_amount = 1917 if country == "GB" else 0
++        if tax_amount is None:
++            tax_amount = 2000 if country == "GB" else initial_amount
+         initial_page = self._page(currency, initial_amount)
+-        page = self._page(currency)
+         paypal_url = (
+             "https://www.paypal.com/agreements/approve?ba_token="
+             f"fixture_{country.lower()}"
+         )
+         events = []
+         built_sessions = []
++        pool1_stripe = _MarkerSession("pool1-stripe")
++        pool2_stripe = _MarkerSession("pool2-stripe")
++        update_values = list(update_effects or ({"ok": True},))
++        post_init_values = list(post_init_effects or (0,))
++        post_state_values = list(post_init_states or ("approved",))
++        post_init_count = 0
++        stripe_init_contexts = []
++        stripe_init_context_snapshots = []
++        confirm_context_snapshot = {}
++        stable_context_fields = (
++            "guid",
++            "muid",
++            "sid",
++            "stripe_js_id",
++            "elements_session_id",
++        )
+ 
+         def build_chatgpt(_token, proxy_url, **kwargs):
+             session = _MarkerSession(f"{proxy_url}-{len(built_sessions)}")
+             built_sessions.append((proxy_url, kwargs, session))
+             return session
+ 
++        def build_stripe(proxy_url, **_kwargs):
++            return (
++                pool1_stripe
++                if proxy_url == self.checkout_proxy
++                else pool2_stripe
++            )
++
+         def stripe_init(*_args, **_kwargs):
++            nonlocal post_init_count
++            stripe_context = _kwargs.get("ctx")
++            stripe_init_contexts.append(stripe_context)
++            stripe_init_context_snapshots.append(
++                {
++                    field: str((stripe_context or {}).get(field) or "")
++                    for field in stable_context_fields
++                }
++            )
++            proxy_url = _args[3]
++            if country == "GB" and proxy_url == self.final_proxy:
++                index = post_init_count
++                post_init_count += 1
++                effect = post_init_values[
++                    min(index, len(post_init_values) - 1)
++                ]
++                if isinstance(effect, Exception):
++                    events.append("post_promo_init_error")
++                    raise effect
++                state = post_state_values[
++                    min(index, len(post_state_values) - 1)
++                ]
++                events.append(f"post_promo_init_{effect}_{state}")
++                if isinstance(effect, dict):
++                    return dict(effect)
++                return self._page(currency, effect, state=state)
+             events.append("stripe_init")
+             return dict(initial_page)
+ 
+-        def update(*_args, **_kwargs):
++        def direct_update(*_args, **_kwargs):
++            events.append("checkout_update")
++            effect = update_values.pop(0) if update_values else {"ok": True}
++            if isinstance(effect, Exception):
++                raise effect
++            if isinstance(effect, dict) and effect != {"ok": True}:
++                return dict(effect)
++            return {
++                "promotion_id": card_link_runtime.PIX_TRIAL_PROMOTION_ID,
++                "currency": currency,
++                "total_summary": {"due": 0},
++                "payment_method_types": ["card", "paypal"],
++            }
++
++        def apply_update(*_args, **_kwargs):
+             events.append("checkout_update")
+             return {
+                 "promotion_id": card_link_runtime.PIX_TRIAL_PROMOTION_ID,
+                 "promotion_applied": True,
+-                "payment_page": dict(page),
++                "payment_page": self._page(currency),
+             }
+ 
++        def verify_promotion(*_args, **_kwargs):
++            return self._page(currency)
++
++        def warmup(*_args, **_kwargs):
++            events.append("checkout_warmup")
++
+         def taxes(*_args, **_kwargs):
+             events.append("checkout_taxes")
+             if taxes_error is not None:
+                 raise taxes_error
+             return {"total_summary": {"due": 0}}
+ 
++        def tax_region(*_args, **_kwargs):
++            events.append("stripe_tax_region")
++            if tax_region_error is not None:
++                raise tax_region_error
++            return self._page(currency, tax_amount)
++
++        def checkout_snapshot(*_args, **_kwargs):
++            events.append("checkout_snapshot")
++            if snapshot_error is not None:
++                raise snapshot_error
++            return {"status_code": 204, "applied": True}
++
+         def create_pm(*_args, **_kwargs):
+             events.append("payment_method")
+             return "pm_fixture"
+ 
++        def prefetch_sentinel(*_args, **_kwargs):
++            events.append("sentinel_prefetch")
++            return {
++                "openai-sentinel-token": "sentinel-token-fixture",
++                "openai-sentinel-so-token": "sentinel-so-fixture",
++            }
++
+         def confirm(*_args, **_kwargs):
+             events.append("confirm")
+-            return {"submission_attempt": {"state": "requires_approval"}}
++            confirm_context_snapshot.update(
++                {
++                    field: str((_args[5] or {}).get(field) or "")
++                    for field in stable_context_fields
++                }
++            )
++            confirm_context_snapshot["checkout_amount"] = str(
++                (_args[5] or {}).get("checkout_amount") or ""
++            )
++            return {"submission_attempt": {"state": confirm_state}}
+ 
+         def approve(*_args, **_kwargs):
+             events.append("approve_poll")
++            if approval_error is not None:
++                raise approval_error
+             return "https://pm-redirects.stripe.com/authorize/fixture"
+ 
++        def resolve_ba(*_args, **_kwargs):
++            if country == "GB":
++                events.append("resolve_ba")
++            return {
++                "paypal_ba_approve_url": paypal_url if ba_available else "",
++                "payment_link_type": (
++                    "paypal_approve" if ba_available else ""
++                ),
++            }
++
+         with ExitStack() as stack:
+             validate = stack.enter_context(
+                 patch.object(
+@@ -154,11 +296,18 @@
+                     },
+                 )
+             )
++            checkout_warmup = stack.enter_context(
++                patch.object(
++                    card_link_runtime,
++                    "opll_chatgpt_checkout_warmup",
++                    side_effect=warmup,
++                )
++            )
+             build_stripe = stack.enter_context(
+                 patch.object(
+                     card_link_runtime,
+                     "opll_build_stripe_session",
+-                    return_value=object(),
++                    side_effect=build_stripe,
+                 )
+             )
+             init = stack.enter_context(
+@@ -172,27 +321,52 @@
+                 patch.object(
+                     card_link_runtime,
+                     "opll_chatgpt_update_checkout_promotion",
++                    side_effect=direct_update,
+                 )
+             )
+             post_init_update = stack.enter_context(
+                 patch.object(
+                     card_link_runtime,
+                     "opll_apply_checkout_trial_promotion",
+-                    side_effect=update,
++                    side_effect=apply_update,
+                 )
+             )
+             wait = stack.enter_context(
+                 patch.object(
+                     card_link_runtime,
+                     "opll_wait_for_us_tr_promoted_payment_page",
+-                    return_value=dict(page),
++                    side_effect=verify_promotion,
+                 )
+             )
+             billing = stack.enter_context(
+                 patch.object(
+                     card_link_runtime,
+                     "opll_billing_for_country",
+-                    return_value={"country": country},
++                    return_value={
++                        "name": "Alex Fixture",
++                        "email": "member@example.com",
++                        "phone": "+442079460000",
++                        "country": country,
++                        "line1": "221B Baker Street",
++                        "city": "London",
++                        "state": "" if country == "GB" else "CA",
++                        "postal_code": "NW1 6XE",
++                        "line2": "",
++                    },
++                )
++            )
++            stripe_tax_region = stack.enter_context(
++                patch.object(
++                    card_link_runtime,
++                    "opll_stripe_update_tax_region",
++                    side_effect=tax_region,
++                )
++            )
++            snapshot = stack.enter_context(
++                patch.object(
++                    card_link_runtime,
++                    "opll_paypal_gb_chatgpt_checkout_snapshot",
++                    side_effect=checkout_snapshot,
+                 )
+             )
+             checkout_taxes = stack.enter_context(
+@@ -209,6 +383,13 @@
+                     side_effect=create_pm,
+                 )
+             )
++            sentinel_prefetch = stack.enter_context(
++                patch.object(
++                    card_link_runtime,
++                    "opll_prefetch_paypal_approval_sentinel",
++                    side_effect=prefetch_sentinel,
++                )
++            )
+             stripe_confirm = stack.enter_context(
+                 patch.object(
+                     card_link_runtime,
+@@ -223,24 +404,30 @@
+                     side_effect=approve,
+                 )
+             )
+-            stack.enter_context(
++            resolve_ba = stack.enter_context(
+                 patch.object(
+                     card_link_runtime,
+                     "opll_resolve_paypal_redirect_result",
+-                    return_value={
+-                        "paypal_ba_approve_url": paypal_url,
+-                        "payment_link_type": "paypal_approve",
+-                    },
++                    side_effect=resolve_ba,
+                 )
+             )
++            retrieve = stack.enter_context(
++                patch.object(
++                    card_link_runtime,
++                    "opll_stripe_retrieve_payment_page",
++                )
++            )
++            sleep = stack.enter_context(
++                patch.object(card_link_runtime.time, "sleep")
++            )
+ 
+             generator = (
+                 card_link_runtime.generate_opll_paypal_gb_pay153_long_link
+                 if country == "GB"
+                 else card_link_runtime.generate_opll_paypal_pay153_long_link
+             )
+-            if taxes_error is None:
+-                result = generator(
++            def call():
++                return generator(
+                     "token",
+                     self.checkout_proxy,
+                     self.final_proxy,
+@@ -248,137 +435,426 @@
+                     account_email="member@example.com",
+                     session_context={"device_id": "saved-device"},
+                 )
+-                error = None
+-            else:
+-                error_prefix = (
+-                    "PAYPAL_GB_PROTOCOL" if country == "GB" else "PAY153_PROTOCOL"
+-                )
++            if expected_error_pattern:
+                 with self.assertRaisesRegex(
+                     RuntimeError,
+-                    f"{error_prefix}_TAXES_FAILED",
++                    expected_error_pattern,
+                 ) as caught:
+-                    generator(
+-                        "token",
+-                        self.checkout_proxy,
+-                        self.final_proxy,
+-                        "0",
+-                        account_email="member@example.com",
+-                    )
++                    call()
+                 result = None
+                 error = caught.exception
++            else:
++                result = call()
++                error = None
+ 
+         return SimpleNamespace(**locals())
+ 
+-    def test_us_and_gb_use_pool1_for_create_and_pool2_from_unique_update(self):
+-        for country, currency, request_locale, payment_locale, timezone in (
+-            ("US", "USD", "en-US", "en", "America/New_York"),
+-            ("GB", "GBP", "en-GB", "en", "Europe/London"),
+-        ):
+-            with self.subTest(country=country):
+-                case = self._run_region(country, currency)
++    def test_us_keeps_legacy_pool2_pre_confirm_update_order(self):
++        case = self._run_region("US", "USD")
+ 
+-                self.assertEqual(
+-                    case.events,
+-                    [
+-                        "stripe_init",
+-                        "checkout_update",
+-                        "checkout_taxes",
+-                        "payment_method",
+-                        "confirm",
+-                        "approve_poll",
+-                    ],
+-                )
+-                case.direct_update.assert_not_called()
+-                case.post_init_update.assert_called_once()
+-                self.assertEqual(
+-                    case.post_init_update.call_args.kwargs["chatgpt_proxy_url"],
+-                    self.final_proxy,
+-                )
+-                self.assertEqual(case.create.call_args.args[1:4], (
+-                    country,
+-                    currency,
+-                    self.checkout_proxy,
+-                ))
+-                self.assertEqual(
+-                    case.create.call_args.kwargs["request_locale"],
+-                    request_locale,
+-                )
+-                self.assertEqual(case.init.call_args.args[3], self.final_proxy)
+-                self.assertEqual(
+-                    case.init.call_args.kwargs["payment_locale"],
+-                    payment_locale,
+-                )
+-                self.assertEqual(
+-                    case.init.call_args.kwargs["browser_timezone"],
+-                    timezone,
+-                )
+-                self.assertEqual(
+-                    [item[0] for item in case.built_sessions],
+-                    [self.checkout_proxy, self.final_proxy, self.final_proxy],
+-                )
+-                self.assertTrue(case.built_sessions[0][2].closed)
+-                self.assertTrue(case.built_sessions[1][2].closed)
+-                self.assertTrue(case.built_sessions[2][2].closed)
+-                taxes_call = case.checkout_taxes.call_args
+-                self.assertEqual(taxes_call.args[3], self.final_proxy)
+-                self.assertEqual(
+-                    taxes_call.kwargs["request_locale"],
+-                    request_locale,
+-                )
+-                self.assertEqual(case.result["promotion_update_count"], 1)
+-                self.assertEqual(
+-                    case.result["promotion_update_country"],
+-                    country,
+-                )
+-                self.assertEqual(
+-                    case.result["promotion_strategy"],
+-                    (
+-                        "checkout_check_then_gb_update"
+-                        if country == "GB"
+-                        else "checkout_check_then_us_update"
+-                    ),
+-                )
+-                self.assertEqual(
+-                    case.result["paypal_flow"],
+-                    (
+-                        "gb_two_proxy_promotion"
+-                        if country == "GB"
+-                        else "pay153_protocol"
+-                    ),
+-                )
+-                self.assertEqual(
+-                    case.result["checkout_taxes_currency"],
+-                    currency,
+-                )
+-                self.assertEqual(
+-                    case.result["create_proxy_used"],
+-                    self.checkout_proxy,
+-                )
+-                self.assertEqual(
+-                    case.result["payment_proxy_used"],
+-                    self.final_proxy,
+-                )
+-                self.assertEqual(
+-                    case.result["paypal_ba_approve_url"],
+-                    case.paypal_url,
+-                )
++        self.assertEqual(
++            case.events,
++            [
++                "stripe_init",
++                "checkout_update",
++                "checkout_taxes",
++                "payment_method",
++                "confirm",
++                "approve_poll",
++            ],
++        )
++        self.assertTrue(case.create.call_args.kwargs["include_trial_promo"])
++        case.direct_update.assert_not_called()
++        case.post_init_update.assert_called_once()
++        self.assertEqual(
++            case.post_init_update.call_args.kwargs["chatgpt_proxy_url"],
++            self.final_proxy,
++        )
++        self.assertEqual(
++            case.create.call_args.args[1:4],
++            ("US", "USD", self.checkout_proxy),
++        )
++        self.assertEqual(case.init.call_args.args[3], self.final_proxy)
++        self.assertIs(case.init.call_args.kwargs["stripe"], case.pool2_stripe)
++        self.assertEqual(case.checkout_taxes.call_args.args[3], self.final_proxy)
++        case.checkout_warmup.assert_not_called()
++        case.stripe_tax_region.assert_not_called()
++        case.snapshot.assert_not_called()
++        self.assertEqual(case.result["promotion_update_count"], 1)
++        self.assertEqual(case.result["promotion_update_country"], "US")
++        self.assertEqual(
++            case.result["promotion_strategy"],
++            "checkout_check_then_us_update",
++        )
++        self.assertEqual(case.result["paypal_flow"], "pay153_protocol")
++        self.assertEqual(case.result["payment_proxy_used"], self.final_proxy)
+ 
+-    def test_taxes_failure_stops_before_payment_method_for_us_and_gb(self):
+-        for country, currency in (("US", "USD"), ("GB", "GBP")):
+-            with self.subTest(country=country):
+-                case = self._run_region(
+-                    country,
+-                    currency,
+-                    taxes_error=RuntimeError("taxes unavailable"),
+-                )
++    def test_gb_uses_pool1_ba_then_pool2_same_checkout_update(self):
++        case = self._run_region("GB", "GBP")
+ 
+-                self.assertEqual(
+-                    case.events,
+-                    ["stripe_init", "checkout_update", "checkout_taxes"],
+-                )
+-                case.payment_method.assert_not_called()
+-                case.stripe_confirm.assert_not_called()
+-                case.redirect.assert_not_called()
++        self.assertEqual(
++            case.events,
++            [
++                "checkout_warmup",
++                "stripe_init",
++                "stripe_tax_region",
++                "checkout_snapshot",
++                "payment_method",
++                "sentinel_prefetch",
++                "confirm",
++                "approve_poll",
++                "resolve_ba",
++                "checkout_update",
++                "post_promo_init_0_approved",
++            ],
++        )
++        self.assertFalse(case.create.call_args.kwargs["include_trial_promo"])
++        self.assertIsNone(case.create.call_args.kwargs["checkout_ui_mode"])
++        self.assertTrue(case.create.call_args.kwargs["compact_json"])
++        self.assertEqual(
++            case.create.call_args.kwargs["referer_url"],
++            "https://chatgpt.com/",
++        )
++        self.assertEqual(
++            case.create.call_args.args[1:4],
++            ("GB", "GBP", self.checkout_proxy),
++        )
++        case.post_init_update.assert_not_called()
++        case.direct_update.assert_called_once()
++        case.checkout_taxes.assert_not_called()
++        case.wait.assert_not_called()
++        case.retrieve.assert_not_called()
++        case.resolve_ba.assert_called_once()
++
++        update_call = case.direct_update.call_args
++        self.assertEqual(update_call.args[1]["cs_id"], "cs_pay153_fixture")
++        self.assertEqual(update_call.args[2], self.final_proxy)
++        self.assertEqual(
++            update_call.kwargs["device_id"],
++            "device-pay153",
++        )
++        self.assertIs(
++            update_call.kwargs["session"],
++            case.built_sessions[-1][2],
++        )
++        self.assertEqual(case.built_sessions[-1][0], self.final_proxy)
++
++        self.assertEqual(case.build_stripe.call_count, 2)
++        first_stripe_build, second_stripe_build = (
++            case.build_stripe.call_args_list
++        )
++        self.assertEqual(first_stripe_build.args[0], self.checkout_proxy)
++        self.assertEqual(second_stripe_build.args[0], self.final_proxy)
++        self.assertIsNot(case.pool1_stripe, case.pool2_stripe)
++        self.assertEqual(case.init.call_count, 2)
++        first_init, post_promo_init = case.init.call_args_list
++        self.assertEqual(first_init.args[0], "cs_pay153_fixture")
++        self.assertEqual(post_promo_init.args[0], "cs_pay153_fixture")
++        self.assertEqual(first_init.args[3], self.checkout_proxy)
++        self.assertEqual(post_promo_init.args[3], self.final_proxy)
++        self.assertIs(first_init.kwargs["stripe"], case.pool1_stripe)
++        self.assertIs(post_promo_init.kwargs["stripe"], case.pool2_stripe)
++        self.assertIs(case.payment_method.call_args.args[0], case.pool1_stripe)
++        self.assertEqual(
++            case.stripe_confirm.call_args.args[4]["total_summary"]["due"],
++            2000,
++        )
++        checkout_session = case.built_sessions[0][2]
++        case.checkout_warmup.assert_called_once()
++        self.assertIs(
++            case.checkout_warmup.call_args.args[0],
++            checkout_session,
++        )
++        self.assertEqual(
++            case.checkout_warmup.call_args.args[1],
++            "cs_pay153_fixture",
++        )
++        case.stripe_tax_region.assert_called_once()
++        self.assertIs(
++            case.stripe_tax_region.call_args.args[0],
++            case.pool1_stripe,
++        )
++        self.assertFalse(
++            case.stripe_tax_region.call_args.kwargs["country_only"]
++        )
++        self.assertTrue(
++            case.stripe_tax_region.call_args.kwargs[
++                "omit_empty_address_fields"
++            ]
++        )
++        case.snapshot.assert_called_once()
++        self.assertIs(case.snapshot.call_args.args[0], checkout_session)
++        case.sentinel_prefetch.assert_called_once()
++        self.assertIs(
++            case.sentinel_prefetch.call_args.args[0],
++            checkout_session,
++        )
++        self.assertEqual(
++            case.sentinel_prefetch.call_args.args[3],
++            self.checkout_proxy,
++        )
++        self.assertEqual(
++            case.sentinel_prefetch.call_args.kwargs["device_id"],
++            "device-pay153",
++        )
++        self.assertFalse(
++            case.sentinel_prefetch.call_args.kwargs["warmup_required"]
++        )
++        self.assertIs(case.stripe_confirm.call_args.args[0], case.pool1_stripe)
++        self.assertIs(case.redirect.call_args.args[1], case.pool1_stripe)
++        self.assertFalse(
++            case.redirect.call_args.kwargs["approve_sentinel_required"]
++        )
++        self.assertTrue(case.redirect.call_args.kwargs["force_checkout_approval"])
++
++        self.assertEqual(case.built_sessions[0][0], self.checkout_proxy)
++        self.assertIs(
++            case.redirect.call_args.kwargs["chatgpt_session"],
++            checkout_session,
++        )
++        self.assertEqual(case.redirect.call_args.args[7], self.checkout_proxy)
++
++        stable_context_fields = (
++            "guid",
++            "muid",
++            "sid",
++            "stripe_js_id",
++            "elements_session_id",
++        )
++        confirm_ctx = case.stripe_confirm.call_args.args[5]
++        post_promo_ctx = post_promo_init.kwargs["ctx"]
++        self.assertIs(confirm_ctx, post_promo_ctx)
++        for field in stable_context_fields:
++            self.assertEqual(
++                case.confirm_context_snapshot[field],
++                case.stripe_init_context_snapshots[-1][field],
++            )
++            self.assertEqual(confirm_ctx[field], post_promo_ctx[field])
++        self.assertEqual(case.confirm_context_snapshot["checkout_amount"], "2000")
++
++        expected_return_url = (
++            card_link_runtime.opll_paypal_gb_confirm_return_url(
++                "cs_pay153_fixture",
++                case.create.return_value,
++                case.initial_page["stripe_hosted_url"],
++            )
++        )
++        self.assertEqual(
++            case.stripe_confirm.call_args.kwargs["return_url"],
++            expected_return_url,
++        )
++        self.assertIn("returned_from_redirect=true", expected_return_url)
++        self.assertIn("ui_mode=custom", expected_return_url)
++        self.assertTrue(expected_return_url.endswith("#stripe-fragment-fixture"))
++
++        self.assertEqual(
++            case.result["promotion_strategy"],
++            "standard_checkout_confirm_approve_then_same_checkout_update",
++        )
++        self.assertEqual(case.result["promotion_timing"], "post_approve")
++        self.assertTrue(case.result["promotion_required"])
++        self.assertEqual(case.result["promotion_update_count"], 1)
++        self.assertEqual(case.result["promotion_update_attempts"], 1)
++        self.assertEqual(case.result["post_approval_init_count"], 1)
++        self.assertEqual(
++            case.result["post_approval_init_proxy_used"],
++            self.final_proxy,
++        )
++        self.assertEqual(
++            case.result["promotion_checkout_id"],
++            "cs_pay153_fixture",
++        )
++        self.assertTrue(case.result["approval_completed_before_promotion"])
++        self.assertTrue(case.result["same_checkout_promotion"])
++        self.assertTrue(case.result["session_proxy_consistent"])
++        self.assertTrue(case.result["stripe_context_consistent"])
++        self.assertEqual(case.result["stripe_amount"], "0")
++        self.assertEqual(case.result["pre_promotion_amount"], "1917")
++        self.assertEqual(case.result["pre_confirm_amount"], "2000")
++        self.assertEqual(case.result["approval_state"], "approved")
++        self.assertEqual(case.result["paypal_ba_state"], "approved")
++        self.assertTrue(case.result["ba_preserved_after_promotion"])
++        self.assertTrue(case.result["paypal_method_retained"])
++        self.assertFalse(case.result["checkout_taxes_performed"])
++        self.assertEqual(case.result["checkout_taxes_count"], 0)
++        self.assertTrue(case.result["checkout_snapshot_performed"])
++        self.assertEqual(case.result["checkout_snapshot_count"], 1)
++        self.assertEqual(case.result["stripe_tax_region_count"], 1)
++        self.assertEqual(case.result["stripe_tax_region_country"], "GB")
++        self.assertEqual(case.result["paypal_ba_approve_url"], case.paypal_url)
++        self.assertEqual(case.result["create_proxy_used"], self.checkout_proxy)
++        self.assertEqual(case.result["payment_proxy_used"], self.checkout_proxy)
++        self.assertEqual(case.result["approve_proxy_used"], self.checkout_proxy)
++        self.assertEqual(case.result["promotion_proxy"], self.final_proxy)
++        self.assertTrue(case.pool1_stripe.closed)
++        self.assertTrue(case.pool2_stripe.closed)
++
++    def test_us_taxes_failure_stops_before_payment_method(self):
++        case = self._run_region(
++            "US",
++            "USD",
++            taxes_error=RuntimeError("taxes unavailable"),
++            expected_error_pattern="PAY153_PROTOCOL_TAXES_FAILED",
++        )
++
++        self.assertEqual(
++            case.events,
++            ["stripe_init", "checkout_update", "checkout_taxes"],
++        )
++        case.payment_method.assert_not_called()
++        case.stripe_confirm.assert_not_called()
++        case.redirect.assert_not_called()
++
++    def test_gb_tax_region_failure_blocks_snapshot_and_payment_method(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            tax_region_error=RuntimeError("tax region unavailable"),
++            expected_error_pattern="PAYPAL_GB_PROTOCOL_TAX_REGION_FAILED",
++        )
++
++        self.assertEqual(
++            case.events,
++            ["checkout_warmup", "stripe_init", "stripe_tax_region"],
++        )
++        case.snapshot.assert_not_called()
++        case.payment_method.assert_not_called()
++        case.stripe_confirm.assert_not_called()
++        case.direct_update.assert_not_called()
++
++    def test_gb_approve_failure_never_updates_checkout(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            approval_error=RuntimeError(
++                "PAYPAL_GB_PROTOCOL_APPROVAL_OR_POLL_FAILED: fixture"
++            ),
++            expected_error_pattern="APPROVAL_OR_POLL_FAILED",
++        )
++
++        self.assertEqual(
++            case.events,
++            [
++                "checkout_warmup",
++                "stripe_init",
++                "stripe_tax_region",
++                "checkout_snapshot",
++                "payment_method",
++                "sentinel_prefetch",
++                "confirm",
++                "approve_poll",
++            ],
++        )
++        case.direct_update.assert_not_called()
++        case.post_init_update.assert_not_called()
++        case.wait.assert_not_called()
++
++    def test_gb_invalid_confirm_state_never_approves_or_updates(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            confirm_state="succeeded",
++            expected_error_pattern="CONFIRM_STATE_INVALID",
++        )
++
++        self.assertEqual(case.events[-1], "confirm")
++        case.redirect.assert_not_called()
++        case.direct_update.assert_not_called()
++        case.wait.assert_not_called()
++
++    def test_gb_missing_ba_never_updates_checkout(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            ba_available=False,
++            expected_error_pattern="BA_MISSING",
++        )
++
++        self.assertEqual(
++            case.events,
++            [
++                "checkout_warmup",
++                "stripe_init",
++                "stripe_tax_region",
++                "checkout_snapshot",
++                "payment_method",
++                "sentinel_prefetch",
++                "confirm",
++                "approve_poll",
++                "resolve_ba",
++            ],
++        )
++        case.direct_update.assert_not_called()
++        case.post_init_update.assert_not_called()
++        case.wait.assert_not_called()
++
++    def test_gb_post_approve_update_failure_never_returns_unverified_ba(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            update_effects=(
++                _PermanentProtocolError("promotion backend unavailable"),
++            ),
++            expected_error_pattern="POST_APPROVE_PROMOTION_FAILED",
++        )
++
++        self.assertIn("resolve_ba", case.events)
++        self.assertEqual(case.events[-1], "checkout_update")
++        case.direct_update.assert_called_once()
++        self.assertIsNone(case.result)
++        case.init.assert_called_once()
++        case.wait.assert_not_called()
++
++    def test_gb_snapshot_failure_is_best_effort(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            snapshot_error=RuntimeError("snapshot unavailable"),
++        )
++
++        self.assertEqual(case.result["stripe_amount"], "0")
++        self.assertFalse(case.result["checkout_snapshot_performed"])
++        self.assertEqual(case.result["checkout_snapshot_count"], 1)
++        case.payment_method.assert_called_once()
++        case.direct_update.assert_called_once()
++
++    def test_gb_update_retry_budget_is_independent_from_post_init(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            update_effects=(
++                _RetryableProtocolError("temporary update 1"),
++                _RetryableProtocolError("temporary update 2"),
++                {"ok": True},
++            ),
++        )
++
++        self.assertEqual(case.direct_update.call_count, 3)
++        self.assertEqual(case.result["promotion_update_attempts"], 3)
++        self.assertEqual(case.result["promotion_update_count"], 1)
++        self.assertEqual(case.result["post_approval_init_count"], 1)
++        self.assertEqual(case.sleep.call_count, 2)
++
++    def test_gb_post_init_retries_without_repeating_update(self):
++        case = self._run_region(
++            "GB",
++            "GBP",
++            post_init_effects=(
++                _RetryableProtocolError("temporary init"),
++                1917,
++                0,
++            ),
++            post_init_states=("approved", "approved", "approved"),
++        )
++
++        case.direct_update.assert_called_once()
++        self.assertEqual(case.result["promotion_update_attempts"], 1)
++        self.assertEqual(case.result["post_approval_init_count"], 3)
++        self.assertEqual(case.init.call_count, 4)
++        self.assertEqual(case.sleep.call_count, 2)
++        case.wait.assert_not_called()
++        case.retrieve.assert_not_called()
++        case.resolve_ba.assert_called_once()
+ 
+     def test_gb_accepts_current_pre_update_amount_snapshots(self):
+         for amount in (1667, 1917, 2000):
+@@ -388,7 +864,7 @@
+                 self.assertEqual(case.result["stripe_amount"], "0")
+                 self.assertEqual(
+                     case.result["promotion_strategy"],
+-                    "checkout_check_then_gb_update",
++                    "standard_checkout_confirm_approve_then_same_checkout_update",
+                 )
+                 self.assertEqual(
+                     case.result["paypal_flow"],
+@@ -560,7 +1036,7 @@
+         )
+         checkout["_checkout_payload"] = {
+             "currency": "GBP",
+-            "total_summary": {"due": 0},
++            "total_summary": {"due": 1917},
+             "payment_method_types": ["card", "paypal"],
+         }
+ 
+@@ -586,11 +1062,6 @@
+                 patch.object(
+                     card_link_runtime,
+                     "opll_chatgpt_update_checkout_promotion",
+-                    return_value={
+-                        "currency": "GBP",
+-                        "total_summary": {"due": 0},
+-                        "payment_method_types": ["card", "paypal"],
+-                    },
+                 )
+             )
+             stack.enter_context(
+@@ -647,7 +1118,7 @@
+ 
+             with self.assertRaisesRegex(
+                 RuntimeError,
+-                "PAYPAL_GB_PROTOCOL_SETUP_INTENT_UNSUPPORTED",
++                "PAYPAL_GB_PROTOCOL_STANDARD_CHECKOUT_REQUIRED",
+             ):
+                 card_link_runtime.generate_opll_paypal_gb_pay153_long_link(
+                     "token",
+@@ -656,9 +1127,8 @@
+                     "0",
+                 )
+ 
+-        direct_update.assert_called_once()
+-        self.assertEqual(direct_update.call_args.args[2], self.final_proxy)
+-        self.assertFalse(materialize.call_args.kwargs["sentinel_required"])
++        direct_update.assert_not_called()
++        materialize.assert_not_called()
+         stripe_init.assert_not_called()
+         create_pm.assert_not_called()
+ 
+--- a/tests/test_paypal_checkout_sentinel.py
++++ b/tests/test_paypal_checkout_sentinel.py
+@@ -3,8 +3,9 @@
+ import subprocess
+ import sys
+ import unittest
++from unittest.mock import patch
+ 
+-from hidemyemail_generator import card_link_runtime
++from hidemyemail_generator import card_link_runtime
+ 
+ 
+ class _CheckoutResponse:
+@@ -31,6 +32,38 @@
+ 
+ 
+ class PayPalCheckoutSentinelTests(unittest.TestCase):
++    def test_approval_challenge_uses_exact_checkout_referer_before_confirm(self):
++        session = _CheckoutSession()
++        checkout = {
++            "cs_id": "cs_test_sentinel",
++            "billing_country": "GB",
++            "processor_entity": "openai_llc",
++        }
++        with patch.object(
++            card_link_runtime,
++            "opll_chatgpt_checkout_warmup",
++        ) as warmup, patch.object(
++            card_link_runtime,
++            "opll_chatgpt_sentinel_ping",
++            return_value={"result": "ok"},
++        ) as ping:
++            challenge = card_link_runtime.opll_prefetch_paypal_approval_sentinel(
++                session,
++                "cs_test_sentinel",
++                checkout,
++                "http://gb-pool1.example:8000",
++                request_locale="en-GB",
++                device_id="device-checkout-test",
++            )
++
++        self.assertEqual(challenge, {"result": "ok"})
++        warmup.assert_called_once()
++        self.assertEqual(
++            ping.call_args.kwargs["referer_url"],
++            "https://chatgpt.com/checkout/openai_llc/cs_test_sentinel",
++        )
++        self.assertEqual(ping.call_args.kwargs["network_attempts"], 2)
++
+     def test_vendored_sentinel_package_imports_without_core_path_injection(self):
+         completed = subprocess.run(
+             [
+@@ -116,6 +149,70 @@
+             '{"so":"observer"}',
+         )
+ 
++    def test_gb_standard_checkout_sends_sen_so_without_promotion(self):
++        session = _CheckoutSession()
++        observed_provider_args: list[tuple[str, str, str]] = []
++
++        def provider(proxy_url: str, device_id: str, locale: str) -> dict[str, str]:
++            observed_provider_args.append((proxy_url, device_id, locale))
++            return {
++                "openai-sentinel-token": '{"p":"gb-main"}',
++                "openai-sentinel-so-token": '{"so":"gb-observer"}',
++            }
++
++        card_link_runtime.opll_create_checkout(
++            "at-gb-checkout-test",
++            "GB",
++            "GBP",
++            "http://gb-pool1.example:8000",
++            request_locale="en-GB",
++            include_trial_promo=False,
++            chatgpt_session=session,
++            sentinel_so_enabled=True,
++            sentinel_header_provider=provider,
++        )
++
++        request = session.calls[0]
++        self.assertNotIn("promo_campaign", request["json"])
++        self.assertEqual(
++            observed_provider_args,
++            [
++                (
++                    "http://gb-pool1.example:8000",
++                    "device-checkout-test",
++                    "en-GB",
++                )
++            ],
++        )
++        self.assertEqual(
++            request["headers"]["openai-sentinel-token"],
++            '{"p":"gb-main"}',
++        )
++        self.assertEqual(
++            request["headers"]["openai-sentinel-so-token"],
++            '{"so":"gb-observer"}',
++        )
++
++    def test_approve_reuses_prefetched_session_without_second_ping(self):
++        session = _CheckoutSession()
++        with patch.object(
++            card_link_runtime,
++            "opll_chatgpt_sentinel_ping",
++        ) as ping:
++            card_link_runtime.opll_chatgpt_approve(
++                session,
++                "cs_test_sentinel",
++                {
++                    "billing_country": "GB",
++                    "processor_entity": "openai_llc",
++                },
++                sentinel_required=False,
++            )
++
++        self.assertEqual(len(session.calls), 1)
++        self.assertTrue(session.calls[0]["url"].endswith("/checkout/approve"))
++        ping.assert_not_called()
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+--- a/tests/test_paypal_two_proxy_flow.py
++++ b/tests/test_paypal_two_proxy_flow.py
+@@ -87,14 +87,30 @@
+                 PAYPAL_GB_PROTOCOL_PROFILE.currency,
+                 PAYPAL_GB_PROTOCOL_PROFILE.standard_amounts,
+                 PAYPAL_GB_PROTOCOL_PROFILE.error_prefix,
++                PAYPAL_GB_PROTOCOL_PROFILE.promotion_timing,
++                PAYPAL_GB_PROTOCOL_PROFILE.checkout_includes_trial_promo,
++                PAYPAL_GB_PROTOCOL_PROFILE.primary_proxy_finishes_checkout,
++                PAYPAL_GB_PROTOCOL_PROFILE.requires_same_checkout_post_approve,
++                PAYPAL_GB_PROTOCOL_PROFILE.browser_http_policy,
+             ),
+             (
+                 "GB",
+                 "GBP",
+                 ("1667", "1917", "2000"),
+                 "PAYPAL_GB_PROTOCOL",
++                "post_approve",
++                False,
++                True,
++                True,
++                "bound_when_supplied",
+             ),
+         )
++        self.assertEqual(PAYPAL_US_PROTOCOL_PROFILE.promotion_timing, "pre_confirm")
++        self.assertTrue(PAYPAL_US_PROTOCOL_PROFILE.checkout_includes_trial_promo)
++        self.assertFalse(PAYPAL_US_PROTOCOL_PROFILE.primary_proxy_finishes_checkout)
++        self.assertFalse(
++            PAYPAL_US_PROTOCOL_PROFILE.requires_same_checkout_post_approve
++        )
+ 
+     def test_nonzero_or_missing_amount_still_routes_update_to_pool2(self):
+         for country, currency in (("US", "USD"), ("GB", "GBP")):
+@@ -113,12 +129,15 @@
+                         f"http://pool2-{country.lower()}.example:8000",
+                     )
+ 
+-    def test_checkout_taxes_submit_strict_region_through_pool2(self):
++    def test_checkout_taxes_submit_through_region_protocol_proxy(self):
+         for country, currency in (("US", "USD"), ("GB", "GBP")):
+             with self.subTest(country=country):
+                 calls = []
+                 messages = []
+-                proxy = f"http://pool2-{country.lower()}.example:8000"
++                pool_number = 1 if country == "GB" else 2
++                proxy = (
++                    f"http://pool{pool_number}-{country.lower()}.example:8000"
++                )
+                 session = object()
+                 checkout = {
+                     "cs_id": f"cs_pay153_{country.lower()}",
+--- a/tests/test_quick_flow_config_ui.py
++++ b/tests/test_quick_flow_config_ui.py
+@@ -198,7 +198,7 @@
+         assert page.locator("#quickExtractionSecondProxyCountry").is_disabled()
+         assert page.locator("#quickCardLinkTargetAmount").input_value() == "0"
+         assert page.locator("#quickCardLinkTargetAmount").is_disabled()
+-        assert "池1 Checkout/优惠检查；池2 Update→Taxes→Stripe→Approve/Poll" in (
++        assert "池1 标准 Checkout→Taxes→Sentinel→Confirm→Approve/Poll/BA；池2 BA 后同 Checkout Update；池1复验 GBP/0" in (
+             page.locator("#quickCardLinkHint").inner_text()
+         )
+         page.locator("#quickCardLinkMethod").select_option("paypal_us")
+--- a/tests/test_card_link_bridge.py
++++ b/tests/test_card_link_bridge.py
+@@ -19,6 +19,7 @@
+     generate_paypal_de_event,
+     generate_paypal_us_event,
+     paypal_ba_approve_url,
++    paypal_two_proxy_event_metadata,
+ )
+ from scripts.vendor_card_link_runtime import source_segment_with_decorators
+ 
+@@ -73,6 +74,53 @@
+ 
+ 
+ class CardLinkBridgeTests(unittest.TestCase):
++    @staticmethod
++    def _gb_post_approve_checkout(**overrides):
++        checkout = {
++            "cs_id": "cs_test_gb",
++            "billing_country": "GB",
++            "currency": "GBP",
++            "paypal_ba_approve_url": (
++                "https://www.paypal.com/agreements/approve?ba_token=gb_test"
++            ),
++            "payment_link_type": "paypal_approve",
++            "stripe_amount": "0",
++            "amount_currency": "GBP",
++            "amount_verification": "checkout_update",
++            "promotion_applied": True,
++            "promotion_strategy": (
++                "standard_checkout_confirm_approve_then_same_checkout_update"
++            ),
++            "paypal_flow": "gb_two_proxy_promotion",
++            "variant": "gb_two_proxy_promotion",
++            "promotion_update_count": 1,
++            "promotion_update_attempts": 1,
++            "promotion_update_country": "GB",
++            "promotion_timing": "post_approve",
++            "promotion_checkout_id": "cs_test_gb",
++            "approval_completed_before_promotion": True,
++            "same_checkout_promotion": True,
++            "checkout_identity_preserved": True,
++            "session_proxy_consistent": True,
++            "stripe_context_consistent": True,
++            "checkout_taxes_performed": False,
++            "checkout_taxes_count": 0,
++            "checkout_snapshot_performed": False,
++            "checkout_snapshot_count": 1,
++            "stripe_tax_region_count": 1,
++            "stripe_tax_region_country": "GB",
++            "post_approval_init_count": 1,
++            "post_approval_init_proxy_used": "pool2",
++            "approval_state": "approved",
++            "paypal_ba_state": "approved",
++            "ba_preserved_after_promotion": True,
++            "approval_strategy": (
++                "pool1_prefetch_confirm_requires_approval_then_approve_poll"
++            ),
++        }
++        checkout.update(overrides)
++        return checkout
++
+     def _run_us_oaics_promotion_case(self, create_amount):
+         first_proxy = "http://us-sticky.example:8000"
+         second_proxy = "socks5://us-final.example:9000"
+@@ -675,6 +723,23 @@
+         self.assertTrue(event["checkout_taxes_performed"])
+         self.assertNotIn("promotion_proxy", event)
+ 
++    def test_us_bridge_still_requires_one_usd_checkout_taxes_call(self):
++        checkout = {
++            "promotion_update_count": 1,
++            "promotion_update_country": "US",
++            "checkout_taxes_performed": False,
++            "checkout_taxes_count": 0,
++            "checkout_taxes_country": "US",
++            "checkout_taxes_currency": "USD",
++        }
++
++        with self.assertRaisesRegex(RuntimeError, "US/USD Checkout Taxes"):
++            paypal_two_proxy_event_metadata(
++                checkout,
++                default_flow="pay153_protocol",
++                expected_country="US",
++            )
++
+     def test_cli_preserves_pay153_second_proxy_for_us_and_gb(self):
+         from hidemyemail_generator import openai_card_link_bridge
+ 
+@@ -743,27 +808,7 @@
+             self.assertEqual(target, "0")
+             self.assertEqual(options["account_email"], "member@icloud.com")
+             self.assertTrue(options["sentinel_so_enabled"])
+-            return {
+-                "cs_id": "cs_test_gb",
+-                "billing_country": "GB",
+-                "currency": "GBP",
+-                "paypal_ba_approve_url": "https://www.paypal.com/agreements/approve?ba_token=gb_test",
+-                "payment_link_type": "paypal_approve",
+-                "stripe_amount": "0",
+-                "amount_currency": "GBP",
+-                "amount_verification": "checkout_update",
+-                "promotion_applied": True,
+-                "promotion_strategy": "checkout_check_then_region_update",
+-                "paypal_flow": "gb_two_proxy_promotion",
+-                "variant": "gb_two_proxy_promotion",
+-                "promotion_update_count": 1,
+-                "promotion_update_country": "GB",
+-                "checkout_taxes_performed": True,
+-                "checkout_taxes_count": 1,
+-                "checkout_taxes_country": "GB",
+-                "checkout_taxes_currency": "GBP",
+-                "approval_strategy": "pool2_clean_session_sentinel_then_approve",
+-            }
++            return self._gb_post_approve_checkout()
+ 
+         runtime = SimpleNamespace(
+             detect_proxy_health=detect,
+@@ -789,9 +834,83 @@
+         self.assertEqual(event["checkout_proxy_ip"], "203.0.113.44")
+         self.assertEqual(event["link_proxy_ip"], "203.0.113.45")
+         self.assertEqual(event["promotion_update_country"], "GB")
+-        self.assertEqual(event["checkout_taxes_currency"], "GBP")
++        self.assertFalse(event["checkout_taxes_performed"])
++        self.assertEqual(event["stripe_tax_region_count"], 1)
++        self.assertEqual(event["checkout_snapshot_count"], 1)
++        self.assertFalse(event["checkout_snapshot_performed"])
++        self.assertEqual(event["post_approval_init_proxy_used"], "pool2")
++        self.assertEqual(event["approval_state"], "approved")
+         self.assertEqual(event["paypal_flow"], "gb_two_proxy_promotion")
+         self.assertEqual(event["variant"], "gb_two_proxy_promotion")
++
++    def test_gb_bridge_accepts_failed_best_effort_snapshot_attempt(self):
++        metadata = paypal_two_proxy_event_metadata(
++            self._gb_post_approve_checkout(
++                checkout_snapshot_performed=False,
++                checkout_snapshot_count=1,
++            ),
++            default_flow="gb_two_proxy_promotion",
++            expected_country="GB",
++        )
++
++        self.assertFalse(metadata["checkout_snapshot_performed"])
++        self.assertEqual(metadata["checkout_snapshot_count"], 1)
++        self.assertEqual(metadata["stripe_tax_region_country"], "GB")
++
++    def test_gb_bridge_rejects_unverified_post_approve_results(self):
++        invalid_cases = (
++            (
++                {"stripe_tax_region_count": 0},
++                "Stripe tax_region",
++            ),
++            (
++                {"checkout_snapshot_count": 0},
++                "Checkout snapshot",
++            ),
++            (
++                {"stripe_amount": "1"},
++                "approved \\+ GBP/0",
++            ),
++            (
++                {"approval_state": "requires_approval"},
++                "必须保持 approved",
++            ),
++            (
++                {"promotion_checkout_id": "cs_other"},
++                "同一标准 Checkout",
++            ),
++            (
++                {"stripe_context_consistent": False},
++                "Stripe Context",
++            ),
++            (
++                {"post_approval_init_proxy_used": "pool1"},
++                "必须使用池 2",
++            ),
++            (
++                {"promotion_update_count": 2},
++                "且只能完成一次",
++            ),
++            (
++                {"promotion_update_attempts": 4},
++                "尝试次数",
++            ),
++            (
++                {
++                    "checkout_taxes_performed": True,
++                    "checkout_taxes_count": 1,
++                },
++                "不得使用 ChatGPT Checkout Taxes",
++            ),
++        )
++        for overrides, message in invalid_cases:
++            with self.subTest(overrides=overrides):
++                with self.assertRaisesRegex(RuntimeError, message):
++                    paypal_two_proxy_event_metadata(
++                        self._gb_post_approve_checkout(**overrides),
++                        default_flow="gb_two_proxy_promotion",
++                        expected_country="GB",
++                    )
+ 
+     def test_de_paypal_uses_checkout_create_promotion_without_update_proxy(self):
+         first_proxy = "http://de-first.example:8000"
+@@ -1061,8 +1180,11 @@
+                 "stripe_amount": "0",
+                 "amount_currency": "USD",
+                 "promotion_update_count": 1,
++                "promotion_update_country": "US",
+                 "checkout_taxes_performed": True,
+                 "checkout_taxes_count": 1,
++                "checkout_taxes_country": "US",
++                "checkout_taxes_currency": "USD",
+             }
+ 
+         runtime = SimpleNamespace(
+--- /dev/null
++++ b/src/hidemyemail_generator/paypal_gb_post_approve_flow.py
+@@ -0,0 +1,351 @@
++"""MVP state machine for the GB PayPal post-approval promotion protocol."""
++
++from __future__ import annotations
++
++from collections.abc import Iterable
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Callable, Protocol, TypeVar
++
++
++PromotionResult = TypeVar("PromotionResult")
++MessageSink = Callable[[str], None]
++STRIPE_CONTEXT_IDENTITY_FIELDS = (
++    "guid",
++    "muid",
++    "sid",
++    "stripe_js_id",
++    "elements_session_id",
++)
++
++
++class PayPalGbPostApprovePhase(str, Enum):
++    """Allowed phases for one immutable Checkout identity."""
++
++    STANDARD_CHECKOUT = "standard_checkout"
++    STRIPE_READY = "stripe_ready"
++    SENTINEL_READY = "sentinel_ready"
++    CONFIRMED = "confirmed"
++    BA_APPROVED = "ba_approved"
++    PROMOTED = "promoted"
++    VERIFIED = "verified"
++
++
++@dataclass(slots=True)
++class PayPalGbPostApproveModel:
++    """Bound identities and observable state for one GB extraction."""
++
++    checkout_id: str
++    stripe_checkout_id: str
++    device_id: str
++    primary_proxy_url: str
++    promotion_proxy_url: str
++    phase: PayPalGbPostApprovePhase = PayPalGbPostApprovePhase.STANDARD_CHECKOUT
++    pre_promotion_amount: str = ""
++    post_approval_amount: str = ""
++    paypal_ba_approve_url: str = ""
++    post_promotion_submission_state: str = ""
++    paypal_method_retained: bool = False
++    promotion_update_count: int = 0
++    browser_http_used: bool = False
++    _primary_chatgpt_session: object | None = field(default=None, repr=False)
++    _primary_stripe_session: object | None = field(default=None, repr=False)
++    _promotion_chatgpt_session: object | None = field(default=None, repr=False)
++    _promotion_stripe_session: object | None = field(default=None, repr=False)
++    _stripe_context: dict | None = field(default=None, repr=False)
++    _stripe_context_identity: tuple[tuple[str, str], ...] = field(
++        default_factory=tuple,
++        repr=False,
++    )
++
++    @property
++    def result_metadata(self) -> dict[str, object]:
++        return {
++            "promotion_timing": "post_approve",
++            "promotion_checkout_id": self.checkout_id,
++            "approval_completed_before_promotion": (
++                self.phase
++                in {
++                    PayPalGbPostApprovePhase.PROMOTED,
++                    PayPalGbPostApprovePhase.VERIFIED,
++                }
++            ),
++            "same_checkout_promotion": self.promotion_update_count == 1,
++            "checkout_identity_preserved": self.promotion_update_count == 1,
++            "session_proxy_consistent": self.phase is PayPalGbPostApprovePhase.VERIFIED,
++            "stripe_context_consistent": self.phase is PayPalGbPostApprovePhase.VERIFIED,
++            "browser_http_used": self.browser_http_used,
++            "pre_promotion_amount": self.pre_promotion_amount,
++            "post_approval_amount": self.post_approval_amount,
++            "paypal_ba_status": (
++                "approved" if self.paypal_ba_approve_url else ""
++            ),
++            "approval_state": self.post_promotion_submission_state,
++            "paypal_ba_state": (
++                "approved" if self.paypal_ba_approve_url else ""
++            ),
++            "ba_preserved_after_promotion": (
++                self.phase is PayPalGbPostApprovePhase.VERIFIED
++                and self.post_promotion_submission_state == "approved"
++            ),
++            "paypal_method_retained": self.paypal_method_retained,
++        }
++
++
++class PayPalGbPostApproveView(Protocol):
++    """View contract kept independent of the protocol gateways."""
++
++    def show_phase(self, model: PayPalGbPostApproveModel) -> None:
++        ...
++
++
++class DiagnosticPayPalGbPostApproveView:
++    """Diagnostic View used by the headless runtime."""
++
++    def __init__(self, sink: MessageSink | None = None):
++        self._sink = sink
++
++    def show_phase(self, model: PayPalGbPostApproveModel) -> None:
++        if callable(self._sink):
++            self._sink(
++                "[PayPal GB/GBP] 后置优惠阶段："
++                f"{model.phase.value}，checkout={model.checkout_id[:20]}..."
++            )
++
++
++class PayPalGbPostApprovePresenter:
++    """Presenter enforcing order and identity/session/proxy continuity."""
++
++    def __init__(
++        self,
++        model: PayPalGbPostApproveModel,
++        view: PayPalGbPostApproveView,
++    ):
++        if not model.checkout_id or not model.stripe_checkout_id:
++            raise RuntimeError("PayPal GB 后置优惠缺少 Checkout ID")
++        if model.checkout_id != model.stripe_checkout_id:
++            raise RuntimeError("PayPal GB 标准 Checkout 必须直接使用同一个 Stripe cs_ ID")
++        if not model.device_id:
++            raise RuntimeError("PayPal GB 后置优惠缺少固定设备 ID")
++        if (
++            not model.primary_proxy_url
++            or not model.promotion_proxy_url
++            or model.primary_proxy_url == model.promotion_proxy_url
++        ):
++            raise RuntimeError("PayPal GB 后置优惠需要两条不同的固定代理")
++        self.model = model
++        self._view = view
++        self._view.show_phase(self.model)
++
++    def _require(self, expected: PayPalGbPostApprovePhase) -> None:
++        if self.model.phase is not expected:
++            raise RuntimeError(
++                "PayPal GB 后置优惠阶段错误："
++                f"expected={expected.value}, actual={self.model.phase.value}"
++            )
++
++    def _transition(self, phase: PayPalGbPostApprovePhase) -> None:
++        self.model.phase = phase
++        self._view.show_phase(self.model)
++
++    @staticmethod
++    def _context_identity(stripe_context: dict) -> tuple[tuple[str, str], ...]:
++        if not isinstance(stripe_context, dict):
++            raise RuntimeError("PayPal GB Stripe Context 无效")
++        identity: list[tuple[str, str]] = []
++        for field_name in STRIPE_CONTEXT_IDENTITY_FIELDS:
++            value = str(stripe_context.get(field_name) or "").strip()
++            if not value:
++                raise RuntimeError(
++                    "PayPal GB Stripe Context 缺少稳定身份字段："
++                    f"{field_name}"
++                )
++            identity.append((field_name, value))
++        return tuple(identity)
++
++    def _assert_stripe_context(self, stripe_context: dict) -> None:
++        if stripe_context is not self.model._stripe_context:
++            raise RuntimeError("PayPal GB Stripe Context 发生漂移")
++        if self._context_identity(stripe_context) != (
++            self.model._stripe_context_identity
++        ):
++            raise RuntimeError("PayPal GB Stripe Context 稳定身份字段发生漂移")
++
++    def bind_stripe(
++        self,
++        *,
++        primary_chatgpt_session: object,
++        stripe_session: object,
++        stripe_context: dict,
++        amount: str,
++        currency: str,
++        browser_http_used: bool,
++    ) -> None:
++        self._require(PayPalGbPostApprovePhase.STANDARD_CHECKOUT)
++        normalized_amount = str(amount or "").strip()
++        if not normalized_amount.isdigit() or int(normalized_amount) <= 0:
++            raise RuntimeError("PayPal GB 标准 Checkout 必须保留非零 GBP 金额")
++        if str(currency or "").strip().upper() != "GBP":
++            raise RuntimeError("PayPal GB 标准 Checkout 的 Stripe 币种必须为 GBP")
++        stripe_context_identity = self._context_identity(stripe_context)
++        self.model.pre_promotion_amount = normalized_amount
++        self.model.browser_http_used = bool(browser_http_used)
++        self.model._primary_chatgpt_session = primary_chatgpt_session
++        self.model._primary_stripe_session = stripe_session
++        self.model._stripe_context = stripe_context
++        self.model._stripe_context_identity = stripe_context_identity
++        self._transition(PayPalGbPostApprovePhase.STRIPE_READY)
++
++    def _assert_primary_bindings(
++        self,
++        *,
++        chatgpt_session: object,
++        stripe_session: object,
++        stripe_context: dict,
++    ) -> None:
++        if chatgpt_session is not self.model._primary_chatgpt_session:
++            raise RuntimeError("PayPal GB 主链 ChatGPT Session 发生漂移")
++        if stripe_session is not self.model._primary_stripe_session:
++            raise RuntimeError("PayPal GB 池 1 Stripe Session 发生漂移")
++        self._assert_stripe_context(stripe_context)
++        session_device_id = str(
++            getattr(chatgpt_session, "opll_oai_device_id", "") or ""
++        ).strip()
++        if session_device_id and session_device_id != self.model.device_id:
++            raise RuntimeError("PayPal GB 主链设备 ID 发生漂移")
++
++    def mark_sentinel_ready(
++        self,
++        *,
++        chatgpt_session: object,
++        stripe_session: object,
++        stripe_context: dict,
++    ) -> None:
++        self._require(PayPalGbPostApprovePhase.STRIPE_READY)
++        self._assert_primary_bindings(
++            chatgpt_session=chatgpt_session,
++            stripe_session=stripe_session,
++            stripe_context=stripe_context,
++        )
++        self._transition(PayPalGbPostApprovePhase.SENTINEL_READY)
++
++    def mark_confirmed(
++        self,
++        *,
++        chatgpt_session: object,
++        stripe_session: object,
++        stripe_context: dict,
++    ) -> None:
++        self._require(PayPalGbPostApprovePhase.SENTINEL_READY)
++        self._assert_primary_bindings(
++            chatgpt_session=chatgpt_session,
++            stripe_session=stripe_session,
++            stripe_context=stripe_context,
++        )
++        self._transition(PayPalGbPostApprovePhase.CONFIRMED)
++
++    def mark_ba_approved(
++        self,
++        *,
++        checkout_id: str,
++        paypal_ba_approve_url: str,
++        chatgpt_session: object,
++        stripe_session: object,
++        stripe_context: dict,
++    ) -> None:
++        self._require(PayPalGbPostApprovePhase.CONFIRMED)
++        self._assert_primary_bindings(
++            chatgpt_session=chatgpt_session,
++            stripe_session=stripe_session,
++            stripe_context=stripe_context,
++        )
++        if str(checkout_id or "").strip() != self.model.checkout_id:
++            raise RuntimeError("PayPal GB Approve 返回了不同 Checkout")
++        url = str(paypal_ba_approve_url or "").strip()
++        if not url:
++            raise RuntimeError("PayPal GB 未确认 BA 前禁止应用优惠")
++        self.model.paypal_ba_approve_url = url
++        self._transition(PayPalGbPostApprovePhase.BA_APPROVED)
++
++    def apply_promotion(
++        self,
++        gateway: Callable[[], PromotionResult],
++        *,
++        checkout_id: str,
++        promotion_session: object,
++        promotion_stripe_session: object,
++        promotion_proxy_url: str,
++        stripe_context: dict,
++    ) -> PromotionResult:
++        self._require(PayPalGbPostApprovePhase.BA_APPROVED)
++        if str(checkout_id or "").strip() != self.model.checkout_id:
++            raise RuntimeError("PayPal GB 优惠 Update 必须复用原 Checkout")
++        if str(promotion_proxy_url or "").strip() != self.model.promotion_proxy_url:
++            raise RuntimeError("PayPal GB 优惠 Update 必须使用固定池 2 代理")
++        session_device_id = str(
++            getattr(promotion_session, "opll_oai_device_id", "") or ""
++        ).strip()
++        if session_device_id and session_device_id != self.model.device_id:
++            raise RuntimeError("PayPal GB 优惠 Session 设备 ID 发生漂移")
++        if promotion_stripe_session is None:
++            raise RuntimeError("PayPal GB 优惠复查缺少池 2 Stripe Session")
++        if promotion_stripe_session is self.model._primary_stripe_session:
++            raise RuntimeError("PayPal GB 优惠复查必须使用独立池 2 Stripe Session")
++        self._assert_stripe_context(stripe_context)
++        if (
++            self.model._promotion_chatgpt_session is not None
++            and promotion_session is not self.model._promotion_chatgpt_session
++        ):
++            raise RuntimeError("PayPal GB 池 2 ChatGPT Session 发生漂移")
++        if (
++            self.model._promotion_stripe_session is not None
++            and promotion_stripe_session
++            is not self.model._promotion_stripe_session
++        ):
++            raise RuntimeError("PayPal GB 池 2 Stripe Session 发生漂移")
++        if self.model.promotion_update_count:
++            raise RuntimeError("PayPal GB 同一 Checkout 只允许一次优惠 Update")
++        self.model._promotion_chatgpt_session = promotion_session
++        self.model._promotion_stripe_session = promotion_stripe_session
++        result = gateway()
++        self.model.promotion_update_count = 1
++        self._transition(PayPalGbPostApprovePhase.PROMOTED)
++        return result
++
++    def mark_verified(
++        self,
++        *,
++        checkout_id: str,
++        stripe_checkout_id: str,
++        amount: str,
++        currency: str,
++        submission_state: str,
++        payment_method_types: Iterable[str],
++        stripe_session: object,
++        stripe_context: dict,
++    ) -> None:
++        self._require(PayPalGbPostApprovePhase.PROMOTED)
++        if str(checkout_id or "").strip() != self.model.checkout_id:
++            raise RuntimeError("PayPal GB 优惠后 ChatGPT Checkout ID 发生变化")
++        if str(stripe_checkout_id or "").strip() != self.model.stripe_checkout_id:
++            raise RuntimeError("PayPal GB 优惠后 Stripe Checkout ID 发生变化")
++        if stripe_session is not self.model._promotion_stripe_session:
++            raise RuntimeError("PayPal GB 优惠复查未复用池 2 Stripe Session")
++        self._assert_stripe_context(stripe_context)
++        normalized_submission_state = str(submission_state or "").strip().lower()
++        if normalized_submission_state != "approved":
++            raise RuntimeError("PayPal GB 优惠后的 Stripe 状态必须为 approved")
++        if str(amount or "").strip() != "0":
++            raise RuntimeError("PayPal GB 优惠后的应付金额必须为 0")
++        if str(currency or "").strip().upper() != "GBP":
++            raise RuntimeError("PayPal GB 优惠后的 Stripe 币种必须保持 GBP")
++        normalized_methods = {
++            str(method or "").strip().lower()
++            for method in payment_method_types
++        }
++        if "paypal" not in normalized_methods:
++            raise RuntimeError("PayPal GB 优惠后的 Stripe 页面未保留 PayPal 方法")
++        self.model.post_approval_amount = "0"
++        self.model.post_promotion_submission_state = "approved"
++        self.model.paypal_method_retained = True
++        self._transition(PayPalGbPostApprovePhase.VERIFIED)
+--- /dev/null
++++ b/tests/test_paypal_gb_post_approve_flow.py
+@@ -0,0 +1,273 @@
++from __future__ import annotations
++
++import unittest
++
++from hidemyemail_generator.paypal_gb_post_approve_flow import (
++    DiagnosticPayPalGbPostApproveView,
++    PayPalGbPostApproveModel,
++    PayPalGbPostApprovePhase,
++    PayPalGbPostApprovePresenter,
++)
++
++
++class _Session:
++    def __init__(self, device_id: str):
++        self.opll_oai_device_id = device_id
++
++
++class PayPalGbPostApproveFlowTests(unittest.TestCase):
++    checkout_id = "cs_gb_post_approve"
++    device_id = "device-gb-post-approve"
++    primary_proxy = "http://gb-pool1.example:8000"
++    promotion_proxy = "http://gb-pool2.example:8000"
++
++    @staticmethod
++    def _stripe_context():
++        return {
++            "guid": "guid-fixture",
++            "muid": "muid-fixture",
++            "sid": "sid-fixture",
++            "stripe_js_id": "stripe-js-fixture",
++            "elements_session_id": "elements-session-fixture",
++        }
++
++    def _presenter(self):
++        messages: list[str] = []
++        presenter = PayPalGbPostApprovePresenter(
++            PayPalGbPostApproveModel(
++                checkout_id=self.checkout_id,
++                stripe_checkout_id=self.checkout_id,
++                device_id=self.device_id,
++                primary_proxy_url=self.primary_proxy,
++                promotion_proxy_url=self.promotion_proxy,
++            ),
++            DiagnosticPayPalGbPostApproveView(messages.append),
++        )
++        return presenter, messages
++
++    def test_promotion_is_gated_by_ba_approval(self):
++        presenter, _messages = self._presenter()
++        calls: list[str] = []
++
++        with self.assertRaisesRegex(RuntimeError, "阶段错误"):
++            presenter.apply_promotion(
++                lambda: calls.append("update"),
++                checkout_id=self.checkout_id,
++                promotion_session=_Session(self.device_id),
++                promotion_stripe_session=object(),
++                promotion_proxy_url=self.promotion_proxy,
++                stripe_context=self._stripe_context(),
++            )
++
++        self.assertEqual(calls, [])
++        self.assertEqual(presenter.model.promotion_update_count, 0)
++
++    def test_full_sequence_preserves_sessions_context_and_checkout(self):
++        presenter, messages = self._presenter()
++        primary = _Session(self.device_id)
++        promotion = _Session(self.device_id)
++        primary_stripe = object()
++        promotion_stripe = object()
++        ctx = self._stripe_context()
++
++        presenter.bind_stripe(
++            primary_chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++            amount="1917",
++            currency="GBP",
++            browser_http_used=True,
++        )
++        presenter.mark_sentinel_ready(
++            chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++        )
++        presenter.mark_confirmed(
++            chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++        )
++        presenter.mark_ba_approved(
++            checkout_id=self.checkout_id,
++            paypal_ba_approve_url=(
++                "https://www.paypal.com/agreements/approve?ba_token=fixture"
++            ),
++            chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++        )
++        update_calls: list[str] = []
++        presenter.apply_promotion(
++            lambda: update_calls.append(self.checkout_id) or {"ok": True},
++            checkout_id=self.checkout_id,
++            promotion_session=promotion,
++            promotion_stripe_session=promotion_stripe,
++            promotion_proxy_url=self.promotion_proxy,
++            stripe_context=ctx,
++        )
++        presenter.mark_verified(
++            checkout_id=self.checkout_id,
++            stripe_checkout_id=self.checkout_id,
++            amount="0",
++            currency="GBP",
++            submission_state="approved",
++            payment_method_types=["card", "paypal"],
++            stripe_session=promotion_stripe,
++            stripe_context=ctx,
++        )
++
++        self.assertEqual(update_calls, [self.checkout_id])
++        self.assertIs(presenter.model.phase, PayPalGbPostApprovePhase.VERIFIED)
++        self.assertEqual(presenter.model.promotion_update_count, 1)
++        self.assertTrue(
++            presenter.model.result_metadata[
++                "approval_completed_before_promotion"
++            ]
++        )
++        self.assertTrue(presenter.model.result_metadata["same_checkout_promotion"])
++        self.assertTrue(presenter.model.result_metadata["browser_http_used"])
++        self.assertEqual(
++            presenter.model.result_metadata["approval_state"],
++            "approved",
++        )
++        self.assertTrue(
++            presenter.model.result_metadata["ba_preserved_after_promotion"]
++        )
++        self.assertTrue(
++            presenter.model.result_metadata["paypal_method_retained"]
++        )
++        self.assertIn("verified", messages[-1])
++
++    def test_identity_or_context_drift_is_rejected(self):
++        presenter, _messages = self._presenter()
++        primary = _Session(self.device_id)
++        stripe = object()
++        ctx = self._stripe_context()
++        presenter.bind_stripe(
++            primary_chatgpt_session=primary,
++            stripe_session=stripe,
++            stripe_context=ctx,
++            amount="1771",
++            currency="GBP",
++            browser_http_used=False,
++        )
++
++        with self.assertRaisesRegex(RuntimeError, "Stripe Context 发生漂移"):
++            presenter.mark_sentinel_ready(
++                chatgpt_session=primary,
++                stripe_session=stripe,
++                stripe_context={},
++            )
++
++    def test_stable_stripe_context_identity_drift_is_rejected(self):
++        presenter, _messages = self._presenter()
++        primary = _Session(self.device_id)
++        stripe = object()
++        ctx = self._stripe_context()
++        presenter.bind_stripe(
++            primary_chatgpt_session=primary,
++            stripe_session=stripe,
++            stripe_context=ctx,
++            amount="1771",
++            currency="GBP",
++            browser_http_used=False,
++        )
++        ctx["muid"] = "drifted-muid"
++
++        with self.assertRaisesRegex(RuntimeError, "稳定身份字段发生漂移"):
++            presenter.mark_sentinel_ready(
++                chatgpt_session=primary,
++                stripe_session=stripe,
++                stripe_context=ctx,
++            )
++
++    def _advance_to_promoted(self):
++        presenter, _messages = self._presenter()
++        primary = _Session(self.device_id)
++        promotion = _Session(self.device_id)
++        primary_stripe = object()
++        promotion_stripe = object()
++        ctx = self._stripe_context()
++        presenter.bind_stripe(
++            primary_chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++            amount="1917",
++            currency="GBP",
++            browser_http_used=True,
++        )
++        presenter.mark_sentinel_ready(
++            chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++        )
++        presenter.mark_confirmed(
++            chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++        )
++        presenter.mark_ba_approved(
++            checkout_id=self.checkout_id,
++            paypal_ba_approve_url=(
++                "https://www.paypal.com/agreements/approve?ba_token=fixture"
++            ),
++            chatgpt_session=primary,
++            stripe_session=primary_stripe,
++            stripe_context=ctx,
++        )
++        presenter.apply_promotion(
++            lambda: {"ok": True},
++            checkout_id=self.checkout_id,
++            promotion_session=promotion,
++            promotion_stripe_session=promotion_stripe,
++            promotion_proxy_url=self.promotion_proxy,
++            stripe_context=ctx,
++        )
++        return presenter, primary_stripe, promotion_stripe, ctx
++
++    def test_promotion_requires_an_independent_pool2_stripe_session(self):
++        presenter, primary_stripe, _promotion_stripe, ctx = self._advance_to_promoted()
++
++        with self.assertRaisesRegex(RuntimeError, "池 2 Stripe Session"):
++            presenter.mark_verified(
++                checkout_id=self.checkout_id,
++                stripe_checkout_id=self.checkout_id,
++                amount="0",
++                currency="GBP",
++                submission_state="approved",
++                payment_method_types=["paypal"],
++                stripe_session=primary_stripe,
++                stripe_context=ctx,
++            )
++
++    def test_verification_requires_approved_gbp_zero_and_paypal(self):
++        invalid_cases = (
++            ({"submission_state": "requires_approval"}, "approved"),
++            ({"amount": "1917"}, "金额必须为 0"),
++            ({"currency": "USD"}, "币种必须保持 GBP"),
++            ({"payment_method_types": ["card"]}, "未保留 PayPal 方法"),
++        )
++        for overrides, expected_error in invalid_cases:
++            with self.subTest(overrides=overrides):
++                presenter, _primary_stripe, promotion_stripe, ctx = (
++                    self._advance_to_promoted()
++                )
++                arguments = {
++                    "checkout_id": self.checkout_id,
++                    "stripe_checkout_id": self.checkout_id,
++                    "amount": "0",
++                    "currency": "GBP",
++                    "submission_state": "approved",
++                    "payment_method_types": ["card", "paypal"],
++                    "stripe_session": promotion_stripe,
++                    "stripe_context": ctx,
++                }
++                arguments.update(overrides)
++
++                with self.assertRaisesRegex(RuntimeError, expected_error):
++                    presenter.mark_verified(**arguments)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tests/test_card_link_browser_http.py
+@@ -0,0 +1,202 @@
++from __future__ import annotations
++
++import unittest
++
++from hidemyemail_generator import card_link_runtime
++
++
++class _FakeBrowserContext:
++    def __init__(self):
++        self.added_cookies = []
++
++    def add_cookies(self, cookies):
++        self.added_cookies.extend(cookies)
++
++
++class _FakePage:
++    def __init__(self, result=None, *, closed=False):
++        self.context = _FakeBrowserContext()
++        self.result = result or {
++            "status": 200,
++            "text": '{"ok":true}',
++            "headers": {"content-type": "application/json"},
++            "url": "https://chatgpt.com/backend-api/payments/checkout/fixture",
++        }
++        self.closed = closed
++        self.evaluations = []
++
++    def is_closed(self):
++        return self.closed
++
++    def evaluate(self, script, payload):
++        self.evaluations.append((script, payload))
++        return self.result
++
++
++class CardLinkBrowserHttpTests(unittest.TestCase):
++    proxy_url = "http://gb-sticky.example:8000"
++
++    def test_cookie_jar_and_device_identity_are_synced_into_page_context(self):
++        page = _FakePage()
++        browser_http = card_link_runtime.OpllBrowserFetchSession(
++            page,
++            label="GB Checkout",
++        )
++        session = card_link_runtime.opll_build_chatgpt_session(
++            "access-token-fixture",
++            self.proxy_url,
++            request_locale="en-GB",
++            session=browser_http,
++            session_context={
++                "device_id": "device-gb-fixture",
++                "storage_state": {
++                    "cookies": [
++                        {
++                            "name": "__Secure-next-auth.session-token",
++                            "value": "session-cookie-fixture",
++                            "domain": ".chatgpt.com",
++                        },
++                        {
++                            "name": "oai-sc",
++                            "value": "sentinel-cookie-fixture",
++                            "domain": "chatgpt.com",
++                        },
++                    ]
++                },
++            },
++        )
++
++        response = session.post(
++            "https://chatgpt.com/backend-api/payments/checkout/fixture",
++            json={"promotion": "trial"},
++            timeout=(5, 9),
++            allow_redirects=False,
++        )
++
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json(), {"ok": True})
++        synced = {
++            (item["name"], item["value"])
++            for item in page.context.added_cookies
++        }
++        self.assertIn(
++            (
++                "__Secure-next-auth.session-token",
++                "session-cookie-fixture",
++            ),
++            synced,
++        )
++        self.assertIn(("oai-sc", "sentinel-cookie-fixture"), synced)
++        self.assertIn(("oai-did", "device-gb-fixture"), synced)
++        self.assertEqual(
++            session.proxies,
++            {"http": self.proxy_url, "https": self.proxy_url},
++        )
++        self.assertEqual(session.opll_oai_device_id, "device-gb-fixture")
++
++        request_payload = page.evaluations[0][1]
++        normalized_headers = {
++            key.lower(): value
++            for key, value in request_payload["headers"].items()
++        }
++        self.assertEqual(
++            normalized_headers["authorization"],
++            "Bearer access-token-fixture",
++        )
++        self.assertEqual(
++            normalized_headers["oai-device-id"],
++            "device-gb-fixture",
++        )
++        self.assertEqual(
++            normalized_headers["content-type"],
++            "application/json",
++        )
++        for browser_owned_header in (
++            "cookie",
++            "origin",
++            "referer",
++            "user-agent",
++            "accept-language",
++        ):
++            self.assertNotIn(browser_owned_header, normalized_headers)
++        self.assertEqual(request_payload["timeoutMs"], 9000)
++        self.assertEqual(request_payload["redirect"], "manual")
++
++    def test_fetch_error_and_closed_page_are_hard_failures(self):
++        page = _FakePage({"fetchError": "TypeError: Failed to fetch"})
++        session = card_link_runtime.OpllBrowserFetchSession(
++            page,
++            label="GB Checkout",
++        )
++
++        with self.assertRaisesRegex(
++            RuntimeError,
++            "GB Checkout 页面内 fetch 失败: TypeError: Failed to fetch",
++        ):
++            session.get("https://chatgpt.com/backend-api/sentinel/ping")
++
++        closed = card_link_runtime.OpllBrowserFetchSession(
++            _FakePage(closed=True),
++            label="GB Checkout",
++        )
++        with self.assertRaisesRegex(RuntimeError, "GB Checkout 页面已关闭"):
++            closed.get("https://chatgpt.com/backend-api/sentinel/ping")
++
++    def test_bound_browser_http_rejects_proxy_drift(self):
++        session = card_link_runtime.OpllBrowserFetchSession(
++            _FakePage(),
++            label="GB Checkout",
++            proxy_url=self.proxy_url,
++        )
++
++        with self.assertRaisesRegex(RuntimeError, "禁止从已绑定代理切换"):
++            card_link_runtime.opll_build_chatgpt_session(
++                "access-token-fixture",
++                "http://different-gb-sticky.example:8000",
++                request_locale="en-GB",
++                session=session,
++                device_id="device-gb-fixture",
++            )
++
++    def test_pool2_update_copies_only_durable_chatgpt_identity(self):
++        source = card_link_runtime.opll_new_http_session()
++        target = card_link_runtime.opll_new_http_session()
++        source.cookies.set(
++            "__Secure-next-auth.session-token",
++            "session-fixture",
++            domain="chatgpt.com",
++            path="/",
++            secure=True,
++        )
++        source.cookies.set(
++            "oai-did",
++            "device-fixture",
++            domain="chatgpt.com",
++            path="/",
++        )
++        source.cookies.set(
++            "cf_clearance",
++            "edge-cookie-fixture",
++            domain="chatgpt.com",
++            path="/",
++        )
++
++        copied = card_link_runtime.opll_copy_chatgpt_identity_cookies(
++            source,
++            target,
++        )
++
++        self.assertEqual(
++            copied,
++            ("__Secure-next-auth.session-token", "oai-did"),
++        )
++        self.assertEqual(
++            target.cookies.get("__Secure-next-auth.session-token"),
++            "session-fixture",
++        )
++        self.assertEqual(target.cookies.get("oai-did"), "device-fixture")
++        self.assertIsNone(target.cookies.get("cf_clearance"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tests/test_paypal_gb_runtime_helpers.py
+@@ -0,0 +1,222 @@
++import json
++from urllib.parse import parse_qs, urlsplit
++
++from hidemyemail_generator import card_link_runtime
++
++
++class _Response:
++    def __init__(self, status_code=200, payload=None, text=""):
++        self.status_code = status_code
++        self._payload = payload if payload is not None else {}
++        self.text = text
++        self.headers = {}
++
++    def json(self):
++        return self._payload
++
++
++class _RecordingSession:
++    def __init__(self, responses):
++        self.responses = list(responses)
++        self.calls = []
++        self.opll_oai_device_id = "device-gb-fixture"
++
++    def post(self, url, **kwargs):
++        self.calls.append((url, kwargs))
++        return self.responses.pop(0)
++
++
++def _stripe_context():
++    return {
++        "guid": "guid-fixture",
++        "muid": "muid-fixture",
++        "sid": "sid-fixture",
++        "stripe_js_id": "stripe-js-fixture",
++        "elements_session_id": "elements-session-fixture",
++        "elements_session_config_id": "elements-config-fixture",
++        "config_id": "checkout-config-fixture",
++        "stripe_version": card_link_runtime.STRIPE_VERSION_FULL,
++    }
++
++
++def test_gb_confirm_return_url_uses_exact_nested_checkout_contract():
++    checkout_id = "cs_gb_return_fixture"
++    hosted_url = (
++        f"https://checkout.stripe.com/c/pay/{checkout_id}"
++        "?ignored=old#fidkdWxOYHwnPyd1blpxYHZxWjA0"
++    )
++    checkout = {
++        "billing_country": "GB",
++        "processor_entity": "openai_llc",
++    }
++
++    result = card_link_runtime.opll_paypal_gb_confirm_return_url(
++        checkout_id,
++        checkout,
++        hosted_url,
++    )
++    verified = card_link_runtime.opll_require_paypal_gb_confirm_return_url(
++        result,
++        checkout_id,
++        hosted_url,
++    )
++
++    assert verified == result
++    parsed = urlsplit(result)
++    assert parsed.netloc == "checkout.stripe.com"
++    assert parsed.path == f"/c/pay/{checkout_id}"
++    assert parsed.fragment == "fidkdWxOYHwnPyd1blpxYHZxWjA0"
++    query = parse_qs(parsed.query, keep_blank_values=True)
++    assert set(query) == {"returned_from_redirect", "ui_mode", "return_url"}
++    assert query["returned_from_redirect"] == ["true"]
++    assert query["ui_mode"] == ["custom"]
++    inner = urlsplit(query["return_url"][0])
++    assert inner.netloc == "chatgpt.com"
++    assert inner.path == "/checkout/verify"
++    assert parse_qs(inner.query)["stripe_session_id"] == [checkout_id]
++
++
++def test_gb_checkout_create_omits_ui_mode_and_uses_compact_json():
++    checkout_id = "cs_gb_create_fixture"
++    session = _RecordingSession(
++        [
++            _Response(
++                payload={
++                    "id": checkout_id,
++                    "processor_entity": "openai_llc",
++                    "stripe_publishable_key": "pk_test_fixture",
++                }
++            )
++        ]
++    )
++
++    checkout = card_link_runtime.opll_create_checkout(
++        "token",
++        "GB",
++        "GBP",
++        "",
++        request_locale="en-GB",
++        include_trial_promo=False,
++        checkout_ui_mode=None,
++        referer_url="https://chatgpt.com/",
++        chatgpt_session=session,
++        compact_json=True,
++    )
++
++    assert checkout["cs_id"] == checkout_id
++    _, kwargs = session.calls[0]
++    assert "json" not in kwargs
++    payload = json.loads(kwargs["data"])
++    assert "checkout_ui_mode" not in payload
++    assert "promo_campaign" not in payload
++    assert payload["billing_details"] == {"country": "GB", "currency": "GBP"}
++    assert kwargs["headers"]["Referer"] == "https://chatgpt.com/"
++
++
++def test_gb_tax_region_posts_full_address_without_empty_state():
++    page = {
++        "currency": "gbp",
++        "total_summary": {"due": 1917},
++        "payment_method_types": ["card", "paypal"],
++    }
++    session = _RecordingSession(
++        [_Response(payload={"payment_page": page})]
++    )
++    billing = {
++        "country": "GB",
++        "line1": "10 Downing Street",
++        "city": "London",
++        "state": "",
++        "postal_code": "SW1A 2AA",
++    }
++
++    result = card_link_runtime.opll_stripe_update_tax_region(
++        session,
++        "cs_gb_tax_fixture",
++        "pk_test_fixture",
++        _stripe_context(),
++        billing,
++        omit_empty_address_fields=True,
++    )
++
++    assert result == page
++    url, kwargs = session.calls[0]
++    assert url.endswith("/v1/payment_pages/cs_gb_tax_fixture")
++    body = kwargs["data"]
++    assert body["tax_region[country]"] == "GB"
++    assert body["tax_region[line1]"] == "10 Downing Street"
++    assert body["tax_region[city]"] == "London"
++    assert body["tax_region[postal_code]"] == "SW1A 2AA"
++    assert "tax_region[state]" not in body
++
++
++def test_gb_snapshot_uses_nested_billing_address_and_checkout_referer():
++    session = _RecordingSession([_Response(status_code=204)])
++    checkout = {
++        "cs_id": "cs_gb_snapshot_fixture",
++        "processor_entity": "openai_llc",
++    }
++    billing = {
++        "name": "Ada Lovelace",
++        "country": "GB",
++        "line1": "12 St James's Square",
++        "line2": "",
++        "city": "London",
++        "state": "",
++        "postal_code": "SW1Y 4LB",
++    }
++
++    result = card_link_runtime.opll_paypal_gb_chatgpt_checkout_snapshot(
++        session,
++        checkout,
++        billing,
++    )
++
++    assert result == {"status_code": 204, "applied": True}
++    url, kwargs = session.calls[0]
++    assert url.endswith("/backend-api/payments/checkout/snapshot")
++    assert kwargs["headers"]["Referer"] == (
++        "https://chatgpt.com/checkout/openai_llc/cs_gb_snapshot_fixture"
++    )
++    payload = json.loads(kwargs["data"])
++    address = payload["snapshot"]["billing_address"]
++    assert address["name"] == "Ada Lovelace"
++    assert address["address"] == {
++        "line1": "12 St James's Square",
++        "city": "London",
++        "line2": "",
++        "postal_code": "SW1Y 4LB",
++        "country": "GB",
++    }
++
++
++def test_paypal_payment_method_omits_empty_gb_state_but_keeps_us_fallback():
++    for country, expected_state in (("GB", None), ("US", "CA")):
++        session = _RecordingSession(
++            [_Response(payload={"id": f"pm_{country.lower()}_fixture"})]
++        )
++        billing = {
++            "name": "Test Member",
++            "email": "member@example.com",
++            "phone": "+442079460000",
++            "country": country,
++            "line1": "10 Test Street",
++            "city": "London" if country == "GB" else "Los Angeles",
++            "state": "",
++            "postal_code": "SW1A 2AA" if country == "GB" else "90026",
++        }
++
++        card_link_runtime.opll_stripe_create_paypal_method(
++            session,
++            f"cs_{country.lower()}_fixture",
++            _stripe_context(),
++            billing,
++            "pk_test_fixture",
++        )
++
++        body = session.calls[0][1]["data"]
++        state_key = "billing_details[address][state]"
++        if expected_state is None:
++            assert state_key not in body
++        else:
++            assert body[state_key] == expected_state

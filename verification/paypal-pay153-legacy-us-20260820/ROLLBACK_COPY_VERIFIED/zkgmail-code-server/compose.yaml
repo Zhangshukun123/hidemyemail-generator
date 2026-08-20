@@ -1,0 +1,49 @@
+name: zkgmail-production
+
+services:
+  zkgmail-code-server:
+    image: zkgmail-code-server:1.3.3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zkgmail-code-server
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${ZKGMAIL_ENV_FILE:-.env}
+    environment:
+      ZKGMAIL_SESSION_STORE_PATH: "${ZKGMAIL_SESSION_STORE_PATH:-/data/access_sessions.json}"
+    command:
+      - --host
+      - 127.0.0.1
+      - --port
+      - "18768"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - zkgmail-session-data:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 96m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:18768/healthz', timeout=3).read(2)
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  zkgmail-session-data:

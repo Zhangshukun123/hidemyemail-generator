@@ -1,0 +1,67 @@
+CHANGED_BRANCH=codex/editable-quick-flow-target-count
+CHANGED_FIELD=DomainLocalPartNamingStrategy.generate / zkgmail.com branch
+RESULT=zkgmail.com 的邮箱本地部分固定为 mark + 4 位随机数字（总长 8 个字符）；其他域名继续使用原有人名规则。
+ORIGINAL_SOURCE_SHA256=5ea0464025a4dce0d16dc1d6408cfb9b94d87b7fa8f22f6217de6797db821fdd
+CURRENT_SOURCE_SHA256=fa06edc29e65980d500575e0f7b66979367a4c0759071dfb6cd00c0e28e5b5ae
+MODIFIED_COPY_SHA256=fa06edc29e65980d500575e0f7b66979367a4c0759071dfb6cd00c0e28e5b5ae
+DIFF_SHA256=6c18e74c6b81e4101697df53609b7bb044d0052ded660034a5f21e2a787f09ae
+ROLLBACK_SHA256=afab52f42209840fb7a888cd40af56c5dc80c671e8ea2a730e37aa8484ba179e
+
+ARTIFACTS
+MODIFIED_FILE=D:\AI\hidemyemail-generator\verification\zkgmail-mark-random-20260819\MODIFIED_FILE.py
+DIFF_FILE=D:\AI\hidemyemail-generator\verification\zkgmail-mark-random-20260819\DIFF_FILE.patch
+VERIFICATION=D:\AI\hidemyemail-generator\verification\zkgmail-mark-random-20260819\VERIFICATION.txt
+ROLLBACK=D:\AI\hidemyemail-generator\verification\zkgmail-mark-random-20260819\ROLLBACK.sh
+
+BASELINE
+COMMAND=D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests/test_zkgmail.py::ZkgmailClientTests::test_human_local_part_uses_alphanumeric_name_and_short_number -q
+INPUT=修改前源码 SHA256 5ea0464025a4dce0d16dc1d6408cfb9b94d87b7fa8f22f6217de6797db821fdd；测试固定 first=emily、last=johnson、suffix=27。
+LITERAL_OUTPUT:
+.                                                                        [100%]
+1 passed in 0.62s
+EXIT_STATUS=0
+BASELINE_STATUS=原规则返回 emilyjohnson27。
+
+MODIFIED
+COMMAND=D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests/test_zkgmail.py::ZkgmailClientTests::test_zkgmail_local_part_uses_short_mark_random_rule tests/test_zkgmail.py::ZkgmailClientTests::test_zkgmail_domain_selects_short_mark_random_rule -q
+INPUT=域名 zkgmail.com；随机值固定为 27；集成结果固定为 mark4821@zkgmail.com。
+LITERAL_OUTPUT:
+..                                                                       [100%]
+2 passed in 0.58s
+EXIT_STATUS=0
+
+MODIFIED_BEHAVIOR
+COMMAND=D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -c "from unittest.mock import patch; from hidemyemail_generator.zkgmail import _generate_short_mark_local_part; p=patch('hidemyemail_generator.zkgmail.secrets.randbelow', return_value=27); p.start(); print(_generate_short_mark_local_part() + '@zkgmail.com'); p.stop()"
+INPUT=domain=zkgmail.com, randbelow=27
+LITERAL_OUTPUT:
+mark0027@zkgmail.com
+EXIT_STATUS=0
+
+MODIFIED_REGRESSION
+COMMAND=D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests/test_zkgmail.py -q --disable-warnings
+INPUT=tests/test_zkgmail.py（完整 zkgmail 测试文件）
+LITERAL_OUTPUT:
+....................                                                     [100%]
+20 passed, 145 warnings in 1.66s
+EXIT_STATUS=0
+
+ROLLBACK
+COMMAND=& 'C:\Program Files\Git\bin\bash.exe' 'D:\AI\hidemyemail-generator\verification\zkgmail-mark-random-20260819\ROLLBACK.sh' 'D:\AI\hidemyemail-generator\.codex-diagnostics\zkgmail-rollback-8196170e48ab4f9193c343d13cb133e5'
+INPUT=另一份包含修改后 src/hidemyemail_generator/zkgmail.py 与 tests/test_zkgmail.py 的副本。
+LITERAL_OUTPUT:
+patching file src/hidemyemail_generator/zkgmail.py
+patching file tests/test_zkgmail.py
+ROLLBACK_RESULT=restored
+ROLLBACK_TARGET=/d/AI/hidemyemail-generator/.codex-diagnostics/zkgmail-rollback-8196170e48ab4f9193c343d13cb133e5
+ROLLBACK_SOURCE_SHA256=5ea0464025a4dce0d16dc1d6408cfb9b94d87b7fa8f22f6217de6797db821fdd
+EXIT_STATUS=0
+ROLLBACK_HASH_MATCH=True
+
+ROLLBACK_RESTORED_BEHAVIOR
+COMMAND=D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests/test_zkgmail.py::ZkgmailClientTests::test_human_local_part_uses_alphanumeric_name_and_short_number -q
+INPUT=已回滚副本，PYTHONPATH 指向副本 src。
+LITERAL_OUTPUT:
+.                                                                        [100%]
+1 passed in 0.60s
+EXIT_STATUS=0
+RESTORED_STATUS=副本恢复原 SHA256，且原 emilyjohnson27 行为测试通过；实际工作区与 MODIFIED_FILE 仍保持 mark + 4 位随机数字的新规则。

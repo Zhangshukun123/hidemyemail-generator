@@ -1,0 +1,296 @@
+diff --git "a/.\\userscripts\\paypal-link-extractor\\ORIGINAL_FILE_v1.0.0.user.js" "b/.\\userscripts\\paypal-link-extractor\\MODIFIED_FILE.user.js"
+index f9936f4..dc87a55 100644
+--- "a/.\\userscripts\\paypal-link-extractor\\ORIGINAL_FILE_v1.0.0.user.js"
++++ "b/.\\userscripts\\paypal-link-extractor\\MODIFIED_FILE.user.js"
+@@ -1,13 +1,14 @@
+ // ==UserScript==
+ // @name         PayPal 提链结果提取器
+ // @namespace    local.hidemyemail
+-// @version      1.0.0
+-// @description  自动提取 pp.uplw.uno 单条/批量任务中的 PayPal 结果链接并复制。
++// @version      1.1.0
++// @description  自动监听 pp.uplw.uno 任务 API，提取 PayPal BA/回跳链接并复制。
+ // @author       Codex
+ // @match        https://pp.uplw.uno/*
+ // @grant        GM_setClipboard
+ // @grant        GM_registerMenuCommand
+-// @run-at       document-idle
++// @grant        unsafeWindow
++// @run-at       document-start
+ // ==/UserScript==
+ 
+ (function () {
+@@ -17,17 +18,25 @@
+     "paypal_approve_url",
+     "final_redirect_url",
+     "paypal_return_url",
++    "paypal_approval_url",
++    "approve_url",
+     "approval_url",
++    "ba_link",
++    "ba_url",
+     "return_url",
+   ]);
+   const STORAGE_KEY = "paypal-link-extractor:mvp:v1";
++  const API_CAPTURE_EVENT = "paypal-link-extractor:api-capture";
+   const MAX_HISTORY = 50;
+ 
+   class LinkModel {
+     constructor(baseUrl = "https://pp.uplw.uno/", initialState = {}) {
+       this.baseUrl = new URL(baseUrl);
+       this.history = Array.isArray(initialState.history)
+-        ? initialState.history.filter((item) => item && item.url).slice(0, MAX_HISTORY)
++        ? initialState.history
++            .map((item) => ({ ...item, url: this.normalize(item?.url) }))
++            .filter((item) => item.url)
++            .slice(0, MAX_HISTORY)
+         : [];
+       this.autoCopy = initialState.autoCopy !== false;
+     }
+@@ -38,16 +47,11 @@
+         .replaceAll("&amp;", "&")
+         .replaceAll("\\u0026", "&")
+         .replace(/^[\s'"`(<\[]+|[\s'"`)>\],.;。；，！？、]+$/g, "");
+-      if (!value) return "";
++      if (!/^https?:\/\//i.test(value)) return "";
+       try {
+-        const url = new URL(value, this.baseUrl);
++        const url = new URL(value);
+         if (!/^https?:$/.test(url.protocol)) return "";
+-        if (
+-          url.origin === this.baseUrl.origin &&
+-          (url.pathname === "/" || url.pathname.startsWith("/api/") || url.pathname.startsWith("/static/"))
+-        ) {
+-          return "";
+-        }
++        if (url.origin === this.baseUrl.origin) return "";
+         return url.href;
+       } catch (_) {
+         return "";
+@@ -66,7 +70,9 @@
+         if (value == null) return;
+         if (typeof value === "string") {
+           for (const url of this.extractUrlsFromText(value)) {
+-            found.push({ url, source, field: path || "text" });
++            if (this.classify(url) === "PayPal BA") {
++              found.push({ url, source, field: path || "text" });
++            }
+           }
+           return;
+         }
+@@ -86,6 +92,25 @@
+       return this.uniqueByUrl(found);
+     }
+ 
++    extractJobIds(payload) {
++      const ids = new Set();
++      const visit = (value, seen) => {
++        if (!value || typeof value !== "object" || seen.has(value)) return;
++        seen.add(value);
++        for (const key of ["job_id", "jobId"]) {
++          const id = String(value[key] || "").trim();
++          if (/^[a-z0-9-]{8,128}$/i.test(id)) ids.add(id);
++        }
++        if (value.job && typeof value.job === "object") {
++          const id = String(value.job.id || "").trim();
++          if (/^[a-z0-9-]{8,128}$/i.test(id)) ids.add(id);
++        }
++        for (const child of Object.values(value)) visit(child, seen);
++      };
++      visit(payload, new WeakSet());
++      return [...ids];
++    }
++
+     uniqueByUrl(items) {
+       const seen = new Set();
+       return items.filter((item) => {
+@@ -139,6 +164,78 @@
+     }
+   }
+ 
++  class ApiCaptureBridge {
++    static install(pageWindow, documentRef) {
++      if (!pageWindow?.fetch || pageWindow.__paypalLinkExtractorFetchInstalled) return;
++      pageWindow.__paypalLinkExtractorFetchInstalled = true;
++      const originalFetch = pageWindow.fetch;
++      pageWindow.fetch = async function (...args) {
++        const response = await Reflect.apply(originalFetch, this, args);
++        try {
++          const input = args[0];
++          const requestUrl = typeof input === "string" ? input : input?.url;
++          const url = new URL(requestUrl, pageWindow.location.href);
++          if (url.origin === pageWindow.location.origin && url.pathname.startsWith("/api/")) {
++            response.clone().json().then((payload) => {
++              documentRef.dispatchEvent(new CustomEvent(API_CAPTURE_EVENT, {
++                detail: {
++                  payload,
++                  url: url.pathname,
++                  method: String(args[1]?.method || input?.method || "GET").toUpperCase(),
++                },
++              }));
++            }).catch(() => {});
++          }
++        } catch (_) {
++          // The original page response must remain untouched.
++        }
++        return response;
++      };
++      const eventSourcePrototype = pageWindow.EventSource?.prototype;
++      if (eventSourcePrototype?.addEventListener && !eventSourcePrototype.__paypalLinkExtractorPatched) {
++        eventSourcePrototype.__paypalLinkExtractorPatched = true;
++        const originalAddEventListener = eventSourcePrototype.addEventListener;
++        eventSourcePrototype.addEventListener = function (type, listener, options) {
++          this.__paypalLinkExtractorTypes ||= new Set();
++          if (!this.__paypalLinkExtractorTypes.has(type)) {
++            this.__paypalLinkExtractorTypes.add(type);
++            Reflect.apply(originalAddEventListener, this, [type, (event) => {
++              try {
++                const payload = JSON.parse(event.data);
++                documentRef.dispatchEvent(new CustomEvent(API_CAPTURE_EVENT, {
++                  detail: { payload, url: this.url || "SSE", method: `SSE:${type}` },
++                }));
++              } catch (_) {
++                // Non-JSON SSE events do not carry extractable fields.
++              }
++            }, options]);
++          }
++          return Reflect.apply(originalAddEventListener, this, [type, listener, options]);
++        };
++      }
++    }
++  }
++
++  class JobRepository {
++    constructor(fetchFunction, baseUrl) {
++      this.fetchFunction = fetchFunction;
++      this.baseUrl = new URL(baseUrl);
++    }
++
++    jobUrl(jobId) {
++      return new URL(`/api/jobs/${encodeURIComponent(jobId)}`, this.baseUrl).href;
++    }
++
++    async get(jobId) {
++      const response = await this.fetchFunction(this.jobUrl(jobId), {
++        credentials: "same-origin",
++        headers: { Accept: "application/json" },
++      });
++      if (!response.ok) throw new Error(`Job API HTTP ${response.status}`);
++      return response.json();
++    }
++  }
++
+   class LinkView {
+     constructor(root = document) {
+       this.root = root;
+@@ -213,7 +310,9 @@
+           candidates.push({ url: anchor.getAttribute("href"), source: "结果区域", field: "href" });
+         }
+         for (const url of model.extractUrlsFromText(resultRoot.textContent)) {
+-          candidates.push({ url, source: "结果区域文本", field: "text" });
++          if (model.classify(url) === "PayPal BA") {
++            candidates.push({ url, source: "结果区域文本", field: "text" });
++          }
+         }
+       }
+       return candidates;
+@@ -253,10 +352,12 @@
+   }
+ 
+   class LinkPresenter {
+-    constructor(model, view, storage = window.localStorage) {
++    constructor(model, view, repository, storage = window.localStorage) {
+       this.model = model;
+       this.view = view;
++      this.repository = repository;
+       this.storage = storage;
++      this.watchedJobs = new Map();
+     }
+ 
+     start() {
+@@ -272,6 +373,7 @@
+         const items = this.model.extractStructured(event.detail, "自定义事件");
+         this.accept(items);
+       });
++      document.addEventListener(API_CAPTURE_EVENT, (event) => this.handleApiCapture(event.detail));
+       this.scan("初始页面");
+       this.registerMenu();
+     }
+@@ -281,6 +383,41 @@
+       this.accept(candidates);
+     }
+ 
++    handleApiCapture(detail) {
++      if (!detail?.payload) return;
++      this.accept(this.model.extractStructured(detail.payload, `API ${detail.method || "GET"} ${detail.url || ""}`));
++      for (const jobId of this.model.extractJobIds(detail.payload)) this.watchJob(jobId);
++    }
++
++    watchJob(jobId) {
++      if (!this.repository || this.watchedJobs.has(jobId)) return;
++      const watch = { startedAt: Date.now(), timer: 0 };
++      this.watchedJobs.set(jobId, watch);
++      this.view.status(`正在监听任务 ${jobId.slice(0, 8)} 的 BA 链接…`);
++      const poll = async () => {
++        try {
++          const payload = await this.repository.get(jobId);
++          const candidates = this.model.extractStructured(payload, `Job ${jobId.slice(0, 8)}`);
++          this.accept(candidates);
++          const job = payload.job || payload;
++          const status = String(job.status || "").toLowerCase();
++          const foundBa = candidates.some((item) => this.model.classify(item.url) === "PayPal BA");
++          if (foundBa || ["success", "failed", "cancelled", "partial"].includes(status)) {
++            this.watchedJobs.delete(jobId);
++            return;
++          }
++        } catch (_) {
++          // A transient API error is retried while the task is active.
++        }
++        if (Date.now() - watch.startedAt >= 300000) {
++          this.watchedJobs.delete(jobId);
++          return;
++        }
++        watch.timer = setTimeout(poll, 650);
++      };
++      poll();
++    }
++
+     accept(candidates) {
+       const added = this.model.capture(candidates);
+       this.save();
+@@ -348,14 +485,30 @@
+     }
+   }
+ 
+-  const testApi = { RESULT_FIELDS, LinkModel, LinkView, LinkPresenter, loadState };
++  const testApi = {
++    RESULT_FIELDS,
++    API_CAPTURE_EVENT,
++    LinkModel,
++    ApiCaptureBridge,
++    JobRepository,
++    LinkView,
++    LinkPresenter,
++    loadState,
++  };
+   if (typeof module !== "undefined" && module.exports) {
+     module.exports = testApi;
+     return;
+   }
+ 
+-  const model = new LinkModel(window.location.href, loadState());
+-  const view = new LinkView(document);
+-  new LinkPresenter(model, view).start();
++  const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
++  ApiCaptureBridge.install(pageWindow, document);
++
++  const bootstrap = () => {
++    const model = new LinkModel(window.location.href, loadState());
++    const view = new LinkView(document);
++    const repository = new JobRepository(pageWindow.fetch.bind(pageWindow), window.location.href);
++    new LinkPresenter(model, view, repository).start();
++  };
++  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
++  else bootstrap();
+ })();
+-

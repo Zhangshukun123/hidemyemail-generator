@@ -1,0 +1,171 @@
+diff --git a/verification/protocol-init-csrf-recovery-20260820/ORIGINAL_FILE b/verification/protocol-init-csrf-recovery-20260820/MODIFIED_FILE
+index f5a6780..fea8fc5 100644
+--- a/verification/protocol-init-csrf-recovery-20260820/ORIGINAL_FILE
++++ b/verification/protocol-init-csrf-recovery-20260820/MODIFIED_FILE
+@@ -13,6 +13,7 @@ import time
+ from types import ModuleType
+ from typing import Any
+ from urllib.error import HTTPError, URLError
++from urllib.parse import quote, unquote, urlsplit, urlunsplit
+ from urllib.request import Request, urlopen
+ 
+ try:
+@@ -102,7 +103,7 @@ def _proxy_fingerprint_profile(country: Any) -> dict[str, str]:
+         "language": language,
+         "timezone": timezone_name,
+     }
+-TRANSIENT_INIT_ERROR_MARKERS = (
++TRANSIENT_INIT_TRANSPORT_MARKERS = (
+     "sslerror",
+     "ssl_connect",
+     "ssl_error_syscall",
+@@ -116,6 +117,89 @@ TRANSIENT_INIT_ERROR_MARKERS = (
+     "tls handshake",
+     "timed out",
+ )
++TRANSIENT_INIT_EDGE_MARKERS = (
++    "csrf 请求失败: 403",
++    "csrf request failed: 403",
++)
++_PROVIDER_PROXY_SID_RE = re.compile(
++    r"(-sid-)([A-Za-z0-9]{4,32})(-t-)",
++    re.IGNORECASE,
++)
++_KOOKEEY_PROXY_ROUTE_RE = re.compile(
++    r"^(?P<base>.+)-(?P<region>[A-Za-z]{2}|global)-"
++    r"(?P<sid>[A-Za-z0-9]{8})-(?P<duration>\d+[mh])$",
++    re.IGNORECASE,
++)
++
++
++class TransientInitRecoveryStrategy:
++    """Classify cold-session failures and rotate refreshable proxy sessions."""
++
++    @staticmethod
++    def classify(result: Any) -> str:
++        if not isinstance(result, dict):
++            return ""
++        if str(result.get("status") or "").strip().casefold() == "success":
++            return ""
++        error = result.get("error")
++        detail = (
++            " ".join(str(value or "") for value in error.values())
++            if isinstance(error, dict)
++            else str(error or "")
++        )
++        normalized = detail.casefold()
++        if "init_page_email" not in normalized:
++            return ""
++        if any(marker in normalized for marker in TRANSIENT_INIT_EDGE_MARKERS):
++            return "edge_403"
++        if any(marker in normalized for marker in TRANSIENT_INIT_TRANSPORT_MARKERS):
++            return "transport"
++        return ""
++
++    @staticmethod
++    def refresh_proxy_session(proxy_url: str) -> str:
++        """Return a provider URL with a fresh sticky-session id when supported."""
++
++        value = str(proxy_url or "").strip()
++        if not value:
++            return value
++        fresh_sid = "".join(
++            secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
++            for _ in range(8)
++        )
++        refreshed = _PROVIDER_PROXY_SID_RE.sub(
++            lambda match: f"{match.group(1)}{fresh_sid}{match.group(3)}",
++            value,
++            count=1,
++        )
++        if refreshed != value:
++            return refreshed
++        try:
++            parsed = urlsplit(value)
++            username = unquote(parsed.username or "")
++            password = unquote(parsed.password or "")
++            route = _KOOKEEY_PROXY_ROUTE_RE.fullmatch(password)
++            hostname = parsed.hostname or ""
++        except ValueError:
++            return value
++        if route is None or not username or not hostname:
++            return value
++        refreshed_password = (
++            f"{route.group('base')}-{route.group('region')}-"
++            f"{fresh_sid}-{route.group('duration')}"
++        )
++        host = f"[{hostname}]" if ":" in hostname else hostname
++        port = f":{parsed.port}" if parsed.port else ""
++        netloc = (
++            f"{quote(username, safe='')}:{quote(refreshed_password, safe='')}@"
++            f"{host}{port}"
++        )
++        return urlunsplit(
++            (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
++        )
++
++
++TRANSIENT_INIT_RECOVERY = TransientInitRecoveryStrategy()
+ 
+ 
+ def _configure_utf8_stdio(streams: tuple[Any, ...] | None = None) -> None:
+@@ -231,19 +315,7 @@ def _is_password_add_completed(result: Any) -> bool:
+ 
+ def _is_transient_init_failure(result: Any) -> bool:
+     """Retry only transport failures that happen before password/OTP work starts."""
+-    if not isinstance(result, dict):
+-        return False
+-    if str(result.get("status") or "").strip().casefold() == "success":
+-        return False
+-    error = result.get("error")
+-    if isinstance(error, dict):
+-        detail = " ".join(str(value or "") for value in error.values())
+-    else:
+-        detail = str(error or "")
+-    normalized = detail.casefold()
+-    return "init_page_email" in normalized and any(
+-        marker in normalized for marker in TRANSIENT_INIT_ERROR_MARKERS
+-    )
++    return bool(TRANSIENT_INIT_RECOVERY.classify(result))
+ 
+ 
+ def _load_core(root: Path) -> ModuleType:
+@@ -649,19 +721,35 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
+                 "error",
+             )
+             break
+-        if _is_transient_init_failure(raw):
++        transient_init_kind = TRANSIENT_INIT_RECOVERY.classify(raw)
++        if transient_init_kind:
+             if transient_init_retries >= TRANSIENT_INIT_FULL_RETRY_LIMIT:
+                 break
+             transient_init_retries += 1
++            refreshed_proxy_url = TRANSIENT_INIT_RECOVERY.refresh_proxy_session(
++                proxy_url
++            )
++            proxy_session_rotated = refreshed_proxy_url != proxy_url
++            proxy_url = refreshed_proxy_url
+             if transient_init_retries == 1:
+                 impersonate = _tls_fallback_impersonate(impersonate)
+                 retry_profile_message = f"切换 TLS 指纹为 {impersonate}"
+             else:
+                 retry_profile_message = f"继续使用 TLS 指纹 {impersonate}"
++            failure_message = (
++                "CSRF 被边缘防护拒绝"
++                if transient_init_kind == "edge_403"
++                else "TLS/代理连接中断"
++            )
++            proxy_message = (
++                "并刷新住宅代理会话"
++                if proxy_session_rotated
++                else "并保持当前代理入口"
++            )
+             _emit_event(
+                 "network",
+-                "init_page_email TLS 连接中断；正在创建全新会话并"
+-                f"{retry_profile_message}"
++                f"init_page_email {failure_message}；正在创建全新会话，"
++                f"{retry_profile_message}{proxy_message}"
+                 f"（{transient_init_retries}/{TRANSIENT_INIT_FULL_RETRY_LIMIT}）",
+                 "warning",
+             )

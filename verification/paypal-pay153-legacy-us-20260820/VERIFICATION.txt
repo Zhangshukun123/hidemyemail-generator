@@ -1,0 +1,170 @@
+PAYPAL LEGACY PAY.153 US PAYMENT VERIFICATION
+Date: 2026-08-20 Asia/Shanghai
+Workspace: D:\AI\hidemyemail-generator
+Branch: main
+Original HEAD: 3325894f7990b86a51edac754d10c3dd00622afe
+Historical PAY.153 boundary: 2e926b8f15cde78b823c3f25aa3e6c9a6cc73983
+
+CHANGED BRANCH / FIELDS
+- WebApp branch: link_method == "paypal_us" now sends
+  buyer_mode="identity_elevation" and payment_protocol="pay153_legacy_us".
+- paypal_gb and every non-US route send payment_protocol="current".
+- WebJob/API field: payment_protocol.
+- Strategy decisions for US pay153_legacy_us:
+  uses_us_email_first=false; acquires_phone_before_flow=true;
+  uses_source_account_email=false; allows_us_member_recovery=false.
+- Restored protocol phases:
+  acquire phone -> generic Phase 2 -> phone OTP -> SignUpNewMember
+  -> identity elevation -> Hermes billingLite -> Buyer Context -> authorize.
+- Current US email-first and GB/current remain selectable and covered by tests.
+- MVP/Strategy files:
+  src/hidemyemail_generator/paypal_payment_protocol.py
+  paypal-agreement-protocol/paypal/payment_protocol.py
+
+FOUR ARTIFACTS
+MODIFIED_FILE:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\MODIFIED_FILE
+DIFF_FILE:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\DIFF_FILE
+VERIFICATION.txt:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\VERIFICATION.txt
+ROLLBACK.sh:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\ROLLBACK.sh
+
+ARTIFACT SHA256
+MODIFIED_FILE 97b31dd221b71ddd93c8b29516262891f5aba8605612d70247a8e1e80046d6a7
+DIFF_FILE 6ca9f8d9d5338c79947a2595528b0525dfc4ec5a2952387c6987523ba3639952
+ROLLBACK.sh 94a1a1fbe2787fd78150911f9819884d9de2e56388b17495ac02a8b28f9866c9
+ROLLBACK_EXECUTABLE=yes
+
+BASELINE TEST (before task changes)
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT (PowerShell):
+$env:PYTHONPATH='D:\AI\hidemyemail-generator\paypal-agreement-protocol;D:\AI\hidemyemail-generator\src'
+.\.venv\Scripts\python.exe -m pytest paypal-agreement-protocol\tests\test_us_email_first_flow.py paypal-agreement-protocol\tests\test_us_email_first_integration.py paypal-agreement-protocol\tests\test_identity_elevation_mode.py tests\test_webapp_stdio.py::CardLinkEndpointTests -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+...............................................................          [100%]
+63 passed, 2968 warnings in 5.84s
+EXIT STATUS: 0
+BASELINE BEHAVIOR:
+US automatic payment used current email-first/member/funding behavior; no
+payment_protocol selector existed in the WebApp payload or protocol WebJob.
+
+MODIFIED TEST (final task files)
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT (PowerShell):
+$env:HME_DB_FILE='D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\modified-tests.db'
+$env:PYTHONPATH='D:\AI\hidemyemail-generator\paypal-agreement-protocol;D:\AI\hidemyemail-generator\src'
+.\.venv\Scripts\python.exe -m pytest tests\test_paypal_payment_protocol.py tests\test_webapp_stdio.py::CardLinkEndpointTests paypal-agreement-protocol\tests\test_us_email_first_integration.py paypal-agreement-protocol\tests\test_us_onboarding_compat.py paypal-agreement-protocol\tests\test_identity_elevation_mode.py -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+........................................................................ [ 97%]
+..                                                                       [100%]
+74 passed, 2968 warnings in 5.84s
+EXIT STATUS: 0
+MODIFIED BEHAVIOR:
+US automatic payment selects pay153_legacy_us, obtains the automatic phone
+before the flow, preserves the generated PayPal email, skips US email actions,
+performs OTP then SignUpNewMember, uses Hermes/Buyer Context authorization,
+and treats createMemberAccount/OAS_ERROR as terminal. GB selects current.
+
+PROTOCOL SUBPROJECT REGRESSION
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT (PowerShell):
+$env:HME_DB_FILE='D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\protocol-tests.db'
+$env:PYTHONPATH='D:\AI\hidemyemail-generator\paypal-agreement-protocol;D:\AI\hidemyemail-generator\src'
+.\.venv\Scripts\python.exe -m pytest paypal-agreement-protocol\tests -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+........................................................................ [ 59%]
+..................................................                       [100%]
+122 passed in 2.14s
+EXIT STATUS: 0
+
+FULL WORKSPACE REGRESSION
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT (PowerShell):
+.\.venv\Scripts\python.exe -m pytest -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+........................................................................ [ 99%]
+.....                                                                    [100%]
+1021 passed, 10140 warnings, 64 subtests passed in 189.10s (0:03:09)
+EXIT STATUS: 0
+
+ROLLBACK TEST (independent copied workspace)
+CWD: D:\AI\hidemyemail-generator
+COMMAND / INPUT (PowerShell invoking Git Bash):
+& 'C:\Program Files\Git\bin\bash.exe' '/d/AI/hidemyemail-generator/verification/paypal-pay153-legacy-us-20260820/ROLLBACK.sh' '/d/AI/hidemyemail-generator/verification/paypal-pay153-legacy-us-20260820/ROLLBACK_COPY_VERIFIED'
+LITERAL OUTPUT / RESULT:
+ROLLBACK_RESULT=restored
+ROLLBACK_STATUS=baseline-hashes-match;added-files-absent
+RESTORED_PAYMENT_PROTOCOL=current
+RESTORED_US_BEHAVIOR=email-first
+ROLLBACK_TARGET=/d/AI/hidemyemail-generator/verification/paypal-pay153-legacy-us-20260820/ROLLBACK_COPY_VERIFIED
+EXIT STATUS: 0
+
+RESTORED BEHAVIOR TEST
+CWD:
+D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\ROLLBACK_COPY_VERIFIED
+COMMAND / INPUT (PowerShell):
+$env:PYTHONPATH='D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\ROLLBACK_COPY_VERIFIED\paypal-agreement-protocol;D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\ROLLBACK_COPY_VERIFIED\src'
+$env:HME_DB_FILE='D:\AI\hidemyemail-generator\verification\paypal-pay153-legacy-us-20260820\ROLLBACK_COPY_VERIFIED\rollback-tests.db'
+D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest paypal-agreement-protocol\tests\test_us_email_first_flow.py paypal-agreement-protocol\tests\test_us_email_first_integration.py paypal-agreement-protocol\tests\test_identity_elevation_mode.py tests\test_webapp_stdio.py::CardLinkEndpointTests -q --disable-warnings -p no:cacheprovider
+LITERAL OUTPUT / RESULT:
+...............................................................          [100%]
+63 passed, 2968 warnings in 6.67s
+EXIT STATUS: 0
+RESTORED STATUS / BEHAVIOR:
+- All seven pre-existing task files exactly match their task-start SHA256.
+- All three task-added files are absent.
+- payment_protocol selector is absent and US behavior is restored to current
+  email-first/member/funding behavior.
+- The baseline test passes again.
+- The main workspace remains modified with pay153_legacy_us selected for US.
+
+STATIC VALIDATION
+COMMAND / INPUT:
+.\.venv\Scripts\ruff.exe check <all ten task Python files>
+git diff --check
+LITERAL OUTPUT / RESULT:
+All checks passed!
+git diff --check produced no errors (only Git CRLF conversion notices).
+EXIT STATUS: 0
+
+FILE SIZE LIMIT
+- Largest changed file: src/hidemyemail_generator/webapp.py, 9303 lines.
+- paypal-agreement-protocol/web.py: 3596 lines.
+- paypal-agreement-protocol/paypal/flow.py: 2823 lines.
+- Every task file is below 10000 lines.
+
+ORIGINAL SHA256 -> MODIFIED SHA256
+src/hidemyemail_generator/webapp.py
+  08051dfa24b9374d10aed7d37f08b6625b518258c561b775dbc0ab758440451c
+  -> 29a0cf35b3365948ad8bb9b321da50c1111fec409646a927964d5e7094a3df12
+paypal-agreement-protocol/web.py
+  ccd138ad9ca08650b46a45adbb3e2ea2ece3d7ec0dd3a796660c5fcf11b59877
+  -> b8b55ab739498ba0c05dd16209d89783e2749e71813f8144ce0f4801762cd6f0
+paypal-agreement-protocol/paypal/flow.py
+  6f78ec6e804679b54cdf537833dc982eb398d954669010da5352b8e5fea832df
+  -> b5c5723215c20fdc284a27225fc6d28c3721026196647a47d9c2b49712b3a108
+paypal-agreement-protocol/paypal/elevation_flow.py
+  8f51f6f855ed65c92dc06c9995eb9833c55e87c2421850d09cca3fa937c31df5
+  -> 09d08f55b085bcb706b2b327e86e9be8560d0903db1b4f5d01fc3e1d187ead1f
+tests/test_webapp_stdio.py
+  3f5f9a7668071274faa71f9e6625813f6c2c7c96819252e88a0f16f4db8bc903
+  -> 52d33e43ce6d8514d7b2eb3fe140608c74f73c0f538b3db7b979a41641cc5e3e
+paypal-agreement-protocol/tests/test_us_email_first_integration.py
+  ef911bcfc297e64fd39ddb8f2bd3440eac8f087ade5dafd225adf2de2f8627cd
+  -> df138975f122e8e00e6ff36fd7c3786e980fd13352f228da53cc3edf4d4d3561
+paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+  14ab08817532615e2d04ab104bd189a020b9375aebd550c7a93e437da303b114
+  -> cba81bbc3683351541bf93c09224ee12344109cf385e379cafbf7deda9c93b97
+src/hidemyemail_generator/paypal_payment_protocol.py
+  ABSENT -> 85f9ccb46bbd2f957025ec29dd4f6bca6064b769bdc5d9b8dd88a3afe8f1ccf0
+paypal-agreement-protocol/paypal/payment_protocol.py
+  ABSENT -> fc6e9268a8b17a6a073b0c8698266b333cbeb2df90ba83c1d53c450869c04961
+tests/test_paypal_payment_protocol.py
+  ABSENT -> 2d6134dea81156e6c9e2a0fe0e5c8d051f04464205ff792d0f341e30d4aff994
+
+PATCH SCOPE
+DIFF_FILE contains exactly the ten task files listed above. Existing prior
+US/GB two-proxy extraction changes, protocol-registration edits, userscripts,
+and earlier verification directories are excluded and preserved.

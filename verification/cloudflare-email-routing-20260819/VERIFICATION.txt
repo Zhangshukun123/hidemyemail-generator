@@ -1,0 +1,54 @@
+# Cloudflare Email Routing verification
+
+BRANCH: codex/editable-quick-flow-target-count
+CHANGED_EXTERNAL_FIELD: registry.nameservers
+CHANGED_EXTERNAL_VALUE: dns1.hichina.com,dns2.hichina.com -> carol.ns.cloudflare.com,rudy.ns.cloudflare.com
+CHANGED_LOCAL_FIELD: settings.zkgmail_qq_inbox_config_v1.activeDomain
+CHANGED_LOCAL_VALUE: zkgmail.com -> shukunlabs.xyz
+CHANGED_ROUTE_FIELD: emailRouting.catchAll.action
+CHANGED_ROUTE_VALUE: Catch-All -> 352***4@qq.com (active; destination verified)
+
+ARTIFACTS:
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\DIFF_FILE
+VERIFICATION_FILE: D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\VERIFICATION.txt
+ROLLBACK_FILE: D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\ROLLBACK.sh
+
+HASHES:
+ORIGINAL_SHA256: 4d3fa0e094ab174bab584e6bb7842f6f3109de26c50977a9f3894da9db5412f8
+MODIFIED_FILE_SHA256: 056b738daa57c653de03a6feeba2d313cdcd458b3dc1c2de386d69cbfc8a7569
+
+BASELINE:
+COMMAND: $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe .\verification\cloudflare-email-routing-20260819\verify_active_domain.py .\verification\cloudflare-email-routing-20260819\ORIGINAL_DB_COPY
+INPUT: D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\ORIGINAL_DB_COPY
+LITERAL_OUTPUT: zkgmail.com
+EXIT_STATUS: 0
+
+MODIFIED:
+COMMAND: $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe .\verification\cloudflare-email-routing-20260819\verify_active_domain.py .\hidemyemail.db
+INPUT: D:\AI\hidemyemail-generator\hidemyemail.db
+LITERAL_OUTPUT: shukunlabs.xyz
+EXIT_STATUS: 0
+
+ROLLBACK:
+COMMAND: C:\Program Files\Git\bin\bash.exe -lc "bash 'D:/AI/hidemyemail-generator/verification/cloudflare-email-routing-20260819/ROLLBACK.sh' 'D:/AI/hidemyemail-generator/verification/cloudflare-email-routing-20260819/rollback-test.db' 'D:/AI/hidemyemail-generator/verification/cloudflare-email-routing-20260819/ORIGINAL_DB_COPY'"
+INPUT: MODIFIED_FILE copied to D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\rollback-test.db, then rollback source D:\AI\hidemyemail-generator\verification\cloudflare-email-routing-20260819\ORIGINAL_DB_COPY
+LITERAL_OUTPUT: ROLLBACK_TARGET=D:/AI/hidemyemail-generator/verification/cloudflare-email-routing-20260819/rollback-test.db | ROLLBACK_SOURCE=D:/AI/hidemyemail-generator/verification/cloudflare-email-routing-20260819/ORIGINAL_DB_COPY | ROLLBACK_SHA256=4d3fa0e094ab174bab584e6bb7842f6f3109de26c50977a9f3894da9db5412f8 *D:/AI/hidemyemail-generator/verification/cloudflare-email-routing-20260819/rollback-test.db | zkgmail.com | ROLLBACK_VERIFY_EXIT=0
+EXIT_STATUS: 0
+RESTORED_BEHAVIOR: rollback-test.db activeDomain=zkgmail.com and SHA256 equals ORIGINAL_SHA256; live hidemyemail.db remains activeDomain=shukunlabs.xyz.
+
+TESTS:
+BASELINE_COMMAND: $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -q tests/test_zkgmail.py
+BASELINE_RESULT: 18 passed, 145 warnings in 1.85s
+BASELINE_EXIT_STATUS: 0
+MODIFIED_COMMAND: $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -q tests/test_zkgmail.py
+MODIFIED_RESULT: 18 passed, 145 warnings in 1.29s
+MODIFIED_EXIT_STATUS: 0
+
+EXTERNAL_VERIFICATION:
+- Alibaba Cloud current nameservers: carol.ns.cloudflare.com, rudy.ns.cloudflare.com.
+- XYZ registry RDAP: STATUS=active; NS=carol.ns.cloudflare.com,rudy.ns.cloudflare.com.
+- Cloudflare assigned nameservers: carol.ns.cloudflare.com, rudy.ns.cloudflare.com.
+- Cloudflare DNS contains route1.mx.cloudflare.net, route2.mx.cloudflare.net, route3.mx.cloudflare.net and SPF include:_spf.mx.cloudflare.net.
+- Cloudflare Email Routing catch-all is active and forwards to the verified destination 352***4@qq.com.
+- Cached recursive resolvers still returned the prior Alibaba NS/MX immediately after the registry change; Alibaba reports DNS synchronization can take 24-48 hours.

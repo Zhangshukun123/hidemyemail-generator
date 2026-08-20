@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#08111f">
+  <title>安全登录 · 账号工作台</title>
+  <style>{{PAGE_STYLES}}</style>
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="loginTitle">
+      <div class="login-intro">
+        <div class="product-lockup">
+          <span class="product-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M7.2 18.2h10a4.3 4.3 0 0 0 .7-8.5A6 6 0 0 0 6.5 8.1a5.1 5.1 0 0 0 .7 10.1Z"/><path d="m7.5 11.5 4.5 3.2 4.5-3.2"/><rect x="7.5" y="10" width="9" height="6.5" rx="1.5"/></svg>
+          </span>
+          <span><strong>账号工作台</strong><small>PRIVATE RELAY CONSOLE</small></span>
+        </div>
+        <div class="login-copy">
+          <h1>统一管理邮箱与账号</h1>
+          <p>管理 iCloud 隐藏邮箱、OpenAI 账号、Session、2FA 与支付链接。</p>
+        </div>
+        <ul class="trust-list">
+          <li><span class="trust-icon">●</span><span><strong>本地数据存储</strong><small>账号资料保存在当前运行环境</small></span></li>
+          <li><span class="trust-icon">●</span><span><strong>SSH 安全隧道</strong><small>适配本地与远程服务器访问</small></span></li>
+          <li><span class="trust-icon">●</span><span><strong>敏感信息保护</strong><small>密码与代理默认隐藏显示</small></span></li>
+        </ul>
+      </div>
+      <form class="login-form" id="loginForm">
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换主题">◐</button>
+        <div class="login-form-copy">
+          <h2 id="loginTitle">安全登录</h2>
+          <p>输入服务器账号和密码继续</p>
+        </div>
+        <label class="field-label" for="username">登录账号</label>
+        <input class="login-username" id="username" type="text" autocomplete="username" placeholder="请输入登录账号" autofocus>
+        <label class="field-label" for="password">管理密码</label>
+        <div class="password-field">
+          <input id="password" type="password" autocomplete="current-password" placeholder="请输入登录密码" required>
+          <button id="passwordToggle" type="button" aria-label="显示或隐藏密码">显示</button>
+        </div>
+        <div class="login-options">
+          <label><input id="rememberLogin" type="checkbox" checked> 保持本机登录</label>
+          <span>本地安全访问</span>
+        </div>
+        <button class="button primary login-submit" id="submit" type="submit">登录工作台</button>
+        <div class="form-notice" id="notice" role="alert" aria-live="polite"></div>
+        <div class="connection-note"><span class="status-dot success"></span>当前连接：本地安全访问</div>
+      </form>
+    </section>
+    <footer class="login-footer"><span>账号工作台 · 版本 1.3.0</span><span><i></i>服务运行正常</span></footer>
+  </main>
+  <script>{{PAGE_SCRIPT}}</script>
+</body>
+</html>

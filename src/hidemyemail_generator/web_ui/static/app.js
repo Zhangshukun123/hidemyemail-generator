@@ -1,6 +1,5 @@
 (() => {
   "use strict";
-
   const $ = (id) => document.getElementById(id);
   const localToken = window.__HME_LOCAL_TOKEN__;
   const pageDetails = {
@@ -16,33 +15,40 @@
   const cardLinkExtractionModes = {
     paypal_us: {
       country: "US",
-      summary: "使用第一代理创建已携带优惠的 US/USD Checkout，并完成金额校验与 PayPal Confirm / Approve",
-      label: "PayPal / 美国 · USD · 全程第一代理",
-      checks: ["✓ Session 可用", "✓ 地区 US", "✓ 币种 USD", "✓ 返回 PayPal 授权链接"],
+      summary: "池1 Checkout/优惠检查；池2 Update→Taxes→Stripe→Approve/Poll",
+      label: "PayPal / 美国 · USD · 双代理严格 0",
+      checks: ["✓ Session 可用", "✓ 地区 US", "✓ 币种 USD", "✓ 优惠后金额 0", "✓ 返回 PayPal BA 授权链接"],
       button: "提取 PayPal 链接",
       success: "PayPal US/USD 授权链接已提取并复制",
-      singleProxy: true,
+      singleProxy: false,
       fixedProxyCountry: true,
       createProxyPreference: "paypalUsCreate",
       createProxyCountry: "US",
       promotionProxyPreference: "paypalUsFollowup",
       promotionProxyCountry: "US",
-      createProxyLabel: "第一代理国家",
-      promotionProxyLabel: "第一代理国家",
+      createProxyLabel: "池1 Checkout 代理国家",
+      promotionProxyLabel: "池2 Update/支付代理国家",
+      promotionProxyChoice: "second",
       targetAmount: true,
+      fixedTargetAmount: "0",
     },
     paypal_gb: {
       country: "GB",
-      summary: "使用英国第一代理创建已携带优惠的 GB/GBP Checkout，并完成金额校验与 PayPal Confirm / Approve",
-      label: "PayPal / 英国 · GBP · 全程第一代理",
-      checks: ["✓ Session 可用", "✓ 地区 GB", "✓ 币种 GBP", "✓ 优惠后金额 0", "✓ 返回 PayPal 授权链接"],
+      summary: "池1 标准 Checkout→Taxes→Sentinel→Confirm→Approve/Poll/BA；池2 BA 后同 Checkout Update；池1复验 GBP/0",
+      label: "PayPal / 英国 · GBP · 双代理严格 0",
+      checks: ["✓ Session 可用", "✓ 地区 GB", "✓ 币种 GBP", "✓ 优惠后金额 0", "✓ 返回 PayPal BA 授权链接"],
       button: "提取 PayPal 链接",
       success: "PayPal GB/GBP 授权链接已提取并复制",
-      singleProxy: true,
+      singleProxy: false,
       fixedProxyCountry: true,
       createProxyPreference: "paypalGbCreate",
       createProxyCountry: "GB",
-      createProxyLabel: "英国第一代理国家",
+      promotionProxyPreference: "paypalGbCreate",
+      promotionProxyCountry: "GB",
+      createProxyLabel: "池1 Checkout 代理国家",
+      promotionProxyLabel: "池2 BA 后 Update 代理国家",
+      promotionProxyChoice: "second",
+      targetAmount: true,
       fixedTargetAmount: "0",
     },
     ph_hosted: {
@@ -72,22 +78,18 @@
       fixedTargetAmount: "0",
     },
   };
-
   function cardLinkRuntimeConfig(method) {
     return cardLinkExtractionModes[method] || cardLinkExtractionModes.ph_hosted;
   }
-
   class CardLinkCountryPolicy {
     constructor(modes) {
       this.modes = modes;
     }
-
     resolve(method, candidate = "") {
       const config = this.modes[method];
       if (config?.fixedProxyCountry) return config.country;
       return String(candidate || "").trim().toUpperCase();
     }
-
     normalizeSnapshot(snapshot = {}) {
       const method = String(snapshot.cardLinkMethod || "");
       const config = this.modes[method];
@@ -100,7 +102,6 @@
       };
     }
   }
-
   const cardLinkCountryPolicy = new CardLinkCountryPolicy(cardLinkExtractionModes);
   class PayPalWorkspaceModel {
     constructor(origin) { this.origin = origin; }
@@ -111,7 +112,6 @@
       return url.origin === this.origin ? url.pathname + url.search + url.hash : url.href;
     }
   }
-
   class PayPalWorkspaceView {
     constructor(frame) {
       this.frame = frame;
@@ -154,7 +154,6 @@
     fallbackUrl() { return this.frame.dataset.src || "/paypal-pay/"; }
     load(url) { this.frame.src = url; this.frame.dataset.loaded = "1"; }
   }
-
   class PayPalWorkspacePresenter {
     constructor(model, view) { this.model = model; this.view = view; this.readyTimer = 0; this.serviceRunning = false; }
     mount() {
@@ -194,9 +193,11 @@
     return {
       target_amount: config.fixedTargetAmount || $("cardLinkTargetAmount").value.trim(),
       sentinel_so_enabled: Boolean($("cardLinkSentinelSo").checked),
+      independent_proxy_pair: !config.singleProxy,
+      use_secondary_proxy: false,
+      promotion_proxy_choice: config.promotionProxyChoice || "first",
     };
   }
-
   function escapeHtml(value) {
     return String(value ?? "")
       .replaceAll("&", "&amp;")
@@ -205,7 +206,6 @@
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
   }
-
   function quickFlowFailureExplanation(item = {}) {
     return window.QuickFlowQuotaEligibilityModel.explainFailure(item);
   }
@@ -1926,7 +1926,7 @@
       );
       const extractionSecondProxyLabel = extractionSecondCountrySelect.closest("label");
       if (extractionSecondProxyLabel) extractionSecondProxyLabel.hidden = config.singleProxy;
-      extractionSecondCountrySelect.disabled = config.singleProxy;
+      extractionSecondCountrySelect.disabled = config.singleProxy || config.fixedProxyCountry;
       const promotionChoice = $("quickPromotionProxyChoice");
       if (promotionChoice.dataset.ready !== "1") {
         promotionChoice.value = localStorage.getItem("hme_quick_promotion_proxy_choice") === "second"
@@ -1939,8 +1939,10 @@
       const targetAmountLabel = $("quickCardLinkTargetAmountLabel");
       const targetAmountInput = $("quickCardLinkTargetAmount");
       targetAmountLabel.hidden = !config.targetAmount;
+      targetAmountInput.disabled = Boolean(config.fixedTargetAmount);
       if (config.targetAmount && targetAmountInput.dataset.method !== method) {
-        targetAmountInput.value = localStorage.getItem("hme_quick_paypal_us_target_amount") || "";
+        targetAmountInput.value = config.fixedTargetAmount ||
+          localStorage.getItem("hme_quick_paypal_us_target_amount") || "";
         targetAmountInput.dataset.method = method;
       }
       $("quickPromotionProxyChoiceLabel").hidden = true;
@@ -1954,8 +1956,7 @@
         ? (config.singleProxy
           ? "提链代理与注册代理独立。第一代理负责 " + config.country +
             " Checkout 创建（直接携带优惠）、金额校验、Confirm 与 Approve；不会提交优惠 Update。"
-          : "提链代理与注册代理独立。首次提链使用第一代理出口；链接失败后重新提链使用第二代理出口。优惠更新当前使用" +
-            (promotionChoice.value === "second" ? "第二 IP" : "第一 IP") + "。") +
+          : "提链代理与注册代理独立。" + config.summary + "。") +
           `提链成功后会按链接国家自动选择支付代理，并由 ${paymentSmsLabel} 自动取号、取码和启动协议支付。`
         : "所选提链代理尚未配置，请先到“提链代理独立配置”保存凭据。";
       $("quickRegistrationProxySummary").textContent = "注册代理：" +
@@ -1969,9 +1970,9 @@
       $("quickExtractionProxySummary").textContent = "提链代理：" +
         (extractionProxyModeSelect.selectedOptions[0]?.textContent || "未选择") +
         "；第一出口：" + (extractionFirstCountrySelect.selectedOptions[0]?.textContent || "—") +
-        (config.singleProxy ? "；全程复用第一代理" :
-          "；第二出口：" + (extractionSecondCountrySelect.selectedOptions[0]?.textContent || "—")) +
-        "；优惠：Checkout 创建时携带";
+        (config.singleProxy ? "；全程复用第一代理；优惠：Checkout 创建时携带" :
+          "；第二出口：" + (extractionSecondCountrySelect.selectedOptions[0]?.textContent || "—") +
+          "；" + config.summary);
 
       const registrationMode = $("quickRegistrationMode").value || "headless";
       const protocolMode = registrationMode === "protocol";
@@ -2019,7 +2020,8 @@
         registrationProxyModeSelect.value === "clash";
       extractionFirstCountrySelect.disabled = config.fixedProxyCountry ||
         extractionProxyModeSelect.value === "clash";
-      extractionSecondCountrySelect.disabled = extractionProxyModeSelect.value === "clash";
+      extractionSecondCountrySelect.disabled = config.singleProxy || config.fixedProxyCountry ||
+        extractionProxyModeSelect.value === "clash";
       promotionChoice.disabled = true;
       const taskState = protocolMode ? state.protocolRegistrationTask : state.registrationTask;
       const canStartNext = taskState?.canStartNext !== false;
@@ -2298,7 +2300,8 @@
         config.promotionProxyPreference || "phPromotion",
         config.promotionProxyCountry || "TR",
       );
-      $("cardLinkPromotionProxyCountry").disabled = config.singleProxy || !modeConfigured;
+      $("cardLinkPromotionProxyCountry").disabled = config.singleProxy ||
+        config.fixedProxyCountry || !modeConfigured;
       $("cardLinkCreateProxyLabel").firstChild.textContent = config.createProxyLabel || (
         config.singleProxy ? "提链代理国家" : "建单代理国家"
       );
@@ -3101,13 +3104,13 @@
         secondary_proxy_country: secondProxyCountry,
         reuse_registration_proxy: false,
         independent_proxy_pair: !singleProxy,
-        use_secondary_proxy: !singleProxy && Boolean(forceRetry),
-        promotion_proxy_choice: singleProxy
+        use_secondary_proxy: !config.promotionProxyChoice && !singleProxy && Boolean(forceRetry),
+        promotion_proxy_choice: config.promotionProxyChoice || (singleProxy
           ? "first"
-          : snapshot.promotionProxyChoice || $("quickPromotionProxyChoice").value || "first",
-        target_amount: config.targetAmount
+          : snapshot.promotionProxyChoice || $("quickPromotionProxyChoice").value || "first"),
+        target_amount: config.fixedTargetAmount || (config.targetAmount
           ? String(snapshot.targetAmount ?? $("quickCardLinkTargetAmount").value).trim()
-          : config.fixedTargetAmount || "0",
+          : "0"),
         sentinel_so_enabled: snapshot.sentinelSoEnabled !== false,
         force_retry: Boolean(forceRetry),
         attempt_limit: Math.max(1, Math.min(
@@ -3803,9 +3806,9 @@
         const method = ["de_oaics_paypal", "paypal_us", "paypal_gb"].includes($("quickCardLinkMethod").value)
           ? $("quickCardLinkMethod").value : "de_oaics_paypal";
         const methodConfig = cardLinkExtractionModes[method];
-        const targetAmount = methodConfig.targetAmount
+        const targetAmount = methodConfig.fixedTargetAmount || (methodConfig.targetAmount
           ? $("quickCardLinkTargetAmount").value.trim()
-          : methodConfig.fixedTargetAmount || "0";
+          : "0");
         if (targetAmount && !/^\d+$/.test(targetAmount)) {
           throw new Error("目标金额必须是非负整数，留空表示不校验");
         }

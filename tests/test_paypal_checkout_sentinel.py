@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 from hidemyemail_generator import card_link_runtime
 
@@ -31,6 +32,38 @@ class _CheckoutSession:
 
 
 class PayPalCheckoutSentinelTests(unittest.TestCase):
+    def test_approval_challenge_uses_exact_checkout_referer_before_confirm(self):
+        session = _CheckoutSession()
+        checkout = {
+            "cs_id": "cs_test_sentinel",
+            "billing_country": "GB",
+            "processor_entity": "openai_llc",
+        }
+        with patch.object(
+            card_link_runtime,
+            "opll_chatgpt_checkout_warmup",
+        ) as warmup, patch.object(
+            card_link_runtime,
+            "opll_chatgpt_sentinel_ping",
+            return_value={"result": "ok"},
+        ) as ping:
+            challenge = card_link_runtime.opll_prefetch_paypal_approval_sentinel(
+                session,
+                "cs_test_sentinel",
+                checkout,
+                "http://gb-pool1.example:8000",
+                request_locale="en-GB",
+                device_id="device-checkout-test",
+            )
+
+        self.assertEqual(challenge, {"result": "ok"})
+        warmup.assert_called_once()
+        self.assertEqual(
+            ping.call_args.kwargs["referer_url"],
+            "https://chatgpt.com/checkout/openai_llc/cs_test_sentinel",
+        )
+        self.assertEqual(ping.call_args.kwargs["network_attempts"], 2)
+
     def test_vendored_sentinel_package_imports_without_core_path_injection(self):
         completed = subprocess.run(
             [
@@ -115,6 +148,70 @@ class PayPalCheckoutSentinelTests(unittest.TestCase):
             request["headers"]["openai-sentinel-so-token"],
             '{"so":"observer"}',
         )
+
+    def test_gb_standard_checkout_sends_sen_so_without_promotion(self):
+        session = _CheckoutSession()
+        observed_provider_args: list[tuple[str, str, str]] = []
+
+        def provider(proxy_url: str, device_id: str, locale: str) -> dict[str, str]:
+            observed_provider_args.append((proxy_url, device_id, locale))
+            return {
+                "openai-sentinel-token": '{"p":"gb-main"}',
+                "openai-sentinel-so-token": '{"so":"gb-observer"}',
+            }
+
+        card_link_runtime.opll_create_checkout(
+            "at-gb-checkout-test",
+            "GB",
+            "GBP",
+            "http://gb-pool1.example:8000",
+            request_locale="en-GB",
+            include_trial_promo=False,
+            chatgpt_session=session,
+            sentinel_so_enabled=True,
+            sentinel_header_provider=provider,
+        )
+
+        request = session.calls[0]
+        self.assertNotIn("promo_campaign", request["json"])
+        self.assertEqual(
+            observed_provider_args,
+            [
+                (
+                    "http://gb-pool1.example:8000",
+                    "device-checkout-test",
+                    "en-GB",
+                )
+            ],
+        )
+        self.assertEqual(
+            request["headers"]["openai-sentinel-token"],
+            '{"p":"gb-main"}',
+        )
+        self.assertEqual(
+            request["headers"]["openai-sentinel-so-token"],
+            '{"so":"gb-observer"}',
+        )
+
+    def test_approve_reuses_prefetched_session_without_second_ping(self):
+        session = _CheckoutSession()
+        with patch.object(
+            card_link_runtime,
+            "opll_chatgpt_sentinel_ping",
+        ) as ping:
+            card_link_runtime.opll_chatgpt_approve(
+                session,
+                "cs_test_sentinel",
+                {
+                    "billing_country": "GB",
+                    "processor_entity": "openai_llc",
+                },
+                sentinel_required=False,
+            )
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertTrue(session.calls[0]["url"].endswith("/checkout/approve"))
+        ping.assert_not_called()
 
 
 if __name__ == "__main__":

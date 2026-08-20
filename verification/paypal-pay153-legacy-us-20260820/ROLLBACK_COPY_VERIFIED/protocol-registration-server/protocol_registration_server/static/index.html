@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>服务器协议注册</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div><small>MAIL AUTH · SERVER</small><h1>服务器协议注册与优惠分池</h1><p>独立服务运行；不改变本地代理和本地注册流程。</p></div>
+      <span id="runtime" class="badge">正在连接</span>
+    </header>
+
+    <section id="authPanel" class="panel auth">
+      <div><strong>连接服务器 API</strong><span>令牌只保存在当前浏览器 localStorage</span></div>
+      <input id="token" type="password" autocomplete="off" placeholder="PROTOCOL_SERVER_API_TOKEN">
+      <button id="connect">连接</button>
+    </section>
+
+    <section id="workspace" hidden>
+      <div class="metrics">
+        <article><span>任务状态</span><strong id="taskStatus">空闲</strong><small id="taskMessage">等待开始</small><small id="verificationInfo">注册后自动验证</small></article>
+        <article><span>有优惠池</span><strong id="offerCount">0</strong><small>Checkout 支持 PayPal 且应付金额为 0</small></article>
+        <article><span>无优惠池</span><strong id="noOfferCount">0</strong><small>所选国家 Checkout 均不满足</small></article>
+        <article><span>待重试</span><strong id="pendingCount">0</strong><small>代理或接口结果不确定</small></article>
+      </div>
+
+      <section class="panel controls">
+        <label>邮箱来源<select id="provider"><option value="inventory">iCloud 服务器库存</option><option value="zkgmail">自有域名 · QQ 接码</option></select></label>
+        <label>注册次数<input id="count" type="number" min="1" max="100" value="1"></label>
+        <label>并发注册数<input id="concurrency" type="number" min="1" max="10" value="1"></label>
+        <label class="check"><input id="useRegistrationKookeey" type="checkbox">注册使用 Kookeey</label>
+        <label id="registrationCountryWrap" hidden>注册出口国家<select id="registrationCountry"></select></label>
+        <label class="check"><input id="setupCredentials" type="checkbox">设置密码与 TOTP 2FA</label>
+        <label class="check"><input id="checkOffer" type="checkbox" checked>注册后通过 Checkout 检查优惠</label>
+        <label class="multi-select">优惠检查国家（可多选）<select id="offerCountries" multiple size="4"></select><small>无 PayPal 时切换 DE 出口并回退 DE/EUR 账单</small></label>
+        <button id="start" class="primary">启动服务器注册</button>
+        <button id="stop" class="danger" disabled>停止</button>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head"><div><strong>注册进度</strong><span id="progressText">0 / 0</span></div><span id="route" class="badge">Clash / 直连</span></div>
+          <progress id="progress" value="0" max="100"></progress>
+          <div id="accounts" class="list empty">暂无运行账号</div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><strong>优惠池</strong><span>本地可通过 /api/accounts 拉取</span></div><button id="refresh">刷新</button></div>
+          <div class="tabs"><button data-pool="all" class="active">全部</button><button data-pool="offer">有优惠</button><button data-pool="no_offer">无优惠</button><button data-pool="pending">待重试</button></div>
+          <div id="pool" class="list empty">暂无优惠记录</div>
+        </article>
+      </section>
+
+      <section class="panel history-panel">
+        <div class="panel-head"><div><strong>最近任务记录</strong><span>服务重启后仍保留状态与参数</span></div></div>
+        <div id="runHistory" class="list empty">暂无任务记录</div>
+      </section>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

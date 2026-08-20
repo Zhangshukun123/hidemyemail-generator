@@ -26,6 +26,10 @@ from paypal.models import (
 )
 from paypal.payment_completion import is_trusted_openai_checkout_url
 from paypal.onboarding_compat import OnboardingCompatibilityPresenter
+from paypal.payment_protocol import (
+    CURRENT_PAYMENT_PROTOCOL,
+    PAYMENT_PROTOCOL_PRESENTER,
+)
 from paypal.us_email_first import (
     MemberAuthenticationResult,
     UsEmailFirstModel,
@@ -41,7 +45,6 @@ from paypal.fingerprint import (
 )
 from paypal.tealeaf import send_tealeaf_data
 from paypal.analytics import (
-    send_xo_logger,
     send_analytics_ts,
     send_observability_emit,
     send_weasley_log,
@@ -141,6 +144,7 @@ class PayPalFlow:
         proxy_enabled: bool | None = None,
         proxy_index: int | None = None,
         proxy_config: ProxyConfig | None = None,
+        payment_protocol: str = CURRENT_PAYMENT_PROTOCOL,
     ):
         self.ba_token = ba_token
         self.user = user
@@ -180,6 +184,10 @@ class PayPalFlow:
         self.lang = self.profile["lang"]
         self.phone_code = self.profile["phone_code"]
         self.accept_language = self.profile["accept_language"]
+        self.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
+            payment_protocol,
+            self.country,
+        )
         self.max_card_attempts = max(1, max_card_attempts)
         self.proxy_config: ProxyConfig = proxy_config or build_proxy_config(
             enabled=proxy_enabled,
@@ -203,13 +211,29 @@ class PayPalFlow:
             self,
         )
 
+    def _uses_us_email_first(self) -> bool:
+        """Return the active Strategy decision; legacy fixtures default current."""
+
+        profile = getattr(self, "payment_protocol_profile", None)
+        if profile is None:
+            country = str(
+                getattr(self, "country", "")
+                or getattr(getattr(self, "address", None), "country", "")
+            ).upper()
+            return country == "US"
+        return bool(profile.uses_us_email_first)
+
+    def _uses_legacy_pay153_us(self) -> bool:
+        profile = getattr(self, "payment_protocol_profile", None)
+        return bool(profile and profile.legacy_pay153_us)
+
     def close(self):
         self.session.close()
 
     def run(self) -> dict:
         """Execute the complete flow. Returns result dict with status and return_url."""
         try:
-            logger.info(f"=== PayPal Billing Agreement Flow ===")
+            logger.info("=== PayPal Billing Agreement Flow ===")
             logger.info("BA Token: {}", sanitize_for_log({"ba_token": self.ba_token})["ba_token"])
             logger.info("Email: {}", sanitize_for_log({"email": self.user.email})["email"])
             logger.info("Phone: {}", sanitize_for_log({"phone": self.user.phone})["phone"])
@@ -230,9 +254,9 @@ class PayPalFlow:
                 }
 
             if result.get("status") == "success":
-                logger.success(f"=== Flow completed successfully ===")
+                logger.success("=== Flow completed successfully ===")
             else:
-                logger.error(f"=== Flow completed with error status ===")
+                logger.error("=== Flow completed with error status ===")
             return result
         except Exception as e:
             logger.error(f"Flow failed: {e}")
@@ -1639,6 +1663,13 @@ class PayPalFlow:
                     (diagnostic.get("last_graphql") or {}).get("paypal_debug_id") or "<missing>",
                 )
 
+            if create_member_oas and self._uses_legacy_pay153_us():
+                raise RuntimeError(
+                    "US PayPal createMemberAccount was rejected by onboarding risk "
+                    "control (OAS_ERROR). The verified OTP session is now terminal; "
+                    "start a new clean job rather than rotating profile data in place."
+                )
+
             compatibility = ONBOARDING_COMPATIBILITY_PRESENTER.recover(
                 country=self.country,
                 errors=errors,
@@ -1746,7 +1777,7 @@ class PayPalFlow:
         """Submit 'Create Account' action to get to the signup page."""
         logger.info("--- Phase 2: Create account flow ---")
 
-        us_email_first = self.country == "US"
+        us_email_first = self._uses_us_email_first()
         bootstrap_response = getattr(self, "_approve_response", None)
         resp = (
             bootstrap_response
@@ -2271,7 +2302,7 @@ class PayPalFlow:
         """
         logger.info("--- Phase 3: Signup form + 2FA ---")
 
-        if self.country == "US":
+        if self._uses_us_email_first():
             return self._phase3_us_email_first()
 
         # Send Tealeaf to simulate form interaction
@@ -2495,7 +2526,8 @@ class PayPalFlow:
         """Send the final authorize mutation to approve the billing agreement."""
         logger.info("--- Phase 4: Final authorization ---")
 
-        if self.country == "US":
+        us_email_first = self._uses_us_email_first()
+        if us_email_first:
             # The email-first branch already has an authenticated buyer and a
             # selected card. Re-entering the legacy addFI/card-error fallback
             # can downgrade or detach that member context.
@@ -2528,7 +2560,7 @@ class PayPalFlow:
         # redirect chain so EUAT, buyer and checkout cookies belong to one session.
         try:
             logger.info("Loading Hermes/Hagrid review context...")
-            if self.country != "US":
+            if not us_email_first:
                 self._load_review_context(
                     hermes_contingency_url,
                     self.state.signup_url,
@@ -2559,7 +2591,7 @@ class PayPalFlow:
 
         # The critical authorize mutation
         billing_agreement_id = self.state.ec_token or self.ba_token
-        if self.country == "US":
+        if us_email_first:
             funding_context = self._sync_buyer_funding_context(
                 billing_agreement_id,
                 review_referer,
@@ -2762,7 +2794,7 @@ class PayPalFlow:
                 event="cl",
             )
 
-            if self.country == "US":
+            if us_email_first:
                 presenter = getattr(self, "us_email_first_presenter", None)
                 if isinstance(presenter, UsEmailFirstPresenter):
                     authorized_model = presenter.mark_authorized()

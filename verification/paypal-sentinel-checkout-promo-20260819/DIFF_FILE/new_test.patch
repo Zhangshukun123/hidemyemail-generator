@@ -1,0 +1,100 @@
+diff --git a/tests/test_paypal_checkout_sentinel.py b/tests/test_paypal_checkout_sentinel.py
+new file mode 100644
+index 0000000..2ed10e6
+--- /dev/null
++++ b/tests/test_paypal_checkout_sentinel.py
+@@ -0,0 +1,94 @@
++from __future__ import annotations
++
++import unittest
++
++from hidemyemail_generator import card_link_runtime
++
++
++class _CheckoutResponse:
++    status_code = 200
++    text = ""
++
++    @staticmethod
++    def json() -> dict:
++        return {
++            "checkout_session_id": "cs_test_sentinel",
++            "processor_entity": "openai_llc",
++        }
++
++
++class _CheckoutSession:
++    opll_oai_device_id = "device-checkout-test"
++
++    def __init__(self) -> None:
++        self.calls: list[dict] = []
++
++    def post(self, url, **options):
++        self.calls.append({"url": url, **options})
++        return _CheckoutResponse()
++
++
++class PayPalCheckoutSentinelTests(unittest.TestCase):
++    def test_checkout_create_promotion_policy_never_schedules_update(self):
++        self.assertFalse(
++            card_link_runtime.opll_should_update_checkout_promotion(
++                apply_trial_promotion=True,
++                checkout_includes_trial_promo=True,
++                target_amount="0",
++                actual_amount="2000",
++            )
++        )
++        self.assertTrue(
++            card_link_runtime.opll_should_update_checkout_promotion(
++                apply_trial_promotion=True,
++                checkout_includes_trial_promo=False,
++                target_amount="0",
++                actual_amount="2000",
++            )
++        )
++
++    def test_checkout_create_submits_promotion_and_sen_so_headers_together(self):
++        session = _CheckoutSession()
++        observed_provider_args: list[tuple[str, str, str]] = []
++
++        def provider(proxy_url: str, device_id: str, locale: str) -> dict[str, str]:
++            observed_provider_args.append((proxy_url, device_id, locale))
++            return {
++                "openai-sentinel-token": '{"p":"main"}',
++                "openai-sentinel-so-token": '{"so":"observer"}',
++            }
++
++        checkout = card_link_runtime.opll_create_checkout(
++            "at-checkout-test",
++            "US",
++            "USD",
++            "http://proxy.example:8000",
++            request_locale="en-US",
++            include_trial_promo=True,
++            chatgpt_session=session,
++            sentinel_so_enabled=True,
++            sentinel_header_provider=provider,
++        )
++
++        self.assertEqual(checkout["cs_id"], "cs_test_sentinel")
++        self.assertEqual(
++            observed_provider_args,
++            [("http://proxy.example:8000", "device-checkout-test", "en-US")],
++        )
++        request = session.calls[0]
++        self.assertEqual(
++            request["json"]["promo_campaign"]["promo_campaign_id"],
++            "plus-1-month-free",
++        )
++        self.assertEqual(
++            request["headers"]["openai-sentinel-token"],
++            '{"p":"main"}',
++        )
++        self.assertEqual(
++            request["headers"]["openai-sentinel-so-token"],
++            '{"so":"observer"}',
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()

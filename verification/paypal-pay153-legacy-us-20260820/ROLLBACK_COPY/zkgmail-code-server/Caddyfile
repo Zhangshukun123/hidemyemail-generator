@@ -1,0 +1,59 @@
+zkgmail.8-208-13-52.sslip.io {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	@health {
+		method GET
+		path /healthz
+	}
+	handle @health {
+		reverse_proxy 127.0.0.1:18768 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+
+	@page {
+		method GET
+		path / /favicon.ico /assets/*
+	}
+	handle @page {
+		reverse_proxy 127.0.0.1:18768 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+
+	@lookup {
+		method POST
+		path /api/access /api/code/latest
+	}
+	handle @lookup {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy 127.0.0.1:18768 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}

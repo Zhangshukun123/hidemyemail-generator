@@ -1,0 +1,1043 @@
+diff --git a/paypal-agreement-protocol/paypal/elevation_flow.py b/paypal-agreement-protocol/paypal/elevation_flow.py
+index 232f786b0abbf8a18679e4972ee065422e832ee2..d0677ce0af7f3f6995602c075531f6c13bd0f253 100644
+--- a/paypal-agreement-protocol/paypal/elevation_flow.py
++++ b/paypal-agreement-protocol/paypal/elevation_flow.py
+@@ -39,7 +39,7 @@ class IdentityElevationPayPalFlow(PayPalFlow):
+             and getattr(self, "_ae_pre_hydrated", False)
+         )
+         preserve_us_email_first = bool(
+-            country == "US"
++            self._uses_us_email_first()
+             and getattr(self.state, "member_authenticated", False)
+             and getattr(self.state, "funding_selected", False)
+         )
+@@ -250,9 +250,8 @@ class IdentityElevationPayPalFlow(PayPalFlow):
+         logger.info("--- Identity elevation: guest checkout -> member checkout ---")
+         self.session.set_euat_token(self.state.euat_token)
+ 
+-        country = str(getattr(self.address, "country", "") or "").upper()
+         if (
+-            country == "US"
++            self._uses_us_email_first()
+             and self.state.member_authenticated
+             and self.state.funding_selected
+         ):
+diff --git a/paypal-agreement-protocol/paypal/flow.py b/paypal-agreement-protocol/paypal/flow.py
+index 51bd765a9b12626352d2e2b419a5d0140c54b61c..2ea180c36ed7f840b27bd51a0cad52cc37fea8b9 100644
+--- a/paypal-agreement-protocol/paypal/flow.py
++++ b/paypal-agreement-protocol/paypal/flow.py
+@@ -26,6 +26,10 @@ from paypal.models import (
+ )
+ from paypal.payment_completion import is_trusted_openai_checkout_url
+ from paypal.onboarding_compat import OnboardingCompatibilityPresenter
++from paypal.payment_protocol import (
++    CURRENT_PAYMENT_PROTOCOL,
++    PAYMENT_PROTOCOL_PRESENTER,
++)
+ from paypal.us_email_first import (
+     MemberAuthenticationResult,
+     UsEmailFirstModel,
+@@ -41,7 +45,6 @@ from paypal.fingerprint import (
+ )
+ from paypal.tealeaf import send_tealeaf_data
+ from paypal.analytics import (
+-    send_xo_logger,
+     send_analytics_ts,
+     send_observability_emit,
+     send_weasley_log,
+@@ -141,6 +144,7 @@ class PayPalFlow:
+         proxy_enabled: bool | None = None,
+         proxy_index: int | None = None,
+         proxy_config: ProxyConfig | None = None,
++        payment_protocol: str = CURRENT_PAYMENT_PROTOCOL,
+     ):
+         self.ba_token = ba_token
+         self.user = user
+@@ -180,6 +184,10 @@ class PayPalFlow:
+         self.lang = self.profile["lang"]
+         self.phone_code = self.profile["phone_code"]
+         self.accept_language = self.profile["accept_language"]
++        self.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++            payment_protocol,
++            self.country,
++        )
+         self.max_card_attempts = max(1, max_card_attempts)
+         self.proxy_config: ProxyConfig = proxy_config or build_proxy_config(
+             enabled=proxy_enabled,
+@@ -203,13 +211,29 @@ class PayPalFlow:
+             self,
+         )
+ 
++    def _uses_us_email_first(self) -> bool:
++        """Return the active Strategy decision; legacy fixtures default current."""
++
++        profile = getattr(self, "payment_protocol_profile", None)
++        if profile is None:
++            country = str(
++                getattr(self, "country", "")
++                or getattr(getattr(self, "address", None), "country", "")
++            ).upper()
++            return country == "US"
++        return bool(profile.uses_us_email_first)
++
++    def _uses_legacy_pay153_us(self) -> bool:
++        profile = getattr(self, "payment_protocol_profile", None)
++        return bool(profile and profile.legacy_pay153_us)
++
+     def close(self):
+         self.session.close()
+ 
+     def run(self) -> dict:
+         """Execute the complete flow. Returns result dict with status and return_url."""
+         try:
+-            logger.info(f"=== PayPal Billing Agreement Flow ===")
++            logger.info("=== PayPal Billing Agreement Flow ===")
+             logger.info("BA Token: {}", sanitize_for_log({"ba_token": self.ba_token})["ba_token"])
+             logger.info("Email: {}", sanitize_for_log({"email": self.user.email})["email"])
+             logger.info("Phone: {}", sanitize_for_log({"phone": self.user.phone})["phone"])
+@@ -230,9 +254,9 @@ class PayPalFlow:
+                 }
+ 
+             if result.get("status") == "success":
+-                logger.success(f"=== Flow completed successfully ===")
++                logger.success("=== Flow completed successfully ===")
+             else:
+-                logger.error(f"=== Flow completed with error status ===")
++                logger.error("=== Flow completed with error status ===")
+             return result
+         except Exception as e:
+             logger.error(f"Flow failed: {e}")
+@@ -1639,6 +1663,13 @@ class PayPalFlow:
+                     (diagnostic.get("last_graphql") or {}).get("paypal_debug_id") or "<missing>",
+                 )
+ 
++            if create_member_oas and self._uses_legacy_pay153_us():
++                raise RuntimeError(
++                    "US PayPal createMemberAccount was rejected by onboarding risk "
++                    "control (OAS_ERROR). The verified OTP session is now terminal; "
++                    "start a new clean job rather than rotating profile data in place."
++                )
++
+             compatibility = ONBOARDING_COMPATIBILITY_PRESENTER.recover(
+                 country=self.country,
+                 errors=errors,
+@@ -1746,7 +1777,7 @@ class PayPalFlow:
+         """Submit 'Create Account' action to get to the signup page."""
+         logger.info("--- Phase 2: Create account flow ---")
+ 
+-        us_email_first = self.country == "US"
++        us_email_first = self._uses_us_email_first()
+         bootstrap_response = getattr(self, "_approve_response", None)
+         resp = (
+             bootstrap_response
+@@ -2271,7 +2302,7 @@ class PayPalFlow:
+         """
+         logger.info("--- Phase 3: Signup form + 2FA ---")
+ 
+-        if self.country == "US":
++        if self._uses_us_email_first():
+             return self._phase3_us_email_first()
+ 
+         # Send Tealeaf to simulate form interaction
+@@ -2495,7 +2526,8 @@ class PayPalFlow:
+         """Send the final authorize mutation to approve the billing agreement."""
+         logger.info("--- Phase 4: Final authorization ---")
+ 
+-        if self.country == "US":
++        us_email_first = self._uses_us_email_first()
++        if us_email_first:
+             # The email-first branch already has an authenticated buyer and a
+             # selected card. Re-entering the legacy addFI/card-error fallback
+             # can downgrade or detach that member context.
+@@ -2528,7 +2560,7 @@ class PayPalFlow:
+         # redirect chain so EUAT, buyer and checkout cookies belong to one session.
+         try:
+             logger.info("Loading Hermes/Hagrid review context...")
+-            if self.country != "US":
++            if not us_email_first:
+                 self._load_review_context(
+                     hermes_contingency_url,
+                     self.state.signup_url,
+@@ -2559,7 +2591,7 @@ class PayPalFlow:
+ 
+         # The critical authorize mutation
+         billing_agreement_id = self.state.ec_token or self.ba_token
+-        if self.country == "US":
++        if us_email_first:
+             funding_context = self._sync_buyer_funding_context(
+                 billing_agreement_id,
+                 review_referer,
+@@ -2762,7 +2794,7 @@ class PayPalFlow:
+                 event="cl",
+             )
+ 
+-            if self.country == "US":
++            if us_email_first:
+                 presenter = getattr(self, "us_email_first_presenter", None)
+                 if isinstance(presenter, UsEmailFirstPresenter):
+                     authorized_model = presenter.mark_authorized()
+diff --git a/paypal-agreement-protocol/paypal/payment_protocol.py b/paypal-agreement-protocol/paypal/payment_protocol.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2e0a72607505a968a01eef91914f5f7fcdd190b
+--- /dev/null
++++ b/paypal-agreement-protocol/paypal/payment_protocol.py
+@@ -0,0 +1,101 @@
++"""MVP/Strategy profiles for versioned PayPal payment behavior."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Protocol
++
++
++CURRENT_PAYMENT_PROTOCOL = "current"
++PAY153_LEGACY_US_PAYMENT_PROTOCOL = "pay153_legacy_us"
++
++
++@dataclass(frozen=True, slots=True)
++class PaymentProtocolModel:
++    """Normalized protocol decisions consumed by the flow view."""
++
++    name: str
++    country: str
++    legacy_pay153_us: bool = False
++
++    @property
++    def uses_us_email_first(self) -> bool:
++        return self.country == "US" and not self.legacy_pay153_us
++
++    @property
++    def acquires_phone_before_flow(self) -> bool:
++        return not self.uses_us_email_first
++
++    @property
++    def uses_source_account_email(self) -> bool:
++        return self.uses_us_email_first
++
++    @property
++    def allows_us_member_recovery(self) -> bool:
++        return self.uses_us_email_first
++
++
++class PaymentProtocolStrategy(Protocol):
++    """Factory strategy for one named protocol."""
++
++    def supports(self, requested: str) -> bool: ...
++
++    def build(self, country: str) -> PaymentProtocolModel: ...
++
++
++class CurrentPaymentProtocolStrategy:
++    def supports(self, requested: str) -> bool:
++        return requested == CURRENT_PAYMENT_PROTOCOL
++
++    def build(self, country: str) -> PaymentProtocolModel:
++        return PaymentProtocolModel(
++            name=CURRENT_PAYMENT_PROTOCOL,
++            country=country,
++        )
++
++
++class LegacyPay153UsPaymentProtocolStrategy:
++    def supports(self, requested: str) -> bool:
++        return requested == PAY153_LEGACY_US_PAYMENT_PROTOCOL
++
++    def build(self, country: str) -> PaymentProtocolModel:
++        if country != "US":
++            raise ValueError("旧 PAY.153 支付协议仅支持 US")
++        return PaymentProtocolModel(
++            name=PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++            country=country,
++            legacy_pay153_us=True,
++        )
++
++
++class PaymentProtocolPresenter:
++    """Validate the API field and present one immutable flow profile."""
++
++    def __init__(
++        self,
++        strategies: tuple[PaymentProtocolStrategy, ...] | None = None,
++    ) -> None:
++        self._strategies = strategies or (
++            LegacyPay153UsPaymentProtocolStrategy(),
++            CurrentPaymentProtocolStrategy(),
++        )
++
++    def present(self, requested: str, country: str) -> PaymentProtocolModel:
++        normalized_name = str(requested or CURRENT_PAYMENT_PROTOCOL).strip().lower()
++        normalized_country = str(country or "BR").strip().upper()
++        for strategy in self._strategies:
++            if strategy.supports(normalized_name):
++                return strategy.build(normalized_country)
++        raise ValueError("支付协议参数不正确")
++
++
++PAYMENT_PROTOCOL_PRESENTER = PaymentProtocolPresenter()
++
++
++__all__ = [
++    "CURRENT_PAYMENT_PROTOCOL",
++    "PAY153_LEGACY_US_PAYMENT_PROTOCOL",
++    "PAYMENT_PROTOCOL_PRESENTER",
++    "PaymentProtocolModel",
++    "PaymentProtocolPresenter",
++]
+diff --git a/paypal-agreement-protocol/tests/test_us_email_first_integration.py b/paypal-agreement-protocol/tests/test_us_email_first_integration.py
+index 5ef957d79cebe9a0a2f46d29bbdc0672a4861d30..f91c99e9e9a2b72fe21de85554c2868525ddb20f 100644
+--- a/paypal-agreement-protocol/tests/test_us_email_first_integration.py
++++ b/paypal-agreement-protocol/tests/test_us_email_first_integration.py
+@@ -6,6 +6,11 @@ import web as paypal_web
+ from paypal.elevation_flow import IdentityElevationPayPalFlow
+ from paypal.flow import PayPalFlow
+ from paypal.models import BillingAddress, CardInfo, SessionState, UserInfo
++from paypal.payment_protocol import (
++    CURRENT_PAYMENT_PROTOCOL,
++    PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++    PAYMENT_PROTOCOL_PRESENTER,
++)
+ from paypal.us_email_first import (
+     MemberAuthenticationResult,
+     PREPARATION_EVENT_ORDER,
+@@ -22,6 +27,7 @@ class ResponseStub:
+     def __init__(self, *, status=200, text="", headers=None, url="https://www.paypal.com/pay"):
+         self.status_code = status
+         self.text = text
++        self.content = text.encode("utf-8")
+         self.headers = dict(headers or {})
+         self.url = url
+ 
+@@ -129,6 +135,110 @@ def fixture_address(country="US"):
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    (
++        "country",
++        "payment_protocol",
++        "email_first",
++        "acquire_before",
++        "source_email",
++        "member_recovery",
++    ),
++    [
++        ("US", CURRENT_PAYMENT_PROTOCOL, True, False, True, True),
++        ("US", PAY153_LEGACY_US_PAYMENT_PROTOCOL, False, True, False, False),
++        ("GB", CURRENT_PAYMENT_PROTOCOL, False, True, False, False),
++    ],
++)
++def test_payment_protocol_strategy_matrix(
++    country,
++    payment_protocol,
++    email_first,
++    acquire_before,
++    source_email,
++    member_recovery,
++):
++    profile = PAYMENT_PROTOCOL_PRESENTER.present(payment_protocol, country)
++
++    assert profile.uses_us_email_first is email_first
++    assert profile.acquires_phone_before_flow is acquire_before
++    assert profile.uses_source_account_email is source_email
++    assert profile.allows_us_member_recovery is member_recovery
++
++
++def test_payment_protocol_rejects_legacy_for_non_us_and_unknown_values():
++    with pytest.raises(ValueError, match="仅支持 US"):
++        PAYMENT_PROTOCOL_PRESENTER.present(
++            PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++            "GB",
++        )
++    with pytest.raises(ValueError, match="支付协议参数不正确"):
++        PAYMENT_PROTOCOL_PRESENTER.present("unknown", "US")
++
++
++def test_legacy_pay153_us_phase2_skips_email_first_server_actions(monkeypatch):
++    class Phase2Session:
++        def __init__(self):
++            self.get_calls = []
++            self.post_calls = []
++            self.graphql_calls = []
++
++        def get(self, url, **kwargs):
++            self.get_calls.append((url, kwargs))
++            return ResponseStub(status=200, url=url)
++
++        def post(self, url, **kwargs):
++            self.post_calls.append((url, kwargs))
++            raise AssertionError("legacy PAY.153 Phase 2 must not submit email actions")
++
++        def graphql(self, operation, query, variables, **kwargs):
++            self.graphql_calls.append((operation, variables, kwargs))
++            return {}
++
++    flow = PayPalFlow.__new__(PayPalFlow)
++    flow.country = "US"
++    flow.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++        PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++        "US",
++    )
++    flow.ba_token = "BA-phase2-fixture"
++    flow.user = fixture_user()
++    flow.address = fixture_address()
++    flow.locale = "en_US"
++    flow.lang = "en"
++    flow.state = SessionState(
++        ba_token=flow.ba_token,
++        ec_token="EC-phase2-fixture",
++        ssrt="ssrt-fixture",
++        ctx_id="ctx-fixture",
++    )
++    flow.session = Phase2Session()
++    flow._approve_response = ResponseStub(
++        status=200,
++        text='{"ecToken":"EC-phase2-fixture"}',
++        url="https://www.paypal.com/pay?token=EC-phase2-fixture",
++    )
++    flow._approve_html = ""
++    flow._approve_url = flow._approve_response.url
++    flow._normalize_address_with_paypal = MethodType(
++        lambda self, _token: None,
++        flow,
++    )
++    for name in (
++        "send_tealeaf_data",
++        "send_observability_emit",
++        "send_weasley_log",
++        "send_device_fingerprint",
++    ):
++        monkeypatch.setattr(f"paypal.flow.{name}", lambda *_args, **_kwargs: None)
++
++    flow._phase2_create_account()
++
++    assert flow.session.post_calls == []
++    assert flow.state.email_submitted is False
++    assert flow.state.signup_url.startswith("https://www.paypal.com/checkoutweb/signup")
++
++
+ def test_paypal_flow_us_phase3_uses_presenter_and_never_legacy_steps(monkeypatch):
+     calls = []
+ 
+@@ -224,6 +334,45 @@ def test_paypal_flow_non_us_phase3_keeps_legacy_two_step_order(monkeypatch):
+     assert flow.state.euat_token == "legacy-euat"
+ 
+ 
++def test_paypal_flow_us_legacy_pay153_keeps_phone_then_signup_order(monkeypatch):
++    calls = []
++
++    class LegacyUsFlow(PayPalFlow):
++        def _confirm_phone_with_retry(self, token, signup_url):
++            calls.append(("confirm_phone", token, signup_url))
++
++        def _signup_with_card_retry(self, token, signup_url):
++            calls.append(("signup", token, signup_url))
++            self.state.euat_token = "legacy-us-euat"
++
++        def _phase3_us_email_first(self):
++            pytest.fail("legacy PAY.153 must not enter US email-first Phase 3")
++
++    flow = LegacyUsFlow.__new__(LegacyUsFlow)
++    flow.country = "US"
++    flow.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++        PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++        "US",
++    )
++    flow.ba_token = "BA-legacy-us"
++    flow.state = SessionState(
++        ba_token=flow.ba_token,
++        ec_token="EC-legacy-us",
++        signup_url="https://www.paypal.com/checkoutweb/signup?token=EC-legacy-us",
++    )
++    flow.session = StateSessionStub(flow.state)
++    monkeypatch.setattr("paypal.flow.send_tealeaf_data", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr("paypal.flow.send_analytics_ts", lambda *_args, **_kwargs: None)
++
++    flow._phase3_signup_and_2fa()
++
++    assert calls == [
++        ("confirm_phone", "EC-legacy-us", flow.state.signup_url),
++        ("signup", "EC-legacy-us", flow.state.signup_url),
++    ]
++    assert flow.state.euat_token == "legacy-us-euat"
++
++
+ @pytest.mark.parametrize(
+     ("selected", "expected_selected", "expected_id"),
+     [
+@@ -311,14 +460,24 @@ def test_web_phone_provider_is_blocked_until_email_submission(monkeypatch):
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("country", "acquire_after_phase2", "expected_email"),
++    ("country", "payment_protocol", "acquire_after_phase2", "expected_email"),
+     [
+-        ("US", True, "source-account@example.com"),
+-        ("GB", False, "generated-gb@example.com"),
++        ("US", CURRENT_PAYMENT_PROTOCOL, True, "source-account@example.com"),
++        (
++            "US",
++            PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++            False,
++            "generated-us@example.com",
++        ),
++        ("GB", CURRENT_PAYMENT_PROTOCOL, False, "generated-gb@example.com"),
+     ],
+ )
+ def test_run_job_automatic_sms_order_and_us_source_email(
+-    monkeypatch, country, acquire_after_phase2, expected_email
++    monkeypatch,
++    country,
++    payment_protocol,
++    acquire_after_phase2,
++    expected_email,
+ ):
+     events = []
+     proxy = SimpleNamespace(url="", enabled=False, label="fixture")
+@@ -340,19 +499,37 @@ def test_run_job_automatic_sms_order_and_us_source_email(
+     class FlowStub:
+         acquire_phone_after_email = paypal_web.WebPayPalFlow.acquire_phone_after_email
+ 
++        def _uses_us_email_first(self):
++            return PAYMENT_PROTOCOL_PRESENTER.present(
++                self.payment_protocol,
++                self.country,
++            ).uses_us_email_first
++
+         def __init__(self, **kwargs):
+             self.job = kwargs["job"]
+             self.user = kwargs["user"]
+             self.card = kwargs["card"]
+             self.address = kwargs["address"]
+             self.country = self.job.country
++            self.payment_protocol = kwargs["payment_protocol"]
+             self.state = SessionState()
+             self.runtime_form_schema = {}
+-            events.append(("flow_init", self.user.email, self.user.phone))
++            events.append(
++                (
++                    "flow_init",
++                    self.user.email,
++                    self.user.phone,
++                    self.payment_protocol,
++                )
++            )
+ 
+         def run(self):
+             events.append(("phase2_complete", self.country))
+-            if self.country == "US":
++            profile = PAYMENT_PROTOCOL_PRESENTER.present(
++                self.payment_protocol,
++                self.country,
++            )
++            if profile.uses_us_email_first:
+                 self.state.email_submitted = True
+                 self.acquire_phone_after_email()
+             return {"status": "success", "return_url": "https://merchant.test/return"}
+@@ -390,6 +567,7 @@ def test_run_job_automatic_sms_order_and_us_source_email(
+         sms_provider="smsbower",
+         sms_country=country,
+         buyer_mode="original",
++        payment_protocol=payment_protocol,
+         source_account_email="source-account@example.com",
+         _proxy_config=proxy,
+     )
+@@ -405,9 +583,72 @@ def test_run_job_automatic_sms_order_and_us_source_email(
+     assert (acquire_index > phase2_index) is acquire_after_phase2
+     flow_init = next(event for event in events if event[0] == "flow_init")
+     assert flow_init[1] == expected_email
++    assert flow_init[3] == payment_protocol
+     assert job.status == "completed"
+ 
+ 
++class AuthorizationBranchReached(RuntimeError):
++    pass
++
++
++@pytest.mark.parametrize(
++    ("payment_protocol", "expected_branch", "expects_contingency"),
++    [
++        (CURRENT_PAYMENT_PROTOCOL, "funding", False),
++        (PAY153_LEGACY_US_PAYMENT_PROTOCOL, "buyer", True),
++    ],
++)
++def test_us_authorize_routes_current_and_legacy_contexts(
++    monkeypatch,
++    payment_protocol,
++    expected_branch,
++    expects_contingency,
++):
++    flow = PayPalFlow.__new__(PayPalFlow)
++    flow.country = "US"
++    flow.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++        payment_protocol,
++        "US",
++    )
++    flow.ba_token = "BA-authorize-fixture"
++    flow.locale = "en_US"
++    flow.address = fixture_address()
++    flow.state = SessionState(
++        ba_token=flow.ba_token,
++        ec_token="EC-authorize-fixture",
++        euat_token="euat-authorize-fixture",
++        signup_url=SIGNUP_URL,
++    )
++    flow.session = StateSessionStub(flow.state)
++    review_calls = []
++    context_calls = []
++
++    def load_review(self, url, referer, max_redirects=8):
++        review_calls.append((url, referer, max_redirects))
++        return ResponseStub(status=200, url=url)
++
++    def buyer_context(self, token, referer):
++        context_calls.append(("buyer", token, referer))
++        raise AuthorizationBranchReached("buyer")
++
++    def funding_context(self, token, referer):
++        context_calls.append(("funding", token, referer))
++        raise AuthorizationBranchReached("funding")
++
++    flow._load_review_context = MethodType(load_review, flow)
++    flow._before_final_authorize = MethodType(lambda self, _url: None, flow)
++    flow._sync_buyer_context = MethodType(buyer_context, flow)
++    flow._sync_buyer_funding_context = MethodType(funding_context, flow)
++    monkeypatch.setattr("paypal.flow.send_tealeaf_data", lambda *_args, **_kwargs: None)
++
++    with pytest.raises(AuthorizationBranchReached, match=expected_branch):
++        flow._phase4_authorize()
++
++    assert context_calls[0][0] == expected_branch
++    loaded_urls = [url for url, _referer, _redirects in review_calls]
++    assert any("addFIContingency=noretry" in url for url in loaded_urls) is expects_contingency
++
++
+ def test_identity_elevation_us_authenticated_selected_skips_signup_get():
+     state = SessionState(
+         ba_token="BA-fixture",
+@@ -445,3 +686,55 @@ def test_identity_elevation_us_authenticated_selected_skips_signup_get():
+     assert result is expected
+     assert query_calls == [("EC-fixture", REVIEW_URL)]
+     assert session.get_calls == []
++
++
++def test_identity_elevation_legacy_us_reenters_signup_and_hermes():
++    class NavigationSession(StateSessionStub):
++        def set_euat_token(self, value):
++            self.state.euat_token = str(value or "")
++
++        def get(self, url, **kwargs):
++            self.get_calls.append(((url,), kwargs))
++            return ResponseStub(status=200, url=url)
++
++    state = SessionState(
++        ba_token="BA-legacy-elevation",
++        ec_token="EC-legacy-elevation",
++        euat_token="legacy-euat",
++        signup_context_ready=True,
++        member_authenticated=True,
++        funding_selected=True,
++        signup_url=SIGNUP_URL,
++    )
++    session = NavigationSession(state)
++    flow = IdentityElevationPayPalFlow.__new__(IdentityElevationPayPalFlow)
++    flow.country = "US"
++    flow.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++        PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++        "US",
++    )
++    flow.state = state
++    flow.session = session
++    flow.address = fixture_address()
++    flow.ba_token = state.ba_token
++    flow.locale = "en_US"
++    expected = {
++        "buyer_ready": True,
++        "funding_selected": False,
++        "funding_available": True,
++        "funding_available_count": 1,
++        "funding_errors": [],
++        "funding_checkpoints": [],
++        "fatal_contingency": "",
++    }
++    flow._query_elevated_context = MethodType(
++        lambda self, _token, _referer: expected,
++        flow,
++    )
++
++    result = flow._protocol_identity_elevation()
++
++    assert result is expected
++    navigated_urls = [args[0] for args, _kwargs in session.get_calls]
++    assert navigated_urls[0] == SIGNUP_URL
++    assert any("billingLite=1" in url for url in navigated_urls[1:])
+diff --git a/paypal-agreement-protocol/tests/test_us_onboarding_compat.py b/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+index c510d2f2cdda3f507131f0b17a4a15e2c0f309ef..b38421103182408701e1b30ee64499e4851cbe62 100644
+--- a/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
++++ b/paypal-agreement-protocol/tests/test_us_onboarding_compat.py
+@@ -1,9 +1,15 @@
+ from types import SimpleNamespace
+ 
++import pytest
++
+ import web as paypal_web
+ from paypal.flow import PayPalFlow
+ from paypal.manual_browser import ManualBrowserController
+ from paypal.models import SessionState
++from paypal.payment_protocol import (
++    PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++    PAYMENT_PROTOCOL_PRESENTER,
++)
+ from paypal.onboarding_compat import (
+     OnboardingCompatibilityPresenter,
+     OnboardingFailureModel,
+@@ -122,6 +128,20 @@ def test_signup_flow_continues_after_us_official_member_handoff():
+     assert flow.state.user_id == "fixture-user"
+ 
+ 
++def test_legacy_pay153_us_oas_is_terminal_without_member_handoff():
++    flow = RecoveringPayPalFlow()
++    flow.payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++        PAY153_LEGACY_US_PAYMENT_PROTOCOL,
++        "US",
++    )
++    signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-fixture"
++
++    with pytest.raises(RuntimeError, match="verified OTP session is now terminal"):
++        flow._signup_with_card_retry("EC-fixture", signup_url)
++
++    assert flow.handoff_urls == []
++
++
+ def test_member_completion_requires_euat_and_paypal_review_route():
+     controller = ManualBrowserController(
+         proxy_config=None,
+diff --git a/paypal-agreement-protocol/web.py b/paypal-agreement-protocol/web.py
+index d68a5ace7292895b3b1ccda93de51670628fcf84..a9a4e1933f3b2897650c2c20ef6214d65c97281d 100644
+--- a/paypal-agreement-protocol/web.py
++++ b/paypal-agreement-protocol/web.py
+@@ -48,6 +48,10 @@ from paypal.payment_completion import (
+     is_strict_https_url,
+     is_trusted_openai_checkout_url,
+ )
++from paypal.payment_protocol import (
++    CURRENT_PAYMENT_PROTOCOL,
++    PAYMENT_PROTOCOL_PRESENTER,
++)
+ from paypal.proxy import ProxyConfig, ProxyEntry, build_proxy_config
+ from paypal.proxy_health import ProxyHealthChecker
+ from paypal.runtime_country_resolver import infer_dynamic_kyc, resolve_runtime_country_schema, validate_runtime_address, validate_runtime_phone
+@@ -883,6 +887,7 @@ class WebJob:
+     sms_max_price: float = SMSBOWER_DEFAULT_MAX_PRICE
+     sms_virtual: bool = False
+     buyer_mode: str = "identity_elevation"
++    payment_protocol: str = CURRENT_PAYMENT_PROTOCOL
+     debug: bool = False
+     max_card_attempts: int = 5
+     manual_funding: bool = False
+@@ -1535,6 +1540,7 @@ class WebJob:
+                 "phone_verification": sanitize_payload(self.phone_verification),
+                 "us_onboarding": us_onboarding,
+                 "buyer_mode": self.buyer_mode,
++                "payment_protocol": self.payment_protocol,
+                 "debug": self.debug and ALLOW_DEBUG_LOGS,
+                 "max_card_attempts": self.max_card_attempts,
+                 "manual_funding": self.manual_funding,
+@@ -1678,7 +1684,7 @@ class WebPayPalFlow(PayPalFlow):
+             # onboarding presenter requests it instead of rejecting the empty
+             # placeholder here.
+             phone_error = ""
+-            if self.user.phone or self.country != "US":
++            if self.user.phone or not self._uses_us_email_first():
+                 phone_error = validate_runtime_phone(
+                     runtime_schema, self.user.phone_local, self.user.phone
+                 )
+@@ -1812,7 +1818,7 @@ class WebPayPalFlow(PayPalFlow):
+     def acquire_phone_after_email(self) -> str:
+         """View: acquire/validate the US phone only after email submission."""
+ 
+-        if self.country != "US":
++        if not self._uses_us_email_first():
+             return str(self.user.phone or "")
+         if not getattr(self.state, "email_submitted", False):
+             raise RuntimeError(
+@@ -1866,7 +1872,7 @@ class WebPayPalFlow(PayPalFlow):
+     def _phase3_signup_and_2fa(self):
+         self._set_stage(
+             "Phase 3：手机验证登录与登录态绑卡"
+-            if self.country == "US"
++            if self._uses_us_email_first()
+             else "Phase 3：短信验证与注册"
+         )
+         return super()._phase3_signup_and_2fa()
+@@ -2655,6 +2661,7 @@ def create_job(
+     checkout_reference: str = "",
+     country: str = "BR",
+     buyer_mode: str = "identity_elevation",
++    payment_protocol: str = CURRENT_PAYMENT_PROTOCOL,
+     proxy_pool: Any = None,
+     exclude_public_metrics: bool = False,
+     source_account_email: str = "",
+@@ -2698,6 +2705,10 @@ def create_job(
+     buyer_mode = str(buyer_mode or "identity_elevation").strip().lower()
+     if buyer_mode not in {"original", "identity_elevation"}:
+         raise ValueError("Buyer 模式参数不正确")
++    payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++        payment_protocol,
++        country,
++    )
+     allowed_countries = supported_country_codes() if ENABLE_DYNAMIC_COUNTRIES else VERIFIED_PROTOCOL_COUNTRIES
+     if country not in allowed_countries:
+         raise ValueError("PayPal 国家参数不正确")
+@@ -2815,6 +2826,7 @@ def create_job(
+         sms_country=sms_country if automatic_sms else "",
+         sms_max_price=sms_max_price,
+         buyer_mode=buyer_mode,
++        payment_protocol=payment_protocol_profile.name,
+         debug=debug,
+         max_card_attempts=max_card_attempts,
+         manual_funding=bool(manual_funding),
+@@ -2907,8 +2919,12 @@ def run_job(job: WebJob) -> None:
+             )
+             job._proxy_config = proxy_config
+             job.check_cancelled()
++            payment_protocol_profile = PAYMENT_PROTOCOL_PRESENTER.present(
++                job.payment_protocol,
++                job.country,
++            )
+             defer_us_phone = bool(
+-                job.country == "US"
++                payment_protocol_profile.uses_us_email_first
+                 and job.sms_provider in AUTOMATIC_SMS_PROVIDERS
+             )
+             if job.sms_provider in AUTOMATIC_SMS_PROVIDERS and not defer_us_phone:
+@@ -2930,7 +2946,10 @@ def run_job(job: WebJob) -> None:
+                     "US PayPal automatic phone acquisition deferred until the email step succeeds"
+                 )
+             user = generate_user(job.phone, country=job.country)
+-            if job.country == "US" and job.source_account_email:
++            if (
++                payment_protocol_profile.uses_source_account_email
++                and job.source_account_email
++            ):
+                 user.email = job.source_account_email
+                 logger.info("US PayPal account creation will use the source account email")
+             job.check_cancelled()
+@@ -2960,6 +2979,7 @@ def run_job(job: WebJob) -> None:
+                 "Buyer mode: {}",
+                 "identity_elevation" if job.buyer_mode == "identity_elevation" else "original",
+             )
++            logger.info("Payment protocol: {}", payment_protocol_profile.name)
+             flow = flow_class(
+                 ba_token=job.ba_token,
+                 user=user,
+@@ -2967,6 +2987,7 @@ def run_job(job: WebJob) -> None:
+                 address=address,
+                 max_card_attempts=max(job.max_card_attempts, 8 if job.country == "BH" else 1),
+                 proxy_config=proxy_config,
++                payment_protocol=payment_protocol_profile.name,
+                 job=job,
+             )
+             job._flow = flow
+@@ -3327,6 +3348,9 @@ class WebHandler(BaseHTTPRequestHandler):
+                     sms_max_price=data.get("sms_max_price") or SMSBOWER_DEFAULT_MAX_PRICE,
+                     country=data.get("country") or data.get("paypal_country") or "BR",
+                     buyer_mode=data.get("buyer_mode") or "identity_elevation",
++                    payment_protocol=(
++                        data.get("payment_protocol") or CURRENT_PAYMENT_PROTOCOL
++                    ),
+                     debug=False,
+                     max_card_attempts=5,
+                     # Braintree link generation is now independent from the
+diff --git a/src/hidemyemail_generator/paypal_payment_protocol.py b/src/hidemyemail_generator/paypal_payment_protocol.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b4f2b945d658de445c652ff70cf02599d10352d
+--- /dev/null
++++ b/src/hidemyemail_generator/paypal_payment_protocol.py
+@@ -0,0 +1,85 @@
++"""MVP/Strategy selector for the regional PayPal payment protocol."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Protocol
++
++
++PAYPAL_PAYMENT_PROTOCOL_CURRENT = "current"
++PAYPAL_PAYMENT_PROTOCOL_PAY153_LEGACY_US = "pay153_legacy_us"
++
++
++@dataclass(frozen=True, slots=True)
++class PayPalPaymentProtocolModel:
++    """Protocol fields presented to the PAY.153 service."""
++
++    link_method: str
++    payment_protocol: str
++    buyer_mode: str = "identity_elevation"
++
++
++class PayPalPaymentProtocolStrategy(Protocol):
++    """Strategy used by the presenter to select one payment protocol."""
++
++    def supports(self, link_method: str) -> bool: ...
++
++    def build(self, link_method: str) -> PayPalPaymentProtocolModel: ...
++
++
++class LegacyPay153UsStrategy:
++    """Restore the combined-signup PAY.153 protocol for US links."""
++
++    def supports(self, link_method: str) -> bool:
++        return link_method == "paypal_us"
++
++    def build(self, link_method: str) -> PayPalPaymentProtocolModel:
++        return PayPalPaymentProtocolModel(
++            link_method=link_method,
++            payment_protocol=PAYPAL_PAYMENT_PROTOCOL_PAY153_LEGACY_US,
++        )
++
++
++class CurrentPayPalPaymentStrategy:
++    """Keep the current protocol for every non-US PayPal link."""
++
++    def supports(self, link_method: str) -> bool:
++        return True
++
++    def build(self, link_method: str) -> PayPalPaymentProtocolModel:
++        return PayPalPaymentProtocolModel(
++            link_method=link_method,
++            payment_protocol=PAYPAL_PAYMENT_PROTOCOL_CURRENT,
++        )
++
++
++class PayPalPaymentProtocolPresenter:
++    """Presenter that exposes the selected strategy to the WebApp view."""
++
++    def __init__(
++        self,
++        strategies: tuple[PayPalPaymentProtocolStrategy, ...] | None = None,
++    ) -> None:
++        self._strategies = strategies or (
++            LegacyPay153UsStrategy(),
++            CurrentPayPalPaymentStrategy(),
++        )
++
++    def present(self, link_method: str) -> PayPalPaymentProtocolModel:
++        normalized_method = str(link_method or "").strip().lower()
++        for strategy in self._strategies:
++            if strategy.supports(normalized_method):
++                return strategy.build(normalized_method)
++        raise ValueError("PayPal 支付协议无法匹配")
++
++
++PAYPAL_PAYMENT_PROTOCOL_PRESENTER = PayPalPaymentProtocolPresenter()
++
++
++__all__ = [
++    "PAYPAL_PAYMENT_PROTOCOL_CURRENT",
++    "PAYPAL_PAYMENT_PROTOCOL_PAY153_LEGACY_US",
++    "PAYPAL_PAYMENT_PROTOCOL_PRESENTER",
++    "PayPalPaymentProtocolModel",
++    "PayPalPaymentProtocolPresenter",
++]
+diff --git a/src/hidemyemail_generator/webapp.py b/src/hidemyemail_generator/webapp.py
+index 8bb1f82ebfa326b561f5bb6e1c248f9c63ed96cb..564cee90b715f85cbfd7e39e5a8ee1bd4ac188bb 100644
+--- a/src/hidemyemail_generator/webapp.py
++++ b/src/hidemyemail_generator/webapp.py
+@@ -79,6 +79,7 @@ from .main import _generate, fetch_account_info
+ from .main import RichHideMyEmail
+ from .openai_mfa import generate_totp
+ from .paypal_protocol_service import PayPalProtocolService
++from .paypal_payment_protocol import PAYPAL_PAYMENT_PROTOCOL_PRESENTER
+ from .payment_completion import (
+     PaymentCompletionModel,
+     PaymentCompletionPresenter,
+@@ -8828,9 +8829,12 @@ def create_app(
+             await payment_guard.release(email=email)
+             raise
+         device_id = paypal_auto_device_id(request, create=True)
++        payment_protocol = PAYPAL_PAYMENT_PROTOCOL_PRESENTER.present(link_method)
+         protocol_payload = {
+             "paypal_url": paypal_url,
+             "country": protocol_country,
++            "buyer_mode": payment_protocol.buyer_mode,
++            "payment_protocol": payment_protocol.payment_protocol,
+             "sms_provider": sms_provider,
+             "sms_service": "paypal",
+             "sms_country": protocol_country,
+@@ -8870,6 +8874,7 @@ def create_app(
+                 "ok": True,
+                 "email": email,
+                 "country": protocol_country,
++                "paymentProtocol": payment_protocol.payment_protocol,
+                 "checkoutCountry": link_country,
+                 "linkProxyCountry": link_proxy_country,
+                 "cookieCount": len(cookies),
+diff --git a/tests/test_paypal_payment_protocol.py b/tests/test_paypal_payment_protocol.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..48710172397430c8c77c6b7270a6d652e4c032c1
+--- /dev/null
++++ b/tests/test_paypal_payment_protocol.py
+@@ -0,0 +1,17 @@
++from hidemyemail_generator.paypal_payment_protocol import (
++    PAYPAL_PAYMENT_PROTOCOL_CURRENT,
++    PAYPAL_PAYMENT_PROTOCOL_PAY153_LEGACY_US,
++    PayPalPaymentProtocolPresenter,
++)
++
++
++def test_presenter_selects_legacy_pay153_only_for_us_link_method():
++    presenter = PayPalPaymentProtocolPresenter()
++
++    us = presenter.present("paypal_us")
++    gb = presenter.present("paypal_gb")
++
++    assert us.payment_protocol == PAYPAL_PAYMENT_PROTOCOL_PAY153_LEGACY_US
++    assert us.buyer_mode == "identity_elevation"
++    assert gb.payment_protocol == PAYPAL_PAYMENT_PROTOCOL_CURRENT
++    assert gb.buyer_mode == "identity_elevation"
+diff --git a/tests/test_webapp_stdio.py b/tests/test_webapp_stdio.py
+index 13615fb1282c9f50e572a8b4d8eecc154f547c9b..9ab0eb83f692fbf50e6e5b8b98a46c45a2700568 100644
+--- a/tests/test_webapp_stdio.py
++++ b/tests/test_webapp_stdio.py
+@@ -1275,6 +1275,8 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         protocol = created.await_args.args[0]
+         self.assertEqual(response.status, 201)
+         self.assertEqual(protocol["country"], "US")
++        self.assertEqual(protocol["buyer_mode"], "identity_elevation")
++        self.assertEqual(protocol["payment_protocol"], "pay153_legacy_us")
+         self.assertEqual(protocol["sms_provider"], "smsbower")
+         self.assertEqual(protocol["sms_service"], "paypal")
+         self.assertEqual(protocol["sms_country"], "US")
+@@ -1283,6 +1285,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(payload["smsService"], "paypal")
+         self.assertEqual(payload["smsServiceCode"], "ts")
+         self.assertEqual(payload["smsMaxPrice"], 0.123)
++        self.assertEqual(payload["paymentProtocol"], "pay153_legacy_us")
+         self.assertTrue(payload["smsVirtualAllowed"])
+ 
+     async def test_one_click_paypal_uses_configured_hero_sms_provider(self):
+@@ -1334,6 +1337,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         protocol = created.await_args.args[0]
+         self.assertEqual(response.status, 201)
+         self.assertEqual(protocol["sms_provider"], "hero-sms")
++        self.assertEqual(protocol["payment_protocol"], "pay153_legacy_us")
+         self.assertEqual(protocol["sms_max_price"], 0.456)
+         self.assertEqual(payload["smsProvider"], "hero-sms")
+         self.assertEqual(payload["smsProviderLabel"], "HeroSMS")
+@@ -1384,6 +1388,8 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         protocol = created.await_args.args[0]
+         self.assertEqual(response.status, 201)
+         self.assertEqual(protocol["country"], "GB")
++        self.assertEqual(protocol["buyer_mode"], "identity_elevation")
++        self.assertEqual(protocol["payment_protocol"], "current")
+         self.assertEqual(protocol["sms_provider"], "smsbower")
+         self.assertEqual(protocol["sms_service"], "paypal")
+         self.assertEqual(protocol["sms_country"], "GB")
+@@ -1394,6 +1400,7 @@ class CardLinkEndpointTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(payload["smsService"], "paypal")
+         self.assertEqual(payload["smsServiceCode"], "ts")
+         self.assertEqual(payload["smsMaxPrice"], 0.30)
++        self.assertEqual(payload["paymentProtocol"], "current")
+         self.assertFalse(payload["smsVirtualAllowed"])
+ 
+     async def test_one_click_paypal_ignores_manual_country_and_uses_link_country(self):

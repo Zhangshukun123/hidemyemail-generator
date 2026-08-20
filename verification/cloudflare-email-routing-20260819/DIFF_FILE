@@ -1,0 +1,7 @@
+CHANGED_EXTERNAL_FIELD: registry.nameservers
+BEFORE_EXTERNAL: dns1.hichina.com, dns2.hichina.com
+AFTER_EXTERNAL: carol.ns.cloudflare.com, rudy.ns.cloudflare.com
+CHANGED_LOCAL_FIELD: settings.zkgmail_qq_inbox_config_v1.activeDomain
+BEFORE_LOCAL: zkgmail.com
+AFTER_LOCAL: shukunlabs.xyz
+EMAIL_ROUTING: Catch-All -> 352***4@qq.com (active, destination verified)

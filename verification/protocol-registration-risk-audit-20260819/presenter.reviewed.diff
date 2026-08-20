@@ -1,0 +1,44 @@
+diff --git "a/D:\\AI\\hidemyemail-generator\\protocol-registration-server\\protocol_registration_server\\presenter.py" "b/D:\\AI\\hidemyemail-generator\\verification\\protocol-registration-risk-audit-20260819\\presenter.reviewed.py"
+index 81e0011..fd7a3c6 100644
+--- "a/D:\\AI\\hidemyemail-generator\\protocol-registration-server\\protocol_registration_server\\presenter.py"
++++ "b/D:\\AI\\hidemyemail-generator\\verification\\protocol-registration-risk-audit-20260819\\presenter.reviewed.py"
+@@ -43,6 +43,10 @@ from .settings import ServerSettings
+ 
+ DEFAULT_OFFER_COUNTRIES = ("US", "GB", "DE")
+ 
++# Conservative review profile: one self-service registration on one route.
++MAX_REVIEW_REGISTRATIONS_PER_TASK = 1
++MAX_REVIEW_CONCURRENCY = 1
++
+ 
+ def normalize_offer_countries(values: Any) -> list[str]:
+     if not isinstance(values, (list, tuple)):
+@@ -411,7 +415,7 @@ class ServerRegistrationPresenter:
+             base_dir=Path(__file__).resolve().parents[2],
+             db_file=self.settings.shared_db,
+             proxy_store=proxy_store or self.active_registration_proxy,
+-            max_concurrency=10,
++            max_concurrency=MAX_REVIEW_CONCURRENCY,
+         )
+ 
+     def _persist_state(self) -> None:
+@@ -563,11 +567,15 @@ class ServerRegistrationPresenter:
+         if self._supervisor is not None and not self._supervisor.done():
+             raise RuntimeError("服务器协议注册任务正在运行")
+         count = int(count)
+-        if not 1 <= count <= 100:
+-            raise ValueError("注册次数必须是 1–100")
++        if not 1 <= count <= MAX_REVIEW_REGISTRATIONS_PER_TASK:
++            raise ValueError("审查配置每次仅允许注册 1 个账号")
+         concurrency = int(concurrency)
+-        if not 1 <= concurrency <= 10:
+-            raise ValueError("并发注册数必须是 1–10")
++        if not 1 <= concurrency <= MAX_REVIEW_CONCURRENCY:
++            raise ValueError("审查配置并发注册数必须为 1")
++        if use_registration_kookeey:
++            raise ValueError("审查配置固定使用既有单一路由")
++        if check_offer:
++            raise ValueError("审查配置不自动创建或跨地区探测优惠 Checkout")
+         provider = str(provider or "").strip().lower()
+         if provider not in {"inventory", "zkgmail"}:
+             raise ValueError("邮箱来源仅支持 inventory 或 zkgmail")

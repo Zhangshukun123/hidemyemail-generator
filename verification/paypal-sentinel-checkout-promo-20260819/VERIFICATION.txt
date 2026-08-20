@@ -1,0 +1,49 @@
+CHANGE
+Branches/methods: de_oaics_paypal, paypal_us, paypal_gb
+Request field: sentinel_so_enabled (default true for PayPal; explicit false disables it)
+Checkout fields/headers: promo_campaign.promo_campaign_id=plus-1-month-free, openai-sentinel-token, openai-sentinel-so-token
+Promotion strategy: checkout_create; when checkout_includes_trial_promo=true the policy returns false for every later promotion Update decision.
+
+ARTIFACTS
+MODIFIED_FILE: D:\AI\hidemyemail-generator\verification\paypal-sentinel-checkout-promo-20260819\MODIFIED_FILE
+DIFF_FILE: D:\AI\hidemyemail-generator\verification\paypal-sentinel-checkout-promo-20260819\DIFF_FILE
+VERIFICATION.txt: D:\AI\hidemyemail-generator\verification\paypal-sentinel-checkout-promo-20260819\VERIFICATION.txt
+ROLLBACK.sh: D:\AI\hidemyemail-generator\verification\paypal-sentinel-checkout-promo-20260819\ROLLBACK.sh
+Original hashes: D:\AI\hidemyemail-generator\verification\paypal-sentinel-checkout-promo-20260819\ORIGINAL_HASHES.txt
+
+BASELINE
+Command: .\.venv\Scripts\python.exe -m pytest tests/test_card_link_bridge.py tests/test_card_link_bridge_service.py tests/test_paypal_link_web_ui.py tests/test_webapp_stdio.py -q
+Input: repository working tree before this change; cwd=D:\AI\hidemyemail-generator
+Literal result: 1 failed, 106 passed, 4992 warnings, 2 subtests passed in 34.10s
+Failing test: tests/test_webapp_stdio.py::CardLinkBridgeStreamingTests::test_legacy_bridge_publishes_log_before_process_finishes
+Exit status: 1
+
+MODIFIED
+Command: .\.venv\Scripts\python.exe -m pytest tests/test_card_link_bridge.py tests/test_card_link_bridge_service.py tests/test_paypal_link_web_ui.py tests/test_paypal_checkout_sentinel.py tests/test_webapp_stdio.py::CardLinkEndpointTests -q
+Input: modified repository with all three PayPal modes, SEN+SO toggle propagation, Checkout headers, and create-time promotion policy; cwd=D:\AI\hidemyemail-generator
+Literal result: 70 passed, 2974 warnings, 2 subtests passed in 21.49s
+Exit status: 0
+
+MODIFIED FULL REGRESSION
+Command: .\.venv\Scripts\python.exe -m pytest tests/test_card_link_bridge.py tests/test_card_link_bridge_service.py tests/test_paypal_link_web_ui.py tests/test_webapp_stdio.py tests/test_paypal_checkout_sentinel.py -q
+Input: modified repository; cwd=D:\AI\hidemyemail-generator
+Literal result: 1 failed, 110 passed, 4992 warnings, 2 subtests passed in 34.15s
+Failing test: the same pre-existing Windows timing test seen in BASELINE.
+Exit status: 1
+
+ROLLBACK
+Command: & 'C:\Program Files\Git\bin\bash.exe' 'D:/AI/hidemyemail-generator/verification/paypal-sentinel-checkout-promo-20260819/ROLLBACK.sh' 'D:/AI/hidemyemail-generator/verification/paypal-sentinel-checkout-promo-20260819/ROLLBACK_TEST_COPY'
+Input: an independent clean clone with DIFF_FILE/tracked.patch and DIFF_FILE/new_test.patch applied
+Literal output:
+ROLLBACK_OK: PayPal Checkout SEN+SO and create-time promotion changes removed
+ROLLBACK_EXIT=0
+WORKTREE_CLEAN
+NEW_TEST_REMOVED
+Exit status: 0
+
+RESTORED BEHAVIOR
+Command: $env:PYTHONPATH=(Resolve-Path 'src').Path; D:\AI\hidemyemail-generator\.venv\Scripts\python.exe -m pytest tests/test_card_link_bridge.py tests/test_card_link_bridge_service.py tests/test_paypal_link_web_ui.py -q
+Input: rolled-back independent copy; cwd=D:\AI\hidemyemail-generator\verification\paypal-sentinel-checkout-promo-20260819\ROLLBACK_TEST_COPY
+Literal result: 27 passed, 2 subtests passed in 16.92s
+Exit status: 0
+Restored status: git status --short returned no entries; tests/test_paypal_checkout_sentinel.py was removed; original PayPal behavior and original tracked file hashes were restored.

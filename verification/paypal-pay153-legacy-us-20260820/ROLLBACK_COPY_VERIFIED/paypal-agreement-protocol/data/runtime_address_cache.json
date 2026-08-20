@@ -1,0 +1,14 @@
+{
+  "US": {
+    "saved_at": 1787040746.0783145,
+    "address": {
+      "street": "Amsterdam Avenue",
+      "house_number": "891",
+      "district": "Manhattan",
+      "city": "New York",
+      "state": "NY",
+      "postal_code": "10025",
+      "country": "US"
+    }
+  }
+}

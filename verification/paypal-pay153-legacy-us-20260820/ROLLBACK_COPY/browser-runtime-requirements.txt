@@ -1,0 +1,6 @@
+playwright>=1.44.0,<1.61
+camoufox[geoip]>=0.5.4,<0.6
+requests>=2.31.0
+curl_cffi>=0.7.0
+httpx>=0.28.1
+qrcode[pil]>=7.4.2
