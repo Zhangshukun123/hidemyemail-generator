@@ -2290,6 +2290,19 @@ class ChatGPTRegister:
                             + (f" ({send_message})" if send_message else "")
                         )
                 self._l(f"  {_ts()} [+] 密码注册验证码已发送，开始接收")
+            elif password_after_otp_required:
+                # Reaching the OTP-first page does not reliably dispatch the
+                # initial message. Request it explicitly before beginning the
+                # mailbox wait so the first 120-second window is not wasted.
+                send_result = await auth.send_email_otp()
+                send_code, send_message = auth_error_details(send_result)
+                send_status = int(send_result.get("_http_status", 0) or 0)
+                if send_code or send_status >= 400:
+                    return self._failed(
+                        f"otp_send_failed: {send_code or send_status}"
+                        + (f" ({send_message})" if send_message else "")
+                    )
+                self._l(f"  {_ts()} [+] 邮箱验证码已显式请求，开始接收")
 
             # 3. 获取并校验 OTP；错误或过期时按服务端当前会话重新发码。
             validate_result: dict = {}
@@ -2298,7 +2311,7 @@ class ChatGPTRegister:
                 otp_wait = (
                     self.otp_timeout
                     if otp_attempt == 1
-                    else min(self.otp_timeout, 45)
+                    else min(self.otp_timeout, 90)
                 )
                 self._l(
                     f"  {_ts()} [..] 等待邮箱验证码 "

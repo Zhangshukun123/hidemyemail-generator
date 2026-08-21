@@ -3397,7 +3397,8 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                 }
 
             async def send_email_otp(self):
-                raise AssertionError("password register continue_url must send the OTP")
+                events.append("otp_send")
+                return {"_http_status": 200}
 
             async def create_account(self, *_args, **_kwargs):
                 raise AssertionError("direct OAuth must skip create_account")
@@ -3435,7 +3436,8 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
             "https://auth.openai.com/log-in-or-create-account",
         )
         self.assertLess(events.index(account_next_event), events.index("otp_page"))
-        self.assertLess(events.index("otp_page"), events.index("otp_receive"))
+        self.assertLess(events.index("otp_page"), events.index("otp_send"))
+        self.assertLess(events.index("otp_send"), events.index("otp_receive"))
         self.assertLess(events.index("otp_receive"), events.index(("otp_validate", "123456")))
         self.assertLess(events.index(("otp_validate", "123456")), events.index("oauth_continue"))
         self.assertNotIn("password_page", events)
@@ -3518,7 +3520,8 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
                 return self.session
 
             async def send_email_otp(self):
-                raise AssertionError("password response URL must send the OTP")
+                events.append("otp_send")
+                return {"_http_status": 200}
 
             async def create_account(self, *_args, **_kwargs):
                 raise AssertionError("direct OAuth must skip create_account")
@@ -3556,6 +3559,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["password_set"])
         self.assertEqual(result["password"], "")
         self.assertTrue(events[0][1]["prefer_password_signup"])
+        self.assertLess(events.index("otp_send"), events.index("otp_receive"))
         self.assertLess(events.index("otp_receive"), events.index("otp_validate"))
         self.assertNotIn("password_page", events)
         self.assertFalse(
@@ -3873,7 +3877,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["status"], "success")
-        self.assertEqual(fetch_timeouts, [120, 45])
+        self.assertEqual(fetch_timeouts, [120, 90])
         self.assertEqual(created[0].resend_count, 1)
         self.assertEqual(created[0].validated_code, "123456")
 
@@ -3937,7 +3941,7 @@ class ProtocolAuthStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result["error"], "otp_timeout: 已等待 3 次仍未收到验证码"
         )
-        self.assertEqual(fetch_timeouts, [120, 45, 45])
+        self.assertEqual(fetch_timeouts, [120, 90, 90])
         self.assertEqual(created[0].resend_count, 2)
 
     async def test_deactivated_account_stops_before_resend_or_create(self):
